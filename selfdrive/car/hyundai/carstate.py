@@ -156,10 +156,9 @@ class CarState(CarStateBase):
       ret.gasPressed = ret.gas > 0
     # *** Gas Interceptor ***
     elif self.CP.enableGasInterceptorDEPRECATED:
-        gas1 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"]
-        gas2 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]
-        ret.gas = (gas1 + gas2) / 2.0
-        ret.gasPressed = ret.gas > 0
+      # Same threshold as panda, equivalent to 1e-5 with previous DBC scaling
+      ret.gas = (cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"] + cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]) // 2
+      ret.gasPressed = ret.gas > 492
     else:
       ret.gas = cp.vl["EMS12"]["PV_AV_CAN"] / 100.
       ret.gasPressed = bool(cp.vl["EMS16"]["CF_Ems_AclAct"])
