@@ -7,7 +7,7 @@ from openpilot.selfdrive.car.hyundai.enable_radar_tracks import enable_radar_tra
 from openpilot.selfdrive.car.hyundai.hyundaicanfd import CanBus
 from openpilot.selfdrive.car.hyundai.values import HyundaiFlags, HyundaiFlagsSP, CAR, DBC, CANFD_CAR, CAMERA_SCC_CAR, CANFD_RADAR_SCC_CAR, \
                                          CANFD_UNSUPPORTED_LONGITUDINAL_CAR, NON_SCC_CAR, EV_CAR, HYBRID_CAR, LEGACY_SAFETY_MODE_CAR, \
-                                         UNSUPPORTED_LONGITUDINAL_CAR, Buttons
+                                         UNSUPPORTED_LONGITUDINAL_CAR, Buttons, FORCE_OP_LONG
 from openpilot.selfdrive.car.hyundai.radar_interface import RADAR_START_ADDR
 from openpilot.selfdrive.car import create_button_events, get_safety_config
 from openpilot.selfdrive.car.interfaces import CarInterfaceBase
@@ -21,6 +21,7 @@ ENABLE_BUTTONS = (Buttons.RES_ACCEL, Buttons.SET_DECEL, Buttons.CANCEL)
 BUTTONS_DICT = {Buttons.RES_ACCEL: ButtonType.accelCruise, Buttons.SET_DECEL: ButtonType.decelCruise,
                 Buttons.GAP_DIST: ButtonType.gapAdjustCruise, Buttons.CANCEL: ButtonType.cancel}
 
+PEDAL_MSG = 0x701
 
 class CarInterface(CarInterfaceBase):
   @staticmethod
@@ -100,6 +101,8 @@ class CarInterface(CarInterfaceBase):
       ret.experimentalLongitudinalAvailable = candidate not in (UNSUPPORTED_LONGITUDINAL_CAR | NON_SCC_CAR)
       if candidate in CAMERA_SCC_CAR:
         ret.spFlags |= HyundaiFlagsSP.SP_CAMERA_SCC_LEAD.value
+    if candidate in FORCE_OP_LONG:
+      ret.experimentalLongitudinalAvailable = True
     ret.openpilotLongitudinalControl = experimental_long and ret.experimentalLongitudinalAvailable
     ret.pcmCruise = not ret.openpilotLongitudinalControl
 
@@ -185,6 +188,9 @@ class CarInterface(CarInterfaceBase):
                      CAR.HYUNDAI_KONA_NON_SCC, CAR.HYUNDAI_KONA_EV_NON_SCC):
       ret.flags |= HyundaiFlags.ALT_LIMITS.value
       ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_ALT_LIMITS
+    if PEDAL_MSG in fingerprint[0]:
+      ret.enableGasInterceptor = True
+      ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_GAS_INTERCEPTOR
 
     ret.centerToFront = ret.wheelbase * 0.4
 

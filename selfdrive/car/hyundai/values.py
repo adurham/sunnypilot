@@ -110,6 +110,7 @@ class HyundaiFlagsSP(IntFlag):
   SP_LKAS12 = 2 ** 7
   SP_RADAR_TRACKS = 2 ** 8
   SP_UPSTREAM_TACO = 2 ** 9
+  SP_FORCE_OP_LONG = 2 ** 10
 
 
 class Footnote(Enum):
@@ -610,7 +611,13 @@ class CAR(Platforms):
     flags=HyundaiFlags.CHECKSUM_CRC8,
     spFlags=HyundaiFlagsSP.SP_NON_SCC | HyundaiFlagsSP.SP_NON_SCC_FCA | HyundaiFlagsSP.SP_NON_SCC_RADAR_FCA,
   )
-
+  HYUNDAI_ELANTRA_N_2022_NON_SCC = HyundaiPlatformConfig(
+    [HyundaiCarDocs("Hyundai Elantra N 2022 Non-SCC", "No Smart Cruise Control (SCC)", car_parts=CarParts.common([CarHarness.hyundai_k]))],
+    CarSpecs(mass=3296 * CV.LB_TO_KG, wheelbase=2.72, steerRatio=12.2, tireStiffnessFactor=0.65),
+    flags=HyundaiFlags.CHECKSUM_CRC8,
+    spFlags=HyundaiFlagsSP.SP_FORCE_OP_LONG,
+    dbc_dict=dbc_dict("hyundai_kia_generic_generated", None)
+  )
 
 class Buttons:
   NONE = 0
@@ -821,5 +828,6 @@ UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.LEGACY) | CAR.with_fl
 NON_SCC_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC)
 NON_SCC_FCA_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC_FCA)
 NON_SCC_RADAR_FCA_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC_RADAR_FCA)
+FORCE_OP_LONG = CAR.with_sp_flags(HyundaiFlagsSP.SP_FORCE_OP_LONG)
 
 DBC = CAR.create_dbc_map()
