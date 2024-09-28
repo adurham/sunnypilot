@@ -154,6 +154,12 @@ class CarState(CarStateBase):
       else:
         ret.gas = cp.vl["E_EMS11"]["Accel_Pedal_Pos"] / 254.
       ret.gasPressed = ret.gas > 0
+    # *** Gas Interceptor ***
+    elif self.CP.enableGasInterceptor:
+        gas1 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"]
+        gas2 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]
+        ret.gas = (gas1 + gas2) / 2.0
+        ret.gasPressed = ret.gas > -5
     else:
       ret.gas = cp.vl["EMS12"]["PV_AV_CAN"] / 100.
       ret.gasPressed = bool(cp.vl["EMS16"]["CF_Ems_AclAct"])
@@ -392,6 +398,9 @@ class CarState(CarStateBase):
 
     if CP.spFlags & HyundaiFlagsSP.SP_NAV_MSG:
       messages.append(("Navi_HU", 5))
+
+    if CP.enableGasInterceptor:
+      messages.append(("GAS_SENSOR", 50))
 
     return CANParser(DBC[CP.carFingerprint]["pt"], messages, 0)
 

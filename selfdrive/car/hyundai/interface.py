@@ -188,6 +188,7 @@ class CarInterface(CarInterfaceBase):
                      CAR.HYUNDAI_KONA_NON_SCC, CAR.HYUNDAI_KONA_EV_NON_SCC):
       ret.flags |= HyundaiFlags.ALT_LIMITS.value
       ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_ALT_LIMITS
+
     if PEDAL_MSG in fingerprint[0]:
       ret.enableGasInterceptorDEPRECATED = True
       ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_GAS_INTERCEPTOR

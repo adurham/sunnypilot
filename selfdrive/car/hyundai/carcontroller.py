@@ -4,7 +4,7 @@ from openpilot.common.conversions import Conversions as CV
 from openpilot.common.numpy_fast import clip, interp
 from openpilot.common.params import Params
 from opendbc.can.packer import CANPacker
-from openpilot.selfdrive.car import DT_CTRL, apply_driver_steer_torque_limits, common_fault_avoidance, make_tester_present_msg
+from openpilot.selfdrive.car import DT_CTRL, apply_driver_steer_torque_limits, common_fault_avoidance, make_tester_present_msg, create_gas_interceptor_command
 from openpilot.selfdrive.car.hyundai import hyundaicanfd, hyundaican
 from openpilot.selfdrive.car.hyundai.hyundaicanfd import CanBus
 from openpilot.selfdrive.car.hyundai.values import HyundaiFlags, HyundaiFlagsSP, Buttons, CarControllerParams, CANFD_CAR, CAR, CAMERA_SCC_CAR, LEGACY_SAFETY_MODE_CAR
@@ -321,6 +321,24 @@ class CarController(CarControllerBase):
       # 2 Hz front radar options
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not escc:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
+
+    if self.CP.enableGasInterceptor:
+      if CC.longActive:
+        MAX_INTERCEPTOR_GAS = 0.5
+        MIN_ACC_SPEED = 19. * CV.MPH_TO_MS
+        PEDAL_TRANSITION = 10. * CV.MPH_TO_MS
+        PEDAL_SCALE = interp(CS.out.vEgo, [0.0, MIN_ACC_SPEED, MIN_ACC_SPEED + PEDAL_TRANSITION], [0.4, 0.5, 0.0])
+        pedal_offset = interp(CS.out.vEgo, [0.0, 2.3, MIN_ACC_SPEED + PEDAL_TRANSITION], [-.4, 0.0, 0.2])
+        pedal_command = PEDAL_SCALE * (actuators.accel + pedal_offset)
+        interceptor_gas_cmd = clip(pedal_command, 0., MAX_INTERCEPTOR_GAS)
+      else:
+        interceptor_gas_cmd = 0
+
+    if self.frame % 2 == 0 and self.CP.enableGasInterceptor and self.CP.openpilotLongitudinalControl:
+      # send exactly zero if gas cmd is zero. Interceptor will send the max between read value and gas cmd.
+      # This prevents unexpected pedal range rescaling
+      can_sends.append(create_gas_interceptor_command(self.packer, interceptor_gas_cmd, self.frame))
+      self.gas = interceptor_gas_cmd
 
     new_actuators = actuators.as_builder()
     new_actuators.steer = apply_steer / self.params.STEER_MAX
