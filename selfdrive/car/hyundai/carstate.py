@@ -159,7 +159,7 @@ class CarState(CarStateBase):
         gas1 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"]
         gas2 = cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]
         ret.gas = (gas1 + gas2) / 2.0
-        ret.gasPressed = ret.gas > -5
+        ret.gasPressed = ret.gas > 0
     else:
       ret.gas = cp.vl["EMS12"]["PV_AV_CAN"] / 100.
       ret.gasPressed = bool(cp.vl["EMS16"]["CF_Ems_AclAct"])
