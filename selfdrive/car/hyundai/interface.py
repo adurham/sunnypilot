@@ -189,7 +189,7 @@ class CarInterface(CarInterfaceBase):
       ret.flags |= HyundaiFlags.ALT_LIMITS.value
       ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_ALT_LIMITS
     if PEDAL_MSG in fingerprint[0]:
-      ret.enableGasInterceptor = True
+      ret.enableGasInterceptorDEPRECATED = True
       ret.safetyConfigs[-1].safetyParam |= Panda.FLAG_HYUNDAI_GAS_INTERCEPTOR
 
     ret.centerToFront = ret.wheelbase * 0.4
