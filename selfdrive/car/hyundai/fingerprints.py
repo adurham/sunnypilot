@@ -1138,8 +1138,6 @@ FW_VERSIONS = {
       b'\xf1\x00US4_ RDR -----      1.00 1.00 99110-CG000         ',
     ],
   },
-
-  # Non SCC
   CAR.GENESIS_G70_2021_NON_SCC: {
     (Ecu.eps, 0x7d4, None): [
       b'\xf1\x00IK  MDPS R 1.00 1.08 57700-G9200 4I2CL108',
@@ -1183,18 +1181,18 @@ FW_VERSIONS = {
     ],
   },
   CAR.KIA_CEED_PHEV_2022_NON_SCC: {
-    (Ecu.eps, 0x7D4, None): [
+    (Ecu.eps, 0x7d4, None): [
       b'\xf1\x00CD  MDPS C 1.00 1.01 56310-XX000 4CPHC101',
     ],
-    (Ecu.fwdCamera, 0x7C4, None): [
+    (Ecu.fwdCamera, 0x7c4, None): [
       b'\xf1\x00CDH LKAS AT EUR LHD 1.00 1.01 99211-CR700 931',
     ],
   },
   CAR.KIA_FORTE_2019_NON_SCC: {
-    (Ecu.eps, 0x7D4, None): [
+    (Ecu.eps, 0x7d4, None): [
       b'\xf1\x00BD  MDPS C 1.00 1.04 56310/M6000 4BDDC104',
     ],
-    (Ecu.fwdCamera, 0x7C4, None): [
+    (Ecu.fwdCamera, 0x7c4, None): [
       b'\xf1\x00BD  LKAS AT USA LHD 1.00 1.02 95740-M6000 J31',
     ],
     (Ecu.engine, 0x7e0, None): [
@@ -1208,10 +1206,10 @@ FW_VERSIONS = {
     ],
   },
   CAR.KIA_FORTE_2021_NON_SCC: {
-    (Ecu.eps, 0x7D4, None): [
+    (Ecu.eps, 0x7d4, None): [
       b'\xf1\x00BD  MDPS C 1.00 1.08 56310M6000\x00 4BDDC108',
     ],
-    (Ecu.fwdCamera, 0x7C4, None): [
+    (Ecu.fwdCamera, 0x7c4, None): [
       b'\xf1\x00BD  LKAS AT USA LHD 1.00 1.04 95740-M6000 J33',
     ],
     (Ecu.engine, 0x7e0, None): [
@@ -1230,20 +1228,20 @@ FW_VERSIONS = {
       b'\xf1\x00SP ESC \r 100"\x04\x01 58910-Q5510',
     ],
     (Ecu.engine, 0x7e0, None): [
-      b'\xf1\x81616K0051\x00\x00\x00\x00\x00\x00\x00\x00',
       b'\xf1\x81616G2051\x00\x00\x00\x00\x00\x00\x00\x00',
+      b'\xf1\x81616K0051\x00\x00\x00\x00\x00\x00\x00\x00',
     ],
     (Ecu.eps, 0x7d4, None): [
-      b'\xf1\x00SP2 MDPS C 1.00 1.04 56310Q5240  4SPSC104',
       b'\xf1\x00SP2 MDPS C 1.00 1.01 56300Q5920          ',
+      b'\xf1\x00SP2 MDPS C 1.00 1.04 56310Q5240  4SPSC104',
     ],
     (Ecu.fwdCamera, 0x7c4, None): [
-      b'\xf1\x00SP2 MFC  AT USA LHD 1.00 1.03 99210-Q5500 230208',
       b'\xf1\x00SP2 MFC  AT AUS RHD 1.00 1.02 99210-Q5500 220624',
+      b'\xf1\x00SP2 MFC  AT USA LHD 1.00 1.03 99210-Q5500 230208',
     ],
     (Ecu.transmission, 0x7e1, None): [
-      b'\xf1\x006V2B0_C2\x00\x006V2D5051\x00\x00CSP2N20NL0\x00\x00\x00\x00',
       b'\xf1\x006V2B0_C2\x00\x006V2D4051\x00\x00CSP2N20KL1\x00\x00\x00\x00',
+      b'\xf1\x006V2B0_C2\x00\x006V2D5051\x00\x00CSP2N20NL0\x00\x00\x00\x00',
     ],
   },
   CAR.HYUNDAI_ELANTRA_2022_NON_SCC: {
@@ -1264,9 +1262,8 @@ FW_VERSIONS = {
     ],
   },
   CAR.HYUNDAI_BAYON_1ST_GEN_NON_SCC: {
-    # TODO: Check working route for more FW
     (Ecu.fwdCamera, 0x7c4, None): [
-      b'\xf1\x00BC3 LKA  AT EUR LHD 1.00 1.01 99211-Q0100 261'
+      b'\xf1\x00BC3 LKA  AT EUR LHD 1.00 1.01 99211-Q0100 261',
     ],
   },
   CAR.HYUNDAI_ELANTRA_N_2022_NON_SCC: {
@@ -1274,11 +1271,11 @@ FW_VERSIONS = {
       b'\xf1\x00CN ESC \t 100!\x05\x01 58910-IB000',
       b'\xf1\x8758910-IB000\xf1\x00CN ESC \t 100!\x05\x01 58910-IB000',
     ],
-    (Ecu.combinationMeter, 0x7C6, None): [
+    (Ecu.combinationMeter, 0x7c6, None): [
       b'\xf1\x00131',
       b'\xf1\x8b !\x11\x19',
     ],
-    (Ecu.cornerRadar, 0x7B7, None): [
+    (Ecu.cornerRadar, 0x7b7, None): [
       b'\xf1\x003D',
       b'\xf1\x8b !\x10)',
     ],
@@ -1294,7 +1291,7 @@ FW_VERSIONS = {
       b'\xf1\x00CN7 MFC  AT USA LHD 1.00 1.00 99210-IB000 210531',
       b'\xf1\x8b !\t\x13',
     ],
-    (Ecu.hvac, 0x7B3, None): [
+    (Ecu.hvac, 0x7b3, None): [
       b'\xf1\x00CN7   97255-AA041CONTROL UNIT        1.05CN7DATC(-)0.8       \x00',
     ],
     (Ecu.transmission, 0x7e1, None): [
