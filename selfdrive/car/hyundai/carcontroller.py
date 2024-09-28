@@ -322,7 +322,7 @@ class CarController(CarControllerBase):
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not escc:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
 
-    if self.CP.enableGasInterceptor:
+    if self.CP.enableGasInterceptorDEPRECATED:
       if CC.longActive:
         MAX_INTERCEPTOR_GAS = 0.5
         MIN_ACC_SPEED = 19. * CV.MPH_TO_MS
@@ -334,7 +334,7 @@ class CarController(CarControllerBase):
       else:
         interceptor_gas_cmd = 0
 
-    if self.frame % 2 == 0 and self.CP.enableGasInterceptor and self.CP.openpilotLongitudinalControl:
+    if self.frame % 2 == 0 and self.CP.enableGasInterceptorDEPRECATED and self.CP.openpilotLongitudinalControl:
       # send exactly zero if gas cmd is zero. Interceptor will send the max between read value and gas cmd.
       # This prevents unexpected pedal range rescaling
       can_sends.append(create_gas_interceptor_command(self.packer, interceptor_gas_cmd, self.frame))
