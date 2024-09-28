@@ -20,6 +20,14 @@ MAX_ANGLE = 85
 MAX_ANGLE_FRAMES = 89
 MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 
+def compute_gas_brake(accel, speed,):
+  creep_brake = 0.0
+  creep_speed = 2.3
+  creep_brake_value = 0.15
+  if speed < creep_speed:
+    creep_brake = (creep_speed - speed) / creep_speed * creep_brake_value
+  gb = float(accel) / 4.8 - creep_brake
+  return clip(gb, 0.0, 1.0), clip(-gb, 0.0, 1.0)
 
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = (hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw))
@@ -111,6 +119,11 @@ class CarController(CarControllerBase):
     self.accel_val = 0
     self.accel_last_jerk = 0
     self.hkg_custom_long_tuning = self.param_s.get_bool("HkgCustomLongTuning")
+
+    self.accel = 0.0
+    self.speed = 0.0
+    self.gas = 0.0
+    self.brake = 0.0
 
   def calculate_lead_distance(self, hud_control: car.CarControl.HUDControl) -> float:
     lead_one = self.sm["radarState"].leadOne
@@ -207,6 +220,14 @@ class CarController(CarControllerBase):
     self.lat_active_last = CC.latActive
 
     escc = self.CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC.value
+
+    wind_brake = interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
+    if CC.longActive:
+      accel = actuators.accel
+      gas, brake = compute_gas_brake(actuators.accel, CS.out.vEgo)
+    else:
+      accel = 0.0
+      gas, brake = 0.0, 0.0
 
     can_sends = []
 
@@ -322,23 +343,19 @@ class CarController(CarControllerBase):
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not escc:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
 
-    if self.CP.enableGasInterceptorDEPRECATED:
-      if CC.longActive:
-        MAX_INTERCEPTOR_GAS = 0.5
-        MIN_ACC_SPEED = 19. * CV.MPH_TO_MS
-        PEDAL_TRANSITION = 10. * CV.MPH_TO_MS
-        PEDAL_SCALE = interp(CS.out.vEgo, [0.0, MIN_ACC_SPEED, MIN_ACC_SPEED + PEDAL_TRANSITION], [0.4, 0.5, 0.0])
-        pedal_offset = interp(CS.out.vEgo, [0.0, 2.3, MIN_ACC_SPEED + PEDAL_TRANSITION], [-.4, 0.0, 0.2])
-        pedal_command = PEDAL_SCALE * (actuators.accel + pedal_offset)
-        interceptor_gas_cmd = clip(pedal_command, 0., MAX_INTERCEPTOR_GAS)
-      else:
-        interceptor_gas_cmd = 0
-
-    if self.frame % 2 == 0 and self.CP.enableGasInterceptorDEPRECATED and self.CP.openpilotLongitudinalControl:
-      # send exactly zero if gas cmd is zero. Interceptor will send the max between read value and gas cmd.
-      # This prevents unexpected pedal range rescaling
-      can_sends.append(create_gas_interceptor_command(self.packer, interceptor_gas_cmd, self.frame))
-      self.gas = interceptor_gas_cmd
+    if self.frame % 2 == 0:
+      if self.CP.enableGasInterceptorDEPRECATED:
+        # way too aggressive at low speed without this
+        gas_mult = interp(CS.out.vEgo, [0., 10.], [0.4, 1.0])
+        # send exactly zero if apply_gas is zero. Interceptor will send the max between read value and apply_gas.
+        # This prevents unexpected pedal range rescaling
+        # Sending non-zero gas when OP is not enabled will cause the PCM not to respond to throttle as expected
+        # when you do enable.
+        if CC.longActive:
+          self.gas = clip(gas_mult * (gas - brake + wind_brake * 3 / 4), 0., 1.)
+        else:
+          self.gas = 0.0
+        can_sends.append(create_gas_interceptor_command(self.packer, self.gas, self.frame // 2))
 
     new_actuators = actuators.as_builder()
     new_actuators.steer = apply_steer / self.params.STEER_MAX
