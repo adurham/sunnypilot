@@ -1,5 +1,5 @@
 import crcmod
-from openpilot.selfdrive.car.hyundai.values import CAR, HyundaiFlags
+from openpilot.selfdrive.car.hyundai.values import CAR, HyundaiFlags, HyundaiFlagsSP
 
 hyundai_checksum = crcmod.mkCrcFun(0x11D, initCrc=0xFD, rev=False, xorOut=0xDF)
 
@@ -247,7 +247,7 @@ def create_acc_commands(
 
   # Only send FCA11 on cars where it exists on the bus
   if use_fca and not escc:
-    if CP.flags & HyundaiFlags.CAMERA_SCC:
+    if (CP.spFlags & HyundaiFlagsSP.CAMERA_SCC) or (CP.openpilotLongitudinalControl and CP.HyundaiFlagsSP.SP_FORCE_OP_LONG):
       fca11_values = CS.fca11
       fca11_values["PAINT1_Status"] = 1
       fca11_values["FCA_DrvSetStatus"] = 1
