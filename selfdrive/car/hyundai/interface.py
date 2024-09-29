@@ -238,6 +238,7 @@ class CarInterface(CarInterfaceBase):
       CP.openpilotLongitudinalControl
       and not ((CP.flags & HyundaiFlags.CANFD_CAMERA_SCC.value) or (CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC))
       and CP.carFingerprint not in CAMERA_SCC_CAR
+      and not (CP.spFlags & HyundaiFlagsSP.SP_FORCE_OP_LONG and CP.spFlags & HyundaiFlagsSP.SP_NON_SCC_FCA)
     ):
       addr, bus = 0x7D0, CanBus(CP).ECAN if CP.carFingerprint in CANFD_CAR else 0
       if CP.flags & HyundaiFlags.CANFD_HDA2.value:
