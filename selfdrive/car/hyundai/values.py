@@ -618,7 +618,8 @@ class CAR(Platforms):
   HYUNDAI_ELANTRA_N_2022_NON_SCC = HyundaiPlatformConfig(
     [HyundaiCarDocs("Hyundai Elantra N 2022 Non-SCC", "No Smart Cruise Control (SCC)", car_parts=CarParts.common([CarHarness.hyundai_k]))],
     CarSpecs(mass=3296 * CV.LB_TO_KG, wheelbase=2.72, steerRatio=12.2, tireStiffnessFactor=0.65),
-    flags=HyundaiFlags.CHECKSUM_CRC8 | HyundaiFlags.USE_FCA,
+    # flags=HyundaiFlags.CHECKSUM_CRC8 | HyundaiFlags.USE_FCA,
+    flags=HyundaiFlags.CHECKSUM_CRC8,
     spFlags=HyundaiFlagsSP.SP_FORCE_OP_LONG | HyundaiFlagsSP.SP_NON_SCC | HyundaiFlagsSP.SP_NON_SCC_FCA,
     dbc_dict=dbc_dict("hyundai_kia_generic_generated", None),
   )
