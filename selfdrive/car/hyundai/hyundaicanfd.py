@@ -35,8 +35,7 @@ class CanBus(CanBusBase):
     return self._cam
 
 
-def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_steer , lateral_paused, blinking_icon):
-
+def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_steer, lateral_paused, blinking_icon):
   ret = []
 
   values = {
@@ -61,6 +60,7 @@ def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_steer ,
 
   return ret
 
+
 def create_suppress_lfa(packer, CAN, hda2_lfa_block_msg, hda2_alt_steering):
   suppress_msg = "CAM_0x362" if hda2_alt_steering else "CAM_0x2a4"
   msg_bytes = 32 if hda2_alt_steering else 24
@@ -73,6 +73,7 @@ def create_suppress_lfa(packer, CAN, hda2_lfa_block_msg, hda2_alt_steering):
   values["RIGHT_LANE_LINE"] = 0
   return packer.make_can_msg(suppress_msg, CAN.ACAN, values)
 
+
 def create_buttons(packer, CP, CAN, cnt, btn):
   values = {
     "COUNTER": cnt,
@@ -83,35 +84,45 @@ def create_buttons(packer, CP, CAN, cnt, btn):
   bus = CAN.ECAN if CP.flags & HyundaiFlags.CANFD_HDA2 else CAN.CAM
   return packer.make_can_msg("CRUISE_BUTTONS", bus, values)
 
+
 def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
   # TODO: why do we copy different values here?
   if CP.flags & HyundaiFlags.CANFD_CAMERA_SCC.value:
-    values = {s: cruise_info_copy[s] for s in [
-      "COUNTER",
-      "CHECKSUM",
-      "NEW_SIGNAL_1",
-      "MainMode_ACC",
-      "ACCMode",
-      "ZEROS_9",
-      "CRUISE_STANDSTILL",
-      "ZEROS_5",
-      "DISTANCE_SETTING",
-      "VSetDis",
-    ]}
+    values = {
+      s: cruise_info_copy[s]
+      for s in [
+        "COUNTER",
+        "CHECKSUM",
+        "NEW_SIGNAL_1",
+        "MainMode_ACC",
+        "ACCMode",
+        "ZEROS_9",
+        "CRUISE_STANDSTILL",
+        "ZEROS_5",
+        "DISTANCE_SETTING",
+        "VSetDis",
+      ]
+    }
   else:
-    values = {s: cruise_info_copy[s] for s in [
-      "COUNTER",
-      "CHECKSUM",
-      "ACCMode",
-      "VSetDis",
-      "CRUISE_STANDSTILL",
-    ]}
-  values.update({
-    "ACCMode": 4,
-    "aReqRaw": 0.0,
-    "aReqValue": 0.0,
-  })
+    values = {
+      s: cruise_info_copy[s]
+      for s in [
+        "COUNTER",
+        "CHECKSUM",
+        "ACCMode",
+        "VSetDis",
+        "CRUISE_STANDSTILL",
+      ]
+    }
+  values.update(
+    {
+      "ACCMode": 4,
+      "aReqRaw": 0.0,
+      "aReqValue": 0.0,
+    }
+  )
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+
 
 def create_lfahda_cluster(packer, CAN, enabled, lat_active, lateral_paused, blinking_icon):
   values = {
@@ -139,7 +150,6 @@ def create_acc_control(packer, CAN, CS, enabled, accel_last, accel, stopping, ga
     "VSetDis": set_speed,
     "JerkLowerLimit": lower_jerk,
     "JerkUpperLimit": upper_jerk,
-
     "ACC_ObjDist": 1,
     "ObjValid": 0,
     "OBJ_STATUS": 2,
@@ -155,8 +165,7 @@ def create_acc_control(packer, CAN, CS, enabled, accel_last, accel, stopping, ga
 def create_spas_messages(packer, CAN, frame, left_blink, right_blink):
   ret = []
 
-  values = {
-  }
+  values = {}
   ret.append(packer.make_can_msg("SPAS1", CAN.ECAN, values))
 
   blink = 0
@@ -178,8 +187,8 @@ def create_fca_warning_light(packer, CAN, frame):
     values = {
       'AEB_SETTING': 0x1,  # show AEB disabled icon
       'SET_ME_2': 0x2,
-      'SET_ME_FF': 0xff,
-      'SET_ME_FC': 0xfc,
+      'SET_ME_FF': 0xFF,
+      'SET_ME_FC': 0xFC,
       'SET_ME_9': 0x9,
     }
     ret.append(packer.make_can_msg("ADRV_0x160", CAN.ECAN, values))
@@ -192,24 +201,23 @@ def create_adrv_messages(packer, CAN, frame):
 
   ret = []
 
-  values = {
-  }
+  values = {}
   ret.append(packer.make_can_msg("ADRV_0x51", CAN.ACAN, values))
 
   ret.extend(create_fca_warning_light(packer, CAN, frame))
 
   if frame % 5 == 0:
     values = {
-      'SET_ME_1C': 0x1c,
-      'SET_ME_FF': 0xff,
-      'SET_ME_TMP_F': 0xf,
-      'SET_ME_TMP_F_2': 0xf,
+      'SET_ME_1C': 0x1C,
+      'SET_ME_FF': 0xFF,
+      'SET_ME_TMP_F': 0xF,
+      'SET_ME_TMP_F_2': 0xF,
     }
     ret.append(packer.make_can_msg("ADRV_0x1ea", CAN.ECAN, values))
 
     values = {
-      'SET_ME_E1': 0xe1,
-      'SET_ME_3A': 0x3a,
+      'SET_ME_E1': 0xE1,
+      'SET_ME_3A': 0x3A,
     }
     ret.append(packer.make_can_msg("ADRV_0x200", CAN.ECAN, values))
 

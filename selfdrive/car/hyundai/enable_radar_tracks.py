@@ -10,7 +10,7 @@ WRITE_DATA_RESPONSE = b'\x68'
 RADAR_TRACKS_CONFIG = b"\x00\x00\x00\x01\x00\x01"
 
 
-def enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7d0, config_data_id=b'\x01\x42', timeout=0.1, retry=10, debug=False):
+def enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7D0, config_data_id=b'\x01\x42', timeout=0.1, retry=10, debug=False):
   cloudlog.warning("radar_tracks: enabling ...")
 
   for i in range(retry):
@@ -20,9 +20,9 @@ def enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7d0, config_data_id=b'\x0
       for _, _ in query.get_data(timeout).items():
         cloudlog.warning("radar_tracks: reconfigure radar to output radar points ...")
 
-        query = IsoTpParallelQuery(sendcan, logcan, bus, [addr],
-                                   [WRITE_DATA_REQUEST + config_data_id + RADAR_TRACKS_CONFIG],
-                                   [WRITE_DATA_RESPONSE], debug=debug)
+        query = IsoTpParallelQuery(
+          sendcan, logcan, bus, [addr], [WRITE_DATA_REQUEST + config_data_id + RADAR_TRACKS_CONFIG], [WRITE_DATA_RESPONSE], debug=debug
+        )
         query.get_data(0)
 
         cloudlog.warning("radar_tracks: successfully enabled")
@@ -32,16 +32,17 @@ def enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7d0, config_data_id=b'\x0
       cloudlog.exception(f"radar_tracks exception: {e}")
 
     cloudlog.error(f"radar_tracks retry ({i + 1}) ...")
-  cloudlog.error(f"radar_tracks: failed")
+  cloudlog.error("radar_tracks: failed")
   return False
 
 
 if __name__ == "__main__":
   import time
   import cereal.messaging as messaging
+
   sendcan = messaging.pub_sock('sendcan')
   logcan = messaging.sub_sock('can')
   time.sleep(1)
 
-  enabled = enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7d0, config_data_id=b'\x01\x42', timeout=0.1, debug=False)
+  enabled = enable_radar_tracks(logcan, sendcan, bus=0, addr=0x7D0, config_data_id=b'\x01\x42', timeout=0.1, debug=False)
   print(f"enabled: {enabled}")

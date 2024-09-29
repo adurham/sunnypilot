@@ -11,6 +11,7 @@ RADAR_MSG_COUNT = 32
 
 # POC for parsing corner radars: https://github.com/commaai/openpilot/pull/24221/
 
+
 def get_radar_can_parser(CP):
   if DBC[CP.carFingerprint]['radar'] is None:
     if CP.carFingerprint in CANFD_CAR:
@@ -39,10 +40,15 @@ class RadarInterface(RadarInterfaceBase):
     self.enhanced_scc = (CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC) and DBC[CP.carFingerprint]['radar'] is None
     self.camera_scc = CP.spFlags & HyundaiFlagsSP.SP_CAMERA_SCC_LEAD
     self.updated_messages = set()
-    self.trigger_msg = 0x2AB if self.enhanced_scc else \
-                       0x1A0 if self.camera_scc and CP.carFingerprint in CANFD_CAR else \
-                       0x420 if self.camera_scc else \
-                       (RADAR_START_ADDR + RADAR_MSG_COUNT - 1)
+    self.trigger_msg = (
+      0x2AB
+      if self.enhanced_scc
+      else 0x1A0
+      if self.camera_scc and CP.carFingerprint in CANFD_CAR
+      else 0x420
+      if self.camera_scc
+      else (RADAR_START_ADDR + RADAR_MSG_COUNT - 1)
+    )
     self.track_id = 0
 
     self.radar_off_can = CP.radarUnavailable
@@ -83,12 +89,9 @@ class RadarInterface(RadarInterfaceBase):
     ret.errors = errors
 
     if self.enhanced_scc or self.camera_scc:
-      msg_src = "ESCC" if self.enhanced_scc else \
-                "SCC_CONTROL" if self.CP.carFingerprint in CANFD_CAR else \
-                "SCC11"
+      msg_src = "ESCC" if self.enhanced_scc else "SCC_CONTROL" if self.CP.carFingerprint in CANFD_CAR else "SCC11"
       msg = self.rcp.vl[msg_src]
-      valid = msg['ACC_ObjDist'] < 204.6 if self.CP.carFingerprint in CANFD_CAR else \
-              msg['ACC_ObjStatus']
+      valid = msg['ACC_ObjDist'] < 204.6 if self.CP.carFingerprint in CANFD_CAR else msg['ACC_ObjStatus']
       for ii in range(1):
         if valid:
           if ii not in self.pts:
