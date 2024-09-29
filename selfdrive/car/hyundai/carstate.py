@@ -172,7 +172,7 @@ class CarState(CarStateBase):
       aeb_braking = cp_cruise.vl[aeb_src]["CF_VSM_DecCmdAct"] != 0 or cp_cruise.vl[aeb_src][aeb_sig] != 0
       ret.stockFcw = (aeb_warning or scc_warning) and not aeb_braking
       ret.stockAeb = aeb_warning and aeb_braking
-    elif (self.CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC) or (self.CP.openpilotLongitudinalControl and self.CP.carFingerprint in NON_SCC_FCA_CAR):
+    elif self.CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC:
       aeb_src = "FCA11" if self.CP.flags & HyundaiFlags.USE_FCA else "ESCC"
       aeb_sig = "FCA_CmdAct" if self.CP.flags & HyundaiFlags.USE_FCA.value else "AEB_CmdAct"
       aeb_warning_sig = "CF_VSM_Warn" if self.CP.flags & HyundaiFlags.USE_FCA.value else "CF_VSM_Warn_SCC12"
@@ -194,9 +194,7 @@ class CarState(CarStateBase):
     self.lkas11 = copy.copy(cp_cam.vl["LKAS11"])
     self.clu11 = copy.copy(cp.vl["CLU11"])
     # only forward FCA messages for FCW/AEB when using openpilot longitudinal on Camera SCC cars
-    if self.CP.openpilotLongitudinalControl and (
-      self.CP.carFingerprint in CAMERA_SCC_CAR or (self.CP.carFingerprint in NON_SCC_FCA_CAR and HyundaiFlagsSP.SP_FORCE_OP_LONG)
-    ):
+    if self.CP.openpilotLongitudinalControl and self.CP.carFingerprint in CAMERA_SCC_CAR:
       self.fca11 = copy.copy(cp_cruise.vl["FCA11"])
       self.fca12 = copy.copy(cp_cruise.vl["FCA12"])
     self.steer_state = cp.vl["MDPS12"]["CF_Mdps_ToiActive"]  # 0 NOT ACTIVE, 1 ACTIVE
@@ -355,8 +353,8 @@ class CarState(CarStateBase):
       messages.append(("BCM_PO_11", 50))
     if CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC.value:
       messages.append(("ESCC", 50))
-    if CP.flags & HyundaiFlags.USE_FCA.value and not any(msg[0] == "FCA11" for msg in messages):
-      messages.append(("FCA11", 50))
+      if CP.flags & HyundaiFlags.USE_FCA.value and not any([msg[0] == "FCA11" for msg in messages]):
+        messages.append(("FCA11", 50))
     if CP.spFlags & HyundaiFlagsSP.SP_NAV_MSG:
       messages.append(("Navi_HU", 5))
     if CP.enableGasInterceptorDEPRECATED:
@@ -378,7 +376,7 @@ class CarState(CarStateBase):
         ]
       if CP.flags & HyundaiFlags.USE_FCA.value:
         messages.append(("FCA11", 50))
-    if CP.openpilotLongitudinalControl and (CP.carFingerprint in CAMERA_SCC_CAR or (CP.carFingerprint in NON_SCC_FCA_CAR and HyundaiFlagsSP.SP_FORCE_OP_LONG)):
+    if CP.openpilotLongitudinalControl and CP.carFingerprint in CAMERA_SCC_CAR:
       if CP.flags & HyundaiFlags.USE_FCA.value:
         messages += [
           ("FCA11", 50),
