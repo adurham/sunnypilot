@@ -19,7 +19,6 @@ from openpilot.selfdrive.car.hyundai.values import (
 )
 from openpilot.selfdrive.car.interfaces import CarControllerBase
 from openpilot.selfdrive.controls.lib.drive_helpers import HYUNDAI_V_CRUISE_MIN
-from typing import Any
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -28,19 +27,6 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 MAX_ANGLE = 85
 MAX_ANGLE_FRAMES = 89
 MAX_ANGLE_CONSECUTIVE_FRAMES = 2
-
-
-def compute_gas_brake(
-  accel,
-  speed,
-):
-  creep_brake = 0.0
-  creep_speed = 2.3
-  creep_brake_value = 0.15
-  if speed < creep_speed:
-    creep_brake = (creep_speed - speed) / creep_speed * creep_brake_value
-  gb = float(accel) / 4.8 - creep_brake
-  return clip(gb, 0.0, 1.0), clip(-gb, 0.0, 1.0)
 
 
 def process_hud_alert(enabled, fingerprint, hud_control):
@@ -124,12 +110,8 @@ class CarController(CarControllerBase):
     self.accel_val = 0
     self.accel_last_jerk = 0
     self.hkg_custom_long_tuning = self.param_s.get_bool("HkgCustomLongTuning")
-    self.accel = 0.0
-    self.speed = 0.0
-    self.gas = 0.0
-    self.brake = 0.0
 
-  def calculate_lead_distance(self, hud_control: Any) -> float:
+  def calculate_lead_distance(self, hud_control: car.CarControl.HUDControl) -> float:
     lead_one = self.sm["radarState"].leadOne
     lead_two = self.sm["radarState"].leadTwo
     if lead_one.status and (not lead_two.status or lead_one.dRel < lead_two.dRel):
@@ -202,13 +184,6 @@ class CarController(CarControllerBase):
       self.slc_active_stock = slc_active
     self.lat_active_last = CC.latActive
     escc = self.CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC.value
-    wind_brake = interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
-    if CC.longActive:
-      accel = actuators.accel
-      gas, brake = compute_gas_brake(actuators.accel, CS.out.vEgo)
-    else:
-      accel = 0.0
-      gas, brake = 0.0, 0.0
     can_sends = []
     # *** common hyundai stuff ***
     # tester present - w/ no response (keeps relevant ECU disabled)
@@ -361,17 +336,9 @@ class CarController(CarControllerBase):
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
     if self.frame % 2 == 0:
       if self.CP.enableGasInterceptorDEPRECATED:
-        # way too aggressive at low speed without this
-        gas_mult = interp(CS.out.vEgo, [0.0, 10.0], [0.4, 1.0])
-        # send exactly zero if apply_gas is zero. Interceptor will send the max between read value and apply_gas.
-        # This prevents unexpected pedal range rescaling
-        # Sending non-zero gas when OP is not enabled will cause the PCM not to respond to throttle as expected
-        # when you do enable.
-        if CC.longActive:
-          self.gas = clip(gas_mult * (gas - brake + wind_brake * 3 / 4), 0.0, 1.0)
-        else:
-          self.gas = 0.0
+        self.gas = 0.0
         can_sends.append(create_gas_interceptor_command(self.packer, self.gas, self.frame // 2))
+
     new_actuators = actuators.as_builder()
     new_actuators.steer = apply_steer / self.params.STEER_MAX
     new_actuators.steerOutputCan = apply_steer
@@ -379,7 +346,7 @@ class CarController(CarControllerBase):
     self.frame += 1
     return new_actuators, can_sends
 
-  def create_button_messages(self, CC: Any, CS: Any, use_clu11: bool):
+  def create_button_messages(self, CC: car.CarControl, CS: car.CarState, use_clu11: bool):
     can_sends = []
     if use_clu11:
       if CC.cruiseControl.cancel:
