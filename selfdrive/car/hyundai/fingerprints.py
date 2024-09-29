@@ -2,11 +2,8 @@ from cereal import car
 from openpilot.selfdrive.car.hyundai.values import CAR
 
 Ecu = car.CarParams.Ecu
-
 # The existence of SCC or RDR in the fwdRadar FW usually determines the radar's function,
 # i.e. if it sends the SCC messages or if another ECU like the camera or ADAS Driving ECU does
-
-
 FW_VERSIONS = {
   CAR.HYUNDAI_AZERA_6TH_GEN: {
     (Ecu.fwdRadar, 0x7D0, None): [

@@ -23,7 +23,6 @@ from typing import Any
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 LongCtrlState = car.CarControl.Actuators.LongControlState
-
 # EPS faults if you apply torque while the steering angle is above 90 degrees for more than 1 second
 # All slightly below EPS thresholds to avoid fault
 MAX_ANGLE = 85
@@ -46,7 +45,6 @@ def compute_gas_brake(
 
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw)
-
   # initialize to no line visible
   # TODO: this is not accurate for all cars
   sys_state = 1
@@ -56,7 +54,6 @@ def process_hud_alert(enabled, fingerprint, hud_control):
     sys_state = 5
   elif hud_control.rightLaneVisible:
     sys_state = 6
-
   # initialize to no warnings
   left_lane_warning = 0
   right_lane_warning = 0
@@ -64,7 +61,6 @@ def process_hud_alert(enabled, fingerprint, hud_control):
     left_lane_warning = 1 if fingerprint in (CAR.GENESIS_G90, CAR.GENESIS_G80) else 2
   if hud_control.rightLaneDepart:
     right_lane_warning = 1 if fingerprint in (CAR.GENESIS_G90, CAR.GENESIS_G80) else 2
-
   return sys_warning, sys_state, left_lane_warning, right_lane_warning
 
 
@@ -75,23 +71,19 @@ class CarController(CarControllerBase):
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_name)
     self.angle_limit_counter = 0
-
     self.accel_last = 0
     self.apply_steer_last = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
-
     self.disengage_blink = 0.0
     self.lat_disengage_init = False
     self.lat_active_last = False
-
     sub_services = ['longitudinalPlan', 'longitudinalPlanSP']
     if CP.openpilotLongitudinalControl:
       sub_services.append('radarState')
     # TODO: Always true, prep for future conditional refactoring
     if sub_services:
       self.sm = messaging.SubMaster(sub_services)
-
     self.param_s = Params()
     self.last_speed_limit_sign_tap_prev = False
     self.speed_limit = 0.0
@@ -121,7 +113,6 @@ class CarController(CarControllerBase):
     self.v_target_plan = 0
     self.custom_stock_planner_speed = self.param_s.get_bool("CustomStockLongPlanner")
     self.lead_distance = 0
-
     self.jerk = 0.0
     self.jerk_l = 0.0
     self.jerk_u = 0.0
@@ -129,12 +120,10 @@ class CarController(CarControllerBase):
     self.cb_upper = 0.0
     self.cb_lower = 0.0
     self.jerk_count = 0.0
-
     self.accel_raw = 0
     self.accel_val = 0
     self.accel_last_jerk = 0
     self.hkg_custom_long_tuning = self.param_s.get_bool("HkgCustomLongTuning")
-
     self.accel = 0.0
     self.speed = 0.0
     self.gas = 0.0
@@ -143,23 +132,19 @@ class CarController(CarControllerBase):
   def calculate_lead_distance(self, hud_control: Any) -> float:
     lead_one = self.sm["radarState"].leadOne
     lead_two = self.sm["radarState"].leadTwo
-
     if lead_one.status and (not lead_two.status or lead_one.dRel < lead_two.dRel):
       return lead_one.dRel
     if lead_two.status:
       return lead_two.dRel
-
     return 19 if hud_control.leadVisible else 0
 
   def update(self, CC, CS, now_nanos):
     if not self.CP.pcmCruiseSpeed or (self.CP.openpilotLongitudinalControl and self.frame % 5 == 0):
       self.sm.update(0)
-
     if not self.CP.pcmCruiseSpeed:
       if self.sm.updated['longitudinalPlan']:
         _speeds = self.sm['longitudinalPlan'].speeds
         self.speeds = _speeds[-1] if len(_speeds) else 0
-
       if self.sm.updated['longitudinalPlanSP']:
         self.v_tsc_state = self.sm['longitudinalPlanSP'].visionTurnControllerState
         self.slc_state = self.sm['longitudinalPlanSP'].speedLimitControlState
@@ -168,15 +153,12 @@ class CarController(CarControllerBase):
         self.speed_limit_offset = self.sm['longitudinalPlanSP'].speedLimitOffset
         self.v_tsc = self.sm['longitudinalPlanSP'].visionTurnSpeed
         self.m_tsc = self.sm['longitudinalPlanSP'].turnSpeed
-
       if self.frame % 200 == 0:
         self.custom_stock_planner_speed = self.param_s.get_bool("CustomStockLongPlanner")
       self.v_cruise_min = HYUNDAI_V_CRUISE_MIN[CS.params_list.is_metric] * (CV.KPH_TO_MPH if not CS.params_list.is_metric else 1)
       self.v_target_plan = min(CC.vCruise * CV.KPH_TO_MS, self.speeds)
-
     actuators = CC.actuators
     hud_control = CC.hudControl
-
     # steering torque
     if self.CP.spFlags & HyundaiFlagsSP.SP_UPSTREAM_TACO.value:
       self.params = CarControllerParams(self.CP, CS.out.vEgoRaw)
@@ -184,57 +166,42 @@ class CarController(CarControllerBase):
     apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last, CS.out.steeringTorque, self.params)
     if self.CP.spFlags & HyundaiFlagsSP.SP_UPSTREAM_TACO.value:
       apply_steer = clip(apply_steer, -self.params.STEER_MAX, self.params.STEER_MAX)
-
     # >90 degree steering fault prevention
     self.angle_limit_counter, apply_steer_req = common_fault_avoidance(
       abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive, self.angle_limit_counter, MAX_ANGLE_FRAMES, MAX_ANGLE_CONSECUTIVE_FRAMES
     )
-
     if not CC.latActive:
       apply_steer = 0
-
     # Hold torque with induced temporary fault when cutting the actuation bit
     torque_fault = CC.latActive and not apply_steer_req
-
     self.apply_steer_last = apply_steer
-
     # accel + longitudinal
     accel = clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX)
     stopping = actuators.longControlState == LongCtrlState.stopping
     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
-
     # HUD messages
     sys_warning, sys_state, left_lane_warning, right_lane_warning = process_hud_alert(CC.enabled, self.car_fingerprint, hud_control)
-
     # show LFA "white_wheel" and LKAS "White car + lanes" when not CC.latActive
     lateral_paused = CS.madsEnabled and not CC.latActive
     if CC.latActive:
       self.lat_disengage_init = False
     elif self.lat_active_last:
       self.lat_disengage_init = True
-
     if not self.lat_disengage_init:
       self.disengage_blink = self.frame
-
     blinking_icon = (self.frame - self.disengage_blink) * DT_CTRL < 1.0 if self.lat_disengage_init else False
-
     if not self.CP.pcmCruiseSpeed:
       if not self.last_speed_limit_sign_tap_prev and CS.params_list.last_speed_limit_sign_tap:
         self.sl_force_active_timer = self.frame
         self.param_s.put_bool_nonblocking("LastSpeedLimitSignTap", False)
       self.last_speed_limit_sign_tap_prev = CS.params_list.last_speed_limit_sign_tap
-
       sl_force_active = CS.params_list.speed_limit_control_enabled and (self.frame < (self.sl_force_active_timer * DT_CTRL + 2.0))
       sl_inactive = not sl_force_active and (not CS.params_list.speed_limit_control_enabled or (True if self.slc_state == 0 else False))
       sl_temp_inactive = not sl_force_active and (CS.params_list.speed_limit_control_enabled and (True if self.slc_state == 1 else False))
       slc_active = not sl_inactive and not sl_temp_inactive
-
       self.slc_active_stock = slc_active
-
     self.lat_active_last = CC.latActive
-
     escc = self.CP.spFlags & HyundaiFlagsSP.SP_ENHANCED_SCC.value
-
     wind_brake = interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
     if CC.longActive:
       accel = actuators.accel
@@ -242,11 +209,8 @@ class CarController(CarControllerBase):
     else:
       accel = 0.0
       gas, brake = 0.0, 0.0
-
     can_sends = []
-
     # *** common hyundai stuff ***
-
     # tester present - w/ no response (keeps relevant ECU disabled)
     if (
       self.frame % 100 == 0
@@ -259,38 +223,30 @@ class CarController(CarControllerBase):
       if self.CP.flags & HyundaiFlags.CANFD_HDA2.value:
         addr, bus = 0x730, self.CAN.ECAN
       can_sends.append(make_tester_present_msg(addr, bus, suppress_response=True))
-
       # for blinkers
       if self.CP.flags & HyundaiFlags.ENABLE_BLINKERS:
         can_sends.append(make_tester_present_msg(0x7B1, self.CAN.ECAN, suppress_response=True))
-
     if self.CP.openpilotLongitudinalControl:
       self.make_jerk(CS, accel, actuators)
-
     # CAN-FD platforms
     if self.CP.carFingerprint in CANFD_CAR:
       hda2 = self.CP.flags & HyundaiFlags.CANFD_HDA2
       hda2_long = hda2 and self.CP.openpilotLongitudinalControl
-
       # steering control
       can_sends.extend(
         hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_steer, lateral_paused, blinking_icon)
       )
-
       # prevent LFA from activating on HDA2 by sending "no lane lines detected" to ADAS ECU
       if self.frame % 5 == 0 and hda2:
         can_sends.append(hyundaicanfd.create_suppress_lfa(self.packer, self.CAN, CS.hda2_lfa_block_msg, self.CP.flags & HyundaiFlags.CANFD_HDA2_ALT_STEERING))
-
       # LFA and HDA icons
       if self.frame % 5 == 0 and (not hda2 or hda2_long):
         can_sends.append(
           hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled and CS.out.cruiseState.enabled, CC.latActive, lateral_paused, blinking_icon)
         )
-
       # blinkers
       if hda2 and self.CP.flags & HyundaiFlags.ENABLE_BLINKERS:
         can_sends.extend(hyundaicanfd.create_spas_messages(self.packer, self.CAN, self.frame, CC.leftBlinker, CC.rightBlinker))
-
       if self.CP.openpilotLongitudinalControl:
         if hda2:
           can_sends.extend(hyundaicanfd.create_adrv_messages(self.packer, self.CAN, self.frame))
@@ -347,7 +303,6 @@ class CarController(CarControllerBase):
           blinking_icon,
         )
       )
-
       if not self.CP.openpilotLongitudinalControl:
         can_sends.extend(self.create_button_messages(CC, CS, use_clu11=True))
         if not (CC.cruiseControl.cancel or CC.cruiseControl.resume) and CS.out.cruiseState.enabled and not self.CP.pcmCruiseSpeed:
@@ -365,11 +320,9 @@ class CarController(CarControllerBase):
                   self.last_button_frame = self.frame
             elif self.frame % 2 == 0:
               can_sends.extend([hyundaican.create_clu11(self.packer, (self.frame // 2) + 1, CS.clu11, self.cruise_button, self.CP)] * 25)
-
       # Parse lead distance from radarState and display the corresponding distance in the car's cluster
       if self.CP.openpilotLongitudinalControl and self.sm.updated['radarState'] and self.frame % 5 == 0:
         self.lead_distance = self.calculate_lead_distance(hud_control)
-
       if self.frame % 2 == 0 and self.CP.openpilotLongitudinalControl:
         # TODO: unclear if this is needed
         # jerk = 3.0 if actuators.longControlState == LongCtrlState.pid else 1.0
@@ -397,19 +350,15 @@ class CarController(CarControllerBase):
             self.cb_upper,
           )
         )
-
       # 20 Hz LFA MFA message
       if self.frame % 5 == 0 and self.CP.flags & HyundaiFlags.SEND_LFA.value:
         can_sends.append(hyundaican.create_lfahda_mfc(self.packer, CC.enabled, CC.latActive, lateral_paused, blinking_icon))
-
       # 5 Hz ACC options
       if self.frame % 20 == 0 and self.CP.openpilotLongitudinalControl:
         can_sends.extend(hyundaican.create_acc_opt(self.packer, escc, CS, self.CP))
-
       # 2 Hz front radar options
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not escc:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
-
     if self.frame % 2 == 0:
       if self.CP.enableGasInterceptorDEPRECATED:
         # way too aggressive at low speed without this
@@ -423,12 +372,10 @@ class CarController(CarControllerBase):
         else:
           self.gas = 0.0
         can_sends.append(create_gas_interceptor_command(self.packer, self.gas, self.frame // 2))
-
     new_actuators = actuators.as_builder()
     new_actuators.steer = apply_steer / self.params.STEER_MAX
     new_actuators.steerOutputCan = apply_steer
     new_actuators.accel = accel
-
     self.frame += 1
     return new_actuators, can_sends
 
@@ -455,7 +402,6 @@ class CarController(CarControllerBase):
             for _ in range(20):
               can_sends.append(hyundaicanfd.create_buttons(self.packer, self.CP, self.CAN, CS.buttons_counter + 1, Buttons.CANCEL))
             self.last_button_frame = self.frame
-
         # cruise standstill resume
         elif CC.cruiseControl.resume:
           if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
@@ -465,7 +411,6 @@ class CarController(CarControllerBase):
             for _ in range(20):
               can_sends.append(hyundaicanfd.create_buttons(self.packer, self.CP, self.CAN, CS.buttons_counter + 1, Buttons.RES_ACCEL))
             self.last_button_frame = self.frame
-
     return can_sends
 
   # multikyd methods, sunnyhaibin logic
@@ -583,7 +528,6 @@ class CarController(CarControllerBase):
         self.final_speed_kph = self.get_curve_speed(target_speed_kph, v_cruise_kph_prev)
       else:
         self.final_speed_kph = target_speed_kph
-
       cruise_button = self.get_button_control(CS, self.final_speed_kph, v_cruise_kph_prev)  # MPH/KPH based button presses
     return cruise_button
 
@@ -596,7 +540,6 @@ class CarController(CarControllerBase):
       accel_diff = 0.0
     else:
       accel_diff = self.accel_raw - self.accel_last_jerk
-
     accel_diff /= DT_CTRL
     self.jerk = self.jerk * 0.9 + accel_diff * 0.1
     return self.jerk
@@ -605,7 +548,6 @@ class CarController(CarControllerBase):
     jerk = self.cal_jerk(accel, actuators)
     a_error = accel - CS.out.aEgo
     jerk = jerk + (a_error * 2.0)
-
     if not self.hkg_custom_long_tuning:
       self.jerk_u = 3.0 if actuators.longControlState == LongCtrlState.pid else 1.0
       self.jerk_l = 5.0

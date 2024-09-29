@@ -1,7 +1,6 @@
 import re
 from dataclasses import dataclass, field
 from enum import Enum, IntFlag
-
 from cereal import car
 from panda.python import uds, Panda
 from openpilot.common.conversions import Conversions as CV
@@ -25,7 +24,6 @@ class CarControllerParams:
     self.STEER_DRIVER_FACTOR = 1
     self.STEER_THRESHOLD = 150
     self.STEER_STEP = 1  # 100 Hz
-
     if CP.carFingerprint in CANFD_CAR:
       upstream_taco = CP.safetyConfigs[-1].safetyParam & Panda.FLAG_HYUNDAI_UPSTREAM_TACO
       self.STEER_MAX = 270 if not upstream_taco else 384 if vEgoRaw < 11.0 else 330
@@ -34,7 +32,6 @@ class CarControllerParams:
       self.STEER_THRESHOLD = 250 if not upstream_taco else 350
       self.STEER_DELTA_UP = 2 if not upstream_taco else 10 if vEgoRaw < 11.0 else 2
       self.STEER_DELTA_DOWN = 3 if not upstream_taco else 10 if vEgoRaw < 11.0 else 3
-
     # To determine the limit for your car, find the maximum value that the stock LKAS will request.
     # If the max stock LKAS request is <384, add your car to this list.
     elif CP.carFingerprint in (
@@ -53,13 +50,11 @@ class CarControllerParams:
       CAR.KIA_SORENTO,
     ):
       self.STEER_MAX = 255
-
     # these cars have significantly more torque than most HKG; limit to 70% of max
     elif CP.flags & HyundaiFlags.ALT_LIMITS:
       self.STEER_MAX = 270
       self.STEER_DELTA_UP = 2
       self.STEER_DELTA_DOWN = 3
-
     # Default for most HKG
     else:
       self.STEER_MAX = 384
@@ -71,42 +66,32 @@ class HyundaiFlags(IntFlag):
   CANFD_ALT_BUTTONS = 2
   CANFD_ALT_GEARS = 2**2
   CANFD_CAMERA_SCC = 2**3
-
   ALT_LIMITS = 2**4
   ENABLE_BLINKERS = 2**5
   CANFD_ALT_GEARS_2 = 2**6
   SEND_LFA = 2**7
   USE_FCA = 2**8
   CANFD_HDA2_ALT_STEERING = 2**9
-
   # these cars use a different gas signal
   HYBRID = 2**10
   EV = 2**11
-
   # Static flags
-
   # If 0x500 is present on bus 1 it probably has a Mando radar outputting radar points.
   # If no points are outputted by default it might be possible to turn it on using  selfdrive/debug/hyundai_enable_radar_points.py
   MANDO_RADAR = 2**12
   CANFD = 2**13
-
   # The radar does SCC on these cars when HDA I, rather than the camera
   RADAR_SCC = 2**14
   CAMERA_SCC = 2**15
   CHECKSUM_CRC8 = 2**16
   CHECKSUM_6B = 2**17
-
   # these cars require a special panda safety mode due to missing counters and checksums in the messages
   LEGACY = 2**18
-
   # these cars have not been verified to work with longitudinal yet - radar disable, sending correct messages, etc.
   UNSUPPORTED_LONGITUDINAL = 2**19
-
   CANFD_NO_RADAR_DISABLE = 2**20
-
   CLUSTER_GEARS = 2**21
   TCU_GEARS = 2**22
-
   MIN_STEER_32_MPH = 2**23
 
 
@@ -114,11 +99,9 @@ class HyundaiFlagsSP(IntFlag):
   SP_ENHANCED_SCC = 1
   SP_CAN_LFA_BTN = 2
   SP_NAV_MSG = 2**2
-
   SP_NON_SCC = 2**3
   SP_NON_SCC_FCA = 2**4
   SP_NON_SCC_RADAR_FCA = 2**5
-
   SP_CAMERA_SCC_LEAD = 2**6
   SP_LKAS12 = 2**7
   SP_RADAR_TRACKS = 2**8
@@ -151,7 +134,6 @@ class HyundaiPlatformConfig(PlatformConfig):
   def init(self):
     if self.flags & HyundaiFlags.MANDO_RADAR:
       self.dbc_dict = dbc_dict('hyundai_kia_generic', 'hyundai_kia_mando_front_radar_generated')
-
     if self.flags & HyundaiFlags.MIN_STEER_32_MPH:
       self.specs = self.specs.override(minSteerSpeed=32 * CV.MPH_TO_MS)
 
@@ -375,7 +357,6 @@ class CAR(Platforms):
     CarSpecs(mass=1690, wheelbase=3.055, steerRatio=17),  # mass: from https://www.hyundai-motor.com.tw/clicktobuy/custin#spec_0, steerRatio: from learner
     flags=HyundaiFlags.CHECKSUM_CRC8,
   )
-
   # Kia
   KIA_FORTE = HyundaiPlatformConfig(
     [
@@ -533,7 +514,6 @@ class CAR(Platforms):
     CarSpecs(mass=2087, wheelbase=3.09, steerRatio=14.23),
     flags=HyundaiFlags.RADAR_SCC,
   )
-
   # Genesis
   GENESIS_GV60_EV_1ST_GEN = HyundaiCanFDPlatformConfig(
     [
@@ -583,7 +563,6 @@ class CAR(Platforms):
     CarSpecs(mass=2258, wheelbase=2.95, steerRatio=14.14),
     flags=HyundaiFlags.RADAR_SCC,
   )
-
   # Non-SCC Cars
   HYUNDAI_BAYON_1ST_GEN_NON_SCC = HyundaiPlatformConfig(
     [HyundaiCarDocs("Hyundai Bayon Non-SCC 2021", "No Smart Cruise Control (SCC)", car_parts=CarParts.common([CarHarness.hyundai_n]))],
@@ -667,7 +646,6 @@ def get_platform_codes(fw_versions: list[bytes]) -> set[tuple[bytes, bytes | Non
       if part is not None:
         # part number starts with generic ECU part type, add what is specific to platform
         code += b"-" + part[-5:]
-
       codes.add((code, date))
   return codes
 
@@ -678,7 +656,6 @@ def match_fw_to_car_fuzzy(live_fw_versions, vin, offline_fw_versions) -> set[str
   # electric or specify electric in the platform code.
   fuzzy_platform_blacklist = {str(c) for c in (CANFD_CAR - EV_CAR - CANFD_FUZZY_WHITELIST)}
   candidates: set[str] = set()
-
   for candidate, fws in offline_fw_versions.items():
     # Keep track of ECUs which pass all checks (platform codes, within date range)
     valid_found_ecus = set()
@@ -688,53 +665,40 @@ def match_fw_to_car_fuzzy(live_fw_versions, vin, offline_fw_versions) -> set[str
       # Only check ECUs expected to have platform codes
       if ecu[0] not in PLATFORM_CODE_ECUS:
         continue
-
       # Expected platform codes & dates
       codes = get_platform_codes(expected_versions)
       expected_platform_codes = {code for code, _ in codes}
       expected_dates = {date for _, date in codes if date is not None}
-
       # Found platform codes & dates
       codes = get_platform_codes(live_fw_versions.get(addr, set()))
       found_platform_codes = {code for code, _ in codes}
       found_dates = {date for _, date in codes if date is not None}
-
       # Check platform code + part number matches for any found versions
       if not any(found_platform_code in expected_platform_codes for found_platform_code in found_platform_codes):
         break
-
       if ecu[0] in DATE_FW_ECUS:
         # If ECU can have a FW date, require it to exist
         # (this excludes candidates in the database without dates)
         if not len(expected_dates) or not len(found_dates):
           break
-
         # Check any date within range in the database, format is %y%m%d
         if not any(min(expected_dates) <= found_date <= max(expected_dates) for found_date in found_dates):
           break
-
       valid_found_ecus.add(addr)
-
     # If all live ECUs pass all checks for candidate, add it as a match
     if valid_expected_ecus.issubset(valid_found_ecus):
       candidates.add(candidate)
-
   return candidates - fuzzy_platform_blacklist
 
 
 HYUNDAI_VERSION_REQUEST_LONG = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + p16(0xF100)  # Long description
-
 HYUNDAI_VERSION_REQUEST_ALT = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + p16(0xF110)  # Alt long description
-
 HYUNDAI_ECU_MANUFACTURING_DATE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + p16(uds.DATA_IDENTIFIER_TYPE.ECU_MANUFACTURING_DATE)
-
 HYUNDAI_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40])
-
 # Regex patterns for parsing platform code, FW date, and part number from FW versions
 PLATFORM_CODE_FW_PATTERN = re.compile(b'((?<=' + HYUNDAI_VERSION_REQUEST_LONG[1:] + b')[A-Z]{2}[A-Za-z0-9]{0,2})')
 DATE_FW_PATTERN = re.compile(b'(?<=[ -])([0-9]{6}$)')
 PART_NUMBER_FW_PATTERN = re.compile(b'(?<=[0-9][.,][0-9]{2} )([0-9]{5}[-/]?[A-Z][A-Z0-9]{3}[0-9])')
-
 # We've seen both ICE and hybrid for these platforms, and they have hybrid descriptors (e.g. MQ4 vs MQ4H)
 CANFD_FUZZY_WHITELIST = {
   CAR.KIA_SORENTO_4TH_GEN,
@@ -743,14 +707,12 @@ CANFD_FUZZY_WHITELIST = {
   # TODO: the hybrid variant is not out yet
   CAR.KIA_CARNIVAL_4TH_GEN,
 }
-
 # List of ECUs expected to have platform codes, camera and radar should exist on all cars
 # TODO: use abs, it has the platform code and part number on many platforms
 PLATFORM_CODE_ECUS = [Ecu.fwdRadar, Ecu.fwdCamera, Ecu.eps]
 # So far we've only seen dates in fwdCamera
 # TODO: there are date codes in the ABS firmware versions in hex
 DATE_FW_ECUS = [Ecu.fwdCamera]
-
 # Note: an ECU on CAN FD cars may sometimes send 0x30080aaaaaaaaaaa (flow control continue) while we
 # are attempting to query ECUs. This currently does not seem to affect fingerprinting from the camera
 FW_QUERY_CONFIG = FwQueryConfig(
@@ -830,39 +792,28 @@ FW_QUERY_CONFIG = FwQueryConfig(
   # Custom fuzzy fingerprinting function using platform codes, part numbers + FW dates:
   match_fw_to_car_fuzzy=match_fw_to_car_fuzzy,
 )
-
 CHECKSUM = {
   "crc8": CAR.with_flags(HyundaiFlags.CHECKSUM_CRC8),
   "6B": CAR.with_flags(HyundaiFlags.CHECKSUM_6B),
 }
-
 CAN_GEARS = {
   # which message has the gear. hybrid and EV use ELECT_GEAR
   "use_cluster_gears": CAR.with_flags(HyundaiFlags.CLUSTER_GEARS),
   "use_tcu_gears": CAR.with_flags(HyundaiFlags.TCU_GEARS),
 }
-
 CANFD_CAR = CAR.with_flags(HyundaiFlags.CANFD)
 CANFD_RADAR_SCC_CAR = CAR.with_flags(HyundaiFlags.RADAR_SCC)
-
 # These CAN FD cars do not accept communication control to disable the ADAS ECU,
 # responds with 0x7F2822 - 'conditions not correct'
 CANFD_UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.CANFD_NO_RADAR_DISABLE)
-
 # The camera does SCC on these cars, rather than the radar
 CAMERA_SCC_CAR = CAR.with_flags(HyundaiFlags.CAMERA_SCC)
-
 HYBRID_CAR = CAR.with_flags(HyundaiFlags.HYBRID)
-
 EV_CAR = CAR.with_flags(HyundaiFlags.EV)
-
 LEGACY_SAFETY_MODE_CAR = CAR.with_flags(HyundaiFlags.LEGACY)
-
 UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.LEGACY) | CAR.with_flags(HyundaiFlags.UNSUPPORTED_LONGITUDINAL)
-
 NON_SCC_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC)
 NON_SCC_FCA_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC_FCA)
 NON_SCC_RADAR_FCA_CAR = CAR.with_sp_flags(HyundaiFlagsSP.SP_NON_SCC_RADAR_FCA)
 FORCE_OP_LONG = CAR.with_sp_flags(HyundaiFlagsSP.SP_FORCE_OP_LONG)
-
 DBC = CAR.create_dbc_map()

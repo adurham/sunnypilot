@@ -1,5 +1,4 @@
 import math
-
 from cereal import car
 from opendbc.can.parser import CANParser
 from openpilot.selfdrive.car.interfaces import RadarInterfaceBase
@@ -9,9 +8,8 @@ from openpilot.selfdrive.car.hyundai.values import DBC, HyundaiFlagsSP, CANFD_CA
 RADAR_START_ADDR = 0x500
 RADAR_MSG_COUNT = 32
 
+
 # POC for parsing corner radars: https://github.com/commaai/openpilot/pull/24221/
-
-
 def get_radar_can_parser(CP):
   if DBC[CP.carFingerprint]['radar'] is None:
     if CP.carFingerprint in CANFD_CAR:
@@ -28,7 +26,6 @@ def get_radar_can_parser(CP):
         return None
     messages = [(lead_src, 50)]
     return CANParser(DBC[CP.carFingerprint]['pt'], messages, bus)
-
   messages = [(f"RADAR_TRACK_{addr:x}", 50) for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT)]
   return CANParser(DBC[CP.carFingerprint]['radar'], messages, 1)
 
@@ -50,44 +47,34 @@ class RadarInterface(RadarInterfaceBase):
       else (RADAR_START_ADDR + RADAR_MSG_COUNT - 1)
     )
     self.track_id = 0
-
     self.radar_off_can = CP.radarUnavailable
     self.rcp = get_radar_can_parser(CP)
-
     self.sp_radar_tracks = CP.spFlags & HyundaiFlagsSP.SP_RADAR_TRACKS
 
   def update(self, can_strings):
     if self.radar_off_can or (self.rcp is None):
       return super().update(None)
-
     vls = self.rcp.update_strings(can_strings)
     self.updated_messages.update(vls)
-
     if self.trigger_msg not in self.updated_messages:
       return None
-
     rr = self._update(self.updated_messages)
     self.updated_messages.clear()
-
     radar_error = []
     if rr is not None:
       radar_error = rr.errors
     if list(radar_error) and self.sp_radar_tracks:
       return super().update(None)
-
     return rr
 
   def _update(self, updated_messages):
     ret = car.RadarData.new_message()
     if self.rcp is None:
       return ret
-
     errors = []
-
     if not self.rcp.can_valid:
       errors.append("canError")
     ret.errors = errors
-
     if self.enhanced_scc or self.camera_scc:
       msg_src = "ESCC" if self.enhanced_scc else "SCC_CONTROL" if self.CP.carFingerprint in CANFD_CAR else "SCC11"
       msg = self.rcp.vl[msg_src]
@@ -104,19 +91,16 @@ class RadarInterface(RadarInterfaceBase):
           self.pts[ii].vRel = msg['ACC_ObjRelSpd']
           self.pts[ii].aRel = float('nan')
           self.pts[ii].yvRel = float('nan')
-
         else:
           if ii in self.pts:
             del self.pts[ii]
     else:
       for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT):
         msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
-
         if addr not in self.pts:
           self.pts[addr] = car.RadarData.RadarPoint.new_message()
           self.pts[addr].trackId = self.track_id
           self.track_id += 1
-
         valid = msg['STATE'] in (3, 4)
         if valid:
           azimuth = math.radians(msg['AZIMUTH'])
@@ -126,9 +110,7 @@ class RadarInterface(RadarInterfaceBase):
           self.pts[addr].vRel = msg['REL_SPEED']
           self.pts[addr].aRel = msg['REL_ACCEL']
           self.pts[addr].yvRel = float('nan')
-
         else:
           del self.pts[addr]
-
     ret.points = list(self.pts.values())
     return ret
