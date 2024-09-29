@@ -247,23 +247,25 @@ def create_acc_commands(
 
   # Only send FCA11 on cars where it exists on the bus
   if use_fca and not escc:
-    if (CP.spFlags & HyundaiFlagsSP.SP_CAMERA_SCC_LEAD) or (CP.openpilotLongitudinalControl and CP.spFlags & HyundaiFlagsSP.SP_FORCE_OP_LONG):
-      fca11_values = CS.fca11
-      fca11_values["PAINT1_Status"] = 1
-      fca11_values["FCA_DrvSetStatus"] = 1
-      fca11_values["FCA_Status"] = 1  # AEB disabled, until a route with AEB or FCW trigger is verified
-    else:
-      # note that some vehicles most likely have an alternate checksum/counter definition
-      # https://github.com/commaai/opendbc/commit/9ddcdb22c4929baf310295e832668e6e7fcfa602
-      fca11_values = {
-        "CR_FCA_Alive": idx % 0xF,
-        "PAINT1_Status": 1,
-        "FCA_DrvSetStatus": 1,
-        "FCA_Status": 1,  # AEB disabled
-      }
-    fca11_dat = packer.make_can_msg("FCA11", 0, fca11_values)[1]
-    fca11_values["CR_FCA_ChkSum"] = hyundai_checksum(fca11_dat[:7])
-    commands.append(packer.make_can_msg("FCA11", 0, fca11_values))
+      if (CP.spFlags & HyundaiFlagsSP.SP_CAMERA_SCC_LEAD) or \
+        (CP.openpilotLongitudinalControl and CP.spFlags & HyundaiFlagsSP.SP_FORCE_OP_LONG) or \
+        (not CP.openpilotLongitudinalControl and CS.out.customStockLongAvailable):
+          fca11_values = CS.fca11
+          fca11_values["PAINT1_Status"] = 1
+          fca11_values["FCA_DrvSetStatus"] = 1
+          fca11_values["FCA_Status"] = 1  # AEB enabled when using stock longitudinal
+      else:
+          # note that some vehicles most likely have an alternate checksum/counter definition
+          # https://github.com/commaai/opendbc/commit/9ddcdb22c4929baf310295e832668e6e7fcfa602
+          fca11_values = {
+              "CR_FCA_Alive": idx % 0xF,
+              "PAINT1_Status": 1,
+              "FCA_DrvSetStatus": 1,
+              "FCA_Status": 1,  # AEB disabled
+          }
+      fca11_dat = packer.make_can_msg("FCA11", 0, fca11_values)[1]
+      fca11_values["CR_FCA_ChkSum"] = hyundai_checksum(fca11_dat[:7])
+      commands.append(packer.make_can_msg("FCA11", 0, fca11_values))
 
   return commands
 
