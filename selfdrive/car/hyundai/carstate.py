@@ -77,7 +77,7 @@ class CarState(CarStateBase):
     self.is_metric = cp.vl["CLU11"]["CF_Clu_SPEED_UNIT"] == 0
     speed_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
     ret.doorOpen = any([cp.vl["CGW1"]["CF_Gway_DrvDrSw"], cp.vl["CGW1"]["CF_Gway_AstDrSw"], cp.vl["CGW2"]["CF_Gway_RLDrSw"], cp.vl["CGW2"]["CF_Gway_RRDrSw"]])
-    ret.seatbeltUnlatched = cp.vl["CGW1"]["CF_Gway_DrvSeatBeltSw" == 0]
+    ret.seatbeltUnlatched = cp.vl["CGW1"]["CF_Gway_DrvSeatBeltSw"] == 0
     ret.wheelSpeeds = self.get_wheel_speeds(
       cp.vl["WHL_SPD11"]["WHL_SPD_FL"],
       cp.vl["WHL_SPD11"]["WHL_SPD_FR"],
@@ -190,31 +190,6 @@ class CarState(CarStateBase):
     if self.CP.enableBsm:
       ret.leftBlindspot = cp.vl["LCA11"]["CF_Lca_IndLeft"] != 0
       ret.rightBlindspot = cp.vl["LCA11"]["CF_Lca_IndRight"] != 0
-    # --- Add the messages list and cp_cam creation here ---
-    messages = [
-      ("LKAS11", 100),
-    ]
-    if not self.CP.openpilotLongitudinalControl and self.CP.carFingerprint in (CAMERA_SCC_CAR | (NON_SCC_FCA_CAR - NON_SCC_RADAR_FCA_CAR)):
-      if self.CP.carFingerprint in CAMERA_SCC_CAR:
-        messages += [
-          ("SCC11", 50),
-          ("SCC12", 50),
-        ]
-      if self.CP.flags & HyundaiFlags.USE_FCA.value:
-        messages.append(("FCA11", 50))
-    if (
-      self.CP.openpilotLongitudinalControl
-      and (self.CP.carFingerprint in CAMERA_SCC_CAR or (self.CP.carFingerprint in NON_SCC_FCA_CAR and HyundaiFlagsSP.SP_FORCE_OP_LONG))
-    ) or (self.param_s.get_bool("CustomStockLongPlanner") and self.CP.carFingerprint in (NON_SCC_FCA_CAR - NON_SCC_RADAR_FCA_CAR)):
-      if self.CP.flags & HyundaiFlags.USE_FCA.value:
-        messages += [
-          ("FCA11", 50),
-          ("FCA12", 50),
-        ]
-    if self.CP.spFlags & HyundaiFlagsSP.SP_LKAS12:
-      messages.append(("LKAS12", 10))
-    cp_cam = CANParser(DBC[self.CP.carFingerprint]["pt"], messages, 2)
-    # --- End of messages list and cp_cam creation ---
     # save the entire LKAS11 and CLU11
     self.lkas11 = copy.copy(cp_cam.vl["LKAS11"])
     self.clu11 = copy.copy(cp.vl["CLU11"])
@@ -387,6 +362,31 @@ class CarState(CarStateBase):
     if CP.enableGasInterceptorDEPRECATED:
       messages.append(("GAS_SENSOR", 50))
     return CANParser(DBC[CP.carFingerprint]["pt"], messages, 0)
+
+  @staticmethod
+  def get_cam_can_parser(CP):
+    if CP.carFingerprint in CANFD_CAR:
+      return CarState.get_cam_can_parser_canfd(CP)
+    messages = [
+      ("LKAS11", 100),
+    ]
+    if not CP.openpilotLongitudinalControl and CP.carFingerprint in (CAMERA_SCC_CAR | (NON_SCC_FCA_CAR - NON_SCC_RADAR_FCA_CAR)):
+      if CP.carFingerprint in CAMERA_SCC_CAR:
+        messages += [
+          ("SCC11", 50),
+          ("SCC12", 50),
+        ]
+      if CP.flags & HyundaiFlags.USE_FCA.value:
+        messages.append(("FCA11", 50))
+    if CP.openpilotLongitudinalControl and (CP.carFingerprint in CAMERA_SCC_CAR or (CP.carFingerprint in NON_SCC_FCA_CAR and HyundaiFlagsSP.SP_FORCE_OP_LONG)):
+      if CP.flags & HyundaiFlags.USE_FCA.value:
+        messages += [
+          ("FCA11", 50),
+          ("FCA12", 50),
+        ]
+    if CP.spFlags & HyundaiFlagsSP.SP_LKAS12:
+      messages.append(("LKAS12", 10))
+    return CANParser(DBC[CP.carFingerprint]["pt"], messages, 2)
 
   def get_can_parser_canfd(self, CP):
     messages = [
