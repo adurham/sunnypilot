@@ -621,7 +621,7 @@ class CAR(Platforms):
     # flags=HyundaiFlags.CHECKSUM_CRC8 | HyundaiFlags.USE_FCA,
     flags=HyundaiFlags.CHECKSUM_CRC8,
     # spFlags=HyundaiFlagsSP.SP_FORCE_OP_LONG | HyundaiFlagsSP.SP_NON_SCC | HyundaiFlagsSP.SP_NON_SCC_FCA,
-    spFlags=HyundaiFlagsSP.SP_NON_SCC | HyundaiFlagsSP.SP_NON_SCC_FCA,
+    spFlags=HyundaiFlagsSP.SP_NON_SCC,
     dbc_dict=dbc_dict("hyundai_kia_generic_generated", None),
   )
 
