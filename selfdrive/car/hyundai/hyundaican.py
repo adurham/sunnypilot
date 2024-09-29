@@ -247,7 +247,7 @@ def create_acc_commands(
 
   # Only send FCA11 on cars where it exists on the bus
   if use_fca and not escc:
-    if (CP.spFlags & HyundaiFlagsSP.CAMERA_SCC) or (CP.openpilotLongitudinalControl and CP.HyundaiFlagsSP.SP_FORCE_OP_LONG):
+    if (CP.spFlags & HyundaiFlagsSP.SP_CAMERA_SCC_LEAD) or (CP.openpilotLongitudinalControl and CP.spFlags & HyundaiFlagsSP.SP_FORCE_OP_LONG):
       fca11_values = CS.fca11
       fca11_values["PAINT1_Status"] = 1
       fca11_values["FCA_DrvSetStatus"] = 1
