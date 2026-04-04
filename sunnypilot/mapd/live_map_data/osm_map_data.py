@@ -10,6 +10,7 @@ import platform
 
 from cereal import log
 from openpilot.common.params import Params
+from openpilot.sunnypilot.mapd.lib.road_type_classifier import classify_road_type
 from openpilot.sunnypilot.mapd.live_map_data.base_map_data import BaseMapData
 from openpilot.sunnypilot.navd.helpers import Coordinate
 
@@ -45,6 +46,9 @@ class OsmMapData(BaseMapData):
 
   def get_current_road_name(self) -> str:
     return str(self.mem_params.get("RoadName") or "")
+
+  def get_current_road_type(self) -> str:
+    return classify_road_type(self.get_current_road_name(), self.get_current_speed_limit())
 
   def get_next_speed_limit_and_distance(self) -> tuple[float, float]:
     next_speed_limit_section_str = self.mem_params.get("NextMapSpeedLimit")
