@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker run:*)",
+      "Bash(rm -rf /tmp/sp_prebuilt_output)",
+      "Bash(mkdir -p /tmp/sp_prebuilt_output)",
+      "Bash(echo \"DOCKER_EXIT: $?\")"
+    ]
+  }
+}
