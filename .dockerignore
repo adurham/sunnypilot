@@ -13,6 +13,10 @@
 *.o-*
 *.os
 *.os-*
+# Exclude scons build outputs to prevent macOS binaries leaking into Docker
+.sconsign.dblite
+**/*.so
+!third_party/**/*.so
 
 venv/
 .venv/
