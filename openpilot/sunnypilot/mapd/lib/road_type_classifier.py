@@ -17,22 +17,14 @@ URBAN_SPEED_CEILING = 20.1  # ~45 mph
 
 # Interstate / freeway patterns — always classified as interstate regardless of speed
 _INTERSTATE_RE = re.compile(
-  r'\bI-\d+\b'
-  r'|\bInterstate\s+\d+'
-  r'|\bFreeway\b'
-  r'|\bExpressway\b',
+  r'\bI-\d+\b|\bInterstate\s+\d+|\bFreeway\b|\bExpressway\b',
   re.IGNORECASE,
 )
 
-# US highway and state route patterns — classified as highway only above speed threshold
+# US highway and state route patterns — classified as highway only above speed threshold.
+# Includes two-letter state prefixes: CA-1, TX-130, NY-17
 _HIGHWAY_NAME_RE = re.compile(
-  r'\bUS[-\s]?\d+'
-  r'|\bUS\s+(Route|Highway)\s+\d+'
-  r'|\bU\.S\.\s+\d+'
-  r'|\bSR[-\s]?\d+'
-  r'|\bState\s+Route\s+\d+'
-  r'|\bState\s+Highway\s+\d+'
-  r'|\b[A-Z]{2}-\d+\b',  # Two-letter state prefix: CA-1, TX-130, NY-17
+  r'\bUS[-\s]?\d+|\bUS\s+(Route|Highway)\s+\d+|\bU\.S\.\s+\d+|\bSR[-\s]?\d+|\bState\s+Route\s+\d+|\bState\s+Highway\s+\d+|\b[A-Z]{2}-\d+\b',
   re.IGNORECASE,
 )
 
