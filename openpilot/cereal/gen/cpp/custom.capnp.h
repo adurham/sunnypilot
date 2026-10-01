@@ -240,6 +240,14 @@ CAPNP_DECLARE_SCHEMA(d8f4f047edce3c71);
 CAPNP_DECLARE_SCHEMA(9e62278160b7df26);
 CAPNP_DECLARE_SCHEMA(b86e6369214c01c8);
 CAPNP_DECLARE_SCHEMA(f416ec09499d9d19);
+CAPNP_DECLARE_SCHEMA(bdd296f3895125d8);
+enum class RoadType_bdd296f3895125d8: uint16_t {
+  UNKNOWN,
+  INTERSTATE,
+  HIGHWAY,
+  URBAN,
+};
+CAPNP_DECLARE_ENUM(RoadType, bdd296f3895125d8);
 CAPNP_DECLARE_SCHEMA(a1680744031fdb2d);
 CAPNP_DECLARE_SCHEMA(b73df234a23b0cc2);
 enum class TurnDirection_b73df234a23b0cc2: uint16_t {
@@ -819,6 +827,8 @@ struct LiveMapDataSP {
   class Reader;
   class Builder;
   class Pipeline;
+  typedef ::capnp::schemas::RoadType_bdd296f3895125d8 RoadType;
+
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(f416ec09499d9d19, 2, 1)
@@ -4465,6 +4475,8 @@ public:
   inline bool hasRoadName() const;
   inline  ::capnp::Text::Reader getRoadName() const;
 
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4514,6 +4526,9 @@ public:
   inline  ::capnp::Text::Builder initRoadName(unsigned int size);
   inline void adoptRoadName(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownRoadName();
+
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType();
+  inline void setRoadType( ::cereal::LiveMapDataSP::RoadType value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -8909,6 +8924,20 @@ inline void LiveMapDataSP::Builder::adoptRoadName(
 inline ::capnp::Orphan< ::capnp::Text> LiveMapDataSP::Builder::disownRoadName() {
   return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Reader::getRoadType() const {
+  return _reader.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Builder::getRoadType() {
+  return _builder.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LiveMapDataSP::Builder::setRoadType( ::cereal::LiveMapDataSP::RoadType value) {
+  _builder.setDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
 }
 
 inline  ::cereal::ModelDataV2SP::TurnDirection ModelDataV2SP::Reader::getLaneTurnDirection() const {
