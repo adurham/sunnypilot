@@ -1,0 +1,352 @@
+name: sync upstream
+
+# Automated upstream sync + deployable prebuilt rebuild for this fork.
+#
+# One run does the whole pipeline:
+#   1. checks upstream's prebuilt branch (`dev`) and this fork's `dev` to decide
+#      whether anything needs doing; if both the fork source and upstream's
+#      prebuilt tree are unchanged since the last build, it exits immediately.
+#   2. clones upstream's prebuilt tree and reads the master commit it was built
+#      from ("master commit: <sha>" in its commit message). That commit is the
+#      sync target: the fork merges exactly it, so the fork never advances past
+#      what upstream can currently build. If upstream dev lags master, the
+#      summary reports the gap.
+#   3. merges the sync target into this fork's main (merging, not rebasing:
+#      conflicts get resolved once and the resolution persists in history).
+#   4. overlays the fork's source diff (sync target -> main) onto the clone,
+#      regenerates the capnp C++ bindings when the cereal schema changed, and
+#      commits.
+#   5. pushes main and force-updates `dev` (the branch the comma device tracks),
+#      then verifies both refs on the remote.
+#
+# A merge conflict aborts without pushing anything and fails the run with
+# resolution instructions in the summary — a red run is always safe.
+#
+# Why overlay instead of a full build: the fork's diff is pure Python plus one
+# capnp schema field, and upstream's prebuilt tree already carries every compiled
+# artifact (camerad, loggerd, models, .so files) built from the same upstream
+# commit. Overlaying the source diff is exact and takes ~1 minute instead of a
+# multi-hour arm64 rebuild.
+
+env:
+  UPSTREAM_REPO: sunnypilot/sunnypilot
+  UPSTREAM_BRANCH: master
+  UPSTREAM_PREBUILT_BRANCH: dev
+  PREBUILT_BRANCH: dev
+  FORK_BRANCH: main
+
+on:
+  # a merge/push to main means the fork's source moved: rebuild the deployable
+  # prebuilt branch. Runs triggered on push skip when nothing changed; pushes
+  # made with GITHUB_TOKEN do not re-trigger this workflow.
+  push:
+    branches: [main]
+  schedule:
+    # daily at 09:17 UTC (off the hour to avoid the top-of-hour CI rush)
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build but do not push anything'
+        required: false
+        default: false
+        type: boolean
+      force_rebuild:
+        description: 'Rebuild the prebuilt branch even if it looks current'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # always operate on the fork's main, regardless of dispatch ref
+          ref: main
+          # shallow first; the next step deepens main only, so the fork's huge
+          # prebuilt-branch history is never downloaded
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Fetch full fork history (main only)
+        run: |
+          set -euo pipefail
+          if [ -f .git/shallow ]; then
+            git fetch --unshallow --no-tags origin "${FORK_BRANCH}"
+          else
+            git fetch --no-tags origin "${FORK_BRANCH}"
+          fi
+          echo "main history: $(git rev-list --count HEAD) commits, shallow=$([ -f .git/shallow ] && echo yes || echo no)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Decide whether anything needs doing
+        run: |
+          set -euo pipefail
+          SOURCE_SHA=$(git rev-parse HEAD)
+
+          # upstream prebuilt tip: plain git, no API token needed
+          UPSTREAM_PREBUILT_SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_PREBUILT_BRANCH}" | cut -f1)
+          [ -n "$UPSTREAM_PREBUILT_SHA" ] || { echo "::error::could not ls-remote upstream ${UPSTREAM_PREBUILT_BRANCH}"; exit 1; }
+
+          # what the fork's current prebuilt branch was built from
+          PREBUILT_SOURCE=""; PREBUILT_BASE=""
+          if PB_MSG=$(gh api "repos/${REPO}/commits/${PREBUILT_BRANCH}" --jq '.commit.message' 2>/dev/null); then
+            PREBUILT_SOURCE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^source: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
+            PREBUILT_BASE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^base: \([0-9a-f]\{7,40\}\).*/\1/p' | head -1)
+          fi
+
+          SKIP=false
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "force_rebuild requested"
+          elif [ "$SOURCE_SHA" = "$PREBUILT_SOURCE" ] && [ -n "$PREBUILT_BASE" ] && [ "${UPSTREAM_PREBUILT_SHA:0:${#PREBUILT_BASE}}" = "$PREBUILT_BASE" ]; then
+            SKIP=true
+          fi
+
+          {
+            echo "SOURCE_SHA=${SOURCE_SHA}"
+            echo "UPSTREAM_PREBUILT_SHA=${UPSTREAM_PREBUILT_SHA}"
+            echo "PREBUILT_SOURCE=${PREBUILT_SOURCE}"
+            echo "PREBUILT_BASE=${PREBUILT_BASE}"
+            echo "SKIP=${SKIP}"
+          } >> "$GITHUB_ENV"
+
+          echo "fork main:                 ${SOURCE_SHA:0:10}"
+          echo "upstream prebuilt tip:     ${UPSTREAM_PREBUILT_SHA:0:10}"
+          echo "last fork build source:    ${PREBUILT_SOURCE:0:10}"
+          echo "last fork build base:      ${PREBUILT_BASE:0:10}"
+          echo "skip: ${SKIP}"
+
+      - name: Clone upstream prebuilt tree
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --single-branch --no-tags --branch "${UPSTREAM_PREBUILT_BRANCH}" \
+            "https://github.com/${UPSTREAM_REPO}.git" "$RUNNER_TEMP/prebuilt"
+          CLONED_BASE=$(git -C "$RUNNER_TEMP/prebuilt" rev-parse HEAD)
+          SYNC_TARGET=$(git -C "$RUNNER_TEMP/prebuilt" log -1 --format=%B | sed -n 's/.*master commit: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
+          if [ -z "$SYNC_TARGET" ]; then
+            echo "::error::could not parse 'master commit: <sha>' from upstream prebuilt commit message"
+            git -C "$RUNNER_TEMP/prebuilt" log -1 --format=%B
+            exit 1
+          fi
+          {
+            echo "CLONED_BASE=${CLONED_BASE}"
+            echo "SYNC_TARGET=${SYNC_TARGET}"
+          } >> "$GITHUB_ENV"
+          echo "cloned upstream prebuilt ${CLONED_BASE:0:10}; built from master commit ${SYNC_TARGET:0:10}"
+
+      - name: Verify prebuilt tree shape
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/prebuilt"
+          test -f prebuilt || { echo "::error::no prebuilt marker in upstream prebuilt tree"; exit 1; }
+          LINKS=$(git ls-files -s | awk '$1=="160000"{n++} END{print n+0}')
+          test "$LINKS" = "0" || { echo "::error::${LINKS} gitlinks present (not a flattened prebuilt tree)"; exit 1; }
+          test ! -f .gitmodules || { echo "::error::.gitmodules present in prebuilt tree"; exit 1; }
+          echo "prebuilt tree OK: $(git ls-files | wc -l) files"
+
+      - name: Fetch upstream and verify the sync target
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch upstream "${UPSTREAM_BRANCH}" --no-tags
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          git merge-base --is-ancestor "${SYNC_TARGET}" "upstream/${UPSTREAM_BRANCH}" \
+            || { echo "::error::sync target ${SYNC_TARGET} is not on upstream/${UPSTREAM_BRANCH}"; exit 1; }
+          MASTER_AHEAD=$(git rev-list --count "${SYNC_TARGET}..upstream/${UPSTREAM_BRANCH}")
+          {
+            echo "UPSTREAM_SHA=${UPSTREAM_SHA}"
+            echo "MASTER_AHEAD=${MASTER_AHEAD}"
+          } >> "$GITHUB_ENV"
+          echo "upstream master tip ${UPSTREAM_SHA:0:10} is ${MASTER_AHEAD} commits beyond the sync target"
+
+      - name: Merge the sync target into main
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor "${SYNC_TARGET}" HEAD; then
+            echo "main already contains the sync target"
+            echo "MERGED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if git merge --no-edit "${SYNC_TARGET}"; then
+            echo "MERGED=true" >> "$GITHUB_ENV"
+            echo "merged upstream ${SYNC_TARGET:0:10}"
+          else
+            git merge --abort || true
+            echo "MERGED=false" >> "$GITHUB_ENV"
+            echo "CONFLICT=true" >> "$GITHUB_ENV"
+            {
+              echo "### Upstream sync stopped: merge conflict"
+              echo ""
+              echo "Merging upstream \`${SYNC_TARGET}\` into this fork hit a conflict; the merge was aborted and **nothing was pushed**."
+              echo ""
+              echo "Resolve locally, push the resolution, then re-run this workflow:"
+              echo '```'
+              echo "git fetch upstream ${UPSTREAM_BRANCH}"
+              echo "git merge ${SYNC_TARGET}   # resolve conflicts, commit"
+              echo "git push origin HEAD:main"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Overlay the fork's source diff
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          SOURCE_SHA=$(git rev-parse HEAD)
+          echo "SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
+
+          SCHEMA_CHANGED=false
+          if ! git diff --quiet "${SYNC_TARGET}" "${SOURCE_SHA}" -- openpilot/cereal/custom.capnp openpilot/cereal/log.capnp openpilot/cereal/deprecated.capnp; then
+            SCHEMA_CHANGED=true
+          fi
+          echo "SCHEMA_CHANGED=${SCHEMA_CHANGED}" >> "$GITHUB_ENV"
+          echo "schema_changed=${SCHEMA_CHANGED}"
+
+          cd "$RUNNER_TEMP/prebuilt"
+          git -C "$GITHUB_WORKSPACE" diff --name-status "${SYNC_TARGET}" "${SOURCE_SHA}" > "$RUNNER_TEMP/overlay.txt"
+          echo "--- overlay ---"
+          cat "$RUNNER_TEMP/overlay.txt"
+          while IFS=$'\t' read -r status path extra; do
+            [ -z "${path:-}" ] && continue
+            case "$status" in
+              D) rm -f "$path"; echo "removed $path" ;;
+              R*|C*)
+                [ -n "${extra:-}" ] || { echo "::error::rename/copy without target: $path"; exit 1; }
+                rm -f "$path"; mkdir -p "$(dirname "$extra")"; cp "$GITHUB_WORKSPACE/$extra" "$extra"; echo "renamed $path -> $extra" ;;
+              *)
+                mkdir -p "$(dirname "$path")"; cp "$GITHUB_WORKSPACE/$path" "$path"; echo "copied $path" ;;
+            esac
+          done < "$RUNNER_TEMP/overlay.txt"
+
+      - name: Regenerate capnp C++ bindings
+        if: env.SKIP != 'true' && env.SCHEMA_CHANGED == 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          VER=$(grep -A2 'name = "comma-deps-capnproto"' uv.lock | sed -n 's/^version = "\(.*\)".*/\1/p' | head -1)
+          echo "comma-deps-capnproto pin in uv.lock: ${VER:-<none>}"
+          if [ -n "$VER" ]; then
+            python -m pip install --quiet "comma-deps-capnproto==${VER}" || python -m pip install --quiet comma-deps-capnproto
+          else
+            python -m pip install --quiet comma-deps-capnproto
+          fi
+          CAPNP_BIN="$(python -c 'import capnproto, os; print(os.path.join(capnproto.BIN_DIR, "capnp"))')"
+          # capnp resolves the c++ generator plugin (capnpc-c++) via PATH: put the
+          # package's own bin dir first so compiler and plugin versions always match
+          export PATH="$(dirname "$CAPNP_BIN"):$PATH"
+          "$CAPNP_BIN" --version
+          T="$RUNNER_TEMP/prebuilt"
+          cd "$T/openpilot/cereal"
+          "$CAPNP_BIN" compile \
+            --src-prefix=. \
+            --src-prefix="$T/opendbc_repo/opendbc/car" \
+            --import-path="$T/opendbc_repo/opendbc/car" \
+            -o "c++:$T/openpilot/cereal/gen/cpp/" \
+            log.capnp deprecated.capnp custom.capnp \
+            "$T/opendbc_repo/opendbc/car/car.capnp"
+          echo "RoadType symbols in regenerated header: $(grep -c RoadType "$T/openpilot/cereal/gen/cpp/custom.capnp.h" || true)"
+
+      - name: Commit the prebuilt tree
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/prebuilt"
+          rm -f .gitattributes .lfsconfig
+          git add -A -f
+          CAFES=$(git ls-files | grep -E '__pycache__' || true)
+          if [ -n "$CAFES" ]; then printf '%s\n' "$CAFES" | xargs -r git rm -r --cached -q; fi
+          if git commit -q -m "sunnypilot prebuilt (fork main)" \
+              -m "source: ${SOURCE_SHA}
+          sync-target: ${SYNC_TARGET}
+          base: ${CLONED_BASE}
+          run: ${GITHUB_RUN_ID}
+          date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"; then
+            echo "REBUILD=true" >> "$GITHUB_ENV"
+            git log -1 --format='%h %s' | head -1
+          else
+            echo "no changes to commit; prebuilt tree already matches"
+            echo "REBUILD=false" >> "$GITHUB_ENV"
+          fi
+          echo "PREBUILT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push branches
+        if: env.SKIP != 'true' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          if [ "${MERGED:-false}" = "true" ]; then
+            git push origin "HEAD:${FORK_BRANCH}"
+            echo "pushed ${FORK_BRANCH} -> ${SOURCE_SHA:0:10}"
+          fi
+          if [ "${REBUILD:-false}" = "true" ]; then
+            AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            cd "$RUNNER_TEMP/prebuilt"
+            # token goes through the credential header, never interpolated into a URL
+            git -c "http.extraheader=AUTHORIZATION: basic ${AUTH}" push --force \
+              "https://github.com/${REPO}.git" "HEAD:${PREBUILT_BRANCH}"
+            echo "pushed ${PREBUILT_BRANCH} (prebuilt) -> ${PREBUILT_SHA:0:10}"
+          fi
+
+      - name: Verify pushed refs
+        if: env.SKIP != 'true' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          FAIL=0
+          if [ "${MERGED:-false}" = "true" ]; then
+            R=$(git ls-remote "https://github.com/${REPO}.git" "refs/heads/${FORK_BRANCH}" | cut -f1)
+            echo "remote ${FORK_BRANCH}: ${R:0:10} (expected ${SOURCE_SHA:0:10})"
+            [ "$R" = "${SOURCE_SHA}" ] || FAIL=1
+          fi
+          if [ "${REBUILD:-false}" = "true" ]; then
+            R=$(git ls-remote "https://github.com/${REPO}.git" "refs/heads/${PREBUILT_BRANCH}" | cut -f1)
+            echo "remote ${PREBUILT_BRANCH}: ${R:0:10} (expected ${PREBUILT_SHA:0:10})"
+            [ "$R" = "${PREBUILT_SHA}" ] || FAIL=1
+          fi
+          exit $FAIL
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Upstream sync"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| skipped (nothing changed) | ${SKIP:-false} |"
+            echo "| sync target (upstream prebuilt's master commit) | \`${SYNC_TARGET}\` |"
+            echo "| upstream prebuilt tip | \`${UPSTREAM_PREBUILT_SHA}\` |"
+            echo "| upstream master tip | \`${UPSTREAM_SHA}\` |"
+            echo "| upstream master beyond sync target | ${MASTER_AHEAD:-n/a} commits |"
+            echo "| fork merged | ${MERGED:-false} |"
+            echo "| merge conflict | ${CONFLICT:-false} |"
+            echo "| prebuilt rebuilt | ${REBUILD:-false} |"
+            echo "| schema changed | ${SCHEMA_CHANGED:-n/a} |"
+            echo "| fork source sha | \`${SOURCE_SHA}\` |"
+            echo "| new prebuilt commit | \`${PREBUILT_SHA}\` |"
+            echo "| dry run | ${{ inputs.dry_run }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
