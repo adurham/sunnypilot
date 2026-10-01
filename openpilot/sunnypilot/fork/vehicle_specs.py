@@ -34,11 +34,16 @@ Sources for the numbers
 * wheelbase 2.72 m and tireStiffnessFactor 0.65 are already correct for the N
   (same CN7 platform, 107.1 in wheelbase) — deliberately not overridden.
 """
-from opendbc.car import structs
+from opendbc.car import STD_CARGO_KG, structs
 
 LB_TO_KG = 0.453592
 
 # Keyed by the fingerprint string the car actually resolves to at runtime.
+#
+# mass is CURB weight, matching how platform CarSpecs express it. This hook runs
+# after CarInterfaceBase.get_params() has already added STD_CARGO_KG (136 kg,
+# upstream's assumed driver/payload), so the same allowance is added here to
+# land on the identical convention: curb + cargo.
 FORK_VEHICLE_SPECS: dict[str, dict[str, float]] = {
   "HYUNDAI_ELANTRA_2022_NON_SCC": {
     "mass": 3296 * LB_TO_KG,  # [kg] N DCT curb weight (base Elantra spec: 2800 lb)
@@ -53,6 +58,6 @@ def apply_fork_vehicle_specs(CP: structs.CarParams) -> bool:
   if spec is None:
     return False
 
-  CP.mass = spec["mass"]
+  CP.mass = spec["mass"] + (0. if CP.notCar else STD_CARGO_KG)
   CP.steerRatio = spec["steerRatio"]
   return True
