@@ -281,17 +281,22 @@ jobs:
           git add -A -f
           CAFES=$(git ls-files | grep -E '__pycache__' || true)
           if [ -n "$CAFES" ]; then printf '%s\n' "$CAFES" | xargs -r git rm -r --cached -q; fi
-          if git commit -q -m "sunnypilot prebuilt (fork main)" \
-              -m "source: ${SOURCE_SHA}
+          if git diff --cached --quiet; then
+            echo "no staged changes; the prebuilt tree already matches the source"
+            echo "REBUILD=false" >> "$GITHUB_ENV"
+          else
+            # this is a different repository from the workspace checkout, and the
+            # runner has no global git identity — pass one explicitly to this commit
+            git -c user.name='github-actions[bot]' \
+                -c user.email='github-actions[bot]@users.noreply.github.com' \
+                commit -q -m "sunnypilot prebuilt (fork main)" \
+                -m "source: ${SOURCE_SHA}
           sync-target: ${SYNC_TARGET}
           base: ${CLONED_BASE}
           run: ${GITHUB_RUN_ID}
-          date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"; then
+          date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "REBUILD=true" >> "$GITHUB_ENV"
             git log -1 --format='%h %s' | head -1
-          else
-            echo "no changes to commit; prebuilt tree already matches"
-            echo "REBUILD=false" >> "$GITHUB_ENV"
           fi
           echo "PREBUILT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
