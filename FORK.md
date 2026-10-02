@@ -44,10 +44,60 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 7 | Audio boot-race survival (micd/soundd lifecycle) | fix | fork-local; upstream-PR candidate |
 | 8 | locationd transient-invalidity hysteresis | fix | fork-local; upstream-PR candidate (cf. openpilot #38929) |
 | 9 | Road-type classifier speed-threshold boundaries | fix | fork-local (part of the feature) |
+| 10 | Hyundai comma-pedal (gas interceptor) longitudinal, non-SCC — INERT until bench-validated | feature (safety C + car) | fork-local; branch `hyundai-pedal-long`, NOT on main |
 
 ---
 
 ## Entries
+
+### feature: Hyundai comma-pedal (gas interceptor) longitudinal — 2026-10-02 (branch `hyundai-pedal-long`, not deployed)
+
+- **What:** accelerator-only openpilot longitudinal for the non-SCC Elantra N through a comma-pedal-type interceptor
+  (TX `0x200` GAS_COMMAND, RX `0x201` GAS_SENSOR). Modeled on the merged Toyota/Honda interceptor pattern, but as a
+  **separate panda mode** (`hyundai_gas_interceptor`), NOT `hyundai_longitudinal` (that selects the SCC11/12/13/14 +
+  FCA + radar-UDS TX allowlist). TX = base Hyundai set + `0x200` only. Engage = falling edge of SET/RES, exit = CANCEL
+  / brake (same button logic as HKG long); the factory conventional cruise is tracked only so openpilot may cancel it.
+  Works on a RELEASE panda build (no `ALLOW_DEBUG` dependency; the clamp at `hyundai_common.h` is untouched).
+- **Inert by construction — two gates, both required:** (1) capability: `0x201` seen on bus 0 at fingerprinting sets
+  `HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED` (non-SCC ICE only); (2) opt-in: param `HyundaiGasInterceptor=1`. Only then:
+  `CP_SP.enableGasInterceptor`, `openpilotLongitudinalControl=True`, `pcmCruise=False`, `minEnableSpeed=25 mph`,
+  `safetyParamSP |= GAS_INTERCEPTOR (16)`. Otherwise CarParams are byte-identical to today (unit-tested). Today the
+  pedal is not visible on CAN at all (0 frames of 0x200/0x201 in 141 segments) → nothing changes on the car.
+- **Driver-supervisory contract (there is NO brake actuator):** accel ≥ 0 → throttle via the pedal (capped);
+  accel < 0 → lift/coast, engine braking only, never service brakes; no stop-and-go (no engage below 25 mph, pedal
+  command cut below ~20.5 mph with a "TAKE CONTROL" warning); downhill the car WILL exceed set speed; it will NOT keep
+  distance to a braking lead. **The driver must brake.** This is not ACC.
+- **TBD-BENCH constants (placeholders, do not road-test before bench):** `HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 500`
+  (C, `safety/modes/hyundai.h`) == Python (`sunnypilot/car/hyundai/gas_interceptor.py`) — a test parses the C value;
+  `MAX_INTERCEPTOR_GAS = 0.15`; `PEDAL_SCALE`/hold-speed offset; `minEnableSpeed`; GAS_COMMAND per-track scaling
+  (copied from Toyota — APS1/APS2 ratio unverified). The cap is deliberately NOT forced below the RX threshold: the
+  comma pedal firmware reports the DRIVER's raw ADC on 0x201 and applies max(driver, cmd) only at its DAC
+  (`panda c076a9f2^:board/pedal/main.c`), so openpilot cannot self-latch gas_pressed. Bench gate: foot off, ramp the
+  command to the cap, GAS_SENSOR must not move (if it does: firmware differs → stop).
+- **Pedal health:** `0x201` RX check enforces the pedal crc8 checksum AND 4-bit counter at 50 Hz (stricter than
+  upstream Toyota/Honda): dead / frozen / corrupt pedal → controls_allowed=false in panda and canValid=false in openpilot.
+- **DBC:** pedal messages live in a NEW `dbc/generator/hyundai/hyundai_gas_interceptor.dbc` (own parser on bus 0 +
+  own packer). NOT appended to `hyundai_can.dbc`: `BO_ 512` is EMS20 there and CANDefine binds `VAL_` by address, so a
+  second `BO_ 512` breaks FCEV gear parsing (verified). Generated DBCs are built in-memory at import (gitignored), no
+  checked-in artifact.
+- **Side effects when active:** ICBM is disabled and its param REMOVED (`openpilot/sunnypilot/selfdrive/car/interfaces.py`
+  `_cleanup_unsupported_params`, because `openpilotLongitudinalControl=True`); panda main-cruise toggling is not used
+  (acc_main_on stays = factory cruise main lamp); MADS lateral unaffected.
+- **Deploy (BLOCKED today):** needs (a) panda firmware rebuild (safety C changed; overlay CI drops submodule changes
+  and compiles no C), (b) libparams rebuild for the new `HyundaiGasInterceptor` key in `common/params_keys.h` (until
+  then the Python reads it defensively and the feature stays off), (c) no capnp change. `can.h` untouched.
+- **Files:** opendbc: `safety/modes/hyundai.h`, `hyundai_common.h`, `hyundai_canfd.h`, `safety/tests/test_hyundai.py`,
+  `car/hyundai/{interface,carstate,carcontroller}.py`, `sunnypilot/car/hyundai/{gas_interceptor,carstate_ext,values}.py`,
+  `sunnypilot/car/interfaces.py`, `dbc/generator/hyundai/hyundai_gas_interceptor.dbc`,
+  `sunnypilot/car/hyundai/tests/test_gas_interceptor.py`. superproject: `openpilot/common/params_keys.h`,
+  `openpilot/sunnypilot/selfdrive/car/{interfaces,car_specific}.py`, this file.
+- **Verification:** safety tests debug build (test_hyundai + test_hyundai_canfd) and the pedal class against a
+  RELEASE-built libsafety; mutation checks (C threshold 500→501, re-enabling EMS16 gas) are caught; car-layer tests.
+  Details: `~/.hermes/cache/scratch/car-features/pedal-implementation.md`.
+- **Open items:** bench characterization (all TBD-BENCH values); disengage on pedal STATE fault (parsed, not acted
+  on); persistent "no brakes" on-road notice needs a new `EventNameSP` (capnp regen) → follow-up; settings UI toggle
+  for `HyundaiGasInterceptor`; CI panda rebuild path.
+- **Merge note:** fork-local; do not merge to `main` until bench-validated and the panda-rebuild deploy path exists.
 
 ### fix: road-type classifier speed-threshold boundaries — 2026-10-02
 

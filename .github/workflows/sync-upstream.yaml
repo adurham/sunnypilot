@@ -22,11 +22,49 @@ name: sync upstream
 # A merge conflict aborts without pushing anything and fails the run with
 # resolution instructions in the summary — a red run is always safe.
 #
+# 6. applies the fork's opendbc patch series (openpilot/sunnypilot/fork/patches/
+#    *.patch, filename order) to a checkout of the opendbc_repo submodule and
+#    copies every file the series touched into the prebuilt tree at the same
+#    relative path, then -- when the series or a relevant pin actually changed --
+#    cross-compiles the panda H7 firmware and installs the signed app at
+#    panda/board/obj/panda_h7.bin.signed.
+#
 # Why overlay instead of a full build: the fork's diff is pure Python plus one
 # capnp schema field, and upstream's prebuilt tree already carries every compiled
 # artifact (camerad, loggerd, models, .so files) built from the same upstream
 # commit. Overlaying the source diff is exact and takes ~1 minute instead of a
 # multi-hour arm64 rebuild.
+#
+# Why patches + a firmware build (v3): two things the overlay structurally cannot
+# carry.
+#  (a) Files *inside* opendbc_repo. The fork records opendbc_repo as a gitlink, so
+#      `git diff --name-status` on the superproject sees one directory entry and
+#      never the files, while the prebuilt tree is asserted to contain zero
+#      gitlinks (it is flattened). A patch series is therefore applied to the
+#      submodule checkout and each touched file is copied across by path.
+#  (b) Compiled firmware. Nothing in this workflow used to compile anything. The H7
+#      app is cross-built with the toolchain pinned in panda/pyproject.toml (Arm
+#      GNU 13.2.1, delivered as a uv wheel) -- a hosted ubuntu runner is enough,
+#      no self-hosted arm64 and no host toolchain. Only the app is shipped; the
+#      bootstub (sector 0) is never rebuilt or replaced.
+#
+# Safety properties, unchanged from v2 except where noted:
+#  * every step is `set -euo pipefail`; a failing patch apply, a failing firmware
+#    build or a failed overlay aborts the run *before* the push step, so nothing
+#    is ever published from a red run.
+#  * `git apply` is plain (no --3way, no --whitespace): a patch that no longer
+#    matches the pinned opendbc is a hard error rather than a guess.
+#  * only the app is staged, and only when its bytes differ from what the prebuilt
+#    already ships -- a no-op day produces no commit at all.
+#  * the prebuilt tree still ends up with zero gitlinks and no .gitmodules:
+#    patched opendbc files are copied *as files*, never as a submodule pointer, and
+#    no .git directory can be copied into the tree (paths named .git* are refused).
+#  * the submodule checkout and the firmware build are both gated on work actually
+#    being needed, so scheduled no-op runs stay ~1 minute and never download a
+#    toolchain.
+#  * a cheap canary warns if the prebuilt tree's opendbc/safety/can.h differs from
+#    the pinned opendbc's, which is how the accepted-but-drifting opendbc skew
+#    becomes visible instead of silent.
 
 env:
   UPSTREAM_REPO: sunnypilot/sunnypilot
@@ -34,6 +72,9 @@ env:
   UPSTREAM_PREBUILT_BRANCH: dev
   PREBUILT_BRANCH: dev
   FORK_BRANCH: main
+  # fork-only namespace holding the opendbc patch series. An absent or empty
+  # directory is a supported state: it means "no opendbc divergence to ship".
+  PATCH_DIR: openpilot/sunnypilot/fork/patches
 
 on:
   # a merge/push to main means the fork's source moved: rebuild the deployable
@@ -114,6 +155,12 @@ jobs:
           if PB_MSG=$(gh api "repos/${REPO}/commits/${PREBUILT_BRANCH}" --jq '.commit.message' 2>/dev/null); then
             PREBUILT_SOURCE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^source: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
             PREBUILT_BASE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^base: \([0-9a-f]\{7,40\}\).*/\1/p' | head -1)
+            # v3 bookkeeping written by the previous run of this workflow. Empty on
+            # any prebuilt commit that predates v3 (and on upstream's own dev
+            # commits); the planning step below treats that as "unknown".
+            PREBUILT_OPENDBC_PIN=$(printf '%s\n' "$PB_MSG" | sed -n 's/^opendbc-pin: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
+            PREBUILT_PANDA_PIN=$(printf '%s\n' "$PB_MSG" | sed -n 's/^panda-pin: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
+            PREBUILT_PATCHES_SHA=$(printf '%s\n' "$PB_MSG" | sed -n 's/^patches-sha256: \([0-9a-f]\{64\}\).*/\1/p' | head -1)
           fi
 
           SKIP=false
@@ -128,6 +175,9 @@ jobs:
             echo "UPSTREAM_PREBUILT_SHA=${UPSTREAM_PREBUILT_SHA}"
             echo "PREBUILT_SOURCE=${PREBUILT_SOURCE}"
             echo "PREBUILT_BASE=${PREBUILT_BASE}"
+            echo "PREBUILT_OPENDBC_PIN=${PREBUILT_OPENDBC_PIN}"
+            echo "PREBUILT_PANDA_PIN=${PREBUILT_PANDA_PIN}"
+            echo "PREBUILT_PATCHES_SHA=${PREBUILT_PATCHES_SHA}"
             echo "SKIP=${SKIP}"
           } >> "$GITHUB_ENV"
 
@@ -135,6 +185,8 @@ jobs:
           echo "upstream prebuilt tip:     ${UPSTREAM_PREBUILT_SHA:0:10}"
           echo "last fork build source:    ${PREBUILT_SOURCE:0:10}"
           echo "last fork build base:      ${PREBUILT_BASE:0:10}"
+          echo "last fork build opendbc:   ${PREBUILT_OPENDBC_PIN:0:10}"
+          echo "last fork build patch set: ${PREBUILT_PATCHES_SHA:0:12}"
           echo "skip: ${SKIP}"
 
       - name: Clone upstream prebuilt tree
@@ -214,6 +266,222 @@ jobs:
             exit 1
           fi
 
+      - name: Plan the opendbc patch + firmware work
+        # Runs after the merge, because the merge is what can move the opendbc_repo
+        # and panda gitlinks that this decision depends on. Everything here is read
+        # out of the superproject tree and the workspace, so it costs no network and
+        # no submodule checkout.
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          SOURCE_SHA=$(git rev-parse HEAD)
+          OPENDBC_PIN=$(git rev-parse "HEAD:opendbc_repo")
+          PANDA_PIN=$(git rev-parse "HEAD:panda")
+
+          # --- the patch series, in filename order ---------------------------
+          PATCHES_ABS=()
+          if [ -d "${PATCH_DIR}" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] && PATCHES_ABS+=("$f")
+            done < <(find "${PATCH_DIR}" -maxdepth 1 -type f -name '*.patch' | LC_ALL=C sort)
+          fi
+          PATCH_COUNT=${#PATCHES_ABS[@]}
+
+          # --- patch-set fingerprint ----------------------------------------
+          # sha256 over "<basename>\n<contents>" for every patch, in order. Covers
+          # every way the series can change -- a patch added, edited, renamed or
+          # removed. The empty series has a well-defined fingerprint too, so
+          # *deleting* the fork's patches is noticed rather than silently ignored
+          # (the prebuilt would need rebuilding from unpatched source).
+          if [ "$PATCH_COUNT" -gt 0 ]; then
+            PATCHES_SHA=$( { for f in "${PATCHES_ABS[@]}"; do
+                                echo "== $(basename "$f")"
+                                cat "$f"
+                              done; } | sha256sum | cut -d' ' -f1)
+          else
+            PATCHES_SHA=$(printf '' | sha256sum | cut -d' ' -f1)
+          fi
+
+          # --- does the firmware need (re)building? -------------------------
+          # The patch series is the *only* thing that makes this fork's firmware
+          # differ from the one upstream already built into the prebuilt tree. With
+          # an empty series the right firmware is upstream's own, and rebuilding it
+          # would change its signature for no reason -- which would make the device
+          # flash a byte-identical-but-differently-signed app. So: no patches, no
+          # build. With a series present, build when the series changed, when one of
+          # the two pins that feed the compilation moved, or when this prebuilt
+          # carries no v3 bookkeeping yet (the first v3 run).
+          FW_NEEDED=false
+          FW_REASON='no opendbc patches to apply'
+          if [ "$PATCH_COUNT" -gt 0 ]; then
+            if [ -z "${PREBUILT_OPENDBC_PIN:-}" ] && [ -z "${PREBUILT_PATCHES_SHA:-}" ]; then
+              FW_NEEDED=true; FW_REASON="first v3 build; ${PATCH_COUNT} patch(es) present"
+            elif [ "$PATCHES_SHA" != "${PREBUILT_PATCHES_SHA:-}" ]; then
+              FW_NEEDED=true; FW_REASON="patch set changed"
+            elif [ "$OPENDBC_PIN" != "${PREBUILT_OPENDBC_PIN:-}" ]; then
+              FW_NEEDED=true; FW_REASON="opendbc pin moved"
+            elif [ "$PANDA_PIN" != "${PREBUILT_PANDA_PIN:-}" ]; then
+              FW_NEEDED=true; FW_REASON="panda pin moved"
+            else
+              FW_REASON='patch set and pins unchanged'
+            fi
+          fi
+          # the patch series always has to be *applied*, even when no rebuild is
+          # needed, because that is what produces the files copied into the prebuilt
+          # tree -- so the submodule checkout is needed whenever there are patches.
+          NEED_SUBMODULES=false
+          if [ "$PATCH_COUNT" -gt 0 ]; then NEED_SUBMODULES=true; fi
+
+          {
+            echo "OPENDBC_PIN=${OPENDBC_PIN}"
+            echo "PANDA_PIN=${PANDA_PIN}"
+            echo "PATCH_COUNT=${PATCH_COUNT}"
+            echo "PATCHES_SHA=${PATCHES_SHA}"
+            echo "FW_NEEDED=${FW_NEEDED}"
+            echo "NEED_SUBMODULES=${NEED_SUBMODULES}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo 'OPENDBC_PATCHES<<OPENDBC_PATCHES_EOF'
+            printf '%s\n' "${PATCHES_ABS[@]:-}"
+            echo 'OPENDBC_PATCHES_EOF'
+          } >> "$GITHUB_ENV"
+
+          echo "opendbc pin:    ${OPENDBC_PIN:0:10} (prebuilt built from ${PREBUILT_OPENDBC_PIN:0:10})"
+          echo "panda pin:      ${PANDA_PIN:0:10} (prebuilt built from ${PREBUILT_PANDA_PIN:0:10})"
+          echo "patch series:   ${PATCH_COUNT} patch(es), sha256 ${PATCHES_SHA:0:12}"
+          echo "submodules:     ${NEED_SUBMODULES}"
+          echo "firmware build: ${FW_NEEDED} (${FW_REASON})"
+
+      - name: Check out the opendbc_repo and panda submodules
+        # Only these two, and only when there is opendbc work to do: they are the
+        # only submodules this workflow needs files from, and checking out all seven
+        # would cost time and bandwidth for nothing. On a no-op day this step and
+        # the firmware step below are both skipped, which is what keeps the daily
+        # schedule at ~1 minute.
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          # --depth 1: only the pinned commit is ever read. The two submodules are a
+          # few MB each; the seven-submodule recursive checkout upstream's prebuilt
+          # workflow does is not needed here.
+          git submodule update --init --depth 1 -- opendbc_repo panda
+          echo "opendbc_repo checked out at $(git -C opendbc_repo rev-parse HEAD)"
+          echo "panda checked out at $(git -C panda rev-parse HEAD)"
+
+      - name: Apply the fork's opendbc patch series
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true'
+        run: |
+          set -euo pipefail
+          SUBMODULE=opendbc_repo
+          cd "${GITHUB_WORKSPACE}/${SUBMODULE}"
+          echo "applying to pristine ${SUBMODULE} $(git rev-parse HEAD)"
+          mapfile -t PATCHES < <(printf '%s\n' "${OPENDBC_PATCHES}")
+          APPLIED=0
+          for p in "${PATCHES[@]}"; do
+            [ -n "$p" ] || continue
+            echo "--- applying $(basename "$p")"
+            # Patches are authored with *submodule-relative* paths
+            # ("opendbc/safety/...", i.e. what `git diff` produces inside
+            # opendbc_repo) and are applied from inside the submodule, where those
+            # paths resolve. The `opendbc_repo/` prefix is added by the copy step,
+            # which is the only place the flattened prebuilt tree's layout matters.
+            # `git apply` itself takes no prefix option (--src-prefix is a `git
+            # diff` flag); -p is left at its default of 1.
+            # Plain apply otherwise: no --3way, no whitespace fuzzing. A patch that
+            # no longer matches the pinned opendbc fails here, and `set -e` aborts
+            # the run before anything is committed or pushed -- the same "a red run
+            # is always safe" property the merge-conflict path relies on. Patch rot
+            # shows up as a red run, never as a silently wrong tree.
+            git apply --verbose "$p"
+            APPLIED=$((APPLIED + 1))
+          done
+          [ "$APPLIED" -gt 0 ] || { echo "::error::patch dir was non-empty but no patch applied"; exit 1; }
+          echo "applied ${APPLIED} patch(es); files changed by the series:"
+          git diff --name-status HEAD
+          echo "APPLIED_PATCHES=${APPLIED}" >> "$GITHUB_ENV"
+
+      - name: Copy the patched opendbc files into the prebuilt tree
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true'
+        run: |
+          set -euo pipefail
+          W="${GITHUB_WORKSPACE}/opendbc_repo"
+          T="$RUNNER_TEMP/prebuilt"
+          cd "$W"
+
+          # cheap skew canary, taken BEFORE the copy loop so a patch that legitimately
+          # touches can.h cannot mask it: opendbc/safety/can.h decides
+          # CAN_PACKET_VERSION_HASH for both the firmware and the host lib, so if the
+          # prebuilt tree's copy differs from the pinned opendbc's, the two trees are
+          # not the same opendbc and this overlay is mixing bases.
+          CANH_OURS=$(git rev-parse "HEAD:opendbc/safety/can.h")
+          CANH_THEIRS=$(git hash-object "$T/opendbc_repo/opendbc/safety/can.h")
+          if [ "$CANH_OURS" != "$CANH_THEIRS" ]; then
+            echo "::warning::prebuilt opendbc/safety/can.h differs from the pinned opendbc (prebuilt and fork opendbc bases have diverged)"
+          else
+            echo "opendbc/safety/can.h matches the prebuilt tree's copy"
+          fi
+
+          # `git diff HEAD` alone would miss the files the series *created*, because
+          # `git apply` leaves new blobs untracked; list those separately. Every path
+          # is emitted *superproject-relative* ("${SUBMODULE}/...") here, once, since
+          # `git diff` inside a submodule reports submodule-relative paths and the
+          # prebuilt tree stores the same content under ${SUBMODULE}/.
+          {
+            git diff --name-status HEAD -- | sed "s|^\([A-Z][0-9]*\)\t|\1\t${SUBMODULE}/|"
+            git ls-files --others --exclude-standard | sed "s|^|A\t${SUBMODULE}/|"
+          } > "$RUNNER_TEMP/opendbc-patched.txt"
+          echo "--- patched opendbc files ---"
+          cat "$RUNNER_TEMP/opendbc-patched.txt"
+
+          COPIED=0
+          cd "$T"
+          # The prebuilt tree keeps the submodule's content FLATTENED at its own
+          # path, so a submodule-relative path P maps to P under ${SUBMODULE}/.
+          # Every path in the list is made superproject-relative here, at the one
+          # place the mapping matters, and validated before it is used.
+          while IFS=$'\t' read -r status path extra; do
+            [ -z "${path:-}" ] && continue
+            case "$path" in
+              /*|*..*)        echo "::error::refusing unsafe path from the patch series: $path"; exit 1 ;;
+              .git*|*/.git*)  echo "::error::refusing to copy a git metadata path: $path"; exit 1 ;;
+              ${SUBMODULE}/*) ;;
+              *)              echo "::error::patch series touched a path outside ${SUBMODULE}/: $path"; exit 1 ;;
+            esac
+            case "$status" in
+              D)
+                rm -f "$path"; echo "removed $path"; COPIED=$((COPIED + 1)) ;;
+              R*|C*)
+                [ -n "${extra:-}" ] || { echo "::error::rename/copy without target: $path"; exit 1; }
+                case "$extra" in
+                  ${SUBMODULE}/*) ;;
+                  *) echo "::error::rename target outside ${SUBMODULE}/: $extra"; exit 1 ;;
+                esac
+                rm -f "$path"
+                mkdir -p "$(dirname "$extra")"
+                # strip the submodule prefix to read from the submodule checkout
+                cp "$W/${extra#${SUBMODULE}/}" "$extra"
+                echo "renamed $path -> $extra"; COPIED=$((COPIED + 1)) ;;
+              *)
+                # $path is superproject-relative; the file itself lives under the
+                # submodule checkout, so strip the prefix to read it
+                REL="${path#${SUBMODULE}/}"
+                SRC="$W/$REL"
+                [ -f "$SRC" ] || { echo "::error::patched source missing: $path"; exit 1; }
+                mkdir -p "$(dirname "$path")"
+                cp "$SRC" "$path"
+                echo "copied $path"; COPIED=$((COPIED + 1)) ;;
+            esac
+          done < "$RUNNER_TEMP/opendbc-patched.txt"
+          [ "$COPIED" -gt 0 ] || { echo "::error::the patch series produced no file changes"; exit 1; }
+          echo "OPENDBC_FILES_COPIED=${COPIED}" >> "$GITHUB_ENV"
+
+          echo "--- prebuilt tree shape after the copy (gitlinks must stay 0) ---"
+          git ls-files -s | awk '$1=="160000"{n++} END{print n+0" gitlinks"}'
+          test ! -f .gitmodules || { echo "::error::.gitmodules appeared in the prebuilt tree"; exit 1; }
+
       - name: Overlay the fork's source diff
         if: env.SKIP != 'true'
         run: |
@@ -225,8 +493,18 @@ jobs:
           if ! git diff --quiet "${SYNC_TARGET}" "${SOURCE_SHA}" -- openpilot/cereal/custom.capnp openpilot/cereal/log.capnp openpilot/cereal/deprecated.capnp; then
             SCHEMA_CHANGED=true
           fi
-          echo "SCHEMA_CHANGED=${SCHEMA_CHANGED}" >> "$GITHUB_ENV"
+
+          PARAMS_CHANGED=false
+          if ! git diff --quiet "${SYNC_TARGET}" "${SOURCE_SHA}" -- openpilot/common/params_keys.h openpilot/common/params.cc openpilot/common/params_c.cc openpilot/common/params.h; then
+            PARAMS_CHANGED=true
+          fi
+
+          {
+            echo "SCHEMA_CHANGED=${SCHEMA_CHANGED}"
+            echo "PARAMS_CHANGED=${PARAMS_CHANGED}"
+          } >> "$GITHUB_ENV"
           echo "schema_changed=${SCHEMA_CHANGED}"
+          echo "params_changed=${PARAMS_CHANGED}"
 
           cd "$RUNNER_TEMP/prebuilt"
           git -C "$GITHUB_WORKSPACE" diff --name-status "${SYNC_TARGET}" "${SOURCE_SHA}" > "$RUNNER_TEMP/overlay.txt"
@@ -243,6 +521,67 @@ jobs:
                 mkdir -p "$(dirname "$path")"; cp "$GITHUB_WORKSPACE/$path" "$path"; echo "copied $path" ;;
             esac
           done < "$RUNNER_TEMP/overlay.txt"
+
+      - name: Build and install the panda H7 firmware
+        # Cross-compiles the H7 app with the toolchain pinned in panda/pyproject.toml
+        # (Arm GNU 13.2.1, delivered as a uv wheel), which is why a hosted ubuntu
+        # runner suffices -- this is not an arm64 build.
+        #
+        # DEBUG build on purpose, twice over:
+        #  * panda/SConscript only appends -DALLOW_DEBUG (and signs with
+        #    board/certs/debug) in the non-RELEASE branch, and
+        #    opendbc/safety/modes/hyundai_common.h compiles hyundai_longitudinal to
+        #    false without it -- so a RELEASE build would silently disable Hyundai
+        #    longitudinal/alpha-long.
+        #  * the bootstub resident on the device is itself a DEBUG build
+        #    (panda/board/obj/version = DEV-unknown-DEBUG), and only that kind of
+        #    bootstub accepts a debug-signed app.
+        # Only the app is installed. bootstub.panda_h7.bin is deliberately NOT
+        # staged: it is signed with the same key but replacing it touches sector 0,
+        # and the resident one is already correct.
+        if: env.SKIP != 'true' && env.FW_NEEDED == 'true'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/panda"
+          ./setup.sh              # installs uv when absent, then uv sync --all-extras
+          # activate by PATH rather than `source`: the venv's activate script is not
+          # `set -u` clean, and this puts arm-none-eabi-* and scons on PATH anyway.
+          export PATH="${GITHUB_WORKSPACE}/panda/.venv/bin:${PATH}"
+          arm-none-eabi-gcc --version | head -1
+          arm-none-eabi-gcc --version | head -1 | grep -q '13.2.1' \
+            || echo "::warning::toolchain is not the version pinned in panda/pyproject.toml (13.2.1); firmware bytes may differ from a pinned build"
+          # Build against the *pinned* opendbc checkout, not the copy of opendbc that
+          # `uv sync` also installs as a git dependency -- that one tracks
+          # sunnypilot/opendbc@master and can move independently of the submodule pin.
+          # Without this, CPPPATH would point at the site-packages copy and the
+          # firmware would be compiled from the wrong safety sources.
+          export PYTHONPATH="${GITHUB_WORKSPACE}/opendbc_repo"
+          python -c "import opendbc; assert opendbc.INCLUDE_PATH.endswith('opendbc_repo'), opendbc.INCLUDE_PATH"
+          # the single target rather than a bare `scons`: the root SConstruct also
+          # builds panda_jungle/body and the whole openpilot tree, none of which is
+          # shipped here.
+          scons -j"$(nproc)" board/obj/panda_h7.bin.signed
+          BUILT="board/obj/panda_h7.bin.signed"
+          test -f "$BUILT" || { echo "::error::the firmware build produced no artifact"; exit 1; }
+          FW_SHA=$(sha256sum "$BUILT" | cut -d' ' -f1)
+          echo "built $(stat -c '%s' "$BUILT") bytes, sha256 ${FW_SHA}"
+          echo "build string: $(cat board/obj/version)"
+          case "$(cat board/obj/version)" in
+            *-DEBUG) echo "build type is DEBUG (ALLOW_DEBUG present)" ;;
+            *) echo "::error::firmware is not a DEBUG build -- hyundai_longitudinal would be compiled out"; exit 1 ;;
+          esac
+          DEST="$RUNNER_TEMP/prebuilt/panda/board/obj/panda_h7.bin.signed"
+          if [ -f "$DEST" ]; then echo "prebuilt currently ships sha256 $(sha256sum "$DEST" | cut -d' ' -f1)"; fi
+          if [ -f "$DEST" ] && cmp -s "$BUILT" "$DEST"; then
+            echo "firmware bytes are identical to what the prebuilt already ships; not staging"
+            echo "FW_UPDATED=false" >> "$GITHUB_ENV"
+          else
+            mkdir -p "$(dirname "$DEST")"
+            cp "$BUILT" "$DEST"
+            echo "FW_UPDATED=true" >> "$GITHUB_ENV"
+            echo "installed the built firmware at panda/board/obj/panda_h7.bin.signed"
+          fi
+          echo "FW_SHA=${FW_SHA}" >> "$GITHUB_ENV"
 
       - name: Regenerate capnp C++ bindings
         if: env.SKIP != 'true' && env.SCHEMA_CHANGED == 'true'
@@ -272,6 +611,93 @@ jobs:
             "$T/opendbc_repo/opendbc/car/car.capnp"
           echo "RoadType symbols in regenerated header: $(grep -c RoadType "$T/openpilot/cereal/gen/cpp/custom.capnp.h" || true)"
 
+      - name: Rebuild libparams_c.so for aarch64
+        # The prebuilt tree's libparams_c.so is a ctypes C-ABI shared library built
+        # from openpilot/common/params.cc + params_c.cc and the static comma-deps
+        # zeromq/json11/capnproto archives. Adding a new key to params_keys.h
+        # (which this fork does for HyundaiGasInterceptor) changes the compiled
+        # artifact. On a hosted x86_64 runner we cross-compile for the aarch64
+        # prebuilt tree. The build is gated on the overlay touching anything under
+        # openpilot/common/params*; on most runs it skips.
+        if: env.SKIP != 'true' && env.PARAMS_CHANGED == 'true'
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/prebuilt"
+          cd "$T"
+
+          apt-get update -qq
+          apt-get install -y -qq g++-aarch64-linux-gnu curl ca-certificates unzip
+
+          # comma-deps versions pinned by uv.lock
+          ZMQ_VER="4.3.5.post98"
+          JSON11_VER="20170411.0.post98"
+          CAPNP_VER="1.0.1.post98"
+
+          mkdir -p "$RUNNER_TEMP/params-deps"
+          cd "$RUNNER_TEMP/params-deps"
+
+          fetch_dep() {
+            local pkg="$1" ver="$2" url="$3"
+            local fn="${pkg}-${ver}.whl"
+            if [ ! -f "$fn" ]; then
+              curl -fsSL -o "$fn" "$url"
+            fi
+            rm -rf "${pkg}-${ver}"
+            unzip -q "$fn" -d "${pkg}-${ver}"
+          }
+
+          fetch_dep comma-deps-zeromq "$ZMQ_VER" \
+            "https://files.pythonhosted.org/packages/2f/9a/d6a381b079516eca1b8a86aa3e972e550a48ff2f069ccc722b118ab53d60/comma_deps_zeromq-${ZMQ_VER}-py3-none-manylinux_2_28_aarch64.whl"
+          fetch_dep comma-deps-json11 "$JSON11_VER" \
+            "https://files.pythonhosted.org/packages/1f/54/0c87fae682ee52e6aec371336ac980921ad34cedabb69e576cc9f83c40a7/comma_deps_json11-${JSON11_VER}-py3-none-manylinux_2_28_aarch64.whl"
+          fetch_dep comma-deps-capnproto "$CAPNP_VER" \
+            "https://files.pythonhosted.org/packages/b0/8b/6f2a29d50ed4c8741dbf0a34ab109899268d09753518cd693e881bbf1a9d/comma_deps_capnproto-${CAPNP_VER}-py3-none-manylinux_2_28_aarch64.whl"
+
+          ZMQ_DIR="$RUNNER_TEMP/params-deps/comma-deps-zeromq-${ZMQ_VER}/comma_deps_zeromq-${ZMQ_VER}.data/purelib"
+          JSON11_DIR="$RUNNER_TEMP/params-deps/comma-deps-json11-${JSON11_VER}/comma_deps_json11-${JSON11_VER}.data/purelib"
+          CAPNP_DIR="$RUNNER_TEMP/params-deps/comma-deps-capnproto-${CAPNP_VER}/comma_deps_capnproto-${CAPNP_VER}.data/purelib"
+
+          CXX=aarch64-linux-gnu-g++
+          OUT="$T/openpilot/common/libparams_c.so"
+
+          CFLAGS=(
+            -g -fPIC -O2 -std=c++1z
+            -D__COMMA_HARDWARE__
+            -Wno-unused -Wno-error -Wno-shadow=local
+            -Wno-unknown-warning-option -Wno-inconsistent-missing-override
+            -Wno-c99-designator -Wno-reorder-init-list -Wno-vla-cxx-extension
+          )
+
+          INCLUDES=(
+            -I"$T"
+            -I"$T/openpilot"
+            -I"$T/msgq_repo"
+            -I"$T/opendbc_repo"
+            -I"$T/rednose_repo"
+            -I"$T/rednose_repo/rednose"
+            -I"$T/openpilot/cereal/gen/cpp"
+            -I"$ZMQ_DIR/zeromq/install/include"
+            -I"$JSON11_DIR/json11/install/include"
+            -I"$CAPNP_DIR/capnproto/install/include"
+          )
+
+          mkdir -p "$RUNNER_TEMP/params-build"
+          for src in params.cc swaglog.cc util.cc ratekeeper.cc yuv.cc params_c.cc; do
+            "$CXX" "${CFLAGS[@]}" "${INCLUDES[@]}" -c "$T/openpilot/common/$src" \
+              -o "$RUNNER_TEMP/params-build/$src.o"
+          done
+
+          "$CXX" -shared -fPIC -Wl,--as-needed -Wl,--no-undefined \
+            "$RUNNER_TEMP/params-build"/*.o \
+            "$JSON11_DIR/json11/install/lib/libjson11.a" \
+            "$ZMQ_DIR/zeromq/install/lib/libzmq.a" \
+            -lpthread -ldl \
+            -o "$OUT"
+
+          file "$OUT"
+          readelf -d "$OUT" | grep NEEDED
+          echo "libparams_c.so rebuilt and installed at $OUT"
+
       - name: Commit the prebuilt tree
         if: env.SKIP != 'true'
         run: |
@@ -293,6 +719,11 @@ jobs:
                 -m "source: ${SOURCE_SHA}
           sync-target: ${SYNC_TARGET}
           base: ${CLONED_BASE}
+          opendbc-pin: ${OPENDBC_PIN}
+          panda-pin: ${PANDA_PIN}
+          patches-sha256: ${PATCHES_SHA}
+          patches: ${PATCH_COUNT:-0}
+          firmware: ${FW_UPDATED:-false}
           run: ${GITHUB_RUN_ID}
           date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "REBUILD=true" >> "$GITHUB_ENV"
@@ -351,6 +782,15 @@ jobs:
             echo "| merge conflict | ${CONFLICT:-false} |"
             echo "| prebuilt rebuilt | ${REBUILD:-false} |"
             echo "| schema changed | ${SCHEMA_CHANGED:-n/a} |"
+            echo "| opendbc patches applied | ${APPLIED_PATCHES:-0} |"
+            echo "| opendbc files copied | ${OPENDBC_FILES_COPIED:-0} |"
+            echo "| opendbc pin | \`${OPENDBC_PIN}\` |"
+            echo "| panda pin | \`${PANDA_PIN}\` |"
+            echo "| patch set sha256 | \`${PATCHES_SHA}\` |"
+            echo "| params changed | ${PARAMS_CHANGED:-false} |"
+            echo "| firmware build needed | ${FW_NEEDED:-false} |"
+            echo "| firmware staged | ${FW_UPDATED:-false} |"
+            echo "| firmware sha256 | \`${FW_SHA}\` |"
             echo "| fork source sha | \`${SOURCE_SHA}\` |"
             echo "| new prebuilt commit | \`${PREBUILT_SHA}\` |"
             echo "| dry run | ${{ inputs.dry_run }} |"

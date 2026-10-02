@@ -8,7 +8,7 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
@@ -138,4 +138,14 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "ToyotaStopAndGoHack",
   ])
 
-  return [{k: params.get(k, return_default=True)} for k in keys]
+  params_list = [{k: params.get(k, return_default=True)} for k in keys]
+
+  # fork: comma pedal opt-in. The key lives in params_keys.h, i.e. inside the compiled libparams; an overlay deploy that
+  # ships this Python without rebuilding libparams would raise UnknownKeyName here and take down card (and lateral) with
+  # it. Read defensively so a stale libparams just leaves the feature off.
+  try:
+    params_list.append({"HyundaiGasInterceptor": params.get("HyundaiGasInterceptor", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasInterceptor param unknown to libparams (not rebuilt?); gas interceptor stays disabled")
+
+  return params_list
