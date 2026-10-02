@@ -83,3 +83,38 @@ class TestUnknown(OpenpilotTestCase):
   def test_ambiguous_speed_no_name(self):
     """50 mph unnamed road — between urban ceiling and highway threshold."""
     self.assertEqual(classify_road_type("", 50 * MPH_TO_MS), RoadType.unknown)
+
+
+class TestSpeedBoundaries(OpenpilotTestCase):
+  """Pin the exact posted-speed boundaries the thresholds claim to implement.
+
+  These values are the ones that regressed before: 24.6 / 20.1 sit a hair off the
+  true 55 / 45 mph values in m/s, so the comparisons failed at the stated limit.
+  """
+
+  def test_45_mph_unnamed_is_urban(self):
+    self.assertEqual(classify_road_type("", 45 * MPH_TO_MS), RoadType.urban)
+
+  def test_45_mph_plain_street_is_urban(self):
+    self.assertEqual(classify_road_type("Joliet Street", 45 * MPH_TO_MS), RoadType.urban)
+
+  def test_45_mph_highway_route_is_urban(self):
+    """Named highway route below the 50 mph highway-name threshold -> urban (speed > 0)."""
+    self.assertEqual(classify_road_type("US-30", 45 * MPH_TO_MS), RoadType.urban)
+
+  def test_50_mph_unnamed_stays_unknown(self):
+    """Ambiguous zone between the 45 mph urban ceiling and 55 mph highway threshold."""
+    self.assertEqual(classify_road_type("", 50 * MPH_TO_MS), RoadType.unknown)
+
+  def test_50_mph_named_highway_route_is_highway(self):
+    self.assertEqual(classify_road_type("US-30", 50 * MPH_TO_MS), RoadType.highway)
+
+  def test_55_mph_unnamed_is_highway(self):
+    self.assertEqual(classify_road_type("", 55 * MPH_TO_MS), RoadType.highway)
+
+  def test_55_mph_plain_street_is_highway(self):
+    """Speed-only fallback: an unrecognized name at 55 mph is highway."""
+    self.assertEqual(classify_road_type("Joliet Street", 55 * MPH_TO_MS), RoadType.highway)
+
+  def test_55_mph_named_highway_route_is_highway(self):
+    self.assertEqual(classify_road_type("US-30", 55 * MPH_TO_MS), RoadType.highway)

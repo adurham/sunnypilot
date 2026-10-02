@@ -10,10 +10,13 @@ from openpilot.cereal import custom
 
 RoadType = custom.LiveMapDataSP.RoadType
 
-# Speed thresholds in m/s
-HIGHWAY_SPEED_THRESHOLD = 24.6  # ~55 mph
-HIGHWAY_NAME_SPEED_THRESHOLD = 22.3  # ~50 mph
-URBAN_SPEED_CEILING = 20.1  # ~45 mph
+# Speed thresholds are derived from their mph intent so the comparison is inclusive at
+# the stated posted limit (e.g. a true 55 mph road must satisfy speed >= threshold).
+MPH = 0.44704  # m/s per mph
+
+HIGHWAY_SPEED_THRESHOLD = 55 * MPH  # 24.5872 m/s — unnamed roads at >= 55 mph are highway
+HIGHWAY_NAME_SPEED_THRESHOLD = 50 * MPH  # 22.352 m/s — named routes at >= 50 mph are highway
+URBAN_SPEED_CEILING = 45 * MPH  # 20.1168 m/s — 0 < limit <= 45 mph is urban
 
 # Interstate / freeway patterns — always classified as interstate regardless of speed
 _INTERSTATE_RE = re.compile(
@@ -59,7 +62,7 @@ def classify_road_type(road_name: str, speed_limit: float) -> str:
   if speed_limit >= HIGHWAY_SPEED_THRESHOLD:
     return RoadType.highway
 
-  if speed_limit > 0 and speed_limit < URBAN_SPEED_CEILING:
+  if 0 < speed_limit <= URBAN_SPEED_CEILING:
     return RoadType.urban
 
   # Ambiguous zone (45-55 mph unnamed) or no data at all
