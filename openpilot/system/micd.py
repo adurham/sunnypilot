@@ -2,10 +2,10 @@
 import numpy as np
 from functools import cache
 import threading
+import time
 
 from openpilot.cereal import messaging
 from openpilot.common.realtime import Ratekeeper
-from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
 
 RATE = 10
@@ -21,6 +21,39 @@ def patch_sounddevice(sd):
     return np.frombuffer(buffer, dtype=dtype).reshape(-1, channels)
 
   sd._array = sounddevice_array
+
+
+def open_audio_stream(sd, factory, *, log_prefix: str, retry_delay: float = 0.5, attempts: int | None = None):
+  """Best-effort open of a STARTED PortAudio stream. Returns a live stream, or None if
+  bounded attempts run out. Never raises: 'audio device not ready' is an operational
+  state. Re-enumerates PortAudio each attempt; logs the REAL exception (rate-limited)."""
+  last_devs = None
+  attempt = 0
+  while attempts is None or attempt < attempts:
+    attempt += 1
+    # reload sounddevice to reinitialize portaudio
+    sd._terminate()
+    sd._initialize()
+    stream = None
+    try:
+      stream = factory(sd)
+      stream.start()  # streams open stopped; a successful start is part of being ready
+      return stream
+    except Exception as e:
+      if stream is not None:
+        try:
+          stream.close()
+        except Exception:
+          pass
+      try:
+        devs = [(d['name'], d['max_input_channels'], d['max_output_channels']) for d in sd.query_devices()]
+      except Exception as e2:
+        devs = f"<query_devices failed: {e2!r}>"
+      if devs != last_devs:  # rate-limit to device-set changes
+        cloudlog.warning(f"{log_prefix}: audio device not ready: {e!r}; devices={devs}")
+        last_devs = devs
+      time.sleep(retry_delay)
+  return None
 
 
 @cache
@@ -102,22 +135,34 @@ class Mic:
 
         self.measurements = self.measurements[FFT_SAMPLES:]
 
-  @retry(attempts=10, delay=3)
-  def get_stream(self, sd):
-    # reload sounddevice to reinitialize portaudio
-    sd._terminate()
-    sd._initialize()
-    return sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
-
   def micd_thread(self):
     # sounddevice must be imported after forking processes
     import sounddevice as sd
     patch_sounddevice(sd)
 
-    with self.get_stream(sd) as stream:
-      cloudlog.info(f"micd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
-      while True:
-        self.update()
+    stream = None
+    while True:
+      if stream is None:
+        stream = open_audio_stream(
+          sd, lambda s: s.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER),
+          log_prefix="micd")
+        if stream is None:
+          continue
+        cloudlog.info(f"micd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
+
+      # publish while the stream is alive; if it dies mid-run, drop it and re-acquire
+      try:
+        while stream.active:
+          self.update()
+        cloudlog.error("micd stream inactive, re-acquiring")
+      except Exception as e:
+        cloudlog.error(f"micd stream lost, re-acquiring: {e!r}")
+      try:
+        stream.close()  # release the device promptly before re-opening
+      except Exception:
+        pass
+      stream = None
+      time.sleep(0.5)  # bound the re-acquire rate if the stream opens but never stays active
 
 
 def main():
