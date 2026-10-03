@@ -47,10 +47,48 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 10 | Hyundai comma-pedal (gas interceptor) longitudinal, non-SCC — INERT until bench-validated | feature (safety C + car) | fork-local; branch `hyundai-pedal-long`, NOT on main |
 | 11 | Hyundai pedal: REMAPPED CAN IDs (0x700/0x701, owner's custom pedal firmware) alongside standard 0x200/0x201 | feature (safety C + car) | fork-local; amends #10, same branch |
 | 12 | Hyundai pedal: low-speed TAKE CONTROL alert gated on longitudinal engagement | fix (selfdrived car events) | fork-local; amends #10 |
+| 13 | Hyundai FCA11 (0x38D) brake-injection TEST safety mode — **TEST-GATED, NOT FOR ROAD USE**, parked/standstill only | research (safety C only) | fork-local; patch `0002`, opendbc branch `fca11-brake-test`, NOT on main's default path |
 
 ---
 
 ## Entries
+
+### research: Hyundai FCA11 brake-injection TEST safety mode — 2026-10-03 (TEST-GATED, NOT FOR ROAD USE)
+
+- **What:** panda safety-mode bit for a PARKED, STANDSTILL test of FCA11 (`0x38D`, forward camera → ESC) brake-message
+  injection ("software AEB" research) on the non-SCC Elantra N. New `safety_param_sp` bit
+  `HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64` (Python `HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST`). **Safety C only — no car-layer
+  code sets the bit**; nothing changes on the car unless something explicitly sends `safetyParamSP |= 64`.
+- **Armed only when:** bit && non-SCC && ICE (not EV/HEV/FCEV, not camera-SCC) && `!hyundai_longitudinal` — the same
+  predicate as the gas interceptor, shared in `hyundai_common_init`. While armed, the bit **overrides** the gas interceptor
+  (no `0x200`/`0x700` TX). Forced off in `hyundaiLegacy` and `hyundaiCanfd`.
+- **When armed:** TX list = common Hyundai set + `{0x38D, 0, 8, .check_relay = true}`, so the stock camera FCA11 is
+  **no longer forwarded** bus 2 → 0 (only one FCA11 source on the car bus). Relay-fault safe on this car: full route logs
+  show `0x38D` received ONLY on bus 2 (src 2/128). `stock_ecu_check` only trips when a `check_relay` address is
+  received on the TX entry's bus (0). tx_hook for `0x38D` allows `CR_VSM_DecCmd <= HYUNDAI_FCA11_TEST_MAX_DEC` (10 raw
+  = 0.10 g; C == Python `opendbc/sunnypilot/car/hyundai/values.py`, enforced by a boundary test), plus `CF_VSM_Prefill`,
+  `FCA_CmdAct` and `CF_VSM_DecCmdAct`. **Always blocked:** decel above the cap, `CF_VSM_HBACmd != 0`, `FCA_StopReq`, and
+  ANY actuation (decel/prefill/act bits) while `vehicle_moving`. Does not depend on `controls_allowed`, since openpilot is
+  disengaged during the test.
+- **Bit unset:** FCA11 handling is byte-identical to before (the only rule is still "block `CR_VSM_DecCmd != 0`,
+  `FCA_CmdAct`, `CF_VSM_DecCmdAct`"; prefill/HBA/StopReq alone pass, as today — pinned by `test_fca11_rule_pinned`).
+  In non-SCC mode without the bit, `0x38D` is not in the TX allowlist at all.
+- **Caution for the test itself:** while armed, the ESC receives NO camera FCA11 (the camera's real AEB path is cut).
+  It is parked-only for that reason too. The FCA11 checksum (`CR_FCA_ChkSum`, byte 7) is CRC8-J1850 init 0xFD
+  xor 0xDF (`opendbc/car/hyundai/hyundaican.py: hyundai_checksum`), NOT a byte sum. Panda does not verify it; the sender
+  must compute it.
+- **Files (opendbc, via patch `openpilot/sunnypilot/fork/patches/0002-hyundai-fca11-brake-test.patch`, opendbc commit
+  `ab370764` on branch `fca11-brake-test`, parent `00d48a2f`):** `safety/modes/hyundai.h`, `hyundai_common.h`,
+  `hyundai_canfd.h`, `sunnypilot/car/hyundai/values.py`, `safety/tests/test_hyundai.py`, `safety/tests/common.py`
+  (`test_tx_hook_on_wrong_safety_mode`: added to the HKG shared-FCA11 group).
+- **Verification:** `test_hyundai.py` 1917 passed (base 1762; +155 new); full `safety/tests/` + `test_gas_interceptor.py`
+  7972 passed; `test_misra.sh` PASS (the `00d48a2f` base FAILED it on a `knownConditionTrueFalse` in the pedal gate,
+  fixed here by the shared predicate + inline suppression). Mutation-checked: removing the cap / HBA / StopReq / moving
+  checks, `check_relay=false`, or dropping the gating terms each fails a dedicated test. Rehearsal: pristine opendbc
+  `f95f996f` + `0001` + `0002` → tree `9b87a144…` == branch tip tree; panda `74a0adce` built `DEV-74a0adce-DEBUG`,
+  `panda_h7.bin.signed` sha256 `61b3165d…e83672` (0001-only build: `64b46c30…`, the deployed one).
+- **Deploy note:** adding `0002` to the patches dir CHANGES THE FIRMWARE on the next sync (bit-inert, but a new binary =
+  one device reflash). Inert unless bit 64 is set.
 
 ### feature: Hyundai comma-pedal (gas interceptor) longitudinal — 2026-10-02 (branch `hyundai-pedal-long`, not deployed)
 
