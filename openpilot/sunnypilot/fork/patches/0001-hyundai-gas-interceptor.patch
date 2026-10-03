@@ -1,7 +1,7 @@
 From 955a87c1c3c7a546afdb834132ce40b44cbb957e Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Fri, 2 Oct 2026 02:11:50 -0500
-Subject: [PATCH] hyundai: comma pedal (gas interceptor) longitudinal for
+Subject: [PATCH 1/2] hyundai: comma pedal (gas interceptor) longitudinal for
  non-SCC ICE cars
 
 Separate safety mode (hyundai_gas_interceptor), not hyundai_longitudinal: TX = base + 0x200 only,
@@ -1080,6 +1080,896 @@ index 5adbf06a..cd5bdb77 100644
 +  # TBD-BENCH: conservative engage floor; the pedal command is also cut below it (gas_interceptor.py)
 +  CP.minEnableSpeed = HYUNDAI_GAS_INTERCEPTOR_MIN_ENABLE_SPEED
 +  CP.longitudinalActuatorDelay = 0.5  # TBD-BENCH: pedal -> ECU torque request -> DCT, unmeasured
++
++
+ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+                                            params_dict: dict[str, str]) -> None:
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8eae1ed217fc0b5bb461a85a939b2e48c7e9b3e2 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Fri, 2 Oct 2026 20:25:34 -0500
+Subject: [PATCH 2/2] hyundai: gas interceptor remapped-ID dialect (0x700 TX /
+ 0x701 RX)
+
+Custom pedal firmware on the owner's car moves the comma-pedal IDs +0x500 (GAS_SENSOR 0x701, GAS_COMMAND
+presumed 0x700) to avoid 0x200 = EMS20. Support both dialects, exactly one active:
+- DBC: GAS_COMMAND_R (1792) / GAS_SENSOR_R (1793), signals identical to 512/513
+- detection: 0x701 -> HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED (2**12)
+- selection: HyundaiGasInterceptorIDSet auto/standard/remapped (auto prefers standard); remapped sets
+  HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED (32), the single source of truth for panda + car layer
+- safety: TX 0x700 instead of 0x200, strict RX check on 0x701 instead of 0x201, guards follow the active id
+- car: carstate/carstate_ext/carcontroller use the active dialect's messages
+Still inert unless a pedal is detected AND HyundaiGasInterceptor=1.
+---
+ opendbc/car/hyundai/carstate.py               |   5 +-
+ opendbc/car/hyundai/interface.py              |  11 +-
+ .../hyundai/hyundai_gas_interceptor.dbc       |  17 ++
+ opendbc/safety/modes/hyundai.h                |  60 ++++++-
+ opendbc/safety/modes/hyundai_canfd.h          |   1 +
+ opendbc/safety/modes/hyundai_common.h         |   9 +
+ opendbc/safety/tests/test_hyundai.py          |  90 ++++++++--
+ opendbc/sunnypilot/car/__init__.py            |   8 +-
+ .../sunnypilot/car/hyundai/carstate_ext.py    |   7 +-
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  37 ++++-
+ .../car/hyundai/tests/test_gas_interceptor.py | 154 ++++++++++++++++--
+ opendbc/sunnypilot/car/hyundai/values.py      |   6 +
+ opendbc/sunnypilot/car/interfaces.py          |  34 +++-
+ 13 files changed, 386 insertions(+), 53 deletions(-)
+
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index f4e0b61f..c9cc086b 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -11,7 +11,7 @@ from opendbc.car.interfaces import CarStateBase
+ 
+ from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+ from opendbc.sunnypilot.car.hyundai.escc import EsccCarStateBase
+-from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC
++from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC, get_interceptor_ids
+ from opendbc.sunnypilot.car.hyundai.mads import MadsCarState
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+@@ -340,5 +340,6 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+     if CP_SP.enableGasInterceptor:
+       # comma pedal on bus 0, own DBC (0x200/0x201 collide with EMS20 in hyundai_can). Explicitly subscribed at the
+       # pedal's rate so a dead pedal times out -> canValid=False (CarInterfaceBase ANDs every parser).
+-      parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [("GAS_SENSOR", 50)], 0)
++      # Only the active ID dialect's sensor (0x201 GAS_SENSOR or remapped 0x701 GAS_SENSOR_R) is subscribed.
++      parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [(get_interceptor_ids(CP_SP).sensor_msg, 50)], 0)
+     return parsers
+diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
+index 1f812acd..9bb780c6 100644
+--- a/opendbc/car/hyundai/interface.py
++++ b/opendbc/car/hyundai/interface.py
+@@ -9,7 +9,7 @@ from opendbc.car.hyundai.carstate import CarState
+ from opendbc.car.hyundai.radar_interface import RadarInterface
+ 
+ from opendbc.sunnypilot.car.hyundai.escc import ESCC_MSG
+-from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_SENSOR_ADDR
++from opendbc.sunnypilot.car.hyundai.gas_interceptor import REMAPPED_IDS, STANDARD_IDS
+ from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import get_longitudinal_tune
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
+ 
+@@ -197,8 +197,13 @@ class CarInterface(CarInterfaceBase):
+       # opendbc/sunnypilot/car/interfaces.py:_initialize_hyundai_gas_interceptor when the user ALSO enables the
+       # HyundaiGasInterceptor param; otherwise every CarParams/CarParamsSP value stays exactly as above.
+       # ICE only: EV/HEV/FCEV non-SCC cars read gas/cruise from other messages the safety pedal path doesn't cover.
+-      if GAS_SENSOR_ADDR in fingerprint[0] and not stock_cp.flags & (HyundaiFlags.EV | HyundaiFlags.HYBRID | HyundaiFlags.FCEV):
+-        ret.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
++      # Two pedal CAN ID dialects: standard comma pedal (sensor 0x201) and remapped custom firmware (sensor 0x701).
++      # Each sets its own capability bit; the dialect is chosen in _initialize_hyundai_gas_interceptor.
++      if not stock_cp.flags & (HyundaiFlags.EV | HyundaiFlags.HYBRID | HyundaiFlags.FCEV):
++        if STANDARD_IDS.sensor_addr in fingerprint[0]:
++          ret.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
++        if REMAPPED_IDS.sensor_addr in fingerprint[0]:
++          ret.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED.value
+ 
+     # untested non-SCC platforms, need user validations
+     if stock_cp.carFingerprint in (CAR.HYUNDAI_BAYON_1ST_GEN_NON_SCC, CAR.KIA_FORTE_2021_NON_SCC,
+diff --git a/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc b/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
+index df8a3080..2a83d1bf 100644
+--- a/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
++++ b/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
+@@ -52,8 +52,25 @@ BO_ 513 GAS_SENSOR: 6 INTERCEPTOR
+  SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" EON
+  SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" EON
+ 
++BO_ 1792 GAS_COMMAND_R: 6 EON
++ SG_ GAS_COMMAND : 7|16@0+ (0.159375,-75.555) [0|1] "" INTERCEPTOR
++ SG_ GAS_COMMAND2 : 23|16@0+ (0.159375,-151.111) [0|1] "" INTERCEPTOR
++ SG_ ENABLE : 39|1@0+ (1,0) [0|1] "" INTERCEPTOR
++ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" INTERCEPTOR
++ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" INTERCEPTOR
++
++BO_ 1793 GAS_SENSOR_R: 6 INTERCEPTOR
++ SG_ INTERCEPTOR_GAS : 7|16@0+ (1,0) [0|1] "" EON
++ SG_ INTERCEPTOR_GAS2 : 23|16@0+ (1,0) [0|1] "" EON
++ SG_ STATE : 39|4@0+ (1,0) [0|15] "" EON
++ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" EON
++ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" EON
++
++CM_ BO_ 1792 "Same as GAS_COMMAND (512) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 512.";
++CM_ BO_ 1793 "Same as GAS_SENSOR (513) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 513.";
+ CM_ SG_ 512 GAS_COMMAND "TBD-BENCH: per-track scaling copied verbatim from toyota/_community.dbc (track 2 offset = 2x track 1). The Elantra APS1/APS2 ratio is unverified; the DAC outputs must keep the ratio the ECU expects or it will flag an APS correlation fault. Derive both tracks on the bench before any road use.";
+ CM_ SG_ 513 INTERCEPTOR_GAS "Raw 12-bit ADC of the DRIVER's pedal (not the pedal output), per comma pedal firmware";
+ CM_ SG_ 513 STATE "Pedal firmware state; any non-zero value = fault: pedal ignores GAS_COMMAND and passes the driver's pedal through";
+ 
+ VAL_ 513 STATE 6 "FAULT_INVALID" 5 "FAULT_TIMEOUT" 4 "FAULT_STARTUP" 3 "FAULT_SCE" 2 "FAULT_SEND" 1 "FAULT_BAD_CHECKSUM" 0 "NO_FAULT" ;
++VAL_ 1793 STATE 6 "FAULT_INVALID" 5 "FAULT_TIMEOUT" 4 "FAULT_STARTUP" 3 "FAULT_SCE" 2 "FAULT_SEND" 1 "FAULT_BAD_CHECKSUM" 0 "NO_FAULT" ;
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index fbb82565..dbf34845 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -71,6 +71,11 @@ const LongitudinalLimits HYUNDAI_LONG_LIMITS = {
+ #define HYUNDAI_GAS_INTERCEPTOR_ADDR_CHECK \
+   {.msg = {{0x201, 0, 6, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+ 
++// Same pedal, REMAPPED CAN IDs (custom pedal firmware: +0x500, GAS_SENSOR on 0x701, GAS_COMMAND on 0x700). Identical
++// payload, crc8 and counter, so the identical strict check applies. Selected by HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED.
++#define HYUNDAI_GAS_INTERCEPTOR_REMAPPED_ADDR_CHECK \
++  {.msg = {{0x701, 0, 6, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++
+ static const CanMsg HYUNDAI_TX_MSGS[] = {
+   HYUNDAI_COMMON_TX_MSGS(0)
+ };
+@@ -108,6 +113,20 @@ static uint8_t hyundai_interceptor_crc8(const CANPacket_t *msg) {
+   return crc;
+ }
+ 
++// active pedal dialect (see hyundai_gas_interceptor_remapped in hyundai_common.h)
++static uint32_t hyundai_interceptor_sensor_addr(void) {
++  return hyundai_gas_interceptor_remapped ? 0x701U : 0x201U;
++}
++
++static uint32_t hyundai_interceptor_command_addr(void) {
++  return hyundai_gas_interceptor_remapped ? 0x700U : 0x200U;
++}
++
++// checksum/counter hooks only run for addresses in the active RX checks, of which at most one pedal sensor is present
++static bool hyundai_is_interceptor_sensor(const CANPacket_t *msg) {
++  return (msg->addr == 0x201U) || (msg->addr == 0x701U);
++}
++
+ static uint8_t hyundai_get_counter(const CANPacket_t *msg) {
+ 
+   uint8_t cnt = 0;
+@@ -121,7 +140,7 @@ static uint8_t hyundai_get_counter(const CANPacket_t *msg) {
+     cnt = msg->data[7] & 0xFU;
+   } else if (msg->addr == 0x4F1U) {
+     cnt = (msg->data[3] >> 4) & 0xFU;
+-  } else if (msg->addr == 0x201U) {
++  } else if (hyundai_is_interceptor_sensor(msg)) {
+     // GAS_SENSOR PEDAL_COUNTER; the upper nibble is the pedal STATE (see hyundai_rx_hook)
+     cnt = msg->data[4] & 0xFU;
+   } else {
+@@ -140,7 +159,7 @@ static uint32_t hyundai_get_checksum(const CANPacket_t *msg) {
+     chksum = msg->data[6] & 0xFU;
+   } else if (msg->addr == 0x421U) {
+     chksum = msg->data[7] >> 4;
+-  } else if (msg->addr == 0x201U) {
++  } else if (hyundai_is_interceptor_sensor(msg)) {
+     chksum = msg->data[5];
+   } else {
+   }
+@@ -149,7 +168,7 @@ static uint32_t hyundai_get_checksum(const CANPacket_t *msg) {
+ 
+ static uint32_t hyundai_compute_checksum(const CANPacket_t *msg) {
+   uint8_t chksum = 0;
+-  if (msg->addr == 0x201U) {
++  if (hyundai_is_interceptor_sensor(msg)) {
+     chksum = hyundai_interceptor_crc8(msg);
+   } else if (msg->addr == 0x386U) {
+     // count the bits
+@@ -229,7 +248,7 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+       gas_pressed = msg->data[6] != 0U;
+     } else if ((msg->addr == 0x260U) && !hyundai_ev_gas_signal && !hyundai_hybrid_gas_signal && !hyundai_gas_interceptor) {
+       gas_pressed = (msg->data[7] >> 6) != 0U;
+-    } else if ((msg->addr == 0x201U) && hyundai_gas_interceptor) {
++    } else if (hyundai_gas_interceptor && (msg->addr == hyundai_interceptor_sensor_addr())) {
+       // gas interceptor replaces EMS16 CF_Ems_AclAct as the gas source: the pedal sits between the driver's pedal and the
+       // ECU, so the ECU's view of the pedal (EMS16) includes openpilot's command, while 0x201 is the driver's input only.
+       // Byte 4 upper nibble = pedal STATE (0 NO_FAULT, 1 BAD_CHECKSUM, 2 SEND, 3 SCE, 4 STARTUP, 5 TIMEOUT, 6 INVALID);
+@@ -338,8 +357,9 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+     }
+   }
+ 
+-  // GAS: safety check (interceptor). Any non-zero GAS_COMMAND requires longitudinal to be allowed
+-  if (msg->addr == 0x200U) {
++  // GAS: safety check (interceptor). Any non-zero GAS_COMMAND requires longitudinal to be allowed. Only the active
++  // dialect's command id is in the TX allowlist; the other one is already rejected before this hook.
++  if (hyundai_gas_interceptor && (msg->addr == hyundai_interceptor_command_addr())) {
+     if (longitudinal_interceptor_checks(msg)) {
+       tx = false;
+     }
+@@ -387,6 +407,12 @@ static safety_config hyundai_init(uint16_t param) {
+     {0x200, 0, 6, .check_relay = false},  // GAS_COMMAND Bus 0 (comma pedal)
+   };
+ 
++  // same, remapped pedal IDs: GAS_COMMAND_R on 0x700 INSTEAD OF 0x200 (never both)
++  static const CanMsg HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS[] = {
++    HYUNDAI_COMMON_TX_MSGS(0)
++    {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
++  };
++
+   hyundai_common_init(param);
+   hyundai_legacy = false;
+ 
+@@ -514,8 +540,27 @@ static safety_config hyundai_init(uint16_t param) {
+       HYUNDAI_LDA_BUTTON_ADDR_CHECK
+     };
+ 
++    static RxCheck hyundai_non_scc_interceptor_remapped_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_REMAPPED_ADDR_CHECK
++    };
++
++    static RxCheck hyundai_non_scc_interceptor_remapped_lda_button_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_REMAPPED_ADDR_CHECK
++      HYUNDAI_LDA_BUTTON_ADDR_CHECK
++    };
++
+     SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
+-    if (hyundai_gas_interceptor) {
++    if (hyundai_gas_interceptor_remapped) {  // implies hyundai_gas_interceptor (hyundai_common_init)
++      // remapped pedal IDs: TX 0x700 / RX 0x701, mutually exclusive with the standard set below
++      SET_TX_MSGS(HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS, ret);
++      if (hyundai_has_lda_button) {
++        SET_RX_CHECKS(hyundai_non_scc_interceptor_remapped_lda_button_addr_checks, ret);
++      } else {
++        SET_RX_CHECKS(hyundai_non_scc_interceptor_remapped_addr_checks, ret);
++      }
++    } else if (hyundai_gas_interceptor) {
+       // hyundai_common_init only allows this for non-SCC ICE (EMS16) cars; RX is the non-SCC set + the pedal
+       SET_TX_MSGS(HYUNDAI_GAS_INTERCEPTOR_TX_MSGS, ret);
+       if (hyundai_has_lda_button) {
+@@ -572,6 +617,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+   hyundai_legacy = true;
+   hyundai_longitudinal = false;
+   hyundai_gas_interceptor = false;
++  hyundai_gas_interceptor_remapped = false;
+   hyundai_camera_scc = false;
+   return BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
+ }
+diff --git a/opendbc/safety/modes/hyundai_canfd.h b/opendbc/safety/modes/hyundai_canfd.h
+index e8a5cddb..b80651e8 100644
+--- a/opendbc/safety/modes/hyundai_canfd.h
++++ b/opendbc/safety/modes/hyundai_canfd.h
+@@ -273,6 +273,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+ 
+   hyundai_common_init(param);
+   hyundai_gas_interceptor = false;  // gas interceptor is only supported on CAN (non-SCC ICE) cars
++  hyundai_gas_interceptor_remapped = false;
+ 
+   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
+   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index f70b083b..f736ed5f 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -23,6 +23,7 @@ enum {
+   HYUNDAI_PARAM_SP_HAS_LDA_BUTTON = 4,
+   HYUNDAI_PARAM_SP_NON_SCC = 8,
+   HYUNDAI_PARAM_SP_GAS_INTERCEPTOR = 16,  // comma pedal longitudinal (non-SCC ICE only), see hyundai.h
++  HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED = 32,  // pedal on remapped IDs: cmd 0x700 / sensor 0x701 (needs GAS_INTERCEPTOR)
+ };
+ 
+ // common state
+@@ -69,6 +70,12 @@ bool hyundai_non_scc = false;
+ extern bool hyundai_gas_interceptor;
+ bool hyundai_gas_interceptor = false;
+ 
++// Pedal CAN ID dialect, only meaningful while hyundai_gas_interceptor. Standard comma pedal: GAS_COMMAND 0x200 TX /
++// GAS_SENSOR 0x201 RX. Remapped (custom pedal firmware, +0x500 to dodge the 0x200 EMS20 address): 0x700 TX / 0x701 RX.
++// Exactly one dialect is active: the other dialect's command is not in the TX allowlist and its sensor is not parsed.
++extern bool hyundai_gas_interceptor_remapped;
++bool hyundai_gas_interceptor_remapped = false;
++
+ static uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
+ 
+ static bool main_button_prev;
+@@ -117,6 +124,8 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_gas_interceptor = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_GAS_INTERCEPTOR) && hyundai_non_scc &&
+                             !hyundai_longitudinal && !hyundai_camera_scc && !hyundai_ev_gas_signal &&
+                             !hyundai_hybrid_gas_signal && !hyundai_fcev_gas_signal;
++  hyundai_gas_interceptor_remapped = hyundai_gas_interceptor &&
++                                     GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED);
+ }
+ 
+ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 551dee27..08deae45 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -12,7 +12,8 @@ from opendbc.safety.tests.gas_interceptor_common import GasInterceptorSafetyTest
+ from opendbc.safety.tests.hyundai_common import Buttons, HyundaiButtonBase, HyundaiLongitudinalBase
+ 
+ from opendbc.sunnypilot.car import crc8_pedal
+-from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
++from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
++                                                         REMAPPED_IDS, STANDARD_IDS
+ 
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+ 
+@@ -554,11 +555,25 @@ class TestHyundaiNonSCCSafety(TestHyundaiSafety):
+     self.assertTrue(self.safety.get_longitudinal_allowed())
+ 
+ 
+-@parameterized_class(LDA_BUTTON)
++# Both pedal CAN ID dialects: standard comma pedal (0x200/0x201) and remapped custom firmware (0x700/0x701).
++# OTHER_IDS is the inactive dialect, which must be neither transmittable nor parsed.
++PEDAL_DIALECTS = [
++  {"PEDAL_IDS": STANDARD_IDS, "OTHER_IDS": REMAPPED_IDS, "DIALECT_SP": 0,
++   "TX_MSGS": [[0x340, 0], [0x4F1, 0], [0x485, 0], [STANDARD_IDS.command_addr, 0]]},
++  {"PEDAL_IDS": REMAPPED_IDS, "OTHER_IDS": STANDARD_IDS, "DIALECT_SP": HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED,
++   "TX_MSGS": [[0x340, 0], [0x4F1, 0], [0x485, 0], [REMAPPED_IDS.command_addr, 0]]},
++]
++
++
++@parameterized_class([{**lda, **d} for d in PEDAL_DIALECTS for lda in LDA_BUTTON])
+ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyundaiNonSCCSafety):
+   """
+-    Non-SCC ICE + comma pedal: SET/RES button engagement (no SCC), TX = base + 0x200 only, gas from 0x201
++    Non-SCC ICE + comma pedal: SET/RES button engagement (no SCC), TX = base + the active dialect's GAS_COMMAND only
++    (0x200, or 0x700 when remapped), gas from the active dialect's GAS_SENSOR (0x201, or 0x701 when remapped)
+   """
++  PEDAL_IDS = STANDARD_IDS
++  OTHER_IDS = REMAPPED_IDS
++  DIALECT_SP = 0
+   TX_MSGS = [[0x340, 0], [0x4F1, 0], [0x485, 0], [0x200, 0]]
+   # Single source of truth for the panda/openpilot threshold: the boundary test below
+   # (test_no_disengage_on_gas_interceptor) fails unless the C constant equals the Python one. TBD-BENCH value.
+@@ -574,21 +589,27 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+     self.packer = CANPackerSafety("hyundai_can_generated")
+     self.pedal_packer = CANPackerSafety(GAS_INTERCEPTOR_DBC)
+     self.safety = libsafety_py.libsafety
+-    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.SAFETY_PARAM_SP)
++    self.safety.set_current_safety_param_sp(self._pedal_sp())
+     self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
+     self.safety.init_tests()
+ 
++  def _pedal_sp(self) -> int:
++    return HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.DIALECT_SP | self.SAFETY_PARAM_SP
++
+   # *** pedal messages (pedal DBC; checksum and counter are enforced by the RX check) ***
+ 
+-  def _interceptor_gas_cmd(self, gas: int):
++  def _interceptor_gas_cmd(self, gas: int, ids=None):
++    ids = ids or self.PEDAL_IDS
+     values: dict[str, float | int] = {"PEDAL_COUNTER": self.__class__.cnt_gas_cmd & 0xF}
+     if gas > 0:
+       values["GAS_COMMAND"] = gas * 255.
+       values["GAS_COMMAND2"] = gas * 255.
+     self.__class__.cnt_gas_cmd += 1
+-    return self.pedal_packer.make_can_msg_safety("GAS_COMMAND", 0, values)
++    return self.pedal_packer.make_can_msg_safety(ids.command_msg, 0, values)
+ 
+-  def _interceptor_user_gas(self, gas: int, state: int = 0, counter: int | None = None, bad_checksum: bool = False):
++  def _interceptor_user_gas(self, gas: int, state: int = 0, counter: int | None = None, bad_checksum: bool = False,
++                            ids=None):
++    ids = ids or self.PEDAL_IDS
+     if counter is None:
+       counter = self.__class__.cnt_user_gas & 0xF
+       self.__class__.cnt_user_gas += 1
+@@ -599,7 +620,56 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+       dat = bytearray(dat)
+       dat[5] = crc8_pedal(dat[:5]) ^ (0xFF if bad_checksum else 0)
+       return addr, dat, bus
+-    return self.pedal_packer.make_can_msg_safety("GAS_SENSOR", 0, values, fix_checksum=fix_checksum)
++    return self.pedal_packer.make_can_msg_safety(ids.sensor_msg, 0, values, fix_checksum=fix_checksum)
++
++  # *** CAN ID dialect: exactly one of standard (0x200/0x201) / remapped (0x700/0x701) is active ***
++
++  def test_pedal_messages_use_dialect_addrs(self):
++    # guards the helpers themselves: the DBC message names must resolve to the dialect's addresses
++    self.assertEqual(self.PEDAL_IDS.command_addr, self._interceptor_gas_cmd(0)[0].addr)
++    self.assertEqual(self.PEDAL_IDS.sensor_addr, self._interceptor_user_gas(0)[0].addr)
++    self.assertEqual(self.OTHER_IDS.command_addr, self._interceptor_gas_cmd(0, ids=self.OTHER_IDS)[0].addr)
++
++  def test_other_dialect_command_blocked(self):
++    self._rx(self._interceptor_user_gas(0))
++    for controls_allowed in (True, False):
++      self.safety.set_controls_allowed(controls_allowed)
++      self.assertTrue(self._tx(self._interceptor_gas_cmd(0)))
++      self.assertEqual(controls_allowed, self._tx(self._interceptor_gas_cmd(1)))
++      # the inactive dialect's command id is not in the TX allowlist at all, not even a zero command
++      self.assertFalse(self._tx(self._interceptor_gas_cmd(0, ids=self.OTHER_IDS)))
++      self.assertFalse(self._tx(self._interceptor_gas_cmd(1, ids=self.OTHER_IDS)))
++
++  def test_other_dialect_sensor_ignored(self):
++    # the inactive dialect's sensor neither satisfies the pedal RX check nor sets gas_pressed
++    for _ in range(3):
++      self._rx_all_but_pedal()
++      self._rx(self._interceptor_user_gas(0x1000, ids=self.OTHER_IDS))
++    self.assertFalse(self.safety.safety_config_valid())
++    self.assertFalse(self.safety.get_gas_pressed_prev())
++    self.assertEqual(0, self.safety.get_gas_interceptor_prev())
++    self._rx(self._interceptor_user_gas(0))
++    self.assertTrue(self.safety.safety_config_valid())
++
++  def test_gas_override_active_dialect(self):
++    self._rx(self._interceptor_user_gas(0))
++    self.safety.set_controls_allowed(True)
++    self._rx(self._interceptor_user_gas(0x1000))
++    self.assertTrue(self.safety.get_gas_pressed_prev())
++    self.assertFalse(self.safety.get_longitudinal_allowed())
++    self.assertFalse(self._tx(self._interceptor_gas_cmd(1)))
++    self._rx(self._interceptor_user_gas(0))
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(1)))
++
++  def test_remapped_bit_alone_is_inert(self):
++    # GAS_INTERCEPTOR_REMAPPED without GAS_INTERCEPTOR selects nothing: no pedal command of either dialect
++    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED |
++                                            self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self.safety.set_controls_allowed(True)
++    for ids in (STANDARD_IDS, REMAPPED_IDS):
++      self.assertFalse(self._tx(self._interceptor_gas_cmd(0, ids=ids)))
++      self.assertFalse(self._tx(self._interceptor_gas_cmd(1, ids=ids)))
+ 
+   # *** engagement is button based (like hyundai_longitudinal), not from the factory cruise state ***
+ 
+@@ -704,7 +774,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+   # *** mode gating ***
+ 
+   def test_pedal_blocked_without_sp_flag(self):
+-    for sp in (HyundaiSafetyFlagsSP.NON_SCC, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR):
++    for sp in (HyundaiSafetyFlagsSP.NON_SCC | self.DIALECT_SP, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.DIALECT_SP):
+       with self.subTest(sp=sp):
+         self.safety.set_current_safety_param_sp(sp | self.SAFETY_PARAM_SP)
+         self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
+@@ -713,7 +783,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+         self.assertFalse(self._tx(self._interceptor_gas_cmd(1)))
+ 
+   def test_pedal_blocked_on_unsupported_cars(self):
+-    sp = HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.SAFETY_PARAM_SP
++    sp = self._pedal_sp()
+     for param in (HyundaiSafetyFlags.EV_GAS, HyundaiSafetyFlags.HYBRID_GAS, HyundaiSafetyFlags.FCEV_GAS,
+                   HyundaiSafetyFlags.CAMERA_SCC):
+       with self.subTest(param=param):
+diff --git a/opendbc/sunnypilot/car/__init__.py b/opendbc/sunnypilot/car/__init__.py
+index 2fbf863f..0b8e6d14 100644
+--- a/opendbc/sunnypilot/car/__init__.py
++++ b/opendbc/sunnypilot/car/__init__.py
+@@ -20,8 +20,8 @@ def crc8_pedal(data):
+   return crc
+ 
+ 
+-def create_gas_interceptor_command(packer, gas_amount, idx):
+-  # Common gas pedal msg generator
++def create_gas_interceptor_command(packer, gas_amount, idx, msg_name="GAS_COMMAND"):
++  # Common gas pedal msg generator. msg_name selects the DBC message (same signals) for pedals on non-standard CAN IDs
+   enable = gas_amount > 0.001
+ 
+   values = {
+@@ -33,9 +33,9 @@ def create_gas_interceptor_command(packer, gas_amount, idx):
+     values["GAS_COMMAND"] = gas_amount * 255.
+     values["GAS_COMMAND2"] = gas_amount * 255.
+ 
+-  dat = packer.make_can_msg("GAS_COMMAND", 0, values)[1]
++  dat = packer.make_can_msg(msg_name, 0, values)[1]
+ 
+   checksum = crc8_pedal(dat[:-1])
+   values["PEDAL_CHECKSUM"] = checksum
+ 
+-  return packer.make_can_msg("GAS_COMMAND", 0, values)
++  return packer.make_can_msg(msg_name, 0, values)
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index efbd3b26..4a91a4ae 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -11,7 +11,7 @@ from opendbc.car import Bus, structs
+ from opendbc.can.parser import CANParser
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+-                                                         get_interceptor_gas
++                                                         get_interceptor_gas, get_interceptor_ids
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ 
+@@ -82,8 +82,9 @@ class CarStateExt:
+       # openpilot's own command and would latch gasPressed/override. GAS_SENSOR carries only the driver's input;
+       # this assignment runs after carstate.py's and replaces it. Same threshold as panda (hyundai.h).
+       cp_gas = can_parsers[GAS_INTERCEPTOR_BUS_KEY]
+-      ret.gasPressed = get_interceptor_gas(cp_gas) > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+-      self.interceptor_state = int(cp_gas.vl["GAS_SENSOR"]["STATE"])
++      sensor_msg = get_interceptor_ids(self.CP_SP).sensor_msg  # GAS_SENSOR (0x201) or GAS_SENSOR_R (0x701)
++      ret.gasPressed = get_interceptor_gas(cp_gas, sensor_msg) > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
++      self.interceptor_state = int(cp_gas.vl[sensor_msg]["STATE"])
+ 
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 99b90126..7a6dd8ee 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -11,6 +11,8 @@ Driver-supervisory contract (there is NO brake actuator on these cars):
+   - accel request <  0  -> pedal command drops toward 0 = lift-off/coast, engine braking only, NEVER service brakes
+   - no stop-and-go: openpilot longitudinal is disengaged below minEnableSpeed; the driver must brake
+ """
++from dataclasses import dataclass
++
+ import numpy as np
+ 
+ from opendbc.can import CANPacker
+@@ -18,10 +20,33 @@ from opendbc.car import Bus, structs
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car import create_gas_interceptor_command
++from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+ 
+ GAS_INTERCEPTOR_DBC = "hyundai_gas_interceptor_generated"
+-GAS_COMMAND_ADDR = 0x200
+-GAS_SENSOR_ADDR = 0x201
++
++
++@dataclass(frozen=True)
++class GasInterceptorIDs:
++  """One pedal CAN ID dialect: addresses + the pedal-DBC message names (identical signals) that carry them."""
++  command_addr: int
++  sensor_addr: int
++  command_msg: str
++  sensor_msg: str
++
++
++# stock comma pedal firmware
++STANDARD_IDS = GasInterceptorIDs(0x200, 0x201, "GAS_COMMAND", "GAS_SENSOR")
++# custom pedal firmware with the IDs moved +0x500 (avoids 0x200 = EMS20 in the Hyundai DBC). Same payload/crc/counter.
++REMAPPED_IDS = GasInterceptorIDs(0x700, 0x701, "GAS_COMMAND_R", "GAS_SENSOR_R")
++
++# legacy aliases (standard dialect)
++GAS_COMMAND_ADDR = STANDARD_IDS.command_addr
++GAS_SENSOR_ADDR = STANDARD_IDS.sensor_addr
++
++
++def get_interceptor_ids(CP_SP: structs.CarParamsSP) -> GasInterceptorIDs:
++  """Active dialect. The safety param bit is the single source of truth, so panda and openpilot can't disagree."""
++  return REMAPPED_IDS if CP_SP.safetyParam & HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED else STANDARD_IDS
+ 
+ # The pedal parser/packer use a separate DBC (see hyundai_gas_interceptor.dbc for why), registered under this key in
+ # CarState.get_can_parsers so that CarInterfaceBase also folds the pedal into canValid (dead pedal -> CAN invalid).
+@@ -58,8 +83,8 @@ def get_pedal_command(accel: float, v_ego: float) -> float:
+   return float(np.clip(PEDAL_SCALE * (accel + offset), 0., MAX_INTERCEPTOR_GAS))
+ 
+ 
+-def get_interceptor_gas(cp) -> float:
+-  return (cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"] + cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]) // 2
++def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
++  return (cp.vl[sensor_msg]["INTERCEPTOR_GAS"] + cp.vl[sensor_msg]["INTERCEPTOR_GAS2"]) // 2
+ 
+ 
+ class GasInterceptorCarController:
+@@ -68,6 +93,7 @@ class GasInterceptorCarController:
+     self.CP_SP = CP_SP
+ 
+     self.gas = 0.
++    self.interceptor_ids = get_interceptor_ids(CP_SP)
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+ 
+   def create_gas_command(self, CC: structs.CarControl, CS, frame: int) -> list[CanData]:
+@@ -82,6 +108,7 @@ class GasInterceptorCarController:
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+     if frame % 2 == 0:
+-      can_sends.append(create_gas_interceptor_command(self.interceptor_packer, self.gas, frame // 2))
++      can_sends.append(create_gas_interceptor_command(self.interceptor_packer, self.gas, frame // 2,
++                                                     self.interceptor_ids.command_msg))
+ 
+     return can_sends
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 177db1c4..c2eeaae7 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -28,6 +28,11 @@ HYUNDAI_COMMON_H = os.path.join(os.path.dirname(__file__), "../../../../safety/m
+ 
+ # A frame set roughly like the real car's bus 0, enough for the NON_SCC platform; pedal adds 0x201
+ BASE_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8}
++# pedal sensor frames as seen in the fingerprint: standard comma pedal / remapped custom firmware (+0x500)
++STD = {0x201: 6}
++REM = {0x701: 6}
++DETECT_FLAGS = HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value | HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED.value
++PEDAL_SP = HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED
+ 
+ 
+ def _c_define(path: str, name: str) -> int:
+@@ -37,12 +42,35 @@ def _c_define(path: str, name: str) -> int:
+   return int(m.group(1))
+ 
+ 
++def _sig_layout(msg):
++  return {n: (s.start_bit, s.size, s.is_signed, s.factor, s.offset, s.is_little_endian) for n, s in msg.sigs.items()}
++
++
+ class TestDBC:
+   def test_pedal_dbc_addresses(self):
+     dbc = DBC(gi.GAS_INTERCEPTOR_DBC)
+     assert dbc.addr_to_msg[gi.GAS_COMMAND_ADDR].name == "GAS_COMMAND"
+     assert dbc.addr_to_msg[gi.GAS_SENSOR_ADDR].name == "GAS_SENSOR"
+-    assert set(dbc.name_to_msg) == {"GAS_COMMAND", "GAS_SENSOR"}
++    # remapped pedal firmware IDs (+0x500)
++    assert dbc.addr_to_msg[1792].name == "GAS_COMMAND_R" and dbc.addr_to_msg[1793].name == "GAS_SENSOR_R"
++    assert set(dbc.name_to_msg) == {"GAS_COMMAND", "GAS_SENSOR", "GAS_COMMAND_R", "GAS_SENSOR_R"}
++    for ids in (gi.STANDARD_IDS, gi.REMAPPED_IDS):
++      assert dbc.name_to_msg[ids.command_msg].address == ids.command_addr
++      assert dbc.name_to_msg[ids.sensor_msg].address == ids.sensor_addr
++
++  def test_remapped_signals_identical(self):
++    # the remapped messages must be byte-for-byte the same layout as the standard ones
++    dbc = DBC(gi.GAS_INTERCEPTOR_DBC)
++    for std, rem in (("GAS_COMMAND", "GAS_COMMAND_R"), ("GAS_SENSOR", "GAS_SENSOR_R")):
++      a, b = dbc.name_to_msg[std], dbc.name_to_msg[rem]
++      assert a.size == b.size == 6
++      assert _sig_layout(a) == _sig_layout(b)
++    assert CANDefine(gi.GAS_INTERCEPTOR_DBC).dv["GAS_SENSOR_R"]["STATE"] == CANDefine(gi.GAS_INTERCEPTOR_DBC).dv["GAS_SENSOR"]["STATE"]
++
++  def test_hyundai_can_dbc_has_no_remapped_ids(self):
++    # 0x700/0x701 must stay free in the main Hyundai DBC (otherwise the separate-DBC rationale would apply again)
++    dbc = DBC("hyundai_can_generated")
++    assert 0x700 not in dbc.addr_to_msg and 0x701 not in dbc.addr_to_msg
+ 
+   def test_hyundai_can_dbc_untouched(self):
+     # the pedal messages must NOT be in hyundai_can: BO_ 512 is EMS20 there, and CANDefine binds VAL_ lines by address,
+@@ -60,11 +88,58 @@ class TestDBC:
+     assert dat[4] & 0xF == 5 and dat[4] >> 7 == 1  # counter, ENABLE
+     assert dat[5] == crc8_pedal(dat[:5])           # pedal accepts only crc8(0xD5) frames
+ 
++  def test_remapped_gas_command_packs(self):
++    packer = CANPacker(gi.GAS_INTERCEPTOR_DBC)
++    addr, dat, bus = create_gas_interceptor_command(packer, 0.1, 5, gi.REMAPPED_IDS.command_msg)
++    assert (addr, bus) == (0x700, 0)
++    assert len(dat) == 6 and any(dat)
++    assert dat[4] & 0xF == 5 and dat[4] >> 7 == 1
++    assert dat[5] == crc8_pedal(dat[:5])
++    # identical payload to the standard dialect
++    assert dat == create_gas_interceptor_command(packer, 0.1, 5)[1]
++
+   def test_zero_command_disables(self):
+     addr, dat, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), 0., 0)
+     assert dat[:4] == b"\x00\x00\x00\x00" and dat[4] >> 7 == 0
+ 
+ 
++def _sensor_frame(ids, gas: int, counter: int):
++  dat = bytearray(6)
++  dat[0:2] = gas.to_bytes(2, "big")
++  dat[2:4] = gas.to_bytes(2, "big")
++  dat[4] = counter & 0xF  # STATE 0
++  dat[5] = crc8_pedal(dat[:5])
++  return ids.sensor_addr, bytes(dat)
++
++
++class TestCarStateDialect:
++  @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
++  def test_gas_pressed_from_active_sensor(self, pedal, ids):
++    # end to end through CarInterface.update -> CarState -> CarStateExt (the real gasPressed path)
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **pedal}, True)
++    CI = CarInterface(CP, CP_SP)
++    other = gi.REMAPPED_IDS if ids is gi.STANDARD_IDS else gi.STANDARD_IDS
++
++    t = 0
++
++    def feed(frames):
++      nonlocal t
++      t += int(0.02e9)
++      return CI.update([(t, [(addr, dat, 0) for addr, dat in frames])])[0]
++
++    # the other dialect's sensor reporting "pressed" is ignored; the active one says released
++    for i in range(10):
++      ret = feed([_sensor_frame(other, 0x1000, i), _sensor_frame(ids, 0, i)])
++    assert not ret.gasPressed
++    for i in range(10):
++      ret = feed([_sensor_frame(ids, 0x1000, i)])
++    assert ret.gasPressed
++    # and the reverse: active released, other pressed -> released
++    for i in range(10):
++      ret = feed([_sensor_frame(ids, 0, i), _sensor_frame(other, 0x1000, i)])
++    assert not ret.gasPressed
++
++
+ class TestThresholds:
+   def test_c_and_python_threshold_match(self):
+     assert _c_define(HYUNDAI_H, "HYUNDAI_GAS_INTERCEPTOR_THRESHOLD") == gi.HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+@@ -73,9 +148,19 @@ class TestThresholds:
+     with open(HYUNDAI_COMMON_H) as f:
+       m = re.search(r"HYUNDAI_PARAM_SP_GAS_INTERCEPTOR\s*=\s*(\d+)", f.read())
+     assert m is not None and int(m.group(1)) == HyundaiSafetyFlagsSP.GAS_INTERCEPTOR
+-    # free in the SP space (and a power of two)
+-    others = [v for k, v in vars(HyundaiSafetyFlagsSP).items() if k.isupper() and k != "GAS_INTERCEPTOR"]
+-    assert HyundaiSafetyFlagsSP.GAS_INTERCEPTOR not in others and bin(HyundaiSafetyFlagsSP.GAS_INTERCEPTOR).count("1") == 1
++    with open(HYUNDAI_COMMON_H) as f:
++      m = re.search(r"HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED\s*=\s*(\d+)", f.read())
++    assert m is not None and int(m.group(1)) == HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED
++    # free in the SP space (and a power of two), and within the Int16 safetyParam field
++    for name in ("GAS_INTERCEPTOR", "GAS_INTERCEPTOR_REMAPPED"):
++      bit = getattr(HyundaiSafetyFlagsSP, name)
++      others = [v for k, v in vars(HyundaiSafetyFlagsSP).items() if k.isupper() and k != name]
++      assert bit not in others and bin(bit).count("1") == 1 and bit < 2 ** 15
++
++  def test_capability_flags_unique(self):
++    vals = [f.value for f in HyundaiFlagsSP]
++    assert len(vals) == len(set(vals))
++    assert HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED.value == 2 ** 12
+ 
+   def test_max_gas_raw_ceiling(self):
+     # Pins the command scaling in raw DAC counts so the cap can't drift silently through a DBC/scale change.
+@@ -99,13 +184,15 @@ def _cp_bytes(CP) -> bytes:
+   return CP.to_bytes()
+ 
+ 
+-def _get_ci(fingerprint_bus0: dict, param: bool | None):
++def _get_ci(fingerprint_bus0: dict, param: bool | None, id_set: str | None = None):
+   fingerprint = {i: {} for i in range(8)}
+   fingerprint[0] = dict(fingerprint_bus0)
+   CarInterface = interfaces[CAR_UNDER_TEST]
+   CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+   CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+   params_list: list = [] if param is None else [{"HyundaiGasInterceptor": param}]
++  if id_set is not None:
++    params_list.append({"HyundaiGasInterceptorIDSet": id_set})
+   setup_interfaces(CarInterface, CP, CP_SP, params_list)
+   return CarInterface, CP, CP_SP
+ 
+@@ -113,22 +200,53 @@ def _get_ci(fingerprint_bus0: dict, param: bool | None):
+ class TestEnablement:
+   def test_no_pedal_is_identical(self):
+     _, CP_ref, CP_SP_ref = _get_ci(BASE_FINGERPRINT, None)
+-    # param alone must not change anything when no pedal is on the bus
+-    _, CP, CP_SP = _get_ci(BASE_FINGERPRINT, True)
+-    assert _cp_bytes(CP) == _cp_bytes(CP_ref) and CP_SP == CP_SP_ref
++    # param alone (incl. any ID-set override) must not change anything when no pedal is on the bus
++    for id_set in (None, "auto", "standard", "remapped"):
++      _, CP, CP_SP = _get_ci(BASE_FINGERPRINT, True, id_set)
++      assert _cp_bytes(CP) == _cp_bytes(CP_ref) and CP_SP == CP_SP_ref, id_set
+     assert not CP_SP.enableGasInterceptor and not CP.openpilotLongitudinalControl and CP.pcmCruise
+     assert not CP_SP.safetyParam & HyundaiSafetyFlagsSP.GAS_INTERCEPTOR
+ 
++  @pytest.mark.parametrize("pedal", [STD, REM, {**STD, **REM}], ids=["standard", "remapped", "both"])
++  @pytest.mark.parametrize("id_set", [None, "auto", "remapped"])
+   @pytest.mark.parametrize("param", [None, False])
+-  def test_pedal_without_opt_in_is_inert(self, param):
++  def test_pedal_without_opt_in_is_inert(self, param, id_set, pedal):
+     _, CP_ref, CP_SP_ref = _get_ci(BASE_FINGERPRINT, None)
+-    _, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, 0x201: 6}, param)
+-    # only the capability flag differs
+-    assert CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED
++    _, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **pedal}, param, id_set)
++    # only the capability flag(s) differ
++    assert bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED) == (0x201 in pedal)
++    assert bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED) == (0x701 in pedal)
+     CP_SP_cmp = copy.deepcopy(CP_SP)
+-    CP_SP_cmp.flags &= ~HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
++    CP_SP_cmp.flags &= ~DETECT_FLAGS
+     assert _cp_bytes(CP) == _cp_bytes(CP_ref) and CP_SP_cmp == CP_SP_ref
+-    assert not CP_SP.enableGasInterceptor
++    assert not CP_SP.enableGasInterceptor and not CP_SP.safetyParam & PEDAL_SP
++
++  @pytest.mark.parametrize("pedal, id_set, expected", [
++    (STD, None, gi.STANDARD_IDS),
++    (STD, "auto", gi.STANDARD_IDS),
++    (REM, None, gi.REMAPPED_IDS),
++    (REM, "auto", gi.REMAPPED_IDS),
++    (REM, b"auto", gi.REMAPPED_IDS),
++    (REM, "bogus", gi.REMAPPED_IDS),
++    ({**STD, **REM}, "auto", gi.STANDARD_IDS),  # both seen: prefer standard
++    ({**STD, **REM}, "standard", gi.STANDARD_IDS),
++    ({**STD, **REM}, "remapped", gi.REMAPPED_IDS),
++    (STD, "standard", gi.STANDARD_IDS),
++    (REM, "remapped", gi.REMAPPED_IDS),
++    (STD, "remapped", None),  # forced dialect not seen on the bus: stay off
++    (REM, "standard", None),
++  ])
++  def test_dialect_selection(self, pedal, id_set, expected):
++    _, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **pedal}, True, id_set)
++    if expected is None:
++      _, CP_ref, _ = _get_ci(BASE_FINGERPRINT, None)
++      assert not CP_SP.enableGasInterceptor and not CP_SP.safetyParam & PEDAL_SP
++      assert _cp_bytes(CP) == _cp_bytes(CP_ref)
++      return
++    assert CP_SP.enableGasInterceptor and CP.openpilotLongitudinalControl and not CP.pcmCruise
++    assert CP_SP.safetyParam & HyundaiSafetyFlagsSP.GAS_INTERCEPTOR
++    assert bool(CP_SP.safetyParam & HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED) == (expected is gi.REMAPPED_IDS)
++    assert gi.get_interceptor_ids(CP_SP) is expected
+ 
+   def test_pedal_and_opt_in_enables(self):
+     _, CP_ref, _ = _get_ci(BASE_FINGERPRINT, None)
+@@ -143,10 +261,12 @@ class TestEnablement:
+     # stock HKG long flag must stay off: it would select the SCC TX allowlist in panda
+     assert CP.safetyConfigs[0].safetyParam == CP_ref.safetyConfigs[0].safetyParam
+ 
+-  def test_runs_and_sends_only_pedal_long(self):
+-    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, 0x201: 6}, True)
++  @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
++  def test_runs_and_sends_only_pedal_long(self, pedal, ids):
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **pedal}, True)
+     CI = CarInterface(CP, CP_SP)
+     assert Bus.alt in CI.can_parsers and CI.can_parsers[Bus.alt].dbc_name == gi.GAS_INTERCEPTOR_DBC
++    other = gi.REMAPPED_IDS if ids is gi.STANDARD_IDS else gi.STANDARD_IDS
+ 
+     CC = structs.CarControl()
+     CC.enabled = CC.latActive = CC.longActive = True
+@@ -160,6 +280,6 @@ class TestEnablement:
+       _, sends = CI.apply(CC.as_reader(), CC_SP, now)
+       sent |= {addr for addr, _, _ in sends}
+       now += int(DT_CTRL * 1e9)
+-    assert 0x200 in sent
++    assert ids.command_addr in sent and other.command_addr not in sent
+     # no SCC replacement / radar disable traffic
+     assert not sent & {0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x38D, 0x483, 0x7D0}
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index ab5224be..c3e68164 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -15,6 +15,9 @@ class HyundaiSafetyFlagsSP:
+   HAS_LDA_BUTTON = 4
+   NON_SCC = 8
+   GAS_INTERCEPTOR = 16  # comma pedal longitudinal; C mirror: HYUNDAI_PARAM_SP_GAS_INTERCEPTOR (safety/modes/hyundai_common.h)
++  # pedal uses the REMAPPED IDs (cmd 0x700 / sensor 0x701) instead of 0x200/0x201. Only meaningful with GAS_INTERCEPTOR.
++  # C mirror: HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED. Also the single source of truth for the dialect in the car layer.
++  GAS_INTERCEPTOR_REMAPPED = 32
+ 
+ 
+ class HyundaiFlagsSP(IntFlag):
+@@ -33,3 +36,6 @@ class HyundaiFlagsSP(IntFlag):
+   SPEED_LIMIT_AVAILABLE = 2 ** 9  # platforms with speed limit data available
+   HAS_LKAS12 = 2 ** 10
+   GAS_INTERCEPTOR_DETECTED = 2 ** 11  # capability only: comma pedal GAS_SENSOR (0x201) seen on bus 0 of a non-SCC ICE car
++  # capability only: remapped-ID pedal (custom firmware) GAS_SENSOR_R (0x701) seen on bus 0 of a non-SCC ICE car.
++  # Independent of GAS_INTERCEPTOR_DETECTED (which stays 'standard 0x201 seen'), so 'both seen' is representable.
++  GAS_INTERCEPTOR_REMAPPED_DETECTED = 2 ** 12
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index cd5bdb77..e028e1f9 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -96,12 +96,22 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+ 
+ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
+   """comma pedal longitudinal on Hyundai non-SCC ICE cars. Requires BOTH a pedal seen on the bus (capability flag set in
+-  the Hyundai interface) AND the explicit HyundaiGasInterceptor param. Otherwise CarParams are left untouched."""
+-  if CP.brand != 'hyundai' or not CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED:
++  the Hyundai interface) AND the explicit HyundaiGasInterceptor param. Otherwise CarParams are left untouched.
++
++  CAN ID dialect: standard (0x200/0x201) or remapped (0x700/0x701, custom pedal firmware), from what the fingerprint saw.
++  HyundaiGasInterceptorIDSet = auto (default; standard wins if both were seen) / standard / remapped. A forced dialect
++  whose sensor was NOT seen leaves the feature off (never command a pedal we can't hear)."""
++  if CP.brand != 'hyundai':
+     return
+   if int(params_dict.get("HyundaiGasInterceptor", 0) or 0) != 1:
+     return
+ 
++  remapped = _select_hyundai_gas_interceptor_remapped(CP_SP, params_dict.get("HyundaiGasInterceptorIDSet"))
++  if remapped is None:
++    return
++
++  if remapped:
++    CP_SP.safetyParam |= HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED
+   CP_SP.enableGasInterceptor = True
+   CP.openpilotLongitudinalControl = True
+   CP.pcmCruise = False  # openpilot owns set speed (CLU11 buttons); panda engages on SET/RES falling edge
+@@ -112,6 +122,26 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   CP.longitudinalActuatorDelay = 0.5  # TBD-BENCH: pedal -> ECU torque request -> DCT, unmeasured
+ 
+ 
++def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
++  """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
++  standard_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED)
++  remapped_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED)
++  if isinstance(id_set, bytes):
++    id_set = id_set.decode(errors="ignore")
++  id_set = str(id_set or "auto").strip().lower()
++
++  if id_set == "standard":
++    return False if standard_seen else None
++  if id_set == "remapped":
++    return True if remapped_seen else None
++  # "auto" and anything unrecognized
++  if standard_seen:
++    return False
++  if remapped_seen:
++    return True
++  return None
 +
 +
  def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,

@@ -45,6 +45,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 8 | locationd transient-invalidity hysteresis | fix | fork-local; upstream-PR candidate (cf. openpilot #38929) |
 | 9 | Road-type classifier speed-threshold boundaries | fix | fork-local (part of the feature) |
 | 10 | Hyundai comma-pedal (gas interceptor) longitudinal, non-SCC — INERT until bench-validated | feature (safety C + car) | fork-local; branch `hyundai-pedal-long`, NOT on main |
+| 11 | Hyundai pedal: REMAPPED CAN IDs (0x700/0x701, owner's custom pedal firmware) alongside standard 0x200/0x201 | feature (safety C + car) | fork-local; amends #10, same branch |
 
 ---
 
@@ -61,8 +62,8 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Inert by construction — two gates, both required:** (1) capability: `0x201` seen on bus 0 at fingerprinting sets
   `HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED` (non-SCC ICE only); (2) opt-in: param `HyundaiGasInterceptor=1`. Only then:
   `CP_SP.enableGasInterceptor`, `openpilotLongitudinalControl=True`, `pcmCruise=False`, `minEnableSpeed=25 mph`,
-  `safetyParamSP |= GAS_INTERCEPTOR (16)`. Otherwise CarParams are byte-identical to today (unit-tested). Today the
-  pedal is not visible on CAN at all (0 frames of 0x200/0x201 in 141 segments) → nothing changes on the car.
+  `safetyParamSP |= GAS_INTERCEPTOR (16)`. Otherwise CarParams are byte-identical to today (unit-tested). The car shows
+  0 frames of 0x200/0x201 (141 segments), but the pedal IS on the bus on remapped IDs (0x701), see entry #11.
 - **Driver-supervisory contract (there is NO brake actuator):** accel ≥ 0 → throttle via the pedal (capped);
   accel < 0 → lift/coast, engine braking only, never service brakes; no stop-and-go (no engage below 25 mph, pedal
   command cut below ~20.5 mph with a "TAKE CONTROL" warning); downhill the car WILL exceed set speed; it will NOT keep
@@ -98,6 +99,46 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   on); persistent "no brakes" on-road notice needs a new `EventNameSP` (capnp regen) → follow-up; settings UI toggle
   for `HyundaiGasInterceptor`; CI panda rebuild path.
 - **Merge note:** fork-local; do not merge to `main` until bench-validated and the panda-rebuild deploy path exists.
+
+### feature: Hyundai pedal REMAPPED CAN IDs (0x700 TX / 0x701 RX) — 2026-10-02 (amends #10; branch `hyundai-pedal-long`)
+
+- **Why:** the owner's pedal runs CUSTOM firmware whose CAN IDs are moved +0x500, chosen years ago to avoid the
+  0x200 = EMS20 address in the Hyundai DBC. Pedal TX (GAS_SENSOR) = `0x701`, commands-in (GAS_COMMAND) = presumed `0x700`.
+  #10 only knew 0x200/0x201, so it would never have detected this pedal.
+- **Evidence (real route logs, 4 drives):** 0x701 frames match the pedal firmware's exact crc8 (poly 0xD5, init 0xFF,
+  bytes 4..0, stored in byte 5) in 400/400 frames, ~0% for every other address; payload = two 16-bit ADC tracks at ~2:1
+  that follow the driver's foot (mean 621 with carState.gasPressed vs 472 released); STATE nibble is constantly 5
+  (FAULT_TIMEOUT = no valid command ever received); the 4-bit counter steps +1; ~97-101 Hz; on bus 0 (mirrored on 2).
+  No Hyundai DBC defines 0x700/0x701, and nothing has ever sent them in sendcan. **0x700 for commands is inferred**
+  from the +0x500 pattern and NOT observed (nothing commands the pedal today); bench-verify first: send a zero command on
+  0x700 and STATE must drop 5 → 0.
+- **What:** both dialects, exactly one active, selected per drive from the fingerprint:
+  - DBC: `BO_ 1792 GAS_COMMAND_R` / `BO_ 1793 GAS_SENSOR_R` added to `hyundai_gas_interceptor.dbc`. The signals are
+    identical to 512/513 (a test enforces this), and 0x700/0x701 are absent from `hyundai_can` (also tested).
+  - Detection: `0x701` on bus 0 sets the new capability flag `HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED` (2**12);
+    `0x201` still sets `GAS_INTERCEPTOR_DETECTED` (2**11).
+  - Selection (`sunnypilot/car/interfaces.py`): optional param `HyundaiGasInterceptorIDSet` = `auto` (default) /
+    `standard` / `remapped`. `auto` uses whatever was seen, and prefers standard if both were. A forced dialect whose
+    sensor was NOT seen leaves the feature OFF. The remapped choice sets `safetyParamSP |= GAS_INTERCEPTOR_REMAPPED (32)`,
+    which is the single source of truth: panda and the car layer (`get_interceptor_ids`) both derive the IDs from it.
+  - Safety C: `HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED = 32` (it is only honored together with GAS_INTERCEPTOR).
+    TX allowlist = base + `{0x700,0,6}` INSTEAD OF `0x200`. The RX check is the same strict crc+counter 50 Hz check on
+    `0x701` INSTEAD OF `0x201`. The interceptor tx_hook guard and gas_pressed follow the active ID. The other dialect's
+    command is rejected and its sensor is ignored (tested).
+  - Car layer: carstate subscribes only the active sensor (50 Hz, bus 0); carstate_ext reads it; the carcontroller packs
+    the active command (`create_gas_interceptor_command(..., msg_name)`, defaults unchanged for Toyota/Honda).
+- **RX-check rate note:** the remapped pedal transmits at ~100 Hz, versus the ~49 Hz in the comma firmware source. The
+  50 Hz check still passes (the lag check is only a minimum-rate check), and counter +1 per frame is what the firmware does.
+- **Inertness unchanged:** with no pedal, or with the param off, CarParams stay byte-identical to today for every ID-set
+  value (tested). With the opt-in and the remapped pedal present, the feature WOULD activate on the owner's car, so the
+  #10 TBD-BENCH gates still apply before `HyundaiGasInterceptor=1`.
+- **Deploy implications:** zero physical work (no reflash, no cable change). The pedal is already on bus 0. The same
+  blockers as #10 still apply: a panda firmware rebuild (the safety C changed again), and a libparams rebuild for
+  `HyundaiGasInterceptor` + `HyundaiGasInterceptorIDSet`. Both keys are read defensively; a missing ID-set key means
+  `auto`. The deploy patch `sunnypilot/fork/patches/0001-hyundai-gas-interceptor.patch` was regenerated.
+- **Verification:** safety tests cover both dialects × LDA (debug and RELEASE libsafety), car-layer tests cover
+  detection, selection, end-to-end gasPressed and the TX id, and 8 dialect-selection mutations are each caught.
+  Details: `~/.hermes/cache/scratch/car-features/pedal-remap-implementation.md`.
 
 ### fix: road-type classifier speed-threshold boundaries — 2026-10-02
 

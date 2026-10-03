@@ -148,4 +148,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiGasInterceptor param unknown to libparams (not rebuilt?); gas interceptor stays disabled")
 
+  # fork: optional pedal CAN ID dialect override (auto/standard/remapped). Same stale-libparams hazard; missing -> "auto"
+  # (opendbc treats an absent key as auto, i.e. whichever pedal dialect the fingerprint saw, standard preferred).
+  try:
+    params_list.append({"HyundaiGasInterceptorIDSet": params.get("HyundaiGasInterceptorIDSet", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasInterceptorIDSet param unknown to libparams (not rebuilt?); using auto pedal ID detection")
+
   return params_list
