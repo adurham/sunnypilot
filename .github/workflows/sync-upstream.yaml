@@ -633,8 +633,12 @@ jobs:
           T="$RUNNER_TEMP/prebuilt"
           cd "$T"
 
-          apt-get update -qq
-          apt-get install -y -qq g++-aarch64-linux-gnu curl ca-certificates unzip
+          # sudo: the workflow does not set a container, so this runs as the
+          # non-root `runner` user and apt would otherwise fail with
+          # "Could not open lock file /var/lib/apt/lists/lock". (A root-only
+          # rehearsal - e.g. in a container - does not catch this.)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-aarch64-linux-gnu curl ca-certificates unzip
 
           # comma-deps versions pinned by uv.lock
           ZMQ_VER="4.3.5.post98"
