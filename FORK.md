@@ -68,13 +68,25 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   accel < 0 → lift/coast, engine braking only, never service brakes; no stop-and-go (no engage below 25 mph, pedal
   command cut below ~20.5 mph with a "TAKE CONTROL" warning); downhill the car WILL exceed set speed; it will NOT keep
   distance to a braking lead. **The driver must brake.** This is not ACC.
-- **TBD-BENCH constants (placeholders, do not road-test before bench):** `HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 500`
-  (C, `safety/modes/hyundai.h`) == Python (`sunnypilot/car/hyundai/gas_interceptor.py`) — a test parses the C value;
-  `MAX_INTERCEPTOR_GAS = 0.15`; `PEDAL_SCALE`/hold-speed offset; `minEnableSpeed`; GAS_COMMAND per-track scaling
-  (copied from Toyota — APS1/APS2 ratio unverified). The cap is deliberately NOT forced below the RX threshold: the
+- **Constants:** `HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420` (bench-measured, see below; C `safety/modes/hyundai.h` ==
+  Python `sunnypilot/car/hyundai/gas_interceptor.py`, a test parses the C value). Still TBD-BENCH-ROAD:
+  `MAX_INTERCEPTOR_GAS = 0.15` (15% travel = mild accel; conservative start, may be raised after road validation);
+  `PEDAL_SCALE`/hold-speed offset; `minEnableSpeed`. The cap is deliberately NOT forced below the RX threshold: the
   comma pedal firmware reports the DRIVER's raw ADC on 0x201 and applies max(driver, cmd) only at its DAC
   (`panda c076a9f2^:board/pedal/main.c`), so openpilot cannot self-latch gas_pressed. Bench gate: foot off, ramp the
   command to the cap, GAS_SENSOR must not move (if it does: firmware differs → stop).
+- **Bench results (2026-10-03, owner's car parked; CAN chain proven working):** the two pedal tracks relate as
+  **B = 0.49413·A + 10.45** (fit over 342,290 real driving pairs; command-range fit n=233,520, median |residual| 3.6).
+  Driver sweep: rest A=465 B=241, full press A=2616 B=1284. The ECU flagged its own gas-pressed at commanded A=620 (~7%
+  travel); the pedal accepted every coherent commanded pair without fault.
+  - **Scaling fix:** the DBC GAS_COMMAND/GAS_COMMAND2 scaling had been copied from Toyota (`(0.159375,-75.555)` /
+    `(0.159375,-151.111)` ⇒ B_raw = A_raw + 475), a pair this car never produces: at the 0.15 cap it sent B=1188 where
+    the car expects ~400 (3.3×), an APS-correlation-fault risk. Now (512 and 1792): A `(0.11855,-55.126)` → raw
+    465..2616 (linear rest..full), B `(0.239915,-57.632)` → raw 240..1303 (= the fitted relation applied to A; the 1303
+    vs measured 1284 full-press gap is the fit's endpoint residual). Physical 0..255 = travel fraction. At the cap:
+    A=788, B=400. `test_dbc_mapping_matches_bench_measurement` pins the raw output at 0/0.05/0.15/0.25/1.0 and the A/B
+    relation (±3) for both dialects; the old Toyota scaling and a one-digit gain flip both fail it.
+  - **Threshold basis:** rest average (465+241)/2 = 353, noise ±12 → 420 (rest + 67 ≈ 4% travel, below the ECU's ~7%).
 - **Pedal health:** `0x201` RX check enforces the pedal crc8 checksum AND 4-bit counter at 50 Hz (stricter than
   upstream Toyota/Honda): dead / frozen / corrupt pedal → controls_allowed=false in panda and canValid=false in openpilot.
 - **DBC:** pedal messages live in a NEW `dbc/generator/hyundai/hyundai_gas_interceptor.dbc` (own parser on bus 0 +
@@ -95,7 +107,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Verification:** safety tests debug build (test_hyundai + test_hyundai_canfd) and the pedal class against a
   RELEASE-built libsafety; mutation checks (C threshold 500→501, re-enabling EMS16 gas) are caught; car-layer tests.
   Details: `~/.hermes/cache/scratch/car-features/pedal-implementation.md`.
-- **Open items:** bench characterization (all TBD-BENCH values); disengage on pedal STATE fault (parsed, not acted
+- **Open items:** road validation of the TBD-BENCH-ROAD values (cap, PEDAL_SCALE, hold offset, minEnableSpeed); disengage on pedal STATE fault (parsed, not acted
   on); persistent "no brakes" on-road notice needs a new `EventNameSP` (capnp regen) → follow-up; settings UI toggle
   for `HyundaiGasInterceptor`; CI panda rebuild path.
 - **Merge note:** fork-local; do not merge to `main` until bench-validated and the panda-rebuild deploy path exists.

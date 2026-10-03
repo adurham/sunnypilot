@@ -1,7 +1,7 @@
 From 955a87c1c3c7a546afdb834132ce40b44cbb957e Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Fri, 2 Oct 2026 02:11:50 -0500
-Subject: [PATCH 1/2] hyundai: comma pedal (gas interceptor) longitudinal for
+Subject: [PATCH 1/3] hyundai: comma pedal (gas interceptor) longitudinal for
  non-SCC ICE cars
 
 Separate safety mode (hyundai_gas_interceptor), not hyundai_longitudinal: TX = base + 0x200 only,
@@ -1092,7 +1092,7 @@ index 5adbf06a..cd5bdb77 100644
 From 8eae1ed217fc0b5bb461a85a939b2e48c7e9b3e2 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Fri, 2 Oct 2026 20:25:34 -0500
-Subject: [PATCH 2/2] hyundai: gas interceptor remapped-ID dialect (0x700 TX /
+Subject: [PATCH 2/3] hyundai: gas interceptor remapped-ID dialect (0x700 TX /
  0x701 RX)
 
 Custom pedal firmware on the owner's car moves the comma-pedal IDs +0x500 (GAS_SENSOR 0x701, GAS_COMMAND
@@ -1975,6 +1975,198 @@ index cd5bdb77..e028e1f9 100644
  def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
                                             params_dict: dict[str, str]) -> None:
  
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 00d48a2f869bb6651f09f6cb8e11609cd40f4e90 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Fri, 2 Oct 2026 22:07:08 -0500
+Subject: [PATCH 3/3] hyundai: gas interceptor DBC scaling + threshold from
+ bench measurement
+
+The pedal DBC carried per-track scaling copied verbatim from toyota/_community.dbc
+(B_raw = A_raw + 475), which this car never produces. Bench (2026-10-03, owner's car):
+track B = 0.49413*A + 10.45 (342,290 driving pairs); rest A=465 B=241, full A=2616 B=1284.
+
+- GAS_COMMAND  (A): (0.159375,-75.555)  -> (0.11855,-55.126)   raw 465..2616
+- GAS_COMMAND2 (B): (0.159375,-151.111) -> (0.239915,-57.632)  raw 240..1303
+  for both 512 (standard) and 1792 (remapped). At the 0.15 cap B goes 1188 -> 400.
+- HYUNDAI_GAS_INTERCEPTOR_THRESHOLD 500 -> 420 (C and Python): rest average 353 +/-12.
+- test pinning the raw mapping at 0/0.05/0.15/0.25/1.0 and the A/B relation, both dialects.
+---
+ .../hyundai/hyundai_gas_interceptor.dbc       | 11 +++---
+ opendbc/safety/modes/hyundai.h                |  7 ++--
+ opendbc/safety/tests/test_hyundai.py          |  2 +-
+ .../sunnypilot/car/hyundai/gas_interceptor.py | 20 ++++++----
+ .../car/hyundai/tests/test_gas_interceptor.py | 39 +++++++++++++++++--
+ 5 files changed, 59 insertions(+), 20 deletions(-)
+
+diff --git a/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc b/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
+index 2a83d1bf..538c54b6 100644
+--- a/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
++++ b/opendbc/dbc/generator/hyundai/hyundai_gas_interceptor.dbc
+@@ -39,8 +39,8 @@ because hyundai_can.dbc already defines BO_ 512 EMS20 (FCEV). A second BO_ 512 i
+ CANDefine (VAL_ lines are resolved by address) bind to the wrong message, breaking FCEV gear parsing.";
+ 
+ BO_ 512 GAS_COMMAND: 6 EON
+- SG_ GAS_COMMAND : 7|16@0+ (0.159375,-75.555) [0|1] "" INTERCEPTOR
+- SG_ GAS_COMMAND2 : 23|16@0+ (0.159375,-151.111) [0|1] "" INTERCEPTOR
++ SG_ GAS_COMMAND : 7|16@0+ (0.11855,-55.126) [0|1] "" INTERCEPTOR
++ SG_ GAS_COMMAND2 : 23|16@0+ (0.239915,-57.632) [0|1] "" INTERCEPTOR
+  SG_ ENABLE : 39|1@0+ (1,0) [0|1] "" INTERCEPTOR
+  SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" INTERCEPTOR
+  SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" INTERCEPTOR
+@@ -53,8 +53,8 @@ BO_ 513 GAS_SENSOR: 6 INTERCEPTOR
+  SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" EON
+ 
+ BO_ 1792 GAS_COMMAND_R: 6 EON
+- SG_ GAS_COMMAND : 7|16@0+ (0.159375,-75.555) [0|1] "" INTERCEPTOR
+- SG_ GAS_COMMAND2 : 23|16@0+ (0.159375,-151.111) [0|1] "" INTERCEPTOR
++ SG_ GAS_COMMAND : 7|16@0+ (0.11855,-55.126) [0|1] "" INTERCEPTOR
++ SG_ GAS_COMMAND2 : 23|16@0+ (0.239915,-57.632) [0|1] "" INTERCEPTOR
+  SG_ ENABLE : 39|1@0+ (1,0) [0|1] "" INTERCEPTOR
+  SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" INTERCEPTOR
+  SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" INTERCEPTOR
+@@ -68,7 +68,8 @@ BO_ 1793 GAS_SENSOR_R: 6 INTERCEPTOR
+ 
+ CM_ BO_ 1792 "Same as GAS_COMMAND (512) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 512.";
+ CM_ BO_ 1793 "Same as GAS_SENSOR (513) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 513.";
+-CM_ SG_ 512 GAS_COMMAND "TBD-BENCH: per-track scaling copied verbatim from toyota/_community.dbc (track 2 offset = 2x track 1). The Elantra APS1/APS2 ratio is unverified; the DAC outputs must keep the ratio the ECU expects or it will flag an APS correlation fault. Derive both tracks on the bench before any road use.";
++CM_ SG_ 512 GAS_COMMAND "Bench-measured for this car (2026-10-03), NOT the Toyota scaling. Physical 0..255 = fraction of pedal travel (0 = foot-off rest, 255 = full press). Track A (GAS_COMMAND) raw = (phys + 55.126)/0.11855 -> 465..2616; track B (GAS_COMMAND2) raw = (phys + 57.632)/0.239915 -> 240..1303. Derivation: the car's two APS tracks relate as B = 0.49413*A + 10.45 (least-squares fit over 342290 real driving pairs; command-range fit n=233520, median |residual| 3.6); endpoints from a driver sweep: rest A=465 B=241, full press A=2616 B=1284. A is mapped linearly rest..full, and B is defined from A through the fitted relation so every commanded pair lies on the car's own curve (APS correlation). The pedal accepted coherent commanded pairs without fault on the bench. The previous Toyota-copied scaling (B_raw = A_raw + 475) sent B ~3.3x too high at the 0.15 cap.";
++CM_ SG_ 512 GAS_COMMAND2 "Track B. Must stay on B = 0.49413*A + 10.45 relative to GAS_COMMAND (see GAS_COMMAND comment).";
+ CM_ SG_ 513 INTERCEPTOR_GAS "Raw 12-bit ADC of the DRIVER's pedal (not the pedal output), per comma pedal firmware";
+ CM_ SG_ 513 STATE "Pedal firmware state; any non-zero value = fault: pedal ignores GAS_COMMAND and passes the driver's pedal through";
+ 
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index dbf34845..0fe24459 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -82,12 +82,13 @@ static const CanMsg HYUNDAI_TX_MSGS[] = {
+ 
+ static bool hyundai_legacy = false;
+ 
+-// TBD-BENCH: placeholder. Must equal HYUNDAI_GAS_INTERCEPTOR_THRESHOLD in opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++// Must equal HYUNDAI_GAS_INTERCEPTOR_THRESHOLD in opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+ // (a unit test enforces this). Raw GAS_SENSOR units = average of the pedal's two 12-bit ADC tracks of the DRIVER's pedal.
+ // The comma pedal firmware reports the driver's raw ADC on 0x201 and applies max(driver, openpilot) only at its DAC output
+ // (panda c076a9f2^:board/pedal/main.c pedal() + TIM3_IRQ_Handler), so openpilot's own command cannot raise this value.
+-// Set it just above the measured foot-off reading of both tracks (+ noise margin) on the bench.
+-#define HYUNDAI_GAS_INTERCEPTOR_THRESHOLD 500
++// Bench-measured: foot-off rest A=465 B=241 -> average 353 (+/-12 noise). 420 = rest + 67, ~4% pedal travel, below the
++// ~7% travel at which the car's own ECU flags gas pressed.
++#define HYUNDAI_GAS_INTERCEPTOR_THRESHOLD 420
+ 
+ static int hyundai_get_interceptor_gas(const CANPacket_t *msg) {
+   uint16_t val1 = (uint16_t)((uint16_t)msg->data[0] << 8U) | (uint16_t)msg->data[1];
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 08deae45..cb547ef4 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -576,7 +576,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+   DIALECT_SP = 0
+   TX_MSGS = [[0x340, 0], [0x4F1, 0], [0x485, 0], [0x200, 0]]
+   # Single source of truth for the panda/openpilot threshold: the boundary test below
+-  # (test_no_disengage_on_gas_interceptor) fails unless the C constant equals the Python one. TBD-BENCH value.
++  # (test_no_disengage_on_gas_interceptor) fails unless the C constant equals the Python one. Bench-measured value.
+   INTERCEPTOR_THRESHOLD = HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+ 
+   @classmethod
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 7a6dd8ee..296fc102 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -52,17 +52,21 @@ def get_interceptor_ids(CP_SP: structs.CarParamsSP) -> GasInterceptorIDs:
+ # CarState.get_can_parsers so that CarInterfaceBase also folds the pedal into canValid (dead pedal -> CAN invalid).
+ GAS_INTERCEPTOR_BUS_KEY = Bus.alt
+ 
+-# TBD-BENCH: placeholder. MUST equal HYUNDAI_GAS_INTERCEPTOR_THRESHOLD in opendbc/safety/modes/hyundai.h
+-# (test_gas_interceptor.py enforces this). Raw GAS_SENSOR units: average of the two 12-bit ADC tracks of the DRIVER's pedal.
+-# A too-low value fails safe (gas reads as pressed -> panda never allows longitudinal); set it just above the measured
+-# foot-off reading + noise margin on the bench.
+-HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 500
+-
+-# TBD-BENCH: conservative placeholder (half of upstream Toyota's 0.3). Cap on openpilot's pedal command, fraction 0..1.
++# MUST equal HYUNDAI_GAS_INTERCEPTOR_THRESHOLD in opendbc/safety/modes/hyundai.h (test_gas_interceptor.py enforces this).
++# Raw GAS_SENSOR units: average of the two 12-bit ADC tracks of the DRIVER's pedal.
++# Bench-measured (2026-10-03): foot-off rest A=465, B=241 -> average 353, noise +/-12. 420 = rest + 67 (~5x the noise
++# band), i.e. ~4% pedal travel along the measured A/B curve, below the ~7% travel (A=620) where the car's own ECU
++# already flags gas pressed. A too-low value fails safe (gas reads as pressed -> panda never allows longitudinal).
++HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
++
++# Cap on openpilot's pedal command, fraction 0..1 of pedal travel (DBC scaling is bench-measured: 0 = rest, 1 = full
++# press; 0.15 -> track A 788 / track B 400 raw). 0.15 = 15% travel = mild accel; for reference the ECU already reports
++# gas pressed at ~7% travel. TBD-BENCH-ROAD: conservative starting cap (half of upstream Toyota's 0.3); may be raised
++# only after road validation.
+ # NOTE: this is intentionally NOT forced below the RX threshold in raw units. The comma pedal reports the driver's raw
+ # ADC on GAS_SENSOR and applies max(driver, openpilot) only at its DAC output, so openpilot's command can't latch
+ # gas_pressed (verified against panda c076a9f2^:board/pedal/main.c). Bench gate: ramp the command to this cap with the
+-# foot off and confirm GAS_SENSOR does not move. A raw-ceiling unit test pins the scaling so it can't drift silently.
++# foot off and confirm GAS_SENSOR does not move. test_gas_interceptor.py pins the DBC mapping in raw counts.
+ MAX_INTERCEPTOR_GAS = 0.15
+ 
+ # TBD-BENCH: conservative. Pedal-long can't be engaged below this (NoEntry) and the pedal command is cut once speed
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index c2eeaae7..f0f2baf8 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -10,6 +10,7 @@ import copy
+ import os
+ import re
+ 
++import numpy as np
+ import pytest
+ 
+ from opendbc.can import CANDefine, CANPacker
+@@ -163,13 +164,45 @@ class TestThresholds:
+     assert HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED.value == 2 ** 12
+ 
+   def test_max_gas_raw_ceiling(self):
+-    # Pins the command scaling in raw DAC counts so the cap can't drift silently through a DBC/scale change.
+-    # TBD-BENCH: re-derive the ceiling with the real pedal; 0.15 -> track1 ~714, track2 ~1188 counts.
++    # Pins the command scaling in raw DAC counts at the cap so it can't drift silently through a DBC/scale change.
++    # Bench-measured scaling: 0.15 -> track A 788, track B 400 (the old Toyota-copied scaling sent B=1188 here).
+     _, dat, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.MAX_INTERCEPTOR_GAS, 0)
+     track1, track2 = (dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3]
+-    assert track1 <= 720 and track2 <= 1200
++    assert abs(track1 - 788) <= 2 and abs(track2 - 400) <= 3
+     assert 0. < gi.MAX_INTERCEPTOR_GAS <= 0.3
+ 
++  @pytest.mark.parametrize("pedal_ids", [gi.STANDARD_IDS, gi.REMAPPED_IDS], ids=["standard", "remapped"])
++  def test_dbc_mapping_matches_bench_measurement(self, pedal_ids):
++    # Bench-measured on the owner's car (2026-10-03): track B = 0.49413 * track A + 10.45 (fit over 342,290 driving pairs);
++    # foot-off rest A=465 B=241, full press A=2616 B=1284. Physical 0..255 = pedal travel fraction. Every commanded pair must
++    # sit on the car's own curve or the ECU can flag an APS correlation fault. This is the test that catches a wrong
++    # (e.g. Toyota-copied, B = A + 475) per-track scaling.
++    packer = CANPacker(gi.GAS_INTERCEPTOR_DBC)
++
++    def raw(frac: float) -> tuple[int, int]:
++      # pack directly: create_gas_interceptor_command zeroes both tracks when frac <= 0.001 (ENABLE off)
++      dat = packer.make_can_msg(pedal_ids.command_msg, 0, {"GAS_COMMAND": frac * 255., "GAS_COMMAND2": frac * 255.})[1]
++      return (dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3]
++
++    a0, b0 = raw(0.)
++    assert abs(a0 - 465) <= 2 and abs(b0 - 240) <= 3  # rest
++    a1, b1 = raw(1.)
++    assert abs(a1 - 2616) <= 2 and abs(b1 - 1303) <= 3  # full press (B from the fitted relation; measured 1284)
++    expected_a = {0.05: 573, 0.15: 788, 0.25: 1003}  # linear rest..full on track A
++    for frac, a_exp in expected_a.items():
++      assert abs(raw(frac)[0] - a_exp) <= 2, frac
++    prev_a = prev_b = -1
++    for frac in np.linspace(0., 1., 41):
++      a, b = raw(float(frac))
++      assert abs(b - (0.49413 * a + 10.45)) <= 3, (frac, a, b)
++      assert a > prev_a and b > prev_b  # monotonic in both tracks
++      prev_a, prev_b = a, b
++    # the real sender agrees with the direct pack whenever it enables (and goes to the active dialect's address)
++    for frac in (0.05, 0.15, 0.25, 1.0):
++      addr, dat, _ = create_gas_interceptor_command(packer, frac, 0, pedal_ids.command_msg)
++      assert addr == pedal_ids.command_addr
++      assert ((dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3]) == raw(frac)
++
+   @pytest.mark.parametrize("v_ego", [0., 5., 11.2, 20., 35.])
+   def test_pedal_command_accel_only(self, v_ego):
+     for accel in (-4., -1., -0.5, 0., 0.5, 2., 10.):
 -- 
 2.54.0 (Apple Git-157)
 
