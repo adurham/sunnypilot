@@ -48,10 +48,72 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 11 | Hyundai pedal: REMAPPED CAN IDs (0x700/0x701, owner's custom pedal firmware) alongside standard 0x200/0x201 | feature (safety C + car) | fork-local; amends #10, same branch |
 | 12 | Hyundai pedal: low-speed TAKE CONTROL alert gated on longitudinal engagement | fix (selfdrived car events) | fork-local; amends #10 |
 | 13 | Hyundai FCA11 (0x38D) brake-injection TEST safety mode — **TEST-GATED, NOT FOR ROAD USE**, parked/standstill only | research (safety C only) | fork-local; patch `0002`, opendbc branch `fca11-brake-test`, NOT on main's default path |
+| 14 | Hyundai pedal SCE-latch fix: fault-clearing zero frame + escalation to accFaulted, and bursted CLU11 cancel in pedal mode — **offline-tested only, not road-validated** | fix (car layer, Python only) | fork-local; amends #10; patch `0003`, opendbc branch `hyundai-pedal-sce-fix` |
 
 ---
 
 ## Entries
+
+### fix: Hyundai pedal SCE-latch recovery + bursted cruise cancel — 2026-10-03 (amends #10; offline-tested, NOT road-validated)
+
+- **Why:** route `0000011c` forensics (`car-features/field-drive-11c-report.md`). During commanded engagements the pedal
+  latched FAULT_SCE (state 3, i.e. passthrough) and stayed latched. Commanded `ENABLE=1` frames never clear a pedal fault;
+  only an `ENABLE=0` all-zero frame does. The pedal applied only **6.56 s of 55.1 s commanded (11.9 %)**: the
+  "surge then shut off". The trigger is our own CLU11 (`0x4F1`) CANCEL. It went out every 10 ms frame while factory cruise
+  was on, colliding with the cluster's 50 Hz CLU11 and producing panda bit1Errors and bus-offs. **43/43** SCE onsets and
+  **1282/1282** bus-0 errors fell inside cancel streams; there were 0 outside them.
+- **FIX 1 — clear frame (`gas_interceptor.py: PedalFaultMonitor`):** while commanding (`active` and gas > 0), if the
+  pedal's broadcast STATE is nonzero (any fault, 1-6), that 50 Hz send slot carries ONE `ENABLE=0` zero frame instead
+  of the command. The counter stays continuous and the CRC is valid. It costs no torque because a faulted pedal is
+  already in passthrough. Rate limit: at most one clear per 60 ms (`PEDAL_CLEAR_HOLDOFF_FRAMES = 6`; the measured
+  clear round trip is 16-26 ms, plus one CarState tick). Panda safety needs no change, since a zero `GAS_COMMAND` is
+  always allowed.
+- **Escalation:** if a fault stays visible while commanding for **> 0.5 s**, or there are **> 8 clears in 2 s**, then
+  `CarState.accFaulted = True`. That is the standard `accFaulted` event, an IMMEDIATE_DISABLE "Cruise Fault" alert, so
+  the driver knows throttle authority is gone. It is held until longitudinal disengages and re-armed when not commanding.
+  A fault that the clears can't recover hits the count path at 480 ms. Chosen over a new sunnypilot event:
+  `accFaulted` already exists end to end (car_events → events.py alert) and needs no cereal/event-enum change. Its
+  "restart the car" wording is stronger than necessary (re-engage works once the pedal is back to state 0).
+- **Plumbing (no schema change):** `CarStateExt` owns the `PedalFaultMonitor` next to `interceptor_state`.
+  `CarInterfaceBase.apply` passes **that same CarState instance** as `CS` to `CarController.update` →
+  `create_gas_command`, so the controller reads `CS.interceptor_state` and steps `CS.pedal_fault_monitor`.
+  `CarStateExt.update` reads `escalated` into `accFaulted` on the next frame (one 10 ms tick of latency). A new
+  `custom.capnp CarStateSP` field was rejected for three reasons: card would only republish data that never leaves the
+  card process; it would force a capnp C++ regen on sync (`SCHEMA_CHANGED`); and it would split the change across the
+  superproject and the patch series. Everything is inert unless `CP_SP.enableGasInterceptor`: `create_gas_command`
+  returns early otherwise, and the STATE parse and escalation are both inside the interceptor block.
+- **FIX 2 — bursted cancel (`car/hyundai/carcontroller.py`, gas-interceptor mode only):** after the existing 10-frame
+  `CANCEL_BUTTON_DELAY_FRAMES`, CLU11 CANCEL is now sent as **5-frame bursts with pauses rotating 150/200/250 ms**
+  (20 % duty, 75-frame cycle) instead of every frame. The pause rotates so a fixed period can't phase-lock against the
+  cluster's 20 ms schedule. Cancel semantics are unchanged: frames go out only while `CC.cruiseControl.cancel` and stop
+  the frame it drops. Stock (`pcmCruise`) Hyundai CAN cars keep the continuous stream (a test pins this). The CAN FD
+  path is untouched. `cancel_counter`/`last_button_frame` are not shared with ICBM (it receives `last_button_frame`
+  by value and never sees `cancel_counter`).
+  - Cancel latency on 11c with the continuous stream was 0.04-12.4 s. The fast cases (0.04-0.13 s) needed 5-13 frames;
+    the long tails (3.7 / 9.3 / 12.4 s) ran at 25-78 bus errors/s. So the stream is not latency-efficient: the tail
+    looks collision/phase-driven, not frame-count-driven. A 5-frame burst covers the fast cases. Whether it lands
+    better or worse in the tails is **unmeasured**.
+  - **Watch on the next drive:** factory-cruise-on → off latency per cancel, and per-burst bus-0 `totalErrorCnt` /
+    `busOffCnt` deltas. If a clean 5-frame burst sometimes doesn't cancel (the cluster/EMS may debounce on hold
+    duration), lengthen the burst; don't shorten the pause.
+- **Files (opendbc, via patch `openpilot/sunnypilot/fork/patches/0003-hyundai-pedal-sce-fix.patch`, opendbc commit
+  `55e0a7f1` on branch `hyundai-pedal-sce-fix`, parent `00d48a2f`):** `car/hyundai/carcontroller.py`,
+  `sunnypilot/car/hyundai/{gas_interceptor,carstate_ext}.py`, `sunnypilot/car/hyundai/tests/test_gas_interceptor.py`.
+  There is no file overlap with `0002`. **Python only, no safety C**, so the panda firmware binary should be unchanged.
+  Note: the sync workflow still REBUILDS firmware because the patch-set hash changed (expected to reproduce the
+  0001+0002 bytes, `61b3165d…`; not built locally).
+- **Verification:** `test_gas_interceptor.py` **81 passed** (+17 new: monitor policy, end-to-end through `CarInterface.update`/`apply`
+  for both ID dialects, non-interceptor inertness, cancel bursts). `safety/tests/test_hyundai.py` **1762 passed**
+  (unchanged). Series rehearsal: pristine `f95f996f` + `0001` + `0002` + `0003`, all plain `git apply` exit 0 with no
+  fuzz → tree `f1621b30…`. Both suites on that tree: **1998 passed**. Mutation-checked: removing the rate limit → 5
+  failures; removing the clear-frame substitution → 2; removing the accFaulted escalation → 1; restoring the continuous
+  cancel → 1. Route-11c replay sim (`car-features/fd11c-sce-sim.py`, 200 seeds, uses the real `PedalFaultMonitor`):
+  recorded 12.0 % applied; modeled no-fix 10.6 % (sanity check); **FIX 1 97.3 %** (min 96.2), with 0.23 escalations
+  per run; FIX 1 + FIX 2 99.5 %, which *assumes* onset rate scales with cancel duty.
+- **NOT proven:** road effectiveness, how the clear frame behaves under the user's custom-ID pedal firmware at speed
+  (evidence: 3/3 on-road latches and ~40 uncommanded blips, all cleared by zero frames), the ECU response to a 20 ms
+  clear dip, and FIX 2's effect on bus errors and cancel latency. Acceptance on the next drive: pedal-applied/commanded
+  ≥ 90 %, no `accFaulted` except under real faults, and criteria A-D still pass.
 
 ### research: Hyundai FCA11 brake-injection TEST safety mode — 2026-10-03 (TEST-GATED, NOT FOR ROAD USE)
 
