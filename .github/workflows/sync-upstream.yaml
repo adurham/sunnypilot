@@ -72,6 +72,10 @@ env:
   UPSTREAM_PREBUILT_BRANCH: dev
   PREBUILT_BRANCH: dev
   FORK_BRANCH: main
+  # the opendbc submodule this workflow patches and copies from. Declared
+  # workflow-level on purpose: it is read by more than one step, and shell
+  # variables do NOT survive between steps (each `run:` is its own process).
+  SUBMODULE: opendbc_repo
   # fork-only namespace holding the opendbc patch series. An absent or empty
   # directory is a supported state: it means "no opendbc divergence to ship".
   PATCH_DIR: openpilot/sunnypilot/fork/patches
@@ -280,10 +284,14 @@ jobs:
           PANDA_PIN=$(git rev-parse "HEAD:panda")
 
           # --- the patch series, in filename order ---------------------------
+          # Paths are made ABSOLUTE here, once: the apply step below runs with its
+          # cwd inside the opendbc_repo submodule (that is where a submodule-relative
+          # patch must be applied from), and a relative path exported from this step
+          # would no longer resolve there. Absolute paths work from any cwd.
           PATCHES_ABS=()
           if [ -d "${PATCH_DIR}" ]; then
             while IFS= read -r f; do
-              [ -n "$f" ] && PATCHES_ABS+=("$f")
+              [ -n "$f" ] && PATCHES_ABS+=("$(readlink -f "$f")")
             done < <(find "${PATCH_DIR}" -maxdepth 1 -type f -name '*.patch' | LC_ALL=C sort)
           fi
           PATCH_COUNT=${#PATCHES_ABS[@]}
