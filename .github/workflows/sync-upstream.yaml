@@ -25,9 +25,12 @@ name: sync upstream
 # 6. applies the fork's opendbc patch series (openpilot/sunnypilot/fork/patches/
 #    *.patch, filename order) to a checkout of the opendbc_repo submodule and
 #    copies every file the series touched into the prebuilt tree at the same
-#    relative path, then -- when the series or a relevant pin actually changed --
-#    cross-compiles the panda H7 firmware and installs the signed app at
-#    panda/board/obj/panda_h7.bin.signed.
+#    relative path, then cross-compiles the panda H7 firmware and installs the
+#    signed app at panda/board/obj/panda_h7.bin.signed. The pushed prebuilt must
+#    contain firmware built from THIS patch series, and a fresh upstream clone
+#    never has it (upstream ships its own unpatched build), so the rebuild is
+#    skipped ONLY when the clone's firmware bytes provably equal the hash the last
+#    fork build recorded (`firmware-sha256:` in the dev commit message).
 #
 # Why overlay instead of a full build: the fork's diff is pure Python plus one
 # capnp schema field, and upstream's prebuilt tree already carries every compiled
@@ -46,7 +49,12 @@ name: sync upstream
 #      app is cross-built with the toolchain pinned in panda/pyproject.toml (Arm
 #      GNU 13.2.1, delivered as a uv wheel) -- a hosted ubuntu runner is enough,
 #      no self-hosted arm64 and no host toolchain. Only the app is shipped; the
-#      bootstub (sector 0) is never rebuilt or replaced.
+#      bootstub (sector 0) is never rebuilt or replaced. Every run starts from a
+#      fresh clone of *upstream's* prebuilt, whose app is upstream's unpatched
+#      build -- the fork's last firmware is not in it. "Series and pins unchanged
+#      since the last fork build" is therefore never on its own a reason to skip
+#      the build; only a clone whose app hashes to the last build's recorded
+#      firmware-sha256 is.
 #
 # Safety properties, unchanged from v2 except where noted:
 #  * every step is `set -euo pipefail`; a failing patch apply, a failing firmware
@@ -54,8 +62,13 @@ name: sync upstream
 #    is ever published from a red run.
 #  * `git apply` is plain (no --3way, no --whitespace): a patch that no longer
 #    matches the pinned opendbc is a hard error rather than a guess.
-#  * only the app is staged, and only when its bytes differ from what the prebuilt
-#    already ships -- a no-op day produces no commit at all.
+#  * only the app is staged, and only when its bytes differ from what the clone
+#    already ships. Whether to build at all is decided against the clone, not
+#    against the last fork build's bookkeeping alone: the pushed prebuilt must
+#    contain firmware built from THIS patch series, so the build is skipped only
+#    when the clone's app provably equals the last fork build's recorded
+#    firmware-sha256. Every prebuilt commit records the sha256 of the app it
+#    actually ships, so the next run can make that comparison.
 #  * the prebuilt tree still ends up with zero gitlinks and no .gitmodules:
 #    patched opendbc files are copied *as files*, never as a submodule pointer, and
 #    no .git directory can be copied into the tree (paths named .git* are refused).
@@ -155,7 +168,7 @@ jobs:
           [ -n "$UPSTREAM_PREBUILT_SHA" ] || { echo "::error::could not ls-remote upstream ${UPSTREAM_PREBUILT_BRANCH}"; exit 1; }
 
           # what the fork's current prebuilt branch was built from
-          PREBUILT_SOURCE=""; PREBUILT_BASE=""
+          PREBUILT_SOURCE=""; PREBUILT_BASE=""; PREBUILT_FW_SHA=""
           if PB_MSG=$(gh api "repos/${REPO}/commits/${PREBUILT_BRANCH}" --jq '.commit.message' 2>/dev/null); then
             PREBUILT_SOURCE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^source: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
             PREBUILT_BASE=$(printf '%s\n' "$PB_MSG" | sed -n 's/^base: \([0-9a-f]\{7,40\}\).*/\1/p' | head -1)
@@ -165,6 +178,10 @@ jobs:
             PREBUILT_OPENDBC_PIN=$(printf '%s\n' "$PB_MSG" | sed -n 's/^opendbc-pin: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
             PREBUILT_PANDA_PIN=$(printf '%s\n' "$PB_MSG" | sed -n 's/^panda-pin: \([0-9a-f]\{40\}\).*/\1/p' | head -1)
             PREBUILT_PATCHES_SHA=$(printf '%s\n' "$PB_MSG" | sed -n 's/^patches-sha256: \([0-9a-f]\{64\}\).*/\1/p' | head -1)
+            # sha256 of the panda_h7.bin.signed the last fork build actually
+            # committed. Empty on any prebuilt commit that predates this field; the
+            # planning step treats that as "unknown" and rebuilds.
+            PREBUILT_FW_SHA=$(printf '%s\n' "$PB_MSG" | sed -n 's/^firmware-sha256: \([0-9a-f]\{64\}\).*/\1/p' | head -1)
           fi
 
           SKIP=false
@@ -182,6 +199,7 @@ jobs:
             echo "PREBUILT_OPENDBC_PIN=${PREBUILT_OPENDBC_PIN}"
             echo "PREBUILT_PANDA_PIN=${PREBUILT_PANDA_PIN}"
             echo "PREBUILT_PATCHES_SHA=${PREBUILT_PATCHES_SHA}"
+            echo "PREBUILT_FW_SHA=${PREBUILT_FW_SHA}"
             echo "SKIP=${SKIP}"
           } >> "$GITHUB_ENV"
 
@@ -191,6 +209,7 @@ jobs:
           echo "last fork build base:      ${PREBUILT_BASE:0:10}"
           echo "last fork build opendbc:   ${PREBUILT_OPENDBC_PIN:0:10}"
           echo "last fork build patch set: ${PREBUILT_PATCHES_SHA:0:12}"
+          echo "last fork build firmware:  ${PREBUILT_FW_SHA:0:12}"
           echo "skip: ${SKIP}"
 
       - name: Clone upstream prebuilt tree
@@ -311,15 +330,30 @@ jobs:
             PATCHES_SHA=$(printf '' | sha256sum | cut -d' ' -f1)
           fi
 
+          # --- what firmware does the fresh clone carry? ---------------------
+          # $RUNNER_TEMP/prebuilt is a fresh clone of *upstream's* prebuilt branch,
+          # not of this fork's last build, so its panda_h7.bin.signed is upstream's
+          # unpatched firmware. Hash it so the decision below can tell whether the
+          # clone happens to carry exactly what the last fork build shipped.
+          BASE_FW_SHA='none'
+          [ -f "$RUNNER_TEMP/prebuilt/panda/board/obj/panda_h7.bin.signed" ] && BASE_FW_SHA=$(sha256sum "$RUNNER_TEMP/prebuilt/panda/board/obj/panda_h7.bin.signed" | cut -d' ' -f1)
+
           # --- does the firmware need (re)building? -------------------------
           # The patch series is the *only* thing that makes this fork's firmware
           # differ from the one upstream already built into the prebuilt tree. With
           # an empty series the right firmware is upstream's own, and rebuilding it
           # would change its signature for no reason -- which would make the device
           # flash a byte-identical-but-differently-signed app. So: no patches, no
-          # build. With a series present, build when the series changed, when one of
-          # the two pins that feed the compilation moved, or when this prebuilt
-          # carries no v3 bookkeeping yet (the first v3 run).
+          # build. With a series present, the invariant is that the pushed prebuilt
+          # contains firmware built from THIS patch series. A fresh upstream clone
+          # never has it, so "the series and pins are unchanged since the last fork
+          # build" is NOT a reason to skip: that build's firmware lives on the fork's
+          # dev branch, not in the clone. Build when the series changed, when one of
+          # the two pins that feed the compilation moved, when this prebuilt carries
+          # no v3 bookkeeping yet (the first v3 run), when the last fork build
+          # recorded no firmware hash, or when the clone's firmware differs from that
+          # hash. A skip is allowed ONLY when the clone's firmware bytes provably
+          # equal the hash the last fork build recorded (firmware-sha256).
           FW_NEEDED=false
           FW_REASON='no opendbc patches to apply'
           if [ "$PATCH_COUNT" -gt 0 ]; then
@@ -331,8 +365,12 @@ jobs:
               FW_NEEDED=true; FW_REASON="opendbc pin moved"
             elif [ "$PANDA_PIN" != "${PREBUILT_PANDA_PIN:-}" ]; then
               FW_NEEDED=true; FW_REASON="panda pin moved"
+            elif [ -z "${PREBUILT_FW_SHA:-}" ]; then
+              FW_NEEDED=true; FW_REASON="previous fork build recorded no firmware hash"
+            elif [ "$BASE_FW_SHA" != "${PREBUILT_FW_SHA:-}" ]; then
+              FW_NEEDED=true; FW_REASON="the fresh upstream clone does not carry this fork's firmware; rebuilding from the patch series"
             else
-              FW_REASON='patch set and pins unchanged'
+              FW_REASON='clone already carries the exact firmware from the last fork build'
             fi
           fi
           # the patch series always has to be *applied*, even when no rebuild is
@@ -347,6 +385,7 @@ jobs:
             echo "PATCH_COUNT=${PATCH_COUNT}"
             echo "PATCHES_SHA=${PATCHES_SHA}"
             echo "FW_NEEDED=${FW_NEEDED}"
+            echo "BASE_FW_SHA=${BASE_FW_SHA}"
             echo "NEED_SUBMODULES=${NEED_SUBMODULES}"
           } >> "$GITHUB_ENV"
 
@@ -360,6 +399,7 @@ jobs:
           echo "panda pin:      ${PANDA_PIN:0:10} (prebuilt built from ${PREBUILT_PANDA_PIN:0:10})"
           echo "patch series:   ${PATCH_COUNT} patch(es), sha256 ${PATCHES_SHA:0:12}"
           echo "submodules:     ${NEED_SUBMODULES}"
+          echo "clone firmware sha: ${BASE_FW_SHA:0:12} (last fork build: ${PREBUILT_FW_SHA:0:12})"
           echo "firmware build: ${FW_NEEDED} (${FW_REASON})"
 
       - name: Check out the opendbc_repo and panda submodules
@@ -719,6 +759,13 @@ jobs:
           git add -A -f
           CAFES=$(git ls-files | grep -E '__pycache__' || true)
           if [ -n "$CAFES" ]; then printf '%s\n' "$CAFES" | xargs -r git rm -r --cached -q; fi
+          # hash of the firmware AS COMMITTED in this tree (whatever path put it
+          # there): recorded as firmware-sha256 so the next run can prove whether a
+          # fresh clone already carries it.
+          FINAL_FW_SHA='none'
+          [ -f panda/board/obj/panda_h7.bin.signed ] && FINAL_FW_SHA=$(sha256sum panda/board/obj/panda_h7.bin.signed | cut -d' ' -f1)
+          echo "FINAL_FW_SHA=${FINAL_FW_SHA}" >> "$GITHUB_ENV"
+          echo "committed firmware sha256: ${FINAL_FW_SHA}"
           if git diff --cached --quiet; then
             echo "no staged changes; the prebuilt tree already matches the source"
             echo "REBUILD=false" >> "$GITHUB_ENV"
@@ -736,6 +783,7 @@ jobs:
           patches-sha256: ${PATCHES_SHA}
           patches: ${PATCH_COUNT:-0}
           firmware: ${FW_UPDATED:-false}
+          firmware-sha256: ${FINAL_FW_SHA}
           run: ${GITHUB_RUN_ID}
           date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "REBUILD=true" >> "$GITHUB_ENV"
@@ -803,6 +851,7 @@ jobs:
             echo "| firmware build needed | ${FW_NEEDED:-false} |"
             echo "| firmware staged | ${FW_UPDATED:-false} |"
             echo "| firmware sha256 | \`${FW_SHA}\` |"
+            echo "| firmware sha256 (committed tree) | \`${FINAL_FW_SHA}\` |"
             echo "| fork source sha | \`${SOURCE_SHA}\` |"
             echo "| new prebuilt commit | \`${PREBUILT_SHA}\` |"
             echo "| dry run | ${{ inputs.dry_run }} |"
