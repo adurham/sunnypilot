@@ -46,6 +46,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 9 | Road-type classifier speed-threshold boundaries | fix | fork-local (part of the feature) |
 | 10 | Hyundai comma-pedal (gas interceptor) longitudinal, non-SCC — INERT until bench-validated | feature (safety C + car) | fork-local; branch `hyundai-pedal-long`, NOT on main |
 | 11 | Hyundai pedal: REMAPPED CAN IDs (0x700/0x701, owner's custom pedal firmware) alongside standard 0x200/0x201 | feature (safety C + car) | fork-local; amends #10, same branch |
+| 12 | Hyundai pedal: low-speed TAKE CONTROL alert gated on longitudinal engagement | fix (selfdrived car events) | fork-local; amends #10 |
 
 ---
 
@@ -151,6 +152,22 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Verification:** safety tests cover both dialects × LDA (debug and RELEASE libsafety), car-layer tests cover
   detection, selection, end-to-end gasPressed and the TX id, and 8 dialect-selection mutations are each caught.
   Details: `~/.hermes/cache/scratch/car-features/pedal-remap-implementation.md`.
+
+### fix: Hyundai pedal low-speed takeover alert only while engaged — 2026-10-03 (amends #10)
+
+- **Bug:** `CarSpecificEventsSP.update()` added `manualRestart` ("TAKE CONTROL / Resume Driving Manually") whenever
+  `enableGasInterceptor` was set and `vEgo < minEnableSpeed - GAS_CUT_HYSTERESIS` (~20 mph), with no engagement
+  check. With the feature merely ARMED, the alert fired while the driver was driving manually at low speed.
+- **Fix:** `update()` takes a new `long_active` argument, and `manualRestart` now requires it. selfdrived passes
+  `self.sm['carControl'].longActive`, the same carControl it already gives to `car_events.update`. That is the
+  previous frame's carControl, so the alert can lag by one 100 Hz frame. `belowEngageSpeed` is unchanged: it still
+  fires only on a `buttonEnable` attempt below `minEnableSpeed`.
+- **Files:** `openpilot/sunnypilot/selfdrive/car/car_specific.py`, `openpilot/selfdrive/selfdrived/selfdrived.py`.
+  No opendbc / patch-series change.
+- **Verification:** new `openpilot/sunnypilot/selfdrive/car/tests/test_car_specific_events.py` (13 cases: armed but not
+  engaged, engaged below and above the cut, belowEngageSpeed only on buttonEnable, feature off). Run with the
+  `0001-hyundai-gas-interceptor.patch` series applied to opendbc, because the submodule checkout lacks
+  `opendbc.sunnypilot.car.hyundai.gas_interceptor`. Removing the gate makes the not-engaged cases fail (mutation caught).
 
 ### fix: road-type classifier speed-threshold boundaries — 2026-10-02
 

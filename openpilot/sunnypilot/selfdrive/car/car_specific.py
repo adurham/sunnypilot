@@ -25,7 +25,7 @@ class CarSpecificEventsSP:
 
     self.low_speed_alert = False
 
-  def update(self, CS: structs.CarState, events: Events):
+  def update(self, CS: structs.CarState, events: Events, long_active: bool):
     events_sp = EventsSP()
 
     if self.CP.brand == 'chrysler':
@@ -53,7 +53,10 @@ class CarSpecificEventsSP:
         # lateral-only engagement (LKAS/main button) at low speed, a regression for this steering-first car
         if CS.vEgo < self.CP.minEnableSpeed and events.has(EventName.buttonEnable):
           events.add(EventName.belowEngageSpeed)
-        if CS.vEgo < self.CP.minEnableSpeed - GAS_CUT_HYSTERESIS:
+        # takeover warning only while longitudinal is actually engaged (long_active = carControl.longActive, passed by
+        # selfdrived): when merely armed and the driver is driving manually, the pedal cut is irrelevant and the
+        # 'TAKE CONTROL' alert below ~20 mph would be a false alarm
+        if long_active and CS.vEgo < self.CP.minEnableSpeed - GAS_CUT_HYSTERESIS:
           events.add(EventName.manualRestart)
 
     elif self.CP.brand == 'toyota':
