@@ -1,7 +1,7 @@
-From ab37076479e7588a6ae6429cbd0b755415e41c1c Mon Sep 17 00:00:00 2001
+From 1ada465ef5e21dab15186851a3d3f863adc43b77 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 10:24:10 -0500
-Subject: [PATCH] hyundai: FCA11 brake-injection TEST safety mode (non-SCC,
+Subject: [PATCH 1/2] hyundai: FCA11 brake-injection TEST safety mode (non-SCC,
  parked only)
 
 TEST-ONLY, NOT FOR ROAD USE. New safety_param_sp bit HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64
@@ -417,6 +417,167 @@ index c3e68164..bbbd792f 100644
  
  
  class HyundaiFlagsSP(IntFlag):
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 12d5a296d338a402f9299fef3f61cb446694745d Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sat, 3 Oct 2026 17:18:50 -0500
+Subject: [PATCH 2/2] =?UTF-8?q?hyundai:=20FCA11=20brake=20test=20=E2=80=94?=
+ =?UTF-8?q?=20block=20ONLY=20camera=20FCA11,=20keep=20LKAS11/LFAHDA=20forw?=
+ =?UTF-8?q?arding?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TEST-ONLY mode (HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST). HYUNDAI_FCA11_TEST_TX_MSGS was built on
+HYUNDAI_COMMON_TX_MSGS(0), whose LKAS11 (0x340) / LFAHDA_MFC (0x485) entries are check_relay=true
+because normal openpilot steering REPLACES the camera's messages. Inherited into the test mode, that
+made safety_fwd_hook drop the camera's own lane-keeping stream (bus 2 -> 0) for the whole armed window
+with nothing replacing it (run 1 starved them for ~34 s).
+
+The test TX list is now {CLU11 0x4F1 (cancel, policed as before), FCA11 0x38D check_relay=true} only:
+- camera 0x340/0x485 keep forwarding bus 2 -> 0 and are not relay-checked;
+- panda can't transmit 0x340/0x485 in this mode (not in the TX list): no second LKAS source;
+- 0x38D handling is unchanged.
+Scoped to the test list: HYUNDAI_COMMON_TX_MSGS, HYUNDAI_TX_MSGS and the gas-interceptor lists are
+untouched, so normal hyundai / pedal safety is byte-identical (test_not_armed_keeps_lkas_takeover pins it).
+
+Tests: TX_MSGS / RELAY_MALFUNCTION_ADDRS / FWD_BLACKLISTED_ADDRS updated; new
+test_camera_lkas_streams_forwarded, test_lkas_tx_rejected, test_not_armed_keeps_lkas_takeover; the
+inherited torque-steering suites are skipped for this class (steering is not transmittable here;
+test_lkas_tx_rejected replaces them). Mutations (revert to v1 list, add 0x340/0x485 as check_relay=false,
+0x38D check_relay=false, base-list change) are all killed.
+---
+ opendbc/safety/modes/hyundai.h       | 12 +++--
+ opendbc/safety/tests/test_hyundai.py | 77 ++++++++++++++++++++++++++--
+ 2 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 2599245c..df6b4834 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -437,14 +437,18 @@ static safety_config hyundai_init(uint16_t param) {
+     {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
+   };
+ 
+-  // TEST-ONLY FCA11 brake test: base TX + FCA11 with check_relay=true, unlike HYUNDAI_LONG_TX_MSGS (false). That makes
+-  // fwd_hook drop the stock camera's FCA11 (bus 2 -> 0), so there is never more than one FCA11 source on the car bus.
++  // TEST-ONLY FCA11 brake test: FCA11 with check_relay=true, unlike HYUNDAI_LONG_TX_MSGS (false). That makes fwd_hook
++  // drop the stock camera's FCA11 (bus 2 -> 0), so there is never more than one FCA11 source on the car bus.
+   // It is relay-fault safe on the target car (2022 Elantra N, non-SCC): full route logs show 0x38D received ONLY on
+   // bus 2 (camera side, src 2/128), never on bus 0, and stock_ecu_check (safety.h) only trips relay_malfunction when a
+   // check_relay addr is RECEIVED on the same bus as the TX entry (bus 0).
++  // Deliberately NOT HYUNDAI_COMMON_TX_MSGS: its LKAS11 (0x340) / LFAHDA_MFC (0x485) entries are check_relay=true
++  // because in normal operation openpilot REPLACES the camera's steering messages; here that would block the camera's
++  // own lane-keeping stream (bus 2 -> 0) for the whole test with nothing replacing it. Both are left out entirely, so
++  // the camera's 0x340/0x485 keep forwarding and panda can't add a second source for them. Only FCA11 is replaced.
+   static const CanMsg HYUNDAI_FCA11_TEST_TX_MSGS[] = {
+-    HYUNDAI_COMMON_TX_MSGS(0)
+-    {0x38D, 0, 8, .check_relay = true},  // FCA11 Bus 0 (replaces the stock camera's)
++    {0x4F1, 0, 4, .check_relay = false},  // CLU11 Bus 0 (cancel only, policed in hyundai_tx_hook)
++    {0x38D, 0, 8, .check_relay = true},   // FCA11 Bus 0 (replaces the stock camera's)
+   };
+ 
+   hyundai_common_init(param);
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 8eae462a..537e2f45 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -833,12 +833,14 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+   """
+     TEST-ONLY FCA11 (0x38D) brake-injection mode on a non-SCC ICE car (HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST).
+-    TX = base + FCA11 with check_relay=true: the stock camera FCA11 (bus 2) is no longer forwarded to bus 0, and a
++    TX = CLU11 + FCA11 with check_relay=true: the stock camera FCA11 (bus 2) is no longer forwarded to bus 0, and a
+     bus-0 FCA11 would be a relay malfunction (on the target car 0x38D is only ever received on bus 2, per route logs).
++    ONLY FCA11 is taken over: LKAS11 (0x340) / LFAHDA_MFC (0x485) are NOT in the TX list, so the camera's own
++    lane-keeping messages keep forwarding bus 2 -> 0 and panda can never transmit them (no second source).
+   """
+-  TX_MSGS = [[0x340, 0], [0x4F1, 0], [0x485, 0], [0x38D, 0]]
+-  RELAY_MALFUNCTION_ADDRS = {0: (0x340, 0x485, 0x38D)}  # LKAS11, LFAHDA_MFC, FCA11
+-  FWD_BLACKLISTED_ADDRS = {2: [0x340, 0x485, 0x38D]}
++  TX_MSGS = [[0x4F1, 0], [0x38D, 0]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x38D,)}  # FCA11 only
++  FWD_BLACKLISTED_ADDRS = {2: [0x38D]}
+ 
+   @classmethod
+   def setUpClass(cls):
+@@ -926,6 +928,73 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+     for addr in (0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x483, 0x7D0, 0x200, 0x700):
+       self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
+ 
++  def test_camera_lkas_streams_forwarded(self):
++    # the camera's LKAS11 / LFAHDA_MFC keep flowing bus 2 -> 0 while armed (only FCA11 is blocked) ...
++    for addr in (0x340, 0x485):
++      self._rx(common.make_msg(2, addr, 8))
++      self.assertEqual(0, self.safety.safety_fwd_hook(2, addr), f"{addr=:#x}")
++      # ... and are not relay-checked: seeing them on bus 0 (e.g. the forwarded stream itself) is no fault
++      self._rx(common.make_msg(0, addr, 8))
++      self.assertFalse(self.safety.get_relay_malfunction(), f"{addr=:#x}")
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    self.assertFalse(self.safety.get_relay_malfunction())
++
++  def test_lkas_tx_rejected(self):
++    # panda can't become a second LKAS11/LFAHDA_MFC source in test mode, not even a zero-torque / idle frame,
++    # regardless of controls_allowed
++    for controls_allowed in (False, True):
++      self.safety.set_controls_allowed(controls_allowed)
++      self.assertFalse(self._tx(self._torque_cmd_msg(0, steer_req=0)))
++      self.assertFalse(self._tx(self._torque_cmd_msg(0, steer_req=1)))
++      self.assertFalse(self._tx(common.make_msg(0, 0x340, 8)))
++      self.assertFalse(self._tx(common.make_msg(0, 0x485, 4)))
++      self.assertFalse(self._tx(self.packer.make_can_msg_safety("LFAHDA_MFC", 0, {})))
++
++  def test_not_armed_keeps_lkas_takeover(self):
++    # without the test bit, normal non-SCC openpilot steering is unchanged: LKAS11/LFAHDA_MFC transmittable and the
++    # camera's copies blocked (the base HYUNDAI_TX_MSGS rule)
++    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.NON_SCC | self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self.assertTrue(self._tx(self._torque_cmd_msg(0, steer_req=0)))
++    self.assertTrue(self._tx(common.make_msg(0, 0x485, 4)))
++    for addr in (0x340, 0x485):
++      self.assertEqual(-1, self.safety.safety_fwd_hook(2, addr), f"{addr=:#x}")
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++
++  # Steering can't be transmitted in this mode (test_lkas_tx_rejected), so the inherited torque-steering suites only
++  # fail at the TX allowlist. They are replaced by that one explicit check.
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_steer_safety_check(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_non_realtime_limit_up(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_steer_req_bit(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_steer_req_bit_frames(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_steer_req_bit_multi_invalid(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_steer_req_bit_realtime(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_against_torque_driver(self):
++    pass
++
++  @unittest.skip("LKAS11 not in the FCA11 test TX list (see test_lkas_tx_rejected)")
++  def test_realtime_limits(self):
++    pass
++
+   def test_test_bit_overrides_gas_interceptor(self):
+     for dialect in (0, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED):
+       self.safety.set_current_safety_param_sp(self._test_sp() | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | dialect)
 -- 
 2.54.0 (Apple Git-157)
 

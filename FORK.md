@@ -47,12 +47,64 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 10 | Hyundai comma-pedal (gas interceptor) longitudinal, non-SCC — INERT until bench-validated | feature (safety C + car) | fork-local; branch `hyundai-pedal-long`, NOT on main |
 | 11 | Hyundai pedal: REMAPPED CAN IDs (0x700/0x701, owner's custom pedal firmware) alongside standard 0x200/0x201 | feature (safety C + car) | fork-local; amends #10, same branch |
 | 12 | Hyundai pedal: low-speed TAKE CONTROL alert gated on longitudinal engagement | fix (selfdrived car events) | fork-local; amends #10 |
-| 13 | Hyundai FCA11 (0x38D) brake-injection TEST safety mode — **TEST-GATED, NOT FOR ROAD USE**, parked/standstill only | research (safety C only) | fork-local; patch `0002`, opendbc branch `fca11-brake-test`, NOT on main's default path |
+| 13 | Hyundai FCA11 (0x38D) brake-injection TEST safety mode — **TEST-GATED, NOT FOR ROAD USE**, parked/standstill only. **v2:** test TX list = CLU11 cancel-only + `0x38D`; camera LKAS11/LFAHDA keep forwarding | research (safety C only) | fork-local; patch `0002` (v2), opendbc branch `fca11-brake-test-v2`, NOT on main's default path |
 | 14 | Hyundai pedal SCE-latch fix: fault-clearing zero frame + escalation to accFaulted, and bursted CLU11 cancel in pedal mode — **offline-tested only, not road-validated** | fix (car layer, Python only) | fork-local; amends #10; patch `0003`, opendbc branch `hyundai-pedal-sce-fix` |
+| 15 | Hyundai pedal tune from route 123: gas cap 0.15 → 0.30 + matching **panda raw ceiling** (A 1110 / B 559), PEDAL_SCALE 0.36, refit hold offset, 0.75/s rise slew — **offline-tested only** | tune + safety C | fork-local; amends #10; patch `0004`, opendbc branch `hyundai-pedal-tune` |
+| 16 | Hyundai pedal: **zero CLU11 TX** in pedal mode, factory-cruise **MAIN lockout**, pause/resume re-engage on a deliberate press, **no auto-resume** — supersedes #14's bursted cancel — **offline-tested only** | fix + feature (safety C + car) | fork-local; amends #10; patch `0005`, opendbc branch `hyundai-pedal-buttons` |
 
 ---
 
 ## Entries
+
+### integration: opendbc series 0002 v2 + 0004 + 0005 — 2026-10-03 (one firmware build; offline-tested, NOT road-validated)
+
+> **Driver notes (read before the next drive):**
+> - **Do NOT arm the factory cruise MAIN button.** It is no longer needed to clear "Enable Adaptive Cruise to Engage".
+>   Pedal-long is available with MAIN off.
+> - **MAIN armed = pedal-long locked out.** Panda drops longitudinal and refuses every engage while the MAIN lamp is on;
+>   openpilot shows "Adaptive Cruise Disabled" (`wrongCruiseMode`). Switch MAIN off to get pedal-long back. Lateral
+>   (MADS) is unaffected either way.
+> - **Pause/resume (the CANCEL position, `CF_Clu_CruiseSwState` 4) re-engages only on a deliberate press:** pressed while
+>   engaged it disengages (as before). Pressed while disengaged, it resumes at the previous set speed, only if brake and
+>   gas stayed released for the whole press plus a 60 ms release debounce, MAIN is off and speed is above the engage
+>   minimum. **There is no auto-resume**: releasing the brake, a timer or speed recovering never re-engages.
+> - **Throttle authority roughly doubles** (cap 15 % → 30 % pedal travel, hard-limited in panda). Expect firmer pulls
+>   uphill and on engage (slewed at 0.75/s). The brake or your foot on the gas still disengages/overrides immediately.
+> - **openpilot no longer sends any CLU11 in pedal mode** (the cause of the pedal SCE latches), so it can't cancel a
+>   factory cruise. That is exactly why MAIN must stay off.
+
+- **What:** the opendbc patch series is now `0001` (pedal) → `0002` **v2** (FCA11 brake test) → `0003` (SCE fix) →
+  `0004` (tune) → `0005` (buttons). It was built as one opendbc branch `pedal-integration` (`f265f992`, tree
+  `38d8bf84`): 00d48a2f + cherry-picks of ab370764, 2634c2e2, 55e0a7f1, f286ba76, ae903fd5. `0001` and `0003` are
+  byte-identical to before. `0002` is regenerated as two commits (v1 + v2 fix) on `00d48a2f`.
+- **Conflicts (both "keep both"):** (1) `0004` × `0002`: the `HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A/_B` defines and
+  `HYUNDAI_FCA11_TEST_MAX_DEC` landed at the same spot in `hyundai.h` (0004 was cut without 0002). (2) `0005` × `0002`:
+  the `hyundai_fca11_brake_test` and `hyundai_factory_main_on`/pause-state declarations landed at the same spot in
+  `hyundai_common.h`. No logic conflicted.
+- **FCA11 test mode (bit 64) still overrides pedal mode:** `hyundai_common_init` forces `hyundai_gas_interceptor =
+  false` when the test is armed, and every 0005 path (MAIN lockout in the EMS16 RX, `pedal_check`, the pause state
+  machine, the SET/RES brake block) is gated on `hyundai_gas_interceptor`, so test mode keeps the stock non-SCC
+  semantics. Its TX list is still exactly CLU11 (cancel only) + `0x38D` check_relay. 0005's pedal TX lists (LKAS11 +
+  LFAHDA + pedal command, no CLU11) and 0004's ceiling coexist in `hyundai.h`. A new test,
+  `test_test_bit_overrides_pedal_buttons` (in 0005), pins it with both bits set: MAIN is not a lockout, CLU11 cancel
+  is TX-able and pause/resume grants nothing.
+- **Supersedes:** #14's FIX 2 (bursted CLU11 cancel) is removed by 0005 (no CLU11 in pedal mode at all). #14's FIX 1
+  (the clear frame + escalation) stays.
+- **Files:** `openpilot/sunnypilot/fork/patches/0002-hyundai-fca11-brake-test.patch` (replaced with v2),
+  `0004-hyundai-pedal-tune.patch`, `0005-hyundai-pedal-buttons.patch` (new);
+  `openpilot/sunnypilot/selfdrive/car/tests/test_pedal_pause_resume.py` (new, from `hyundai-pedal-buttons` ca790223d0).
+  Reports: `car-features/integration-report.md`, `cruise-buttons-report.md`, `drive-123-report.md`,
+  `pedal-tune-verification.md`, `fca11-prereqs.md`.
+- **Verification:** CI-style rehearsal (fresh clone of the pin `f95f996f`, sorted glob, plain `git apply --verbose`
+  from inside the submodule): 5/5 applied, no fuzz, tree `38d8bf84` == integrated branch tip. Results on that tree:
+  `test_gas_interceptor.py` + `test_hyundai.py` + `test_release_build.py` **2063 passed**;
+  `test_pedal_pause_resume.py` + `test_car_specific_events.py` **22 passed**. Cross-feature mutations (auto-resume,
+  ceiling removed/raised, cap reverted, FCA11 0x340/0x485 re-blocked, CLU11 back in either pedal list, test bit no
+  longer overriding pedal mode, MAIN lockout/pause machine leaking into test mode, test TX list swapped) were all
+  killed. Panda `74a0adce` DEBUG build from the rehearsal tree: `panda_h7.bin.signed` sha256 `4bac8d02…28e4f5` (106400 B,
+  `DEV-74a0adce-DEBUG`). The control build of master's series reproduces `61b3165d…`.
+- **Deploy note:** this CHANGES THE FIRMWARE (0004/0005 are safety C). It means one device reflash on the next sync.
+  `cppcheck`/MISRA was not run locally.
 
 ### fix: Hyundai pedal SCE-latch recovery + bursted cruise cancel — 2026-10-03 (amends #10; offline-tested, NOT road-validated)
 
@@ -124,7 +176,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Armed only when:** bit && non-SCC && ICE (not EV/HEV/FCEV, not camera-SCC) && `!hyundai_longitudinal` — the same
   predicate as the gas interceptor, shared in `hyundai_common_init`. While armed, the bit **overrides** the gas interceptor
   (no `0x200`/`0x700` TX). Forced off in `hyundaiLegacy` and `hyundaiCanfd`.
-- **When armed:** TX list = common Hyundai set + `{0x38D, 0, 8, .check_relay = true}`, so the stock camera FCA11 is
+- **When armed (v1; v2 2026-10-03 narrows it to CLU11 cancel-only + `0x38D`, see the integration entry):** TX list = common Hyundai set + `{0x38D, 0, 8, .check_relay = true}`, so the stock camera FCA11 is
   **no longer forwarded** bus 2 → 0 (only one FCA11 source on the car bus). Relay-fault safe on this car: full route logs
   show `0x38D` received ONLY on bus 2 (src 2/128). `stock_ecu_check` only trips when a `check_relay` address is
   received on the TX entry's bus (0). tx_hook for `0x38D` allows `CR_VSM_DecCmd <= HYUNDAI_FCA11_TEST_MAX_DEC` (10 raw
