@@ -26,6 +26,13 @@ MAX_SENSOR_TIME_DIFF = 0.1  # s
 YAWRATE_CROSS_ERR_CHECK_FACTOR = 30
 INPUT_INVALID_LIMIT = 2.0 # 1 (camodo) / 9 (sensor) bad input[s] ignored
 INPUT_INVALID_RECOVERY = 10.0 # ~10 secs to resume after exceeding allowed bad inputs by one
+# sm.all_valid() has no hysteresis of its own, so a single message flagged invalid (e.g. one skipped camera
+# frame yielding a single cameraOdometry message with valid=False) used to drop deviceMotion.inputsOK for a
+# frame, which selfdrived raises as locationdTemporaryError (full-screen take-control alert). Tolerate this
+# many consecutive invalid cameraOdometry polls (20Hz -> a sustained fault is still declared bad ~100ms after
+# the first invalid poll); any valid poll resets the count. The counter starts at this limit so inputs that
+# have never been seen (e.g. at segment start) still read bad from the first poll. See openpilot #38505 / #38929.
+ALL_VALID_INVALID_LIMIT = 3
 POSENET_STD_INITIAL_VALUE = 10.0
 POSENET_STD_HIST_HALF = 20
 CAM_ODO_POSE_DELAY = 0.1 # dependent on the vision model context frames and temporal frequency (current model is 5 fps with 2 context frames)
@@ -35,6 +42,18 @@ CAM_ODO_TRANS_STD_MULT = 4
 
 def calculate_invalid_input_decay(invalid_limit, recovery_time, frequency):
   return (1 - 1 / (2 * invalid_limit)) ** (1 / (recovery_time * frequency))
+
+
+def debounce_all_valid(invalid_cnt: int, all_valid: bool) -> tuple[int, bool]:
+  """Hysteresis for sm.all_valid(): tolerate a few consecutive invalid polls before declaring inputs bad.
+
+  Returns the updated consecutive-invalid count and whether the inputs are still considered valid. Any valid
+  poll resets the count to zero, so a single transient invalid message (e.g. one cameraOdometry with
+  valid=False from a skipped camera frame) no longer flips deviceMotion.inputsOK. A sustained invalid stream
+  is still reported once ALL_VALID_INVALID_LIMIT consecutive polls have been invalid.
+  """
+  invalid_cnt = 0 if all_valid else invalid_cnt + 1
+  return invalid_cnt, invalid_cnt < ALL_VALID_INVALID_LIMIT
 
 
 def init_xyz_measurement(measurement: capnp._DynamicStructBuilder, values: np.ndarray, stds: np.ndarray, valid: bool):
@@ -280,6 +299,9 @@ def main():
   filter_initialized = False
   critcal_services = ["accelerometer", "gyroscope", "cameraOdometry"]
   observation_input_invalid = defaultdict(int)
+  # start at the limit so a never-yet-seen (e.g. extrinsicsCalibration at startup) still reads bad from the
+  # first poll, leaving startup identical to before; any valid poll drops it to zero
+  all_valid_invalid_cnt = ALL_VALID_INVALID_LIMIT
 
   input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critcal_services}
   input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critcal_services}
@@ -329,7 +351,8 @@ def main():
 
     if sm.updated["cameraOdometry"]:
       critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critcal_services)
-      inputs_valid = sm.all_valid() and critical_service_inputs_valid
+      all_valid_invalid_cnt, all_valid = debounce_all_valid(all_valid_invalid_cnt, sm.all_valid())
+      inputs_valid = all_valid and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
       msg = estimator.get_msg(sensors_valid, inputs_valid, filter_initialized)

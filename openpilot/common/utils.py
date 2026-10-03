@@ -261,16 +261,18 @@ def retry(attempts=3, delay=1.0, ignore_failure=False):
   def decorator(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+      last_exc = None
       for _ in range(attempts):
         try:
           return func(*args, **kwargs)
-        except Exception:
+        except Exception as e:
+          last_exc = e
           print(f"{func.__name__} failed, trying again")
           time.sleep(delay)
 
       if ignore_failure:
         print(f"{func.__name__} failed after retry")
       else:
-        raise Exception(f"{func.__name__} failed after retry")
+        raise Exception(f"{func.__name__} failed after retry") from last_exc
     return wrapper
   return decorator

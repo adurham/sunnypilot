@@ -1021,8 +1021,9 @@ class SafetyTest(SafetyTestBase):
               continue
             if {attr, current_test}.issubset({'TestHyundaiLongitudinalSafety', 'TestHyundaiLongitudinalSafetyCameraSCC', 'TestHyundaiSafetyFCEVLong'}):
               continue
+            # (FCA11 brake test shares FCA11 0x38D with HKG longitudinal; both police its content in hyundai_tx_hook)
             base_tests = {'TestHyundaiLongitudinalSafety', 'TestHyundaiLongitudinalSafetyCameraSCC', 'TestHyundaiSafetyFCEVLong',
-                          'TestHyundaiLongitudinalESCCSafety'}
+                          'TestHyundaiLongitudinalESCCSafety', 'TestHyundaiNonSCCFCA11BrakeTestSafety'}
             if any(attr.startswith(test) for test in base_tests) and any(current_test.startswith(test) for test in base_tests):
               continue
             volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')

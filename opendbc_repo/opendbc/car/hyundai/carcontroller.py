@@ -9,6 +9,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParam
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController, cancel_burst_active
 from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
@@ -55,7 +56,7 @@ def process_hud_alert(enabled, fingerprint, hud_control):
 
 
 class CarController(CarControllerBase, EsccCarController, LeadDataCarController, LongitudinalController, MadsCarController,
-                    IntelligentCruiseButtonManagementInterface):
+                    IntelligentCruiseButtonManagementInterface, GasInterceptorCarController):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
     EsccCarController.__init__(self, CP, CP_SP)
@@ -63,7 +64,10 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     LeadDataCarController.__init__(self, CP)
     LongitudinalController.__init__(self, CP, CP_SP)
     IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
+    GasInterceptorCarController.__init__(self, CP, CP_SP, dbc_names)
     self.CAN = CanBus(CP)
+    # comma pedal longitudinal: openpilot long without SCC. Only 0x200 is added; no SCC/FCA/radar messages are sent.
+    self.scc_long = CP.openpilotLongitudinalControl and not CP_SP.enableGasInterceptor
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
     self.angle_limit_counter = 0
@@ -109,7 +113,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     # tester present - w/ no response (keeps relevant ECU disabled)
     if self.frame % 100 == 0 and not ((self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) or self.ESCC.enabled) and \
-            self.CP.openpilotLongitudinalControl:
+            self.scc_long:
       # for longitudinal control, either radar or ADAS driving ECU
       addr, bus = 0x7d0, self.CAN.ECAN if self.CP.flags & HyundaiFlags.CANFD else 0
       if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
@@ -136,6 +140,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       can_sends.extend(self.create_can_msgs(apply_steer_req, apply_torque, torque_fault, set_speed_in_units, accel,
                                             stopping, hud_control, actuators, CS, CC))
 
+      # comma pedal (no-op unless CP_SP.enableGasInterceptor)
+      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame))
+
     # Intelligent Cruise Button Management
     can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN))
 
@@ -161,10 +168,14 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                               self.lkas_icon))
 
     # Button messages
-    if not self.CP.openpilotLongitudinalControl:
+    # With the gas interceptor, SET/RES also engages the factory (non-adaptive) cruise, which would hold speed while
+    # openpilot wants to coast: controlsd requests cancel whenever it is on (pcmCruise=False), so keep cancelling it.
+    if not self.CP.openpilotLongitudinalControl or self.CP_SP.enableGasInterceptor:
       if self.cancel_counter > CANCEL_BUTTON_DELAY_FRAMES:
-        can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
-      elif CC.cruiseControl.resume:
+        # gas interceptor: bursts with pauses, not every frame (CLU11 collisions with the cluster latch pedal faults)
+        if not self.CP_SP.enableGasInterceptor or cancel_burst_active(self.cancel_counter - CANCEL_BUTTON_DELAY_FRAMES - 1):
+          can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
+      elif CC.cruiseControl.resume and not self.CP_SP.enableGasInterceptor:
         # send resume at a max freq of 10Hz
         if (self.frame - self.last_button_frame) * DT_CTRL > 0.1:
           # send 25 messages at a time to increases the likelihood of resume being accepted
@@ -172,7 +183,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
           if (self.frame - self.last_button_frame) * DT_CTRL >= 0.15:
             self.last_button_frame = self.frame
 
-    if self.frame % 2 == 0 and self.CP.openpilotLongitudinalControl:
+    if self.frame % 2 == 0 and self.scc_long:
       # TODO: unclear if this is needed
       jerk = 3.0 if actuators.longControlState == LongCtrlState.pid else 1.0
       use_fca = self.CP.flags & HyundaiFlags.USE_FCA.value
@@ -186,11 +197,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       can_sends.append(hyundaican.create_lfahda_mfc(self.packer, CC.enabled, self.lfa_icon))
 
     # 5 Hz ACC options
-    if self.frame % 20 == 0 and self.CP.openpilotLongitudinalControl:
+    if self.frame % 20 == 0 and self.scc_long:
       can_sends.extend(hyundaican.create_acc_opt(self.packer, self.CP, self.ESCC))
 
     # 2 Hz front radar options
-    if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not self.ESCC.enabled:
+    if self.frame % 50 == 0 and self.scc_long and not self.ESCC.enabled:
       can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
 
     return can_sends

@@ -22,6 +22,9 @@ enum {
   HYUNDAI_PARAM_SP_LONGITUDINAL_MAIN_CRUISE_TOGGLEABLE = 2,
   HYUNDAI_PARAM_SP_HAS_LDA_BUTTON = 4,
   HYUNDAI_PARAM_SP_NON_SCC = 8,
+  HYUNDAI_PARAM_SP_GAS_INTERCEPTOR = 16,  // comma pedal longitudinal (non-SCC ICE only), see hyundai.h
+  HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED = 32,  // pedal on remapped IDs: cmd 0x700 / sensor 0x701 (needs GAS_INTERCEPTOR)
+  HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64,  // TEST-ONLY: parked FCA11 (0x38D) brake-injection research, see hyundai.h
 };
 
 // common state
@@ -61,6 +64,25 @@ bool hyundai_has_lda_button = false;
 
 extern bool hyundai_non_scc;
 bool hyundai_non_scc = false;
+
+// Gas interceptor (comma pedal) longitudinal. Deliberately a separate mode from hyundai_longitudinal:
+// hyundai_longitudinal selects the SCC11/SCC12/SCC14/FCA11/radar-UDS TX allowlist, which pedal-long must NOT get.
+// Pedal-long only adds 0x200 (GAS_COMMAND) TX + 0x201 (GAS_SENSOR) RX, and uses button-based controls_allowed.
+extern bool hyundai_gas_interceptor;
+bool hyundai_gas_interceptor = false;
+
+// Pedal CAN ID dialect, only meaningful while hyundai_gas_interceptor. Standard comma pedal: GAS_COMMAND 0x200 TX /
+// GAS_SENSOR 0x201 RX. Remapped (custom pedal firmware, +0x500 to dodge the 0x200 EMS20 address): 0x700 TX / 0x701 RX.
+// Exactly one dialect is active: the other dialect's command is not in the TX allowlist and its sensor is not parsed.
+extern bool hyundai_gas_interceptor_remapped;
+bool hyundai_gas_interceptor_remapped = false;
+
+// TEST-ONLY, NOT FOR ROAD USE. Parked/standstill research mode for FCA11 (0x38D) brake-message injection on non-SCC
+// cars (forward camera -> ESC). When armed, panda owns FCA11 on bus 0 (the stock camera's FCA11 is no longer forwarded)
+// and openpilot may request a small, capped CR_VSM_DecCmd at standstill only. Mutually exclusive with every
+// openpilot longitudinal mode (SCC-replacement and the gas interceptor). Limits/rules: hyundai_tx_hook.
+extern bool hyundai_fca11_brake_test;
+bool hyundai_fca11_brake_test = false;
 
 static uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
 
@@ -104,6 +126,23 @@ void hyundai_common_init(uint16_t param) {
 #else
   hyundai_longitudinal = false;
 #endif
+
+  // Pedal-long and the FCA11 brake test are only defined for non-SCC ICE cars (EMS16 gas/cruise signals, no SCC ECU to
+  // fight with) and never coexist with SCC-replacement longitudinal. Safety modes that don't support them reset them after init.
+  // cppcheck-suppress knownConditionTrueFalse ; hyundai_longitudinal is always false in non-ALLOW_DEBUG builds
+  const bool non_scc_ice_no_long = hyundai_non_scc && !hyundai_longitudinal && !hyundai_camera_scc &&
+                                   !hyundai_ev_gas_signal && !hyundai_hybrid_gas_signal && !hyundai_fcev_gas_signal;
+  hyundai_gas_interceptor = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_GAS_INTERCEPTOR) && non_scc_ice_no_long;
+  hyundai_gas_interceptor_remapped = hyundai_gas_interceptor &&
+                                     GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED);
+
+  // FCA11 brake test (TEST-ONLY) takes precedence over the pedal: while armed there is no openpilot accel path at all
+  // (no 0x200/0x700 TX).
+  hyundai_fca11_brake_test = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST) && non_scc_ice_no_long;
+  if (hyundai_fca11_brake_test) {
+    hyundai_gas_interceptor = false;
+    hyundai_gas_interceptor_remapped = false;
+  }
 }
 
 void hyundai_common_cruise_state_check(const bool cruise_engaged) {
@@ -111,7 +150,8 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
   // so keep track of user button presses to deny engagement if no interaction
 
   // enter controls on rising edge of ACC and recent user button press, exit controls when ACC off
-  if (!hyundai_longitudinal) {
+  // (openpilot-managed longitudinal, incl. gas interceptor, uses the buttons instead: see hyundai_common_cruise_buttons_check)
+  if (!(hyundai_longitudinal || hyundai_gas_interceptor)) {
     if (cruise_engaged && !cruise_engaged_prev && (hyundai_last_button_interaction < HYUNDAI_PREV_BUTTON_SAMPLES)) {
       controls_allowed = true;
     }
@@ -120,6 +160,11 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
       controls_allowed = false;
     }
     cruise_engaged_prev = cruise_engaged;
+  } else if (hyundai_gas_interceptor) {
+    // Pressing SET/RES on a non-SCC car also engages the factory (non-adaptive) cruise, which would hold speed while
+    // openpilot coasts. Track its state only so openpilot may send CANCEL (hyundai_tx_hook); never grants controls.
+    cruise_engaged_prev = cruise_engaged;
+  } else {
   }
 }
 
@@ -130,7 +175,7 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     hyundai_last_button_interaction = SAFETY_MIN(hyundai_last_button_interaction + 1U, HYUNDAI_PREV_BUTTON_SAMPLES);
   }
 
-  if (hyundai_longitudinal) {
+  if (hyundai_longitudinal || hyundai_gas_interceptor) {
     // enter controls on falling edge of resume or set
     bool set = (cruise_button != HYUNDAI_BTN_SET) && (cruise_button_prev == HYUNDAI_BTN_SET);
     bool res = (cruise_button != HYUNDAI_BTN_RESUME) && (cruise_button_prev == HYUNDAI_BTN_RESUME);
@@ -144,7 +189,9 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     }
 
     // toggle main cruise state on rising edge of main cruise button
-    if (main_button && !main_button_prev && hyundai_longitudinal_main_cruise_toggleable) {
+    // not for the gas interceptor: on non-SCC cars acc_main_on stays sourced from the factory cruise main lamp
+    // (EMS16 CRUISE_LAMP_M), matching what sunnypilot reports as cruiseState.available, so there is a single writer
+    if (main_button && !main_button_prev && hyundai_longitudinal_main_cruise_toggleable && !hyundai_gas_interceptor) {
       acc_main_on = !acc_main_on;
     }
 

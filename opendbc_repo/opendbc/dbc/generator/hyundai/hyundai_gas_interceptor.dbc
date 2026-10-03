@@ -1,0 +1,77 @@
+VERSION ""
+
+
+NS_ :
+    NS_DESC_
+    CM_
+    BA_DEF_
+    BA_
+    VAL_
+    CAT_DEF_
+    CAT_
+    FILTER
+    BA_DEF_DEF_
+    EV_DATA_
+    ENVVAR_DATA_
+    SGTYPE_
+    SGTYPE_VAL_
+    BA_DEF_SGTYPE_
+    BA_SGTYPE_
+    SIG_TYPE_REF_
+    VAL_TABLE_
+    SIG_VALTYPE_
+    SIGTYPE_VALTYPE_
+    BO_TX_BU_
+    BA_DEF_REL_
+    BA_REL_
+    BA_DEF_DEF_REL_
+    BU_SG_REL_
+    BU_EV_REL_
+    BU_BO_REL_
+    SG_MUL_VAL_
+
+BS_:
+
+BU_: XXX EON INTERCEPTOR
+
+CM_ "comma pedal (gas interceptor) messages for Hyundai CAN cars. Kept in its own DBC (separate CANParser/CANPacker)
+because hyundai_can.dbc already defines BO_ 512 EMS20 (FCEV). A second BO_ 512 in the same DBC makes addr_to_msg and
+CANDefine (VAL_ lines are resolved by address) bind to the wrong message, breaking FCEV gear parsing.";
+
+BO_ 512 GAS_COMMAND: 6 EON
+ SG_ GAS_COMMAND : 7|16@0+ (0.11855,-55.126) [0|1] "" INTERCEPTOR
+ SG_ GAS_COMMAND2 : 23|16@0+ (0.239915,-57.632) [0|1] "" INTERCEPTOR
+ SG_ ENABLE : 39|1@0+ (1,0) [0|1] "" INTERCEPTOR
+ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" INTERCEPTOR
+ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" INTERCEPTOR
+
+BO_ 513 GAS_SENSOR: 6 INTERCEPTOR
+ SG_ INTERCEPTOR_GAS : 7|16@0+ (1,0) [0|1] "" EON
+ SG_ INTERCEPTOR_GAS2 : 23|16@0+ (1,0) [0|1] "" EON
+ SG_ STATE : 39|4@0+ (1,0) [0|15] "" EON
+ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" EON
+ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" EON
+
+BO_ 1792 GAS_COMMAND_R: 6 EON
+ SG_ GAS_COMMAND : 7|16@0+ (0.11855,-55.126) [0|1] "" INTERCEPTOR
+ SG_ GAS_COMMAND2 : 23|16@0+ (0.239915,-57.632) [0|1] "" INTERCEPTOR
+ SG_ ENABLE : 39|1@0+ (1,0) [0|1] "" INTERCEPTOR
+ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" INTERCEPTOR
+ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" INTERCEPTOR
+
+BO_ 1793 GAS_SENSOR_R: 6 INTERCEPTOR
+ SG_ INTERCEPTOR_GAS : 7|16@0+ (1,0) [0|1] "" EON
+ SG_ INTERCEPTOR_GAS2 : 23|16@0+ (1,0) [0|1] "" EON
+ SG_ STATE : 39|4@0+ (1,0) [0|15] "" EON
+ SG_ PEDAL_COUNTER : 35|4@0+ (1,0) [0|15] "" EON
+ SG_ PEDAL_CHECKSUM : 47|8@0+ (1,0) [0|255] "" EON
+
+CM_ BO_ 1792 "Same as GAS_COMMAND (512) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 512.";
+CM_ BO_ 1793 "Same as GAS_SENSOR (513) on the REMAPPED pedal ID set (custom pedal firmware, +0x500). Signals must stay identical to 513.";
+CM_ SG_ 512 GAS_COMMAND "Bench-measured for this car (2026-10-03), NOT the Toyota scaling. Physical 0..255 = fraction of pedal travel (0 = foot-off rest, 255 = full press). Track A (GAS_COMMAND) raw = (phys + 55.126)/0.11855 -> 465..2616; track B (GAS_COMMAND2) raw = (phys + 57.632)/0.239915 -> 240..1303. Derivation: the car's two APS tracks relate as B = 0.49413*A + 10.45 (least-squares fit over 342290 real driving pairs; command-range fit n=233520, median |residual| 3.6); endpoints from a driver sweep: rest A=465 B=241, full press A=2616 B=1284. A is mapped linearly rest..full, and B is defined from A through the fitted relation so every commanded pair lies on the car's own curve (APS correlation). The pedal accepted coherent commanded pairs without fault on the bench. The previous Toyota-copied scaling (B_raw = A_raw + 475) sent B ~3.3x too high at the 0.15 cap.";
+CM_ SG_ 512 GAS_COMMAND2 "Track B. Must stay on B = 0.49413*A + 10.45 relative to GAS_COMMAND (see GAS_COMMAND comment).";
+CM_ SG_ 513 INTERCEPTOR_GAS "Raw 12-bit ADC of the DRIVER's pedal (not the pedal output), per comma pedal firmware";
+CM_ SG_ 513 STATE "Pedal firmware state; any non-zero value = fault: pedal ignores GAS_COMMAND and passes the driver's pedal through";
+
+VAL_ 513 STATE 6 "FAULT_INVALID" 5 "FAULT_TIMEOUT" 4 "FAULT_STARTUP" 3 "FAULT_SCE" 2 "FAULT_SEND" 1 "FAULT_BAD_CHECKSUM" 0 "NO_FAULT" ;
+VAL_ 1793 STATE 6 "FAULT_INVALID" 5 "FAULT_TIMEOUT" 4 "FAULT_STARTUP" 3 "FAULT_SCE" 2 "FAULT_SEND" 1 "FAULT_BAD_CHECKSUM" 0 "NO_FAULT" ;

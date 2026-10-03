@@ -10,6 +10,8 @@ from enum import StrEnum
 from opendbc.car import Bus, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+                                                         PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
@@ -19,6 +21,10 @@ class CarStateExt:
     self.CP_SP = CP_SP
 
     self.aBasis = 0.0
+    # GAS_SENSOR STATE, 0 = NO_FAULT. Read by GasInterceptorCarController.create_gas_command (this CarState instance is
+    # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
+    self.interceptor_state = 0
+    self.pedal_fault_monitor = PedalFaultMonitor()
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -73,6 +79,19 @@ class CarStateExt:
         aeb_braking = cp_cruise.vl[aeb_src]["CF_VSM_DecCmdAct"] != 0 or cp_cruise.vl[aeb_src]["FCA_CmdAct"] != 0
         ret.stockFcw = aeb_warning and not aeb_braking
         ret.stockAeb = aeb_warning and aeb_braking
+
+    if self.CP_SP.enableGasInterceptor:
+      # The pedal sits between the driver's pedal and the ECU, so EMS16 CF_Ems_AclAct (set in carstate.py) also sees
+      # openpilot's own command and would latch gasPressed/override. GAS_SENSOR carries only the driver's input;
+      # this assignment runs after carstate.py's and replaces it. Same threshold as panda (hyundai.h).
+      cp_gas = can_parsers[GAS_INTERCEPTOR_BUS_KEY]
+      sensor_msg = get_interceptor_ids(self.CP_SP).sensor_msg  # GAS_SENSOR (0x201) or GAS_SENSOR_R (0x701)
+      ret.gasPressed = get_interceptor_gas(cp_gas, sensor_msg) > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+      self.interceptor_state = int(cp_gas.vl[sensor_msg]["STATE"])
+      # pedal fault the clear frames could not recover (set by the controller on the previous frame): standard cruise
+      # fault -> immediate disengage + alert, so the driver knows openpilot no longer has throttle authority
+      if self.pedal_fault_monitor.escalated:
+        ret.accFaulted = True
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
 

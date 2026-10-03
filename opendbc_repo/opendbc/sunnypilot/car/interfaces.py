@@ -16,8 +16,9 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import HYUNDAI_GAS_INTERCEPTOR_MIN_ENABLE_SPEED
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP, SubaruSafetyFlagsSP
 from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP, TeslaSafetyFlagsSP
 from opendbc.sunnypilot.car.toyota.values import ToyotaFlagsSP
@@ -84,12 +85,61 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
 
   params_dict = {k: v for param in params_list for k, v in param.items()}
 
+  _initialize_hyundai_gas_interceptor(CP, CP_SP, params_dict)
   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params_dict)
   _initialize_coop_steering(CP, CP_SP, params_dict)
   _initialize_tesla_mads_screen_button(CP, CP_SP, params_dict)
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
   _initialize_toyota(CP, CP_SP, params_dict)
+
+
+def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
+  """comma pedal longitudinal on Hyundai non-SCC ICE cars. Requires BOTH a pedal seen on the bus (capability flag set in
+  the Hyundai interface) AND the explicit HyundaiGasInterceptor param. Otherwise CarParams are left untouched.
+
+  CAN ID dialect: standard (0x200/0x201) or remapped (0x700/0x701, custom pedal firmware), from what the fingerprint saw.
+  HyundaiGasInterceptorIDSet = auto (default; standard wins if both were seen) / standard / remapped. A forced dialect
+  whose sensor was NOT seen leaves the feature off (never command a pedal we can't hear)."""
+  if CP.brand != 'hyundai':
+    return
+  if int(params_dict.get("HyundaiGasInterceptor", 0) or 0) != 1:
+    return
+
+  remapped = _select_hyundai_gas_interceptor_remapped(CP_SP, params_dict.get("HyundaiGasInterceptorIDSet"))
+  if remapped is None:
+    return
+
+  if remapped:
+    CP_SP.safetyParam |= HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED
+  CP_SP.enableGasInterceptor = True
+  CP.openpilotLongitudinalControl = True
+  CP.pcmCruise = False  # openpilot owns set speed (CLU11 buttons); panda engages on SET/RES falling edge
+  CP_SP.safetyParam |= HyundaiSafetyFlagsSP.GAS_INTERCEPTOR
+  # Accelerator-only, no brake actuator: no stop-and-go. autoResumeSng is irrelevant (no standstill/resume path).
+  # TBD-BENCH: conservative engage floor; the pedal command is also cut below it (gas_interceptor.py)
+  CP.minEnableSpeed = HYUNDAI_GAS_INTERCEPTOR_MIN_ENABLE_SPEED
+  CP.longitudinalActuatorDelay = 0.5  # TBD-BENCH: pedal -> ECU torque request -> DCT, unmeasured
+
+
+def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
+  """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
+  standard_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED)
+  remapped_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED)
+  if isinstance(id_set, bytes):
+    id_set = id_set.decode(errors="ignore")
+  id_set = str(id_set or "auto").strip().lower()
+
+  if id_set == "standard":
+    return False if standard_seen else None
+  if id_set == "remapped":
+    return True if remapped_seen else None
+  # "auto" and anything unrecognized
+  if standard_seen:
+    return False
+  if remapped_seen:
+    return True
+  return None
 
 
 def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,

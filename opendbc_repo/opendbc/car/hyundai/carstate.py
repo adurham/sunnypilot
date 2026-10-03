@@ -11,6 +11,7 @@ from opendbc.car.interfaces import CarStateBase
 
 from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarStateBase
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC, get_interceptor_ids
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarState
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
@@ -332,7 +333,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     if CP.flags & HyundaiFlags.CANFD:
       return self.get_can_parsers_canfd(CP)
 
-    return {
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
+    if CP_SP.enableGasInterceptor:
+      # comma pedal on bus 0, own DBC (0x200/0x201 collide with EMS20 in hyundai_can). Explicitly subscribed at the
+      # pedal's rate so a dead pedal times out -> canValid=False (CarInterfaceBase ANDs every parser).
+      # Only the active ID dialect's sensor (0x201 GAS_SENSOR or remapped 0x701 GAS_SENSOR_R) is subscribed.
+      parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [(get_interceptor_ids(CP_SP).sensor_msg, 50)], 0)
+    return parsers
