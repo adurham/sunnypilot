@@ -166,6 +166,8 @@ class TestPedalButtons(OpenpilotTestCase):
       op.press(PAUSE, v=v)
       assert op.enabled, v
       assert op.v_set_mph == want, v
+      # stored exactly on a whole mph (so later +/-1 mph steps stay on whole mph), not a rounded km/h value
+      assert op.vch.v_cruise_kph == round(want * CV.MPH_TO_KPH, 1), v
 
   def test_pause_resume_engages_at_any_speed(self):
     # no floor: standstill, crawl, and just below / above the old 25 mph SET/RES floor
@@ -329,6 +331,7 @@ class TestPedalButtons(OpenpilotTestCase):
     op.press(DOWN, LONG, v=26.)  # now at 58.2 mph
     assert op.enabled
     assert op.v_set_mph == 58  # current speed, no extra -1 on release
+    assert op.vch.v_cruise_kph == round(58 * CV.MPH_TO_KPH, 1)  # exactly 58 mph (display unit), not rounded km/h
     op.press(DOWN, 150, v=17.)  # held 3 s: only once per press (no repeated action)
     assert op.v_set_mph == round(17. * CV.MS_TO_MPH)
 
