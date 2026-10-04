@@ -55,10 +55,46 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 18 | Hyundai pedal buttons v2 (route 128): pause/resume = openpilot long on/off at **any speed incl. standstill**, gas no longer blocks the press, panda grant independent of `controls_allowed`; audible SET/RES-below-25-mph and factory-MAIN-lockout alerts; SET at current speed; launch limit 12 % at standstill → full cap by 25 mph; hold-offset table refit — **offline-tested only** | fix + feature (safety C + car + selfdrived) | fork-local; amends #16; patch `0006`, opendbc branch `pedal-buttons-v2` |
 | 19 | Hyundai FCA11 **ROLLING** brake test, TEST-ONLY bit 128 on top of bit 64: capped 0.10 g decel only in a 5-35 km/h D window, latching cut, 1.2 s cap, auto camera hand-back — **TEST-GATED, NOT FOR ROAD USE, inert unless armed by the runner** | research (safety C only) | fork-local; amends #13; patch `0007`, opendbc branch `fca11-rolling` |
 | 20 | Hyundai pedal gas cap 0.30 → **0.35** (owner-approved) + panda raw ceiling A 1218 / B 612 — **offline-tested only** | tune + safety C | fork-local; amends #15; patch `0008` |
+| 21 | Hyundai pedal **timed factory-cruise CANCEL** backstop: if factory cruise goes ACTIVE (EMS16 `CRUISE_LAMP_S`) under engaged openpilot long, panda itself sends CLU11 button-4 frames right after cluster CLU11 frames (4×3 max, 15 ms rate cap, 2 s give-up); CLU11 stays out of the USB TX list; openpilot long is still dropped by the MAIN lockout and alerts **"Cruise Fault"** if factory cruise is still on after 2.5 s. Should rarely fire. **ECM acceptance unproven until the road test** — **offline-tested only** | safety net (safety C + car) | fork-local; amends #16/#18; patch `0009`, opendbc branch `timed-cancel` (fbc82f9c) → `integration-3` |
 
 ---
 
 ## Entries
+
+### integration-3: integration-2 + opendbc 0009 timed factory-cruise cancel — 2026-10-04 (one firmware build; offline-tested, NOT road-validated)
+
+> **Driver notes (read before the next drive):** everything in the integration-2 notes below still applies.
+> - **New backstop, should rarely fire.** If the factory cruise ever becomes *active* while openpilot long is engaged
+>   (the only case seen in the logs is pressing CC/MAIN while engaged), openpilot long drops immediately (as before) and
+>   panda tries to cancel the factory cruise itself with a short pause/resume press on the cluster's behalf.
+> - **If the factory cruise is still on 2.5 s later you get an audible "Cruise Fault"** (immediate disable) and the
+>   alert stays while factory cruise is on. Then **press CC off or brake** — the factory cruise is in control.
+> - **Whether the ECM accepts panda's cancel is unproven until the road test.** Do not rely on it; keep CC/MAIN off.
+
+- **What:** opendbc **`0009`** = `timed-cancel` fbc82f9c (written on pedal-buttons-v2 24ba04bb) cherry-picked onto
+  `integration-2` cc592f1c as opendbc branch `integration-3` (032ded0d), plus one integration test. The car-features
+  file `0007-hyundai-timed-factory-cruise-cancel.patch` is renumbered `0009` and regenerated against cc592f1c.
+  `0001`-`0008` unchanged. No superproject code change: `accFaulted` already maps to the audible immediate disable.
+- **Conflicts:** none (auto-merge in `hyundai.h`, `hyundai_common.h`, `test_hyundai.py`, `test_gas_interceptor.py`).
+  Audited: the cancel is gated on `hyundai_gas_interceptor`, which `hyundai_common_init` forces false with bit 64 (and
+  so 64+128) → inert in both FCA11 test modes; it runs before the v2 MAIN/active lockout on the same EMS16 frame (the
+  lockout still drops long); it never touches the pedal command path or the 0.35 ceiling; pedal TX lists still have
+  no CLU11. New test `test_test_bit_overrides_timed_factory_cancel` (64 and 64+128, with pedal, both dialects):
+  0 self-TX, with a pedal-only positive control of 12.
+- **Test harness:** libsafety gains a recording `can_send`/`can_set_checksum` and `set_heartbeat_engaged`
+  (reset in `init_tests`); the full targeted suites pass with it.
+- **Verification:** CI-style rehearsal from the committed patch blobs (fresh clone of `f95f996f`, sorted glob, plain
+  `git apply --verbose`): 9/9, no fuzz, tree `f312b599` == `integration-3` tip. `test_gas_interceptor` + `test_hyundai`
+  + `test_release_build` **2374 passed**; whole `opendbc/safety/tests` **8252 passed** (harness change breaks nothing);
+  `test_pedal_pause_resume` + `test_car_specific_events` + `fork/tests` **54 passed**. Mutations **29/30** killed (all
+  integration-2 mutants + CLU11 TX outside the trigger ×2, TX without a cluster frame, rate cap removed, parity not
+  recomputed, TX in FCA11 test mode, cancel after the lockout, lockout removed, Cruise Fault removed); the one survivor
+  is integration-2's documented equivalent. MISRA (cppcheck 2.21.0): 0 findings. Panda `74a0adce` DEBUG build:
+  `panda_h7.bin.signed` sha256 `53700ef3…23eb` (109316 B), rebuild and a clean `git archive` build byte-identical.
+- **Correction to integration-2 below:** its recorded firmware sha `1d654e95…` is NOT tree `94f3d9f6`; it reproduces
+  exactly as `94f3d9f6` with the "pedal ceiling removed" mutant applied (the build shared the rehearsal tree with a
+  concurrent mutation run). The correct integration-2 build is `4c7514a7…d80a` (108700 B). Never flash `1d654e95`.
+- **Deploy note:** CHANGES THE FIRMWARE (one reflash). Report: `car-features/integration-3-report.md`.
 
 ### integration-2: opendbc 0006 pedal buttons v2 + 0007 FCA11 rolling test + 0008 cap 0.35, with adaptive follow — 2026-10-04 (one firmware build; offline-tested, NOT road-validated)
 
