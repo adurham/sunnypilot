@@ -61,6 +61,17 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 
 ## Entries
 
+### buttons-v3: opendbc 0010 pedal buttons v3 — 2026-10-04 (one firmware build; offline-tested + independently reviewed GO, NOT road-validated)
+
+- opendbc `buttons-v3` @ 0a19ee8a (on 2258c35a); patch `0010-hyundai-pedal-buttons-v3.patch`; panda firmware sha256 `d0f5396c55a1d5a0b34cb193172a12dd7890d6d2ad65e97fc1b6cca9fba98a1b` (109336 B, two clean `git archive` builds byte-identical; reviewer rebuilt it independently).
+- Wheel buttons (CF_Clu_CruiseSwState up=1, down=2, pause/resume=4, from routes 127/128):
+  - pause/resume is the ONLY on/off for openpilot long, at any speed incl. standstill; deliberate press only, NO auto-resume (panda + openpilot lockstep).
+  - up/down ONLY change the set speed (±1 mph short, +5 long-up), engaged or not; they never engage or disengage (panda grant removed in pedal mode).
+  - long press down (0.5 s) sets the set speed to the current speed, never engages.
+- `minEnableSpeed = -1` (no floor); the 25 mph refusal beep/alert and "Press Set to Engage" removed in pedal mode. The launch limit (12% at standstill -> 35% cap by 25 mph) stays; it caps throttle, it is not an engage floor. openpilot still cannot brake.
+- Driver notes: pause/resume engages at the stored set speed (or current speed rounded to mph if none yet; 5 mph from a stop). A stored speed far BELOW current speed coasts down; a stored speed far ABOVE (e.g. 65 from the highway, resumed at a city light) accelerates toward it, launch-limited. Check the grey MAX number or long-press down first.
+- Verification: opendbc 2408 passed; openpilot 99 passed; mutations 60/61 killed (+6 reviewer mutants killed; the survivor is the known equivalent); 0001-0010 apply clean on pristine f95f996f; MISRA 0 findings. Review: car-features/buttons-v3-review.md.
+
 ### integration-3: integration-2 + opendbc 0009 timed factory-cruise cancel — 2026-10-04 (one firmware build; offline-tested, NOT road-validated)
 
 > **Driver notes (read before the next drive):** everything in the integration-2 notes below still applies.
