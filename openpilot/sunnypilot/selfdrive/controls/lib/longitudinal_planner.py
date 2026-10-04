@@ -16,6 +16,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist 
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
+from openpilot.sunnypilot.fork.adaptive_follow import AdaptiveFollow, is_throttle_only
 
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
@@ -32,6 +33,7 @@ class LongitudinalPlannerSP:
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
+    self.adaptive_follow = AdaptiveFollow(is_throttle_only(CP, CP_SP))
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -42,6 +44,12 @@ class LongitudinalPlannerSP:
       return experimental_mode
 
     return experimental_mode and self.dec.mode() == "blended"
+
+  def get_t_follow(self, sm: messaging.SubMaster, v_ego: float) -> float | None:
+    """Fork adaptive follow distance; None when the AdaptiveFollowDistance param is off (stock T_FOLLOW)."""
+    road_type = str(sm['liveMapDataSP'].roadType)  # unknown (enum default) until mapd publishes
+    lead = sm['radarState'].leadOne
+    return self.adaptive_follow.update(sm['selfdriveState'].personality, v_ego, road_type, lead.present, lead.vLead)
 
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']

@@ -243,6 +243,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ToyotaStopAndGoHack", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     {"DynamicExperimentalControl", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"AdaptiveFollowDistance", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/adaptive_follow.py
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params

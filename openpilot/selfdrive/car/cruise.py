@@ -144,6 +144,11 @@ class VCruiseHelper(VCruiseHelperSP):
       return
 
     initial_experimental_mode = experimental_mode and not dynamic_experimental_control
+    # fork: Hyundai comma pedal. SET engages at the current speed: the experimental-mode 105 km/h floor turned every SET
+    # below 65 mph into a 65 mph set speed (route 00000128: SET at 26 / 30 / 29 mph -> 105 km/h; route 00000127 with
+    # experimental off: SET at 27 mph -> 45 km/h). An accelerator-only car must not be told to run 30+ mph over.
+    if self.CP_SP.enableGasInterceptor:
+      initial_experimental_mode = False
     initial = V_CRUISE_INITIAL_EXPERIMENTAL_MODE if initial_experimental_mode else V_CRUISE_INITIAL
 
     if any(b.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for b in CS.buttonEvents) and self.v_cruise_initialized:

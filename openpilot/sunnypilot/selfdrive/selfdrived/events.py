@@ -73,6 +73,11 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
     Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleLow, .1)
 
 
+def _display_speed(speed_ms: float, metric: bool) -> str:
+  speed = int(round(speed_ms * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)))
+  return f"{speed} {'km/h' if metric else 'mph'}"
+
+
 class EventsSP(EventsBase):
   def __init__(self):
     super().__init__()
@@ -251,6 +256,19 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       AlertStatus.userPrompt, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.1),
+  },
+
+  # fork: Hyundai comma pedal. The factory cruise MAIN is armed, so pedal-long is locked out (wrongCruiseMode). MADS strips
+  # wrongCruiseMode before the alerts are built (so lateral survives), which made this lockout completely silent.
+  EventNameSP.pedalFactoryCruiseLockout: {
+    ET.PERMANENT: NormalPermanentAlert("Factory Cruise Armed: openpilot Long Off", "Press the CC button to turn it off"),
+  },
+
+  EventNameSP.pedalBelowEngageSpeed: {
+    ET.PERMANENT: lambda CP, CS, sm, metric, soft_disable_time, personality: Alert(
+      f"SET/RES needs {_display_speed(CP.minEnableSpeed, metric)}+",
+      "Below that, use the pause/resume button to engage",
+      AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.refuse, 3.),
   },
 
   EventNameSP.bigModelReady: {

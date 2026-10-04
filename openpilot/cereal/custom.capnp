@@ -354,6 +354,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     e2eChime @23;
     laneChangeRoadEdge @24;
     bigModelReady @25;
+    pedalFactoryCruiseLockout @26;  # fork: Hyundai gas interceptor, factory cruise MAIN armed (alert only)
+    pedalBelowEngageSpeed @27;  # fork: Hyundai gas interceptor, SET/RES below minEnableSpeed refused (alert only)
   }
 }
 

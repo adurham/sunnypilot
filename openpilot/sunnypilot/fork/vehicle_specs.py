@@ -48,6 +48,11 @@ FORK_VEHICLE_SPECS: dict[str, dict[str, float]] = {
   "HYUNDAI_ELANTRA_2022_NON_SCC": {
     "mass": 3296 * LB_TO_KG,  # [kg] N DCT curb weight (base Elantra spec: 2800 lb)
     "steerRatio": 12.2,       # [] N rack ratio (base Elantra spec: 12.9)
+    # [] true speed / wheel-speed speed. Measured on routes 00000127+00000128 (46 km): GPS doppler/vEgo 1.0125,
+    # GPS position distance/vEgo distance 1.0131 (127: 1.0118/1.0109), flat across 12-36 m/s. Upstream default 1.0
+    # made the car run ~1.25 % (0.9 mph at 70) faster than the set speed. Tire-dependent: re-measure after a tire
+    # change (fork drive report drive-128-planner-report.md has the method).
+    "wheelSpeedFactor": 1.0125,
   },
 }
 
@@ -60,4 +65,8 @@ def apply_fork_vehicle_specs(CP: structs.CarParams) -> bool:
 
   CP.mass = spec["mass"] + (0. if CP.notCar else STD_CARGO_KG)
   CP.steerRatio = spec["steerRatio"]
+  if "wheelSpeedFactor" in spec:
+    # CarState reads CP.wheelSpeedFactor live (CarStateBase.parse_wheel_speeds) and holds this same CP object, so the
+    # override applies from the first CarState update after card's set_car_specific_params
+    CP.wheelSpeedFactor = spec["wheelSpeedFactor"]
   return True

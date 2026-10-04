@@ -51,10 +51,96 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 14 | Hyundai pedal SCE-latch fix: fault-clearing zero frame + escalation to accFaulted, and bursted CLU11 cancel in pedal mode — **offline-tested only, not road-validated** | fix (car layer, Python only) | fork-local; amends #10; patch `0003`, opendbc branch `hyundai-pedal-sce-fix` |
 | 15 | Hyundai pedal tune from route 123: gas cap 0.15 → 0.30 + matching **panda raw ceiling** (A 1110 / B 559), PEDAL_SCALE 0.36, refit hold offset, 0.75/s rise slew — **offline-tested only** | tune + safety C | fork-local; amends #10; patch `0004`, opendbc branch `hyundai-pedal-tune` |
 | 16 | Hyundai pedal: **zero CLU11 TX** in pedal mode, factory-cruise **MAIN lockout**, pause/resume re-engage on a deliberate press, **no auto-resume** — supersedes #14's bursted cancel — **offline-tested only** | fix + feature (safety C + car) | fork-local; amends #10; patch `0005`, opendbc branch `hyundai-pedal-buttons` |
+| 17 | Adaptive follow distance (road type × speed + throttle-only closing margin), param `AdaptiveFollowDistance` default OFF; Elantra N `wheelSpeedFactor` 1.0125 (GPS-measured) — **offline-tested only** | feature + car-specific | fork-local; branch `planner-tune`, integrated in `integration-2` |
+| 18 | Hyundai pedal buttons v2 (route 128): pause/resume = openpilot long on/off at **any speed incl. standstill**, gas no longer blocks the press, panda grant independent of `controls_allowed`; audible SET/RES-below-25-mph and factory-MAIN-lockout alerts; SET at current speed; launch limit 12 % at standstill → full cap by 25 mph; hold-offset table refit — **offline-tested only** | fix + feature (safety C + car + selfdrived) | fork-local; amends #16; patch `0006`, opendbc branch `pedal-buttons-v2` |
+| 19 | Hyundai FCA11 **ROLLING** brake test, TEST-ONLY bit 128 on top of bit 64: capped 0.10 g decel only in a 5-35 km/h D window, latching cut, 1.2 s cap, auto camera hand-back — **TEST-GATED, NOT FOR ROAD USE, inert unless armed by the runner** | research (safety C only) | fork-local; amends #13; patch `0007`, opendbc branch `fca11-rolling` |
+| 20 | Hyundai pedal gas cap 0.30 → **0.35** (owner-approved) + panda raw ceiling A 1218 / B 612 — **offline-tested only** | tune + safety C | fork-local; amends #15; patch `0008` |
 
 ---
 
 ## Entries
+
+### integration-2: opendbc 0006 pedal buttons v2 + 0007 FCA11 rolling test + 0008 cap 0.35, with adaptive follow — 2026-10-04 (one firmware build; offline-tested, NOT road-validated)
+
+> **Driver notes (read before the next drive):**
+> - **Keep the factory CC/MAIN button OFF.** openpilot long never needs it. If it gets armed, openpilot long turns off
+>   and shows "Factory Cruise Armed: openpilot Long Off"; SET/RES then drive the *factory* cruise, which openpilot can't
+>   cancel. Press CC off (or brake).
+> - **Pause/resume = openpilot long on/off.** Pressed while engaged: off. Pressed while off (foot off the brake): on, at
+>   the previous set speed, **at any speed including a standstill**, also with the foot on the gas (it takes over when
+>   you lift). It **re-engages only on a deliberate press**: releasing the brake, waiting or speed recovering never
+>   turns it on.
+> - **openpilot cannot brake. You brake for every stop** (stopped car, red light, the DCT creeps on its own). From a
+>   stop the pedal is limited to 12 % rising to the full cap by 25 mph; any brake press turns long off immediately.
+> - **SET/RES** still need 25 mph+; below that they now refuse with a sound and point at pause/resume. SET uses the
+>   current speed (no more jump to 65 in experimental mode).
+> - **Throttle cap 30 % → 35 %** of pedal travel (hard-limited in panda), for on-ramps.
+> - **The FCA11 rolling brake-test bit (128) is test-only and inert** unless the parked runner arms it (sp 200 = 8|64|128).
+>   Nothing in normal driving sets it.
+> - Adaptive follow distance is behind `AdaptiveFollowDistance` (default OFF); the wheel-speed correction (1.0125) is
+>   always on for the Elantra N.
+
+- **What:** opendbc series is now `0001` → `0002` v2 → `0003` → `0004` → `0005` → **`0006`** (pedal buttons v2,
+  `pedal-buttons-v2` 24ba04bb) → **`0007`** (FCA11 rolling, `fca11-rolling` d2c8497f) → **`0008`** (cap 0.35). Built
+  as opendbc branch `integration-2` on `f265f992`: 7607261b (cherry-pick 24ba04bb, clean), 4951ec91 (cherry-pick
+  d2c8497f + 1 integration test), cc592f1c (cap). Tree `94f3d9f6`. Superproject side: pedal-buttons-v2 a80ec7360c and
+  planner-tune 52df330beb (both clean on 08f100c21e). `0001`-`0005` unchanged; the two car-features files both named
+  `0006` are now `0006` (buttons v2, body identical) and `0007` (rolling).
+- **Conflicts:** one, `test_hyundai.py` imports (rolling's speed constants vs v2's `PAUSE_RELEASE_SAMPLES`), kept both.
+  `hyundai.h`/`hyundai_common.h` auto-merged; audited: no logic interacts.
+- **Test modes still override the pedal:** `hyundai_common_init` forces `hyundai_gas_interceptor = false` whenever bit
+  64 is armed, and rolling (128) is only honoured on top of an armed 64. So with 64 or 64+128 none of the pedal
+  button/launch/hold/ceiling code runs; TX is CLU11 cancel-only + `0x38D` (no 0x340/0x485, no pedal IDs); the pedal
+  TX lists still have no CLU11. New test `test_rolling_bits_override_pedal_buttons_v2` (64+128+pedal, both dialects):
+  no v2 pause/resume grant (gas held, standstill, stale grant), no pedal command, EMS16 still latches the rolling cut,
+  dynamic camera hand-back intact.
+- **0008 (cap 0.35):** `MAX_INTERCEPTOR_GAS` 0.35; panda `HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A/_B` from the packer exactly
+  as 0004: **A 1218 / B 612** (was 1110 / 559) = 35.0 % of track-A travel; B on the measured line B = 0.494·A + 10.5
+  (612.3). `LOW_SPEED_MAX_GAS` ends at the cap at 25 mph (the SET/RES floor, 11.18 m/s).
+- **Verification:** CI-style rehearsal (fresh clone of `f95f996f`, sorted glob, plain `git apply --verbose`): 8/8, no
+  fuzz, tree `94f3d9f6` == `integration-2` tip. `test_gas_interceptor` + `test_hyundai` + `test_release_build`
+  **2263 passed**; `test_pedal_pause_resume` + `test_car_specific_events` + `fork/tests` **54 passed**. Mutations 20/21
+  killed (auto-resume panda/car, ceiling removed, cap reverted, stale ceiling, launch limit removed, CLU11 back in
+  either pedal list, rolling ceiling/driver cut/hand-backs removed, 0x340 re-blocked in both test lists, test bits not
+  overriding the pedal, pause machine in test mode, adaptive-follow hook and wheelSpeedFactor dropped); one equivalent
+  survivor (128 without 64), its paired mutant killed. MISRA (cppcheck 2.21.0, `test_misra.sh` flags): 0 findings.
+  Panda `74a0adce` DEBUG build: `panda_h7.bin.signed` sha256 `1d654e95…9d6d55` (108668 B), rebuild byte-identical.
+  Rolling/parked runners checked against the firmware constants: match, unchanged.
+- **Deploy note:** CHANGES THE FIRMWARE (one reflash). `params_keys.h` changed → libparams rebuild on sync.
+- Report: `car-features/integration-2-report.md`.
+
+### feature: adaptive follow distance + Elantra N wheel-speed factor — 2026-10-03 (offline-tested, NOT road-validated)
+
+- **Why:** drive report `car-features/drive-128-planner-report.md` (routes 00000127 + 00000128). The car followed at
+  a median **1.0 s** at 26-32 m/s on the interstate (truck ahead) vs the MPC's 1.73 s target, and the cluster read
+  2-3 mph over the set speed. Root causes are mostly in the pedal layer (hold-offset table is 0.1-0.25 m/s^2 too high
+  above 22 m/s; the fix is in the report, for the opendbc patch series). This entry holds the planner/car-param part.
+- **wheelSpeedFactor (fork/vehicle_specs.py):** `HYUNDAI_ELANTRA_2022_NON_SCC` → 1.0125. Over 46 km, GPS doppler/vEgo
+  = 1.0125 and GPS-position distance/vEgo distance = 1.0131, flat over 12-36 m/s, so the car ran 1.25 % (0.9 mph at
+  70) above the set speed in true terms. CarState reads `CP.wheelSpeedFactor` live and shares card's CP object, so
+  the override reaches vEgoRaw (test drives the real Hyundai CarInterface). Tire-dependent: re-measure after tire
+  changes.
+- **Adaptive follow (fork/adaptive_follow.py, param `AdaptiveFollowDistance`, BOOL default 0):**
+  `T = T_FOLLOW(personality) × factor(roadType, vEgo) + closing_margin`. factor = 1.0 urban (never shorter: the car
+  cannot brake), 1.0→1.2 between 20 and 29 m/s on highway/interstate, 1.0→1.1 on unknown. The closing margin applies
+  only to throttle-only cars (Hyundai + `enableGasInterceptor`) with a slower lead: the extra distance to cancel the
+  closing speed by coasting (measured 0.27-0.42 m/s^2, derated) instead of the MPC's 2.5 m/s^2 `COMFORT_BRAKE`, capped
+  at 0.6 s. Output is rate-limited (+1.0 s/s, −0.2 s/s). Hook: `LongitudinalMpc.update(..., t_follow=None)` (the
+  time gap is already runtime param p[4], so OCP/codegen are unchanged); `LongitudinalPlannerSP.get_t_follow`
+  computes it. Param off, or unknown to a stale libparams → returns None → stock T_FOLLOW, byte-identical behaviour.
+  modelV2 leads carry no class/size, so trucks are not singled out.
+- **Files:** `openpilot/sunnypilot/fork/{adaptive_follow.py,vehicle_specs.py}`,
+  `openpilot/sunnypilot/fork/tests/{test_adaptive_follow.py,test_vehicle_specs.py}`,
+  `openpilot/selfdrive/controls/lib/{longitudinal_planner.py,longitudinal_mpc_lib/long_mpc.py}`,
+  `openpilot/sunnypilot/selfdrive/controls/lib/longitudinal_planner.py`, `openpilot/common/params_keys.h`
+  (new key → **libparams rebuild** on sync, already gated by the CI params_keys.h check).
+- **Verification:** `fork/tests` 24 passed, including end to end through the real LongitudinalPlanner + acados MPC
+  (Plant): the MPC receives the override, and the steady gap grows by the expected +10 % T·v. Two mutants were killed
+  (hook dropped, wheelSpeedFactor dropped). Closed-loop replay of the three logged highway follows, through the real
+  planner/MPC with a fitted pedal plant (`car-features/planner128/replay_follow.py`), reproduces the logged gap (sim
+  1.13/1.22 s vs logged 1.20/0.98 s). Upstream `test_following_distance.py` fails 15/18 on an UNMODIFIED tree on this
+  host: Plant's Honda CP has `openpilotLongitudinalControl=False`, so the planner resets every step. This is
+  pre-existing and not caused by this change.
 
 ### integration: opendbc series 0002 v2 + 0004 + 0005 — 2026-10-03 (one firmware build; offline-tested, NOT road-validated)
 

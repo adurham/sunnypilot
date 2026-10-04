@@ -70,4 +70,29 @@ class TestForkVehicleSpecs(OpenpilotTestCase):
   def test_spec_table_only_carries_expected_fields(self):
     for fingerprint, spec in FORK_VEHICLE_SPECS.items():
       with self.subTest(fingerprint=fingerprint):
-        self.assertLessEqual(set(spec), {"mass", "steerRatio"})
+        self.assertLessEqual(set(spec), {"mass", "steerRatio", "wheelSpeedFactor"})
+
+  def test_elantra_n_wheel_speed_factor(self):
+    """GPS-measured (routes 127/128): true speed = 1.0125 x wheel-speed vEgo. Other platforms keep upstream's 1.0."""
+    cp = _car("HYUNDAI_ELANTRA_2022_NON_SCC")
+    cp.wheelSpeedFactor = 1.0  # what CarInterfaceBase.get_std_params sets before the hook runs
+    apply_fork_vehicle_specs(cp)
+    self.assertAlmostEqual(cp.wheelSpeedFactor, 1.0125, places=6)
+
+    other = _car("HYUNDAI_ELANTRA_2021")
+    other.wheelSpeedFactor = 1.0
+    apply_fork_vehicle_specs(other)
+    self.assertAlmostEqual(other.wheelSpeedFactor, 1.0, places=6)
+
+  def test_wheel_speed_factor_reaches_car_state(self):
+    """The override must reach vEgoRaw through the real CarState path (card mutates CP after CarState is built)."""
+    from opendbc.car.hyundai.interface import CarInterface
+    from opendbc.car.hyundai.values import CAR
+    CP = CarInterface.get_non_essential_params(CAR.HYUNDAI_ELANTRA_2022_NON_SCC)
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.HYUNDAI_ELANTRA_2022_NON_SCC)
+    CI = CarInterface(CP, CP_SP)
+    apply_fork_vehicle_specs(CI.CP)
+    self.assertIs(CI.CS.CP, CI.CP)
+    ret = structs.CarState()
+    CI.CS.parse_wheel_speeds(ret, 100., 100., 100., 100.)
+    self.assertAlmostEqual(ret.vEgoRaw, 100. / 3.6 * 1.0125, places=4)

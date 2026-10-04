@@ -64,7 +64,7 @@ class _Openpilot:
     self.k = 0
     self.enable_frames = []
 
-  def step(self, btn=0, brake=False, gas=False, main=False, v=20.):
+  def step(self, btn=0, brake=False, gas=False, main=False, v=20., experimental=False):
     """one 50 Hz CLU11 sample = two 100 Hz openpilot frames"""
     for sub in range(2):
       self.t += int(DT_CTRL * 1e9)
@@ -86,7 +86,7 @@ class _Openpilot:
       # card.py order: update_v_cruise, then initialize on the enable edge using the previous CarState
       self.vch.update_v_cruise(CS, self.enabled, is_metric=True)
       if self.enabled and not self.enabled_prev:
-        self.vch.initialize_v_cruise(self.CS_prev_card, False, False)
+        self.vch.initialize_v_cruise(self.CS_prev_card, experimental, False)
       self.enabled_prev = self.enabled
       self.CS_prev_card = CS
 
@@ -164,26 +164,68 @@ class TestPedalPauseResume(OpenpilotTestCase):
     op.run(50)
     assert not op.enabled
 
-  def test_pause_resume_with_brake_or_gas_pressed(self):
-    for kw in ({"brake": True}, {"gas": True}):
-      op = _Openpilot()
-      self._engaged_at_set_speed(op)
-      op.run(5, brake=True)
-      op.run(5)
-      op.run(5, btn=4, **kw)
-      op.run(5, **kw)
-      op.run(50)
-      assert not op.enabled, kw
-
-  def test_pause_resume_below_min_enable_speed(self):
+  def test_pause_resume_with_brake_pressed(self):
     op = _Openpilot()
     self._engaged_at_set_speed(op)
     op.run(5, brake=True)
-    v_low = op.CP.minEnableSpeed - 1.
-    op.run(10, v=v_low)
-    op.run(5, btn=4, v=v_low)
-    op.run(50, v=v_low)
+    op.run(5)
+    op.run(5, btn=4, brake=True)
+    op.run(5, brake=True)
+    op.run(50)
     assert not op.enabled
+
+  def test_pause_resume_with_gas_pressed_engages(self):
+    # route 00000128 @2152.9/2154.2/2155.7: three presses with the foot on the gas, all refused. Now: engages (override)
+    op = _Openpilot()
+    v_set = self._engaged_at_set_speed(op)
+    op.run(5, brake=True)
+    op.run(5)
+    op.run(5, btn=4, gas=True)
+    op.run(5, gas=True)
+    assert op.enabled and op.vch.v_cruise_kph == v_set
+
+  def test_pause_resume_below_min_enable_speed_engages(self):
+    # green-light resume: deliberate pause/resume press engages below 25 mph and from a standstill
+    for v_low in (0., 3., 9.):
+      op = _Openpilot()
+      v_set = self._engaged_at_set_speed(op)
+      op.run(5, brake=True, v=v_low)   # braked to a stop / to low speed
+      op.run(10, v=v_low)              # brake released (driver's foot moving off the brake)
+      assert not op.enabled            # never by itself
+      op.run(5, btn=4, v=v_low)
+      op.run(5, v=v_low)
+      assert op.enabled, v_low
+      assert op.vch.v_cruise_kph == v_set, v_low
+
+  def test_set_below_min_enable_speed_still_refused(self):
+    op = _Openpilot()
+    for btn in (1, 2):
+      op.run(10, v=8.)
+      op.run(5, btn=btn, v=8.)
+      op.run(20, v=8.)
+      assert not op.enabled, btn
+
+  def test_resume_after_refused_set(self):
+    # route 00000128 @138.3-139.4 s: SET refused at 24.7 mph, then pause/resume -> must engage now (prev set speed)
+    op = _Openpilot()
+    v_set = self._engaged_at_set_speed(op)
+    op.run(5, brake=True, v=11.)
+    op.run(10, v=11.)
+    op.run(5, btn=2, v=11.)
+    op.run(40, v=11.)
+    assert not op.enabled
+    op.run(5, btn=4, v=11.)
+    op.run(5, v=11.)
+    assert op.enabled and op.vch.v_cruise_kph == v_set
+
+  def test_set_in_experimental_mode_uses_current_speed(self):
+    # route 00000128 (experimental mode ON): SET at 26-30 mph gave a 105 km/h (65 mph) set speed. Must be ~vEgo now.
+    op = _Openpilot()
+    op.run(10, v=12., experimental=True)
+    op.run(5, btn=2, v=12., experimental=True)
+    op.run(5, v=12., experimental=True)
+    assert op.enabled
+    assert op.vch.v_cruise_kph == round(12. * 3.6)
 
   def test_pause_while_engaged_disengages(self):
     op = _Openpilot()
