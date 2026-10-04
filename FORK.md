@@ -101,12 +101,19 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
     plan is coasting (< −0.05) and there is no curve evidence (current lat < 1.0 and predicted lat < 1.3). After 2 s
     the SCC targets are released (V_CRUISE_UNSET) and stay latched until curve evidence appears, the raw SCC target
     reaches ≥ vEgo + 1 or long disengages. Cloudlog `scc_throttle_only_guard` on each edge.
+  - Guard arming keys off `CP.brand == "hyundai"` (opendbc has no brand enum/constant; the folder-name string is the
+    contract). `test_adaptive_follow.py::TestThrottleOnlyRealCarParams` builds the real `HYUNDAI_ELANTRA_2022_NON_SCC`
+    interface with the pedal enabled and pins `is_throttle_only() is True` (plus a real Toyota interceptor at False), so
+    an upstream brand rename fails the suite instead of silently disarming the guard on the owner's car.
   - Sizing: on 12e/12f the only uncorroborated SCC coast > 0.7 s is the 12f @699 phantom (5.4 s); legit slowdowns,
     including the 9.5 s 12f @1349 curve, were corroborated from their start.
 - **Adaptive follow:** `HIGHWAY_FACTOR_V` [1.0, 1.2] → [1.0, 1.1] (gap at 29 m/s 1.95 → 1.80 s). Unknown road stays 1.1.
-- **Verification:** opendbc 0001-0011 on pristine f95f996f: 11/11 clean, 0 fuzz, tree == branch tip.
-  `test_gas_interceptor` + `test_hyundai` + `test_release_build` **2412 passed**. openpilot pedal/events/fork/SCC/mapd/
-  longcontrol **170 passed**. Mutations **31/31 killed** (9 pedal/jerk, 4 vision, 8 map, 7 guard, 1 hook, 2 follow). Launch sim through the shipped code: max(aEgo − request) at
+- **Verification (post-review fixes):** opendbc 0001-0011 on pristine f95f996f: 11/11 clean, 0 fuzz, tree == branch tip
+  (patch 0011 sha256 `d2b3c19e509455f95e1283426d00fd55c6282635058e02efe3830fb204bcd9e9`). `test_gas_interceptor` +
+  `test_hyundai` + `test_release_build` **145 passed, 2 skipped, 388 subtests**. openpilot pedal/events/fork/SCC/mapd/
+  longcontrol **172 passed** (63 fork+SCC incl. the 2 new real-CarParams guard tests, 32 mapd, 2 longcontrol, 25 pedal,
+  50 events). Mutations **33/33 killed** (9 pedal/jerk, 4 vision, 8 map, 7 guard, 1 hook, 2 follow, plus the reviewer's
+  3). Launch sim through the shipped code: max(aEgo − request) at
   6-14 m/s +0.44 → +0.03, peak 1.59 → 1.28 m/s².
 - **Report:** `car-features/drive-12ef-fixes-report.md`.
 

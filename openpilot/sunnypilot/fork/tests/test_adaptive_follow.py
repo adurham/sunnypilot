@@ -132,6 +132,49 @@ class TestAdaptiveFollowController(OpenpilotTestCase):
     self.assertFalse(af.is_throttle_only(P(brand="toyota"), P(enableGasInterceptor=True)))
 
 
+# A bus-0 frame set like the owner's car with the comma pedal's sensor frame (0x201) present.
+PEDAL_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8, 0x201: 6}
+
+
+def _real_car_params(candidate: str):
+  """Real CarParams straight from the opendbc interface, with the gas interceptor actually enabled.
+
+  Goes through the fingerprint + opt-in path (no hand-built stubs) so the brand string, the
+  GAS_INTERCEPTOR capability flag and ``enableGasInterceptor`` are exactly what the car produces at runtime.
+  """
+  from opendbc.car.car_helpers import interfaces
+  from opendbc.sunnypilot.car.interfaces import setup_interfaces
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = dict(PEDAL_FINGERPRINT)
+  CarInterface = interfaces[candidate]
+  CP = CarInterface.get_params(candidate, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, candidate, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": 1}])
+  return CP, CP_SP
+
+
+class TestThrottleOnlyRealCarParams(OpenpilotTestCase):
+  """is_throttle_only against the real Hyundai interface, not a stub.
+
+  The guard keys off ``CP.brand == "hyundai"`` (no upstream brand enum/constant exists). If that string is ever
+  renamed, these tests fail loudly instead of the guard silently going inert on the owner's car.
+  """
+
+  def test_real_hyundai_elantra_interceptor_is_throttle_only(self):
+    from opendbc.car.hyundai.values import CAR
+    CP, CP_SP = _real_car_params(CAR.HYUNDAI_ELANTRA_2022_NON_SCC)
+    self.assertTrue(CP_SP.enableGasInterceptor)         # the pedal really got enabled through the interface
+    self.assertEqual(CP.brand, "hyundai")               # the brand string the guard compares against
+    self.assertTrue(af.is_throttle_only(CP, CP_SP))     # ... and the guard is live for it
+
+  def test_real_non_hyundai_interceptor_is_not_throttle_only(self):
+    # a comma-pedal car of another brand keeps its brakes: the guard must stay off, so only the brand decides it
+    from opendbc.car.toyota.values import CAR
+    CP, CP_SP = _real_car_params(CAR.TOYOTA_COROLLA_TSS2)
+    self.assertTrue(CP_SP.enableGasInterceptor)
+    self.assertFalse(af.is_throttle_only(CP, CP_SP))
+
+
 class TestPlannerFollowsOverride(OpenpilotTestCase):
   """End to end through the real LongitudinalPlanner + acados MPC (openpilot's longitudinal_maneuvers Plant).
 
