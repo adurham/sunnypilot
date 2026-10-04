@@ -140,8 +140,9 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   either pedal list, rolling ceiling/driver cut/hand-backs removed, 0x340 re-blocked in both test lists, test bits not
   overriding the pedal, pause machine in test mode, adaptive-follow hook and wheelSpeedFactor dropped); one equivalent
   survivor (128 without 64), its paired mutant killed. MISRA (cppcheck 2.21.0, `test_misra.sh` flags): 0 findings.
-  Panda `74a0adce` DEBUG build: `panda_h7.bin.signed` sha256 `1d654e95…9d6d55` (108668 B), rebuild byte-identical.
-  Rolling/parked runners checked against the firmware constants: match, unchanged.
+  Panda `74a0adce` DEBUG build: `panda_h7.bin.signed` sha256 **`4c7514a7…d80a`** (108700 B). *Corrected 2026-10-04: the
+  originally recorded `1d654e95…9d6d55` (108668 B) was built from the rehearsal tree while a mutation ("pedal ceiling
+  removed") was applied; never flash it.* Rolling/parked runners checked against the firmware constants: match, unchanged.
 - **Deploy note:** CHANGES THE FIRMWARE (one reflash). `params_keys.h` changed → libparams rebuild on sync.
 - Report: `car-features/integration-2-report.md`.
 
