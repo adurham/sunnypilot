@@ -72,7 +72,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 > - **Whether the ECM accepts panda's cancel is unproven until the road test.** Do not rely on it; keep CC/MAIN off.
 
 - **What:** opendbc **`0009`** = `timed-cancel` fbc82f9c (written on pedal-buttons-v2 24ba04bb) cherry-picked onto
-  `integration-2` cc592f1c as opendbc branch `integration-3` (032ded0d), plus one integration test. The car-features
+  `integration-2` cc592f1c as opendbc branch `integration-3` (032ded0d; final 2258c35a after the 3b review fixes), plus one integration test. The car-features
   file `0007-hyundai-timed-factory-cruise-cancel.patch` is renumbered `0009` and regenerated against cc592f1c.
   `0001`-`0008` unchanged. No superproject code change: `accFaulted` already maps to the audible immediate disable.
 - **Conflicts:** none (auto-merge in `hyundai.h`, `hyundai_common.h`, `test_hyundai.py`, `test_gas_interceptor.py`).
@@ -90,7 +90,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   integration-2 mutants + CLU11 TX outside the trigger ×2, TX without a cluster frame, rate cap removed, parity not
   recomputed, TX in FCA11 test mode, cancel after the lockout, lockout removed, Cruise Fault removed); the one survivor
   is integration-2's documented equivalent. MISRA (cppcheck 2.21.0): 0 findings. Panda `74a0adce` DEBUG build:
-  `panda_h7.bin.signed` sha256 `53700ef3…23eb` (109316 B), rebuild and a clean `git archive` build byte-identical.
+  `panda_h7.bin.signed` sha256 `53700ef3…23eb` (109316 B) was the pre-review build; the shipped integration-3b firmware is `49bff2e0…52ea` (109444 B), built from two clean `git archive` exports of 2258c35a, byte-identical.
 - **Correction to integration-2 below:** its recorded firmware sha `1d654e95…` is NOT tree `94f3d9f6`; it reproduces
   exactly as `94f3d9f6` with the "pedal ceiling removed" mutant applied (the build shared the rehearsal tree with a
   concurrent mutation run). The correct integration-2 build is `4c7514a7…d80a` (108700 B). Never flash `1d654e95`.
