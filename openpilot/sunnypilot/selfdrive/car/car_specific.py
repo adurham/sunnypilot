@@ -15,7 +15,6 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 EventName = log.OnroadEvent.EventName
 EventNameSP = custom.OnroadEventSP.EventName
 GearShifter = structs.CarState.GearShifter
-ButtonType = structs.CarState.ButtonEvent.Type
 
 
 class CarSpecificEventsSP:
@@ -44,23 +43,16 @@ class CarSpecificEventsSP:
         events.add(EventName.belowSteerSpeed)
 
     elif self.CP.brand == 'hyundai':
-      # fork: comma pedal longitudinal (accelerator only, no brakes). Upstream car_events has no Hyundai minEnableSpeed
-      # handling, so add it here: block engagement below minEnableSpeed and, once engaged, warn when the car is slow
-      # enough that the pedal command is cut (gas_interceptor.py) -> the driver must take over speed control.
-      # resumeRequired never fires for Hyundai (car_events has no Hyundai branch; non-SCC cruiseState.standstill is False).
+      # fork: comma pedal longitudinal (accelerator only, no brakes), buttons-v3. There is NO engage floor any more
+      # (CP.minEnableSpeed = -1): the pause/resume press is the only on/off and engages at any speed incl. a standstill;
+      # the up/down arrows only change the set speed. So no belowEngageSpeed, no SET/RES refusal alert and no low-speed
+      # takeover warning. The driver remains the brake; any brake press disengages; the launch is throttle-limited
+      # (gas_interceptor.py LOW_SPEED_MAX_GAS).
       if self.CP_SP.enableGasInterceptor:
-        # SET/RES below minEnableSpeed: refused (an unconditional NO_ENTRY would also block MADS lateral-only engagement).
-        # NOT for the deliberate pause/resume press (resumeCruise, pause_resume.py): that is the green-light resume after
-        # a red-light stop and may engage at any speed incl. a standstill (drive-128 report §3). The driver remains the
-        # brake (there is no brake actuator); brake press disengages instantly; the throttle is launch-limited in
-        # gas_interceptor.py (LOW_SPEED_MAX_GAS). No low-speed pedal cut / 'TAKE CONTROL' any more: it made the resume
-        # impossible and the alert would fire for the whole stop-and-go phase.
-        pause_resume = any(be.type == ButtonType.resumeCruise for be in CS.buttonEvents)
-        if CS.vEgo < self.CP.minEnableSpeed and events.has(EventName.buttonEnable) and not pause_resume:
-          events.add(EventName.belowEngageSpeed)
-          # MADS removes belowEngageSpeed from the events after the state machine used it (only the alert is lost), so
-          # without this the refusal was silent (route 00000128 @128.5-138.5 s, 1685-1689 s: 8 silent refusals)
-          events_sp.add(EventNameSP.pedalBelowEngageSpeed)
+        # pause/resume with no set speed yet this drive engages at the current speed (cruise.py initialize_v_cruise),
+        # so selfdrived's 'Press Set to Engage' block (there is no SET-to-engage button in this mode) must not apply
+        if events.has(EventName.resumeBlocked):
+          events.remove(EventName.resumeBlocked)
         # factory cruise MAIN armed: wrongCruiseMode locks pedal-long out, but MADS strips wrongCruiseMode too (route
         # 00000128 @152.5-187.4 s: 35 s locked out, 13 button presses, no alert at all)
         if CS.cruiseState.nonAdaptive:
