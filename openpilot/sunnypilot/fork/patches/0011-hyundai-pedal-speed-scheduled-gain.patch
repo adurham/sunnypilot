@@ -1,0 +1,338 @@
+From 84fb6fef43ae3298d5c1822af089c26f0683dc93 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sun, 4 Oct 2026 14:30:34 -0500
+Subject: [PATCH] hyundai: gas interceptor: speed-scheduled pedal gain + hold
+ table, jerk-based rise limit (drive 12e/12f launch surge)
+
+PEDAL_SCALE 0.36 was the highway gain; the measured gain at 1-15 m/s is 2-3x higher, so launches rode the
+launch ceiling and surged to 2.1-2.5 m/s^2 for a 1.15-1.3 request at 8-12 m/s. Gain now [0.10..0.36] at
+[0..22] m/s with a matching hold table in command units; identical to the old law at >= 22 m/s. The fixed
+0.75/s rise slew becomes 2.0 m/s^3 * gain(v). Cap 0.35, launch ceiling and panda ceiling unchanged.
+
+Hold table standstill anchor 0.04 -> 0. This car has gas-only authority (no brake actuator), so any throttle
+at a standstill against a zero/negative request is uncommanded motion; the old 0.04 commanded ~0.5 m/s^2
+(0.04 * the ~13/unit low-speed gain). A zero/negative request at 0 m/s now commands exactly 0 pedal (the
+ENABLE=0 all-zero frame). The 0-5 m/s hold ramps linearly 0 -> 0.08, so >= 5 m/s and the highway law are
+unchanged, and the pull-away path is untouched (0.10 gain at 0 m/s: 0.5 -> 0.05, 1.0 -> 0.10). Pinned by
+test_standstill_hold_is_zero and test_standstill_zero_request_sends_zero_frame.
+---
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  87 ++++++----
+ .../car/hyundai/tests/test_gas_interceptor.py | 150 ++++++++++++++----
+ 2 files changed, 180 insertions(+), 57 deletions(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index ade8cd28..695b8f03 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -85,45 +85,74 @@ MAX_INTERCEPTOR_GAS = 0.35
+ # an engage floor (there is none in pedal mode, CP.minEnableSpeed = -1) and nothing disengages below it.
+ LOW_SPEED_FULL_GAS_SPEED = 25. * CV.MPH_TO_MS
+ 
+-# accel (m/s^2) -> pedal fraction gain (route 00000123 fit: aEgo(t+0.5 s) = 2.76*cmd + ..., PEDAL_SCALE = 1/2.76), and a
+-# speed-dependent "hold speed" feedforward (m/s^2 equivalent) so a 0 m/s^2 request holds speed instead of coasting.
+-# Hold table refit on routes 00000127 + 00000128 (drive-128 planner report §1.4 + drive-128 buttons report §6): steady
+-# hold (1 s mean |aEgo| < 0.06, pedal state 0, no pedals), residual accel removed at k = 2.76, speed axis = vEgo * 1.0125
+-# (wheelSpeedFactor of superproject branch planner-tune, so the table is right once that lands; without it the
+-# breakpoints sit <= 0.4 m/s off). Measured median offset per band: 15 m/s 0.31, 20 0.31, 25 0.43, 30 0.52, 33-35 0.57
+-# (planner report: 0.25/0.33/0.35/0.43/0.47/0.49/0.53/0.55). The old v^2 table (fit 14-24 m/s, extrapolated) was
+-# +0.10..+0.27 too high above 23 m/s; with the P-only accel loop (kiV = 0) that bias WAS the steady overspeed (+0.235 m/s
+-# at 69.6 mph set) and the 1.0 s truck gap (MPC distance error x gain = bias).
+-PEDAL_SCALE = 0.36
+-HOLD_SPEED_OFFSET_BP = [0., 10., 15., 20., 25., 30., 35.]          # vEgo, m/s
+-HOLD_SPEED_OFFSET_V = [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]     # m/s^2 equivalent
++# accel (m/s^2) -> pedal fraction law: cmd = pedal_scale(v) * accel + hold_cmd(v), clipped to [0, launch ceiling(v)].
++#
++# History: route 00000123 fit a single highway gain, aEgo(t+0.5 s) = 2.76*cmd + ..., PEDAL_SCALE = 1/2.76 = 0.36, with a
++# speed-dependent hold feedforward in m/s^2 (refit on routes 127+128, speed axis vEgo*1.0125 = wheelSpeedFactor).
++# Drives 12e/12f (car-features/drive-12e-12f-report.md §A) showed the scalar gain is correct only above ~22-25 m/s: the
++# measured gain (aEgo per unit pedal, steady pedal, driver + openpilot fits) is 13.0 @1-3, 9.7 @3-6, 8.25/6.7 @6-9,
++# 6.1/5.8 @9-12, 5.05/5.6 @12-15, 3.8/4.0 @15-20, 3.2 @20-25, 2.9 @25-30 m/s. With 0.36 everywhere the launch command was
++# simply the launch ceiling (an open-loop throttle ramp: more speed -> more ceiling -> more speed) and, once it opened at
++# 8-12 m/s, aEgo hit 2.1-2.5 m/s^2 for a 1.15-1.3 request: the pull-away "surge". The longitudinal PID is P/I = 0, so
++# nothing closes the loop on aEgo; the feedforward gain has to be right.
++# Gains are ~10-20 % below the fitted 1/G (margin: a too-low gain under-delivers, it never surges). From 22 m/s up the
++# gain is the old 0.36, and from 20 m/s up the hold command is exactly 0.36 * the old m/s^2 hold table, so the highway
++# law (following, set-speed hold, on-ramp merge at >= 22 m/s) is bit-for-bit the previous one at >= 22 m/s.
++PEDAL_SCALE_HIGHWAY = 0.36
++PEDAL_SCALE_BP = [0., 3., 6., 9., 12., 15., 18., 22.]                  # vEgo, m/s
++PEDAL_SCALE_V = [0.10, 0.10, 0.12, 0.14, 0.165, 0.20, 0.25, PEDAL_SCALE_HIGHWAY]  # pedal fraction per m/s^2
++
++# Hold command (pedal fraction at accel = 0). The standstill anchor is 0: this car has gas-only authority, so a
++# zero/negative request at 0 m/s must command EXACTLY 0 pedal (any hold here is uncommanded motion), and 0-5 m/s ramps
++# linearly from 0 to the 12e/12f fitted 0.08. From 5 m/s: 12e/12f steady-pedal fit (0.08 @5-10, 0.09 @12-15, 0.11-0.12
++# @15-20 m/s). From 20 m/s: PEDAL_SCALE_HIGHWAY * the route-127/128 hold table in m/s^2 (0.34 @20, 0.43 @25, 0.49 @30,
++# 0.56 @35), i.e. 0.1224/0.1548/0.1764/0.2016, unchanged.
++HOLD_SPEED_OFFSET_HIGHWAY_V = [0.34, 0.43, 0.49, 0.56]                 # m/s^2 equivalent at 20/25/30/35 m/s
++HOLD_CMD_BP = [0., 5., 10., 15., 20., 25., 30., 35.]                  # vEgo, m/s
++HOLD_CMD_V = [0., 0.08, 0.085, 0.095, *[PEDAL_SCALE_HIGHWAY * o for o in HOLD_SPEED_OFFSET_HIGHWAY_V]]  # pedal fraction
+ 
+ # Low-speed ceiling on the command (openpilot side; panda keeps its flat raw ceiling at the cap, it has no vEgo). The
+-# pedal is
+-# far stronger at low speed (driver data 127+128, aEgo(+0.3 s) per unit pedal: 0-1 m/s 10.9, 1-3 13.2, 3-6 10.0,
+-# 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6 m/s^2,
+-# 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a full-cap (~3 m/s^2) jump. Full cap from 25 mph
+-# (11.18 m/s).
++# pedal is far stronger at low speed (driver data 127+128, aEgo(+0.3 s) per unit pedal: 0-1 m/s 10.9, 1-3 13.2, 3-6
++# 10.0, 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6
++# m/s^2, 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a full-cap (~3 m/s^2) jump. Full cap from 25 mph
++# (11.18 m/s). With the speed-scheduled gain this is a bound, no longer the active limiter above ~6 m/s (12e/12f: the
++# command sat on it 72-94 % of every launch with the scalar gain). Values unchanged (the driver likes the first metres).
+ LOW_SPEED_MAX_GAS_BP = [0., 5., LOW_SPEED_FULL_GAS_SPEED]  # vEgo, m/s (full cap at 25 mph)
+ LOW_SPEED_MAX_GAS_V = [0.12, 0.20, MAX_INTERCEPTOR_GAS]     # pedal fraction
+ 
+-# Upward slew limit on the pedal command (fraction of travel per second); decreases are immediate. Raising the cap made
+-# the engage step (0 -> cap in one frame, seen 8x on route 00000123) twice as large; 0.75/s = 0 -> 0.35 in 0.47 s,
+-# just above the driver's own p99 pedal rise rate on this car (0.62/s). Units: 100 Hz controller frames (DT_CTRL).
+-PEDAL_RATE_UP = 0.75
+-PEDAL_RATE_UP_PER_FRAME = PEDAL_RATE_UP * DT_CTRL
++# Upward slew limit on the pedal command, as a JERK limit in accel units: rate_up(v) = PEDAL_JERK_UP * pedal_scale(v)
++# pedal fraction per second (0.20/s at a standstill, 0.33/s at 12 m/s, 0.50/s at 18 m/s, 0.72/s from 22 m/s, i.e.
++# about the old fixed 0.75/s on the highway). The old fixed 0.75/s was 0 -> cap in 0.47 s at any speed = +1.0 m/s^2 in
++# ~0.5 s on the 11-19 m/s rolling engagements of 12e/12f (the "jump to max"); 2.0 m/s^3 is the planner's own comfort
++# jerk scale. Decreases stay immediate: there are no brakes, lifting must never be delayed. Units: 100 Hz controller
++# frames (DT_CTRL).
++PEDAL_JERK_UP = 2.0  # m/s^3
++
++
++def get_pedal_scale(v_ego: float) -> float:
++  """Pedal fraction per m/s^2 at this speed."""
++  return float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
++
++
++def get_hold_command(v_ego: float) -> float:
++  """Pedal fraction that holds speed on flat ground (accel request 0)."""
++  return float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
++
++
++def get_pedal_rate_up(v_ego: float) -> float:
++  """Upward slew limit, pedal fraction per second."""
++  return PEDAL_JERK_UP * get_pedal_scale(v_ego)
+ 
+ 
+ def get_pedal_command(accel: float, v_ego: float) -> float:
+   """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake."""
+-  offset = float(np.interp(v_ego, HOLD_SPEED_OFFSET_BP, HOLD_SPEED_OFFSET_V))
+   ceiling = min(MAX_INTERCEPTOR_GAS, float(np.interp(v_ego, LOW_SPEED_MAX_GAS_BP, LOW_SPEED_MAX_GAS_V)))
+-  return float(np.clip(PEDAL_SCALE * (accel + offset), 0., ceiling))
++  return float(np.clip(get_pedal_scale(v_ego) * accel + get_hold_command(v_ego), 0., ceiling))
+ 
+ 
+-def rate_limit_pedal_command(gas: float, gas_last: float) -> float:
+-  """Rise at most PEDAL_RATE_UP_PER_FRAME per controller frame; fall immediately."""
+-  return min(gas, gas_last + PEDAL_RATE_UP_PER_FRAME)
++def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float) -> float:
++  """Rise at most get_pedal_rate_up(v_ego) * DT_CTRL per controller frame; fall immediately."""
++  return min(gas, gas_last + get_pedal_rate_up(v_ego) * DT_CTRL)
+ 
+ 
+ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
+@@ -203,9 +232,9 @@ class GasInterceptorCarController:
+     # also clears any latched pedal fault (pedal firmware)
+     # (no low-speed cut: a pause/resume engagement may start from a standstill; LOW_SPEED_MAX_GAS limits the launch)
+     active = CC.longActive
+-    # slew-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
++    # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+-    self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas) if active else 0.
++    self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas, CS.out.vEgo) if active else 0.
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+     send_slot = frame % 2 == 0
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 3552cd21..05397c60 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -224,20 +224,82 @@ class TestThresholds:
+       assert gi.get_pedal_command(0., v_ego) == pytest.approx(measured_hold, abs=0.012), v_ego
+ 
+   def test_hold_table_pinned(self):
+-    # the corrected table itself; the old v^2 table (0.55 @25, 0.76 @30, flat beyond) was +0.10..+0.27 m/s^2 too high
+-    # above 23 m/s, and with the P-only loop that bias was the steady overspeed and the 1.0 s truck gap on route 128
+-    assert gi.HOLD_SPEED_OFFSET_BP == [0., 10., 15., 20., 25., 30., 35.]
+-    assert gi.HOLD_SPEED_OFFSET_V == [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]
++    # 0 m/s anchors at 0 (no uncommanded motion at a standstill; gas-only authority); from 20 m/s: 0.36 x the
++    # route-127/128 m/s^2 table (unchanged law)
++    assert gi.HOLD_CMD_BP == [0., 5., 10., 15., 20., 25., 30., 35.]
++    assert gi.HOLD_CMD_V == pytest.approx([0., 0.08, 0.085, 0.095, 0.1224, 0.1548, 0.1764, 0.2016])
+     for v in (25., 28., 31., 34.):
+-      assert gi.get_pedal_command(0., v) < 0.36 * (0.55 if v < 26 else 0.70), v  # well below the old table's hold
++      assert gi.get_pedal_command(0., v) < 0.36 * (0.55 if v < 26 else 0.70), v  # well below the old v^2 table's hold
++    # 12e/12f steady-hold fit (drive-12e-12f report §A.3), within +/-0.02 pedal, from 4.5 m/s up (0-5 ramps off the 0 anchor)
++    for v, hold in ((4.5, 0.08), (7.5, 0.09), (10.5, 0.08), (13.5, 0.09), (17.5, 0.115), (22.5, 0.12)):
++      assert gi.get_pedal_command(0., v) == pytest.approx(hold, abs=0.02), v
++
++  def test_standstill_hold_is_zero(self):
++    # The car has gas-only authority: with no brake actuator, any throttle at a standstill against a zero/negative
++    # request is uncommanded motion. The zero/negative-request command at 0 m/s must be EXACTLY 0 pedal, so the send
++    # path emits the ENABLE=0 all-zero frame (create_gas_interceptor_command enables only above 0.001).
++    assert gi.HOLD_CMD_V[0] == 0.
++    assert gi.get_hold_command(0.) == 0.
++    for accel in (-4., -1., -0.5, 0.):
++      assert gi.get_pedal_command(accel, 0.) == 0., accel
++    # and the law stays 0 through the ramp until the request is positive (the 0-5 m/s hold ramps 0 -> 0.08)
++    assert gi.get_hold_command(2.5) == pytest.approx(0.04)
++    # pull-away path untouched: a positive request at 0 m/s still uses the 0.10 gain (ceiling 0.12 binds above ~1.2 m/s^2)
++    assert gi.get_pedal_command(0.5, 0.) == pytest.approx(0.05)
++    assert gi.get_pedal_command(1.0, 0.) == pytest.approx(0.10)
++
++  def test_pedal_scale_table_pinned(self):
++    assert gi.PEDAL_SCALE_BP == [0., 3., 6., 9., 12., 15., 18., 22.]
++    assert gi.PEDAL_SCALE_V == [0.10, 0.10, 0.12, 0.14, 0.165, 0.20, 0.25, 0.36]
++    assert all(b > a for a, b in zip(gi.PEDAL_SCALE_V[1:], gi.PEDAL_SCALE_V[2:], strict=False))  # monotonic rising
++
++  @staticmethod
++  def _old_law(a, v):
++    # the law shipped up to buttons-v3 (0010): scalar 0.36 gain + m/s^2 hold table, same ceiling
++    off = float(np.interp(v, [0., 10., 15., 20., 25., 30., 35.], [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]))
++    ceil = min(gi.MAX_INTERCEPTOR_GAS, float(np.interp(v, gi.LOW_SPEED_MAX_GAS_BP, gi.LOW_SPEED_MAX_GAS_V)))
++    return float(np.clip(0.36 * (a + off), 0., ceil))
++
++  def test_highway_law_unchanged_from_22_mps(self):
++    # following / set-speed hold / highway merges must not change: identical to the previous law at >= 22 m/s
++    for v in np.linspace(22., 40., 37):
++      for a in np.linspace(-1.5, 2.0, 15):
++        assert gi.get_pedal_command(float(a), float(v)) == pytest.approx(self._old_law(float(a), float(v)), abs=1e-9), (a, v)
++
++  # 12e/12f gain fit (aEgo(t+0.5 s) per unit pedal, steady pedal; driver <15 m/s, openpilot >=15 m/s), report §A.3
++  FIT_V = [2., 4.5, 7.5, 10.5, 13.5, 17.5, 22.5, 27.5, 33.]
++  FIT_G = [13.0, 9.7, 7.5, 6.0, 5.3, 3.9, 3.2, 2.9, 2.1]
++
++  def test_launch_no_surge_on_fitted_plant(self):
++    # 12e/12f surge band: a 1.15-1.3 m/s^2 request at 8-12 m/s gave 2.1-2.5 m/s^2. On the fitted gain the new law must
++    # deliver no more than the request (+0.2 m/s^2 slack) wherever the launch ceiling no longer binds, 3-22 m/s ...
++    for v in np.linspace(3., 22., 39):
++      g = float(np.interp(v, self.FIT_V, self.FIT_G))
++      ceiling = min(gi.MAX_INTERCEPTOR_GAS, float(np.interp(v, gi.LOW_SPEED_MAX_GAS_BP, gi.LOW_SPEED_MAX_GAS_V)))
++      for a in (0.5, 0.8, 1.0, 1.2, 1.5):
++        cmd = gi.get_pedal_command(a, float(v))
++        delivered = g * (cmd - gi.get_hold_command(float(v)))
++        if cmd < ceiling - 1e-6:  # the law, not the launch ceiling, sets the command
++          assert delivered <= a + 0.2, (v, a, delivered)
++          # ... and still delivers most of it (an on-ramp keeps its pull) wherever the unchanged 0.35 cap does not bind
++          if v >= 6. and cmd < gi.MAX_INTERCEPTOR_GAS - 1e-6:
++            assert delivered >= 0.7 * a, (v, a, delivered)
++    # the old law on the same (linear, steady-state) plant over-delivers a 1.2 request at 10-12 m/s by >= +0.2 m/s^2
++    # (the road showed +0.8..+1.2; the linear fit under-predicts it, drive-12e-12f report §A.4), the new one does not
++    for v in (10., 11., 12.):
++      g = float(np.interp(v, self.FIT_V, self.FIT_G))
++      old = g * (self._old_law(1.2, v) - gi.get_hold_command(v))
++      new = g * (gi.get_pedal_command(1.2, v) - gi.get_hold_command(v))
++      assert old - 1.2 > 0.2 and new - 1.2 < 0.0, (v, old, new)
+ 
+   def test_onramp_authority_kept(self):
+-    # route 128 on-ramps (335-350, 1699-1704, 1757-1763, 2033-2039 s) ran at 12-20 m/s with the planner asking
+-    # +0.5..1.2 m/s^2: there the new table is equal or higher than the old one, so the fix can't weaken on-ramp pull
+-    old = lambda a, v: float(np.clip(0.36 * (a + np.interp(v, [0, 10, 15, 20, 25, 30], [0, .06, .18, .34, .55, .76])), 0, .3))
+-    for v in (12., 14., 16., 18., 20.):
+-      for a in (0.5, 0.8, 1.2):
+-        assert gi.get_pedal_command(a, v) >= old(a, v) - 1e-9, (a, v)
++    # on-ramps (route 128 at 12-20 m/s, 12f first ramp to 33 m/s): the cap is still reachable when the planner asks
++    # for it, at every speed from 20 mph up, and a +1.0 request on a 4 % climb at 18-20 m/s still exceeds the old
++    # 0.15 cap (route 123 hill)
++    for v in (12., 15., 18., 20., 25., 30.):
++      assert gi.get_pedal_command(2.0, v) == pytest.approx(gi.MAX_INTERCEPTOR_GAS), v  # ACCEL_MAX reaches the cap
++    for v in (17.5, 18.9, 19.9):
++      assert gi.get_pedal_command(1.0, v) > 0.30, v  # route 123 climb: needed ~0.37, old cap 0.15
+ 
+   def test_low_speed_launch_ceiling(self):
+     # pause/resume may engage from a standstill: the launch is limited (pedal ~4-5x stronger per unit at <6 m/s)
+@@ -265,18 +327,33 @@ class TestThresholds:
+       assert a_at_cap(v_ego, grade) > 0., (v_ego, grade)
+ 
+   def test_rate_limit(self):
+-    step = gi.PEDAL_RATE_UP_PER_FRAME
+-    assert step == pytest.approx(gi.PEDAL_RATE_UP * DT_CTRL)
+-    assert gi.rate_limit_pedal_command(0.3, 0.) == pytest.approx(step)  # rise limited
+-    assert gi.rate_limit_pedal_command(0.1, 0.09) == pytest.approx(0.09 + step)
+-    assert gi.rate_limit_pedal_command(0.1, 0.0999) == 0.1               # within one step: exact
+-    assert gi.rate_limit_pedal_command(0., 0.3) == 0.                    # lift is immediate
+-    # 0 -> cap takes cap / rate seconds (0.47 s at 0.35 and 0.75/s)
+-    g, n = 0., 0
+-    while g < gi.MAX_INTERCEPTOR_GAS:
+-      g = gi.rate_limit_pedal_command(gi.MAX_INTERCEPTOR_GAS, g)
+-      n += 1
+-    assert n * DT_CTRL == pytest.approx(gi.MAX_INTERCEPTOR_GAS / gi.PEDAL_RATE_UP, abs=DT_CTRL)
++    # jerk-based: rate_up(v) = 2.0 m/s^3 * pedal_scale(v) pedal/s
++    assert gi.PEDAL_JERK_UP == 2.0
++    for v, rate in ((0., 0.20), (12., 0.33), (18., 0.50), (22., 0.72), (35., 0.72)):
++      assert gi.get_pedal_rate_up(v) == pytest.approx(rate), v
++    for v in (0., 6., 12., 20., 30.):
++      step = gi.get_pedal_rate_up(v) * DT_CTRL
++      assert gi.rate_limit_pedal_command(0.3, 0., v) == pytest.approx(step)  # rise limited
++      assert gi.rate_limit_pedal_command(0.1, 0.09, v) == pytest.approx(min(0.1, 0.09 + step))
++      assert gi.rate_limit_pedal_command(0.1, 0.1 - step / 2, v) == 0.1      # within one step: exact
++      assert gi.rate_limit_pedal_command(0., 0.3, v) == 0.                   # lift is immediate
++    # equivalent accel jerk is 2.0 m/s^3 at every speed (the old fixed 0.75/s was 7.5 m/s^3 at a standstill)
++    for v in np.linspace(0., 40., 41):
++      assert gi.get_pedal_rate_up(float(v)) / gi.get_pedal_scale(float(v)) == pytest.approx(2.0)
++
++  def test_rolling_engage_ramp_time(self):
++    # 12e @112 / 12f @137 / @686: rolling engages at 11-19 m/s jumped 0 -> 0.35 in 0.47 s (+1.0 m/s^2 in ~0.5 s).
++    # Now 0 -> cap takes >= 1.0 s at 12 m/s, ~0.7 s at 18 m/s, and ~0.49 s on the highway (about as before)
++    def ramp_s(v):
++      g, n = 0., 0
++      while g < gi.MAX_INTERCEPTOR_GAS:
++        g = gi.rate_limit_pedal_command(gi.MAX_INTERCEPTOR_GAS, g, v)
++        n += 1
++      return n * DT_CTRL
++    assert ramp_s(12.) == pytest.approx(gi.MAX_INTERCEPTOR_GAS / 0.33, abs=2 * DT_CTRL)
++    assert ramp_s(12.) > 1.0
++    assert ramp_s(18.) == pytest.approx(0.70, abs=0.02)
++    assert ramp_s(30.) == pytest.approx(gi.MAX_INTERCEPTOR_GAS / 0.72, abs=2 * DT_CTRL)
+ 
+   @pytest.mark.parametrize("v_ego", [0., 5., 11.2, 20., 35.])
+   def test_pedal_command_accel_only(self, v_ego):
+@@ -523,17 +600,33 @@ class TestPedalFaultClearEndToEnd:
+     # pause/resume may engage at a standstill: the CarController must command throttle there (no low-speed cut), but
+     # never above the launch ceiling. Through CarInterface.apply -> 0x700 on the wire.
+     CI, CC, CC_SP, ids = self._setup()
+-    out = self._drive(CI, CC, CC_SP, ids, [0] * 80, v_ego=v_ego)
++    out = self._drive(CI, CC, CC_SP, ids, [0] * 200, v_ego=v_ego)
+     a = [_cmd_fields(d) for d, _ in out if d is not None]
+     ceiling = float(np.interp(v_ego, gi.LOW_SPEED_MAX_GAS_BP, gi.LOW_SPEED_MAX_GAS_V))
+-    _, dc, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), ceiling, 0)
++    # accel 1.0 at 0-6 m/s: the speed-scheduled law (0.10-0.12 gain + hold) stays below the launch ceiling at every
++    # speed here (with the 0 m/s hold anchor at 0), so a +1.0 request commands throttle and only stronger requests bind
++    target = min(ceiling, gi.get_pedal_scale(v_ego) * 1.0 + gi.get_hold_command(v_ego))
++    assert target < ceiling
++    _, dc, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), target, 0)
+     assert a[-1][2] == 1 and abs(a[-1][0] - ((dc[0] << 8) | dc[1])) <= 2, (v_ego, a[-1])
+     assert all(x[0] <= ((dc[0] << 8) | dc[1]) + 2 for x in a)
+ 
++  @pytest.mark.parametrize("accel", [0., -1., -2.])
++  def test_standstill_zero_request_sends_zero_frame(self, accel):
++    # Gas-only authority (no brake actuator): engaged at 0 m/s with a zero/negative request, the wire must carry the
++    # all-zero ENABLE=0 frame, never the old 0.04 hold (which would be uncommanded motion at a standstill).
++    CI, _, CC_SP, ids = self._setup()
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = CC.longActive = True
++    CC.actuators.accel = accel
++    out = self._drive(CI, CC.as_reader(), CC_SP, ids, [0] * 60, v_ego=0.)
++    cmds = [_cmd_fields(d) for d, _ in out if d is not None]
++    assert cmds and all(c[:3] == (0, 0, 0) for c in cmds)
++
+   @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
+   def test_clear_frame_on_fault(self, pedal, ids):
+     CI, CC, CC_SP, ids = self._setup(ids, pedal)
+-    # 60 frames healthy (the engage ramp reaches the cap after 47), 20 faulted, 20 healthy
++    # 60 frames healthy (the engage ramp reaches the cap after 49 at 25 m/s), 20 faulted, 20 healthy
+     out = self._drive(CI, CC, CC_SP, ids, [0] * 60 + [3] * 20 + [0] * 20)
+     cmds = [(f, _cmd_fields(d)) for f, (d, _) in enumerate(out) if d is not None]
+     assert all(f % 2 == 0 for f, _ in cmds) and len(cmds) == 50
+@@ -556,10 +649,11 @@ class TestPedalFaultClearEndToEnd:
+     out = self._drive(CI, CC, CC_SP, ids, [0] * 60)
+     a = [_cmd_fields(d)[0] for d, _ in out if d is not None]
+     # first frame is one rate step, not a step to the cap (old behaviour: 0 -> cap in one frame)
+-    _, d1, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.PEDAL_RATE_UP_PER_FRAME, 0)
++    # v_ego 25 m/s (from _drive): jerk limit 2.0 m/s^3 * 0.36 = 0.72/s, 0 -> 0.35 in 0.49 s
++    _, d1, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.get_pedal_rate_up(25.) * DT_CTRL, 0)
+     assert a[0] == (d1[0] << 8) | d1[1]
+     assert all(y >= x for x, y in zip(a, a[1:], strict=False)) and abs(a[-1] - 1218) <= 2
+-    assert sum(abs(x - 1218) > 2 for x in a) == 23  # 0.47 s ramp: 23 send slots below the cap
++    assert sum(abs(x - 1218) > 2 for x in a) == 24  # 0.49 s ramp: 24 send slots below the cap
+     # accel request drops to coast -> the very next frame is the zero frame
+     CC2 = structs.CarControl()
+     CC2.enabled = CC2.latActive = CC2.longActive = True
+-- 
+2.54.0 (Apple Git-157)
+

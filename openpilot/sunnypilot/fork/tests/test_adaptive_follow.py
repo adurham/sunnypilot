@@ -34,11 +34,21 @@ class TestRoadSpeedFactor(OpenpilotTestCase):
   def test_highway_ramps_up_with_speed(self):
     for rt in af.HIGHWAY_ROAD_TYPES:
       self.assertEqual(af.road_speed_factor(rt, 15.), 1.0)
-      self.assertAlmostEqual(af.road_speed_factor(rt, 29.), 1.2)
-      self.assertAlmostEqual(af.road_speed_factor(rt, 35.), 1.2)
+      self.assertAlmostEqual(af.road_speed_factor(rt, 29.), 1.1)
+      self.assertAlmostEqual(af.road_speed_factor(rt, 35.), 1.1)
       vs = [15. + i for i in range(20)]
       fs = [af.road_speed_factor(rt, v) for v in vs]
       self.assertEqual(fs, sorted(fs))
+
+  def test_highway_factor_drive_12f(self):
+    # drive 12f: 1.2 gave 1.97-2.02 s to a car at 29 m/s ("a bit far"); 1.1 -> T 1.60 s, d = T*v + 6 m = 52.3 m = 1.80 s
+    self.assertEqual(af.HIGHWAY_FACTOR_V, [1.0, 1.1])
+    t = af.get_adaptive_t_follow(STANDARD, 29., "interstate", True, 29., True)
+    self.assertAlmostEqual(t, 1.1 * get_T_FOLLOW(STANDARD))
+    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.80, places=2)
+    # never below stock on the highway (no-brake car keeps margin over stock 1.45 s)
+    for v in (15., 20., 25., 29., 35.):
+      self.assertGreaterEqual(af.road_speed_factor("highway", v), 1.0)
 
   def test_unknown_is_between(self):
     self.assertAlmostEqual(af.road_speed_factor("unknown", 30.), 1.1)
@@ -71,7 +81,7 @@ class TestAdaptiveTFollow(OpenpilotTestCase):
     for p in PERSONALITIES:
       with self.subTest(personality=p):
         self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), get_T_FOLLOW(p))
-        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True), 1.2 * get_T_FOLLOW(p))
+        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True), 1.1 * get_T_FOLLOW(p))
 
   def test_closing_margin_only_for_throttle_only_cars_with_a_lead(self):
     with_brakes = af.get_adaptive_t_follow(STANDARD, 30., "highway", True, 28., throttle_only=False)
@@ -97,7 +107,7 @@ class TestAdaptiveFollowController(OpenpilotTestCase):
     self.assertIsNone(a.update(STANDARD, 31., "highway", False, 0.))
     p.enabled = True
     out = [a.update(STANDARD, 31., "highway", False, 0.) for _ in range(int(1. / a.dt) + 1)]
-    self.assertAlmostEqual(out[-1], 1.2 * get_T_FOLLOW(STANDARD))
+    self.assertAlmostEqual(out[-1], 1.1 * get_T_FOLLOW(STANDARD))
 
   def test_rate_limits(self):
     a = af.AdaptiveFollow(True, params=FakeParams())

@@ -15,9 +15,9 @@ What it does
 ``t_follow = get_T_FOLLOW(personality) * road_speed_factor(road_type, v_ego) + closing_margin(...)``, rate-limited.
 
 * road/speed factor: 1.0 in urban (no change in town; shortening the gap on a car that cannot brake is the wrong
-  direction). On highway/interstate it ramps 1.0 -> 1.2 between 20 and 29 m/s (45 -> 65 mph). On unknown road type
-  it ramps 1.0 -> 1.1 on speed alone. modelV2 leads carry no class/size, so trucks cannot be singled out. The bump
-  applies to every lead at highway speed.
+  direction). On highway/interstate it ramps 1.0 -> 1.1 between 20 and 29 m/s (45 -> 65 mph; 1.2 until drive 12f, where
+  it gave a 1.95-2.0 s car gap at 29 m/s). On unknown road type it ramps 1.0 -> 1.1 on speed alone. modelV2 leads
+  carry no class/size, so trucks cannot be singled out. The bump applies to every lead at highway speed.
 * closing margin (throttle-only cars only): extra distance needed to cancel the closing speed by coasting instead of
   braking at ``COMFORT_BRAKE``: ``vrel^2/2 * (1/a_coast(v) - 1/COMFORT_BRAKE)``, as time at v_ego, capped at
   ``MAX_CLOSING_MARGIN``. It only acts while the lead is slower. A same-speed lead that brakes hard gets no extra margin
@@ -34,7 +34,7 @@ PARAM = "AdaptiveFollowDistance"
 
 # road-type x speed multiplier on the personality T_FOLLOW (vEgo m/s)
 HIGHWAY_FACTOR_BP = [20., 29.]
-HIGHWAY_FACTOR_V = [1.0, 1.2]
+HIGHWAY_FACTOR_V = [1.0, 1.1]  # 1.2 -> 1.1 after drive 12f: 1.2 gave a 1.95-2.0 s gap at 29 m/s, "a bit far" behind cars
 UNKNOWN_FACTOR_V = [1.0, 1.1]
 HIGHWAY_ROAD_TYPES = ("highway", "interstate")
 

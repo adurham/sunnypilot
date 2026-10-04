@@ -56,10 +56,59 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 19 | Hyundai FCA11 **ROLLING** brake test, TEST-ONLY bit 128 on top of bit 64: capped 0.10 g decel only in a 5-35 km/h D window, latching cut, 1.2 s cap, auto camera hand-back — **TEST-GATED, NOT FOR ROAD USE, inert unless armed by the runner** | research (safety C only) | fork-local; amends #13; patch `0007`, opendbc branch `fca11-rolling` |
 | 20 | Hyundai pedal gas cap 0.30 → **0.35** (owner-approved) + panda raw ceiling A 1218 / B 612 — **offline-tested only** | tune + safety C | fork-local; amends #15; patch `0008` |
 | 21 | Hyundai pedal **timed factory-cruise CANCEL** backstop: if factory cruise goes ACTIVE (EMS16 `CRUISE_LAMP_S`) under engaged openpilot long, panda itself sends CLU11 button-4 frames right after cluster CLU11 frames (4×3 max, 15 ms rate cap, 2 s give-up); CLU11 stays out of the USB TX list; openpilot long is still dropped by the MAIN lockout and alerts **"Cruise Fault"** if factory cruise is still on after 2.5 s. Should rarely fire. **ECM acceptance unproven until the road test** — **offline-tested only** | safety net (safety C + car) | fork-local; amends #16/#18; patch `0009`, opendbc branch `timed-cancel` (fbc82f9c) → `integration-3` |
+| 22 | Hyundai pedal **speed-scheduled gain** (0.10 → 0.36 over 0-22 m/s) + hold table in command units, **jerk-based** rise limit (2.0 m/s³ × gain) instead of the fixed 0.75/s — identical to the old law at ≥ 22 m/s; cap 0.35, launch ceiling and panda ceiling unchanged (**no firmware change**) — **offline-tested only** | tune (car layer, Python only) | fork-local; amends #15/#20; patch `0011`, opendbc branch `pedal-tune-12ef` |
+| 23 | SCC fixes (fork subclasses, upstream SCC files untouched): vision output floored at MIN_V, no ENTERING below 9 m/s, already-turning → TURNING; map path ignored when > 25 m away or mapd unmatched, `scc_map_diag` cloudlog diagnostics; **throttle-only guard** releases an SCC coast with no lateral corroboration after 2 s. Adaptive follow highway factor 1.2 → 1.1 — **offline-tested only** | fix + safety net (planner) | fork-local (`fork/scc.py`); SCC bug fixes are upstream-PR candidates |
 
 ---
 
 ## Entries
+
+### pedal-tune-12ef: drive 12e/12f fixes — opendbc 0011 pedal gain/jerk + SCC fixes + throttle-only SCC guard + follow 1.1 — 2026-10-04 (offline-tested, NOT road-validated; no firmware change)
+
+> **Driver notes (read before the next drive):**
+> - **Pull-aways are gentler.** Below ~22 m/s (50 mph) openpilot uses much less pedal per m/s² asked (the car is 2-3×
+>   stronger there than on the highway). The 25 mph "surge" should be gone. The cost is about 1.5 s longer to reach
+>   35-45 mph on a cruise-only launch. Engaging while rolling ramps the throttle in over ~1 s at 25 mph (was 0.5 s).
+>   From 50 mph up nothing changes.
+> - **Launching into a turn keeps accelerating.** The vision turn controller no longer engages below 20 mph, and it never
+>   asks for less than 12 mph.
+> - **The phantom on-ramp slowdown is fixed.** The map turn controller ignores its path when mapd is unmatched or the
+>   path is > 25 m away. As a backstop, any turn-controller coast with no curve visible (no lateral accel, none
+>   predicted) is cancelled after 2 s.
+> - **Interstate follow is a bit closer**: ~1.8 s behind a car at 65 mph (was ~2.0 s). Town is unchanged.
+> - **Nothing about brakes/gas-pressed/panda changed.** openpilot still cannot brake.
+
+- **Why:** `car-features/drive-12e-12f-report.md` (routes 0000012e / 0000012f).
+- **0011 (opendbc, `gas_interceptor.py`):** `cmd = pedal_scale(v)·a + hold_cmd(v)`.
+  - `PEDAL_SCALE_V` [0.10, 0.10, 0.12, 0.14, 0.165, 0.20, 0.25, 0.36] at [0, 3, 6, 9, 12, 15, 18, 22] m/s; ~10-20 % under the
+    fitted 1/G.
+  - `HOLD_CMD_V` [0.04, 0.08, 0.085, 0.095, then 0.36 × (0.34, 0.43, 0.49, 0.56)] at [0..35 step 5] m/s.
+  - Rise limit `2.0 m/s³ × pedal_scale(v)` per second (0.20/s at 0, 0.33/s at 12 m/s, 0.72/s from 22 m/s). Decreases
+    stay immediate.
+  - Bit-identical to the 0010 law at ≥ 22 m/s (test). `MAX_INTERCEPTOR_GAS` 0.35, `LOW_SPEED_MAX_GAS`, panda
+    `HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A/_B` and the gas-pressed threshold are untouched. Python only, so **no panda reflash**.
+- **SCC (`openpilot/sunnypilot/fork/scc.py`):** `ForkSCCVision` / `ForkSCCMap` / `ForkSmartCruiseControl` subclass the
+  upstream controllers, so the upstream files are unchanged. The single hook is in
+  `sunnypilot/selfdrive/controls/lib/longitudinal_planner.py` (`self.scc = ForkSmartCruiseControl(is_throttle_only(...))`).
+  `fork/tests/test_scc.py::TestUpstreamHooks` pins the overridden upstream members.
+  - Vision: output = max(upstream, MIN_V) while active; no ENTERING below 9 m/s; ENTERING with current lat ≥ 1.0 →
+    TURNING.
+  - Map: path rejected if nearest point > 25 m, or mapd unmatched (roadType unknown, no speed limit, no name). The
+    rejection is immediate while not turning and needs 1 s while turning (a match blip does not snap back to cruise).
+  - Diagnostics: cloudlog `scc_map_diag` at 1 Hz while engaged plus on state/gate change (points, nearest m/idx,
+    target lat/lon/m, road info, reason). Cloudlog was chosen to avoid a capnp change.
+  - Throttle-only guard (Hyundai + interceptor only). Time accumulates while an SCC output is below vEgo − 0.5, the
+    plan is coasting (< −0.05) and there is no curve evidence (current lat < 1.0 and predicted lat < 1.3). After 2 s
+    the SCC targets are released (V_CRUISE_UNSET) and stay latched until curve evidence appears, the raw SCC target
+    reaches ≥ vEgo + 1 or long disengages. Cloudlog `scc_throttle_only_guard` on each edge.
+  - Sizing: on 12e/12f the only uncorroborated SCC coast > 0.7 s is the 12f @699 phantom (5.4 s); legit slowdowns,
+    including the 9.5 s 12f @1349 curve, were corroborated from their start.
+- **Adaptive follow:** `HIGHWAY_FACTOR_V` [1.0, 1.2] → [1.0, 1.1] (gap at 29 m/s 1.95 → 1.80 s). Unknown road stays 1.1.
+- **Verification:** opendbc 0001-0011 on pristine f95f996f: 11/11 clean, 0 fuzz, tree == branch tip.
+  `test_gas_interceptor` + `test_hyundai` + `test_release_build` **2412 passed**. openpilot pedal/events/fork/SCC/mapd/
+  longcontrol **170 passed**. Mutations **31/31 killed** (9 pedal/jerk, 4 vision, 8 map, 7 guard, 1 hook, 2 follow). Launch sim through the shipped code: max(aEgo − request) at
+  6-14 m/s +0.44 → +0.03, peak 1.59 → 1.28 m/s².
+- **Report:** `car-features/drive-12ef-fixes-report.md`.
 
 ### buttons-v3: opendbc 0010 pedal buttons v3 — 2026-10-04 (one firmware build; offline-tested + independently reviewed GO, NOT road-validated)
 
