@@ -1,0 +1,308 @@
+From 97ae21337eda40bfa1cc39b5b72f63fc96d75d40 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Mon, 5 Oct 2026 14:22:56 -0500
+Subject: [PATCH] hyundai: FCA11 rolling test: raise the decel cap to 0.30 g
+ (rolling mode only) for the scaling test
+
+The rolling test (FCA11_BRAKE_TEST | FCA11_ROLLING_TEST) now accepts CR_VSM_DecCmd up to raw 30 (0.30 g) so a
+dose-response test (0.10 / 0.20 / 0.30 g) can tell whether ESC braking scales with the command. Every other rolling
+guard is unchanged: speed window, gear D, pedal cut, freshness, latched cut, 1.2 s continuous clock, camera hand-back,
+HBA/StopReq block, check_relay. The parked mode (64 alone) keeps 0.10 g; with the test bits unset no decel is
+transmittable at all (unchanged).
+---
+ opendbc/safety/modes/hyundai.h           |  13 +-
+ opendbc/safety/tests/test_hyundai.py     | 152 +++++++++++++++++++++--
+ opendbc/sunnypilot/car/hyundai/values.py |   3 +
+ 3 files changed, 154 insertions(+), 14 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index ee099d70..f530e412 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -93,6 +93,11 @@ static bool hyundai_legacy = false;
+ // FCA11 brake test (HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST): max raw CR_VSM_DecCmd (0.01 g/LSB) -> 0.10 g.
+ // Must equal HYUNDAI_FCA11_TEST_MAX_DEC in opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
+ #define HYUNDAI_FCA11_TEST_MAX_DEC 10
++// ROLLING mode only (64|128): raised cap for the dose-response (scaling) test -> 0.30 g. The parked mode (64 alone) keeps
++// HYUNDAI_FCA11_TEST_MAX_DEC; with the test bits unset every decel stays blocked. Every other rolling guard (window, 1.2 s
++// clock, latched cut, freshness, camera hand-back) is unchanged. Must equal HYUNDAI_FCA11_ROLL_MAX_DEC in
++// opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
++#define HYUNDAI_FCA11_ROLL_MAX_DEC 30
+ 
+ // FCA11 ROLLING test (HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST, only on top of FCA11_BRAKE_TEST). Raw WHL_SPD11 units,
+ // 0.03125 km/h/LSB. Actuation is allowed only while EVERY wheel is above the floor and NO wheel is above the ceiling.
+@@ -498,7 +503,7 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       }
+     } else {
+       // TEST-ONLY (parked brake-injection research). Deliberately independent of controls_allowed: openpilot is
+-      // disengaged during the test. Allowed: CR_VSM_DecCmd <= cap, CF_VSM_Prefill (bit 0), FCA_CmdAct (bit 20),
++      // disengaged during the test. Allowed: CR_VSM_DecCmd <= cap (0.10 g parked, 0.30 g rolling), CF_VSM_Prefill (bit 0), FCA_CmdAct (bit 20),
+       // CF_VSM_DecCmdAct (bit 31). Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2, brake assist),
+       // FCA_StopReq (bit 21), and ANY actuation (decel/act/prefill) while the vehicle is moving.
+       // ROLLING extension (bit 128): the moving/standstill rule is REPLACED by the rolling window: actuation ONLY while
+@@ -509,7 +514,11 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       bool FCA_StopReq = GET_BIT(msg, 21U);
+       bool actuation = (CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct || CF_VSM_Prefill;
+ 
+-      bool violation = (CR_VSM_DecCmd > HYUNDAI_FCA11_TEST_MAX_DEC);
++      int dec_cap = HYUNDAI_FCA11_TEST_MAX_DEC;
++      if (hyundai_fca11_rolling_test) {
++        dec_cap = HYUNDAI_FCA11_ROLL_MAX_DEC;
++      }
++      bool violation = (CR_VSM_DecCmd > dec_cap);
+       violation |= (CF_VSM_HBACmd != 0);
+       violation |= FCA_StopReq;
+       if (hyundai_fca11_rolling_test) {
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index f4fbd301..03802063 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -20,7 +20,7 @@ from opendbc.sunnypilot.car import crc8_pedal, create_gas_interceptor_command
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+                                                          MAX_INTERCEPTOR_GAS, REMAPPED_IDS, STANDARD_IDS
+ 
+-from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC, \
++from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC, HYUNDAI_FCA11_ROLL_MAX_DEC, \
+   HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH, HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+ 
+@@ -1626,6 +1626,7 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+   TX_MSGS = [[0x4F1, 0], [0x38D, 0]]
+   RELAY_MALFUNCTION_ADDRS = {0: (0x38D,)}  # FCA11 only
+   FWD_BLACKLISTED_ADDRS = {2: [0x38D]}
++  DEC_CAP = HYUNDAI_FCA11_TEST_MAX_DEC  # parked mode (64 alone): 0.10 g; the rolling subclass overrides it (0013)
+ 
+   @classmethod
+   def setUpClass(cls):
+@@ -1654,14 +1655,15 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+ 
+   def test_fca11_helper_raw_decel(self):
+     # guards the helper: dec maps to the raw byte the panda reads (data[1])
+-    for dec in (0, 1, HYUNDAI_FCA11_TEST_MAX_DEC, HYUNDAI_FCA11_TEST_MAX_DEC + 1, 255):
++    for dec in (0, 1, self.DEC_CAP, self.DEC_CAP + 1, 255):
+       msg = self._fca11(dec=dec)  # keep the owning cffi pointer alive while reading it
+       self.assertEqual(dec, msg[0].data[1])
+ 
+   def test_c_python_cap_match(self):
+-    # boundary is the C HYUNDAI_FCA11_TEST_MAX_DEC: fails unless it equals the Python mirror
+-    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC)))
+-    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC + 1)))
++    # boundary is the C cap of this mode (HYUNDAI_FCA11_TEST_MAX_DEC parked, HYUNDAI_FCA11_ROLL_MAX_DEC rolling): fails
++    # unless it equals the Python mirror
++    self.assertTrue(self._tx(self._brake_cmd(self.DEC_CAP)))
++    self.assertFalse(self._tx(self._brake_cmd(self.DEC_CAP + 1)))
+ 
+   def test_decel_zero_allowed(self):
+     self.assertTrue(self._tx(self._fca11()))
+@@ -1670,14 +1672,14 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+     # independent of controls_allowed: openpilot is disengaged during the parked test
+     for controls_allowed in (False, True):
+       self.safety.set_controls_allowed(controls_allowed)
+-      for dec in range(HYUNDAI_FCA11_TEST_MAX_DEC + 1):
++      for dec in range(self.DEC_CAP + 1):
+         self.assertTrue(self._tx(self._fca11(dec=dec)), dec)
+         self.assertTrue(self._tx(self._brake_cmd(dec)), dec)
+       for sig in ("prefill", "cmd_act", "dec_cmd_act"):
+         self.assertTrue(self._tx(self._fca11(**{sig: 1})), sig)
+ 
+   def test_decel_over_cap_blocked(self):
+-    for dec in range(HYUNDAI_FCA11_TEST_MAX_DEC + 1, 256):
++    for dec in range(self.DEC_CAP + 1, 256):
+       self.assertFalse(self._tx(self._fca11(dec=dec)), dec)
+       self.assertFalse(self._tx(self._brake_cmd(dec)), dec)
+ 
+@@ -1909,6 +1911,7 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+   FWD_BLACKLISTED_ADDRS = {}
+   RAW_PER_KPH = 32  # WHL_SPD11 0.03125 km/h/LSB
+   IN_WINDOW_RAW = 20 * 32  # 20 km/h
++  DEC_CAP = HYUNDAI_FCA11_ROLL_MAX_DEC  # 0013: rolling mode cap 0.30 g (parked stays HYUNDAI_FCA11_TEST_MAX_DEC)
+   cnt_lvr = 0
+ 
+   @classmethod
+@@ -1971,7 +1974,7 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+       with self.subTest(raw=raw):
+         self._rearm()
+         self._open_window(raw)
+-        self.assertEqual(ok, self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC)))
++        self.assertEqual(ok, self._tx(self._brake_cmd(self.DEC_CAP)))
+ 
+   def test_standstill_blocked(self):
+     # the rolling mode never actuates at standstill (that is the parked mode's job, and stopping the car is not allowed)
+@@ -1984,7 +1987,7 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+   def test_no_actuation_while_moving(self):
+     # parked-mode rule replaced: inside the window actuation is allowed while moving
+     self.assertTrue(self.safety.get_vehicle_moving())
+-    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC)))
++    self.assertTrue(self._tx(self._brake_cmd(self.DEC_CAP)))
+ 
+   def test_each_wheel_policed(self):
+     lo = HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH * self.RAW_PER_KPH
+@@ -2077,8 +2080,8 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+     self._assert_cut_latched()
+ 
+   def test_cut_keeps_cap_hba_stopreq(self):
+-    # inside the window the parked-mode limits still apply
+-    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC + 1)))
++    # inside the window the cap (0.30 g rolling), HBA and StopReq limits still apply
++    self.assertFalse(self._tx(self._brake_cmd(self.DEC_CAP + 1)))
+     self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, hba=1, cmd_act=1, dec_cmd_act=1)))
+     self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, cmd_act=1, dec_cmd_act=1, stop_req=1)))
+ 
+@@ -2123,7 +2126,7 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+   def test_rejected_tx_does_not_block_camera(self):
+     self._rearm()
+     self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC + 1)))
++    self.assertFalse(self._tx(self._brake_cmd(self.DEC_CAP + 1)))
+     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
+ 
+   def test_camera_request_hands_back(self):
+@@ -2162,6 +2165,131 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+     self.assertTrue(self._tx(self._fca11()))        # a passive frame ends the actuation ...
+     self.assertTrue(self._tx(self._brake_cmd(5)))   # ... and a new one may start
+ 
++
++  # *** 0013: rolling-mode decel cap 0.30 g (scaling test); parked and normal modes unchanged ***
++
++  def test_rolling_cap_c_python_match(self):
++    hm = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai.h")).read()
++    m = re.search(r"#define\s+HYUNDAI_FCA11_ROLL_MAX_DEC\s+(\d+)", hm)
++    self.assertIsNotNone(m)
++    self.assertEqual(HYUNDAI_FCA11_ROLL_MAX_DEC, int(m.group(1)))
++    self.assertEqual(30, HYUNDAI_FCA11_ROLL_MAX_DEC)   # 0.30 g, the owner-set scaling-test ceiling
++    self.assertEqual(10, HYUNDAI_FCA11_TEST_MAX_DEC)   # the parked cap is NOT raised
++
++  def test_rolling_cap_boundary_all_shapes(self):
++    # 0.30 accepted, 0.31 rejected, for every frame shape the runner sends (variant A, variant B, full brake_cmd)
++    shapes = ({"warn": 2, "dec_cmd_act": 1, "prefill": 1}, {"warn": 3, "cmd_act": 1, "prefill": 1},
++              {"prefill": 1, "cmd_act": 1, "dec_cmd_act": 1}, {})
++    for kw in shapes:
++      for dec, ok in ((HYUNDAI_FCA11_TEST_MAX_DEC + 1, True), (20, True), (30, True), (31, False), (255, False)):
++        with self.subTest(kw=kw, dec=dec):
++          self._rearm()
++          self._open_window()
++          self.assertEqual(ok, self._tx(self._fca11(dec=dec, **kw)))
++          if not ok:
++            self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))  # a rejected frame never blocks the camera
++
++  def test_rolling_cap_keeps_window(self):
++    # the raised cap opens NOTHING else: 0.30 g outside the window / at standstill / after a cut is still rejected
++    lo = HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH * self.RAW_PER_KPH
++    hi = HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH * self.RAW_PER_KPH
++    for raw in (0, lo, hi + 1):
++      with self.subTest(raw=raw):
++        self._rearm()
++        self._open_window(raw)
++        self.assertFalse(self._tx(self._brake_cmd(30)))
++    for c in ("brake", "gas", "gear"):
++      with self.subTest(cut=c):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._brake_cmd(30)))
++        {"brake": lambda: self._rx(self._user_brake_msg(True)), "gas": lambda: self._rx(self._user_gas_msg(1)),
++         "gear": lambda: self._rx(self._gear_msg(4))}[c]()
++        self.assertFalse(self._tx(self._brake_cmd(30)))
++        self._open_window()
++        self.assertFalse(self._tx(self._brake_cmd(30)))   # latched until re-arm
++
++  def test_rolling_cap_keeps_freshness(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(30)))
++    self.safety.set_timer(1000000 + 100001)
++    self.assertFalse(self._tx(self._brake_cmd(30)))
++
++  def test_rolling_cap_keeps_clock(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))       # lead-in starts the episode
++    self.safety.set_timer(1000000 + 1200000)
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(dec=30, prefill=1, cmd_act=1, warn=3)))
++    self.safety.set_timer(1000000 + 1200001)
++    self._open_window()
++    self.assertFalse(self._tx(self._fca11(dec=30, prefill=1, cmd_act=1, warn=3)))
++
++  def test_rolling_cap_keeps_camera_handback(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(30)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    self._rx(self._cam_fca11(CF_VSM_Warn=1))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self.assertFalse(self._tx(self._brake_cmd(30)))
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  def test_rolling_cap_camera_handback_each_strength(self):
++    # a REAL camera request takes FCA11 back on the next frame at EVERY commanded strength, incl. above the old 0.10 cap
++    for dec in (20, 30):
++      with self.subTest(dec=dec):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._fca11(dec=dec, prefill=1, cmd_act=1, warn=3)))
++        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++        self._rx(self._cam_fca11(CR_VSM_DecCmd=0.5))
++        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))           # camera forwarded at once
++        self.assertFalse(self._tx(self._fca11(dec=dec, prefill=1, cmd_act=1, warn=3)))
++        self.assertFalse(self._tx(self._fca11()))                           # not even a passive frame
++        self._open_window()
++        self._rx(self._cam_fca11())
++        self.assertFalse(self._tx(self._fca11(dec=dec, prefill=1, cmd_act=1, warn=3)))   # latched until re-arm
++
++  def test_rolling_cap_camera_request_mid_pulse_030(self):
++    # 0.30 g pulse running (lead-in + 0.3 s into the actuation), the camera raises its own warning: next frame refused
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    for k in range(1, 9):
++      self.safety.set_timer(1000000 + 500000 + k * 40000)
++      self._open_window()
++      self.assertTrue(self._tx(self._fca11(dec=30, prefill=1, cmd_act=1, warn=3)), k)
++    self._rx(self._cam_fca11(CF_VSM_Warn=2))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self.assertFalse(self._tx(self._fca11(dec=30, prefill=1, cmd_act=1, warn=3)))
++    self.assertFalse(self._tx(self._fca11(dec=20, prefill=1, cmd_act=1, warn=3)))
++    self.assertFalse(self._tx(self._fca11()))
++
++  def test_rolling_cap_not_in_parked_mode(self):
++    # 64 alone (parked): the cap stays 0.10 g at standstill
++    self._rearm(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST | self.SAFETY_PARAM_SP)
++    self._rx(self._wheel_msg(0))
++    self._rx(self._speed_msg(0))
++    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_TEST_MAX_DEC)))
++    for dec in (HYUNDAI_FCA11_TEST_MAX_DEC + 1, 20, 30):
++      self.assertFalse(self._tx(self._brake_cmd(dec)), dec)
++      self.assertFalse(self._tx(self._fca11(dec=dec)), dec)
++
++  def test_rolling_cap_not_with_bits_unset(self):
++    # no test bits (normal driving) and 128 without 64: no decel of any size is ever transmittable
++    for sp in (HyundaiSafetyFlagsSP.NON_SCC | self.SAFETY_PARAM_SP,
++               HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.FCA11_ROLLING_TEST | self.SAFETY_PARAM_SP):
++      for dec in (1, HYUNDAI_FCA11_TEST_MAX_DEC, 30):
++        with self.subTest(sp=sp, dec=dec):
++          self._rearm(sp)
++          self._open_window()
++          self.safety.set_controls_allowed(True)
++          self.assertFalse(self._tx(self._brake_cmd(dec)))
++          self.assertFalse(self._tx(self._fca11(dec=dec)))
++
+   # *** CF_VSM_Warn (dash FCW) is policed like actuation in the rolling mode ***
+ 
+   def test_warn_helper_bits(self):
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index 9d11863a..ba892880 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -30,6 +30,9 @@ class HyundaiSafetyFlagsSP:
+ 
+ # Raw CR_VSM_DecCmd cap (0.01 g/LSB) for FCA11_BRAKE_TEST; must equal HYUNDAI_FCA11_TEST_MAX_DEC in safety/modes/hyundai.h
+ HYUNDAI_FCA11_TEST_MAX_DEC = 10
++# Raw CR_VSM_DecCmd cap for the ROLLING mode (FCA11_BRAKE_TEST | FCA11_ROLLING_TEST) only: 0.30 g for the scaling test.
++# Must equal HYUNDAI_FCA11_ROLL_MAX_DEC in safety/modes/hyundai.h. The parked mode keeps HYUNDAI_FCA11_TEST_MAX_DEC.
++HYUNDAI_FCA11_ROLL_MAX_DEC = 30
+ # FCA11_ROLLING_TEST speed window (km/h, per wheel); must equal HYUNDAI_FCA11_ROLL_MIN_SPEED / _MAX_SPEED (raw / 32) in
+ # safety/modes/hyundai.h (unit tests pin both boundaries)
+ HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH = 5
+-- 
+2.54.0 (Apple Git-157)
+

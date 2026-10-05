@@ -62,6 +62,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 25 | Hyundai FCA11 rolling test **Warn gating**: in the rolling mode (bit 128, armed only by the runner) a `CF_VSM_Warn` > 0 FCA11 frame is policed like actuation — same 5-35 km/h D window, latched cut and fresh-input rules, and it shares the 1.2 s episode clock. **Inert unless bit 128 is armed**; parked mode and normal driving byte-for-byte unchanged — **TEST-GATED, offline-tested only** | safety C (tightening) | fork-local; amends #19; patch `0012`, opendbc branch `fca11-warn-0012` |
 | 26 | ESC read **standstill fix** (amends #24): "stationary" = Park + fewer than 2 wheels above 12 LSB (0.375 km/h, opendbc's Hyundai STANDSTILL_THRESHOLD) and no wheel above 96 LSB, instead of all wheels exactly 0 (parked single-wheel noise skipped the read on the car). Same definition for the pre-check and every per-frame check; a pre-check skip no longer uses up the ignition (≤ 3 tries per ignition, ≤ 3 s settle wait in Park) | diagnostics | fork-local (`fork/esc_diag.py`) |
 | 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, **enter extended session (10 03 — the vendor's own write flow, decoded GIT VariantCodingTable)**, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`) |
+| 28 | Hyundai FCA11 rolling test **decel cap 0.10 g → 0.30 g** for the dose-response (scaling) test, **rolling mode only** (bits 64\|128, armed only by the runner); window, 1.2 s clock, latched cut, freshness, camera hand-back, HBA/StopReq block and check_relay unchanged; parked mode keeps 0.10 g; with the bits unset no decel is transmittable — **TEST-GATED, offline-tested only** | safety C (test-mode widening) | fork-local; amends #19/#25; patch `0013`, opendbc branch `fca11-scale-0013` |
 
 ---
 
@@ -135,6 +136,20 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   rule boundaries, the TX-site check alone, mid-read creep and noise, the bounded settle wait, a skip not using up
   the ignition, and the per-ignition skip bound. Mutation proof: `car-features/auto-esc-mutation.py` **40/40 killed**
   (10 new mutants for this change).
+
+### fca11-scale-0013: opendbc 0013 FCA11 rolling-test decel cap 0.30 g — 2026-10-05 (offline-tested; one firmware build; NOT road-run)
+
+- **Why:** the 2026-10-05 rolling A/B run (`roll-20261005T190845Z`) made the ESC brake (FCA_ACK 0→1, BrakeLight 0→1,
+  −0.39 / −0.81 m/s² extra) but both passes used 0.10 g, so it cannot say whether the braking scales with the command.
+- **What:** `HYUNDAI_FCA11_ROLL_MAX_DEC 30` used as the decel cap only when `hyundai_fca11_rolling_test` (64\|128);
+  parked (64 alone) keeps `HYUNDAI_FCA11_TEST_MAX_DEC 10`; normal driving still blocks every decel. Python mirror
+  `HYUNDAI_FCA11_ROLL_MAX_DEC` in `values.py`.
+- **opendbc:** `fca11-scale-0013` @ `97ae2133` on `fca11-warn-0012` @ `935e5ed3`. Patch sha256 `845dec6c62515eae4b7bdd7b9fca54b4df4bde299246e658475f32d868b72d2f`.
+- **Verification:** 0001-0013 apply clean on pristine `f95f996f` (13/13, 0 fuzz), tree `1f8824a5` == branch tip.
+  Hyundai safety tests: exactly +20 PASSED vs 0012, no outcome changed. Mutation 22/22 non-equivalent killed (2 argued equivalent). MISRA 0 findings.
+  Firmware `panda_h7.bin.signed` sha256 `0d5e138ff516e7d4620964518f874ba3d05edd7e4fc46d524ec35b68dc350513`
+  (109,352 B, export ×2 == CI series; controls reproduce `d0f5396c` and `65d3692f`).
+- **Report:** `car-features/fca11-scaling-prep.md`.
 
 ### fca11-warn-0012: opendbc 0012 FCA11 rolling-test Warn gating — 2026-10-05 (offline-tested; one firmware build; NOT road-run)
 
