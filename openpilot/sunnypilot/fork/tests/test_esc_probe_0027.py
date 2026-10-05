@@ -328,6 +328,125 @@ class TestSessionBeforeWrite(Base):
     self.assertEqual(doc["reread_value"], "90060350")
 
 
+class TestPhase2(Base):
+  """Phase 2 (state ``{"phase": 2}``): the vendor-exact write order with NO pre-write seed request, and ONE post-write
+  ``27 01`` sample recorded as ``seed_post`` (a data point only — it never gates the write, which already happened)."""
+
+  def setUp(self):
+    super().setUp()
+    self.set_phase(2)
+
+  def set_phase(self, phase):
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump({"probe_enabled": True, "phase": phase}, f)
+
+  def test_phase2_no_pre_write_seed_and_post_write_sample(self):
+    car = FakeCar()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    # vendor-exact order: READ -> SESSION -> WRITE -> re-read -> (single) post-write seed sample
+    frames = self.tx_frames(car)
+    self.assertEqual(frames, [bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00"),
+                              bytes([2, 0x10, 0x03]).ljust(8, b"\x00"),
+                              bytes([7, 0x2E, 0x01, 0x03]) + CURRENT,
+                              bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00"),
+                              bytes([2, 0x27, 0x01]).ljust(8, b"\x00")])
+    services = [d[1] for d in frames]
+    self.assertEqual(services, [0x22, 0x10, 0x2E, 0x22, 0x27])
+    i_write = services.index(0x2E)
+    self.assertNotIn(0x27, services[:i_write])       # NO seed frame before the write (the whole point of phase 2)
+    self.assertEqual(services.index(0x27), len(services) - 1)  # the seed sample is the LAST frame
+    self.assertNotIn(0x02, [d[2] for d in frames if d[1] == 0x27])  # sendKey is never sent
+    doc = self.result_doc()
+    self.assertEqual(doc["phase"], 2)
+    self.assertIsNone(doc["seed_request"])           # no pre-write seed
+    self.assertIsNone(doc["seed"])
+    self.assertIsNotNone(doc["seed_post"])           # post-write sample recorded
+    self.assertTrue(doc["seed_post"]["positive"])
+    self.assertEqual(doc["seed_post"]["resp"], "670111223344")
+    self.assertTrue(doc["write_attempted"])
+    self.assertTrue(doc["write"]["positive"])
+    self.assertEqual(doc["reread_value"], "90060350")
+    self.assertFalse(doc["value_changed"])
+    self.assertEqual(s["phase"], 2)
+    self.assertTrue(s["seed_post_positive"])
+    self.assertEqual(self.events[-1][0], "esc_probe_0027")
+
+  def test_phase2_write_refused_seed_post_still_sampled(self):
+    car = FakeCar()
+    car.write_refused = True                          # the fake answers 7F 2E 33 (like phase 1 did on the car)
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    self.assertTrue(s["write_attempted"])
+    self.assertEqual(s["write_nrc"], 0x33)            # refused write is recorded, does not abort
+    doc = self.result_doc()
+    self.assertEqual(doc["write"]["nrc"], 0x33)
+    self.assertIsNone(doc["seed_request"])
+    self.assertIsNotNone(doc["seed_post"])            # the post-write sample is STILL attempted + recorded
+    self.assertTrue(doc["seed_post"]["positive"])
+    self.assertEqual(len(self.write_frames(car)), 1)
+    self.assertEqual([d[1] for d in self.tx_frames(car)], [0x22, 0x10, 0x2E, 0x22, 0x27])
+
+  def test_phase2_seed_post_silent_no_abort(self):
+    car = FakeCar()
+    car.seed_silent = True                            # the post-write 27 01 gets no frame at all
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])                   # the write already happened: seed silence must NOT abort
+    self.assertIsNone(s["error"])
+    self.assertTrue(s["write_attempted"])
+    self.assertTrue(s["write_positive"])
+    doc = self.result_doc()
+    self.assertIsNone(doc["seed_request"])
+    self.assertIsNotNone(doc["seed_post"])
+    self.assertTrue(doc["seed_post"]["no_response"])  # silence, recorded as such
+    self.assertIsNone(doc["seed_post"].get("resp"))
+    self.assertFalse(s["seed_post_positive"])
+
+  def test_phase2_session_silent_aborts_before_write(self):
+    car = FakeCar()
+    car.session_silent = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("session", s["aborted"])            # same rule as phase 1: no 10 03 answer -> no write
+    self.assertFalse(s["write_attempted"])
+    self.assertEqual(self.write_frames(car), [])
+    services = [d[1] for d in self.tx_frames(car)]
+    self.assertNotIn(0x2E, services)
+    self.assertNotIn(0x27, services)                  # phase 2 has no pre-write seed either
+    self.assertIsNone(self.result_doc()["seed_post"])
+
+  def test_missing_phase_key_is_phase1(self):
+    self.set_phase(None)                              # {"phase": None} is treated as the default
+    car = FakeCar()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertEqual(s["phase"], 1)
+    self.assertEqual([d[1] for d in self.tx_frames(car)], [0x22, 0x10, 0x27, 0x2E, 0x22])
+    doc = self.result_doc()
+    self.assertEqual(doc["phase"], 1)
+    self.assertIsNotNone(doc["seed_request"])         # phase 1 keeps the pre-write seed
+    self.assertIsNone(doc["seed_post"])
+
+  def test_unknown_phase_sends_nothing(self):
+    # NB: `int(state.get("phase", 1) or 1)` maps a FALSY value (missing, None, 0) to the default 1; only a value that
+    # is neither 1 nor 2 (e.g. 3, -1) or non-numeric ("banana") is unknown.
+    for phase in (3, -1, "banana"):
+      with self.subTest(phase=phase):
+        self.fresh_state()
+        self.set_phase(phase)
+        car = FakeCar()
+        s = self.run_car(car, key=f"k{phase}")
+        self.assertFalse(s["ran"])
+        self.assertEqual(s["skip"], "unknown phase")
+        self.assertEqual(car.sent, [])
+        self.assertEqual(car.mux_calls, [])
+
+
 class TestReadGate(Base):
   def test_read_refused_no_write(self):
     car = FakeCar()

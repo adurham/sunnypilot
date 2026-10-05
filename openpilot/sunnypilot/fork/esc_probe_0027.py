@@ -30,6 +30,25 @@ ECU (the 27 01 templates exist only for the Kia CONTI/MANDO entries with securit
 still ASKS for the 0x27 seed (that contrast is informative), but mirrors the vendor exactly at the write: read 0x0103
 -> 10 03 extended session -> 2E 0103 no-op.
 
+Phase 1 result / Phase 2 rationale
+----------------------------------
+Phase 1 ran on the car (2026-10-05 21:45Z; result
+``car-features/esc-software/probe-results/20261005T214537Z-result.json``): the 0x0103 read answered (``62 01 03 90 06 03
+50``), the ``10 03`` session answered (``50 03 00 32 01 F4``), the ``27 01`` seed request answered POSITIVELY with an
+8-byte, static-looking seed (``67 01 5A B0 5A B0 5A B0 5A B0`` x4), the no-op ``2E`` write was REFUSED (``7F 2E 33`` =
+securityAccessDenied), the re-read was unchanged, the multiplexer was restored, and nothing errored (0.425 s). That
+refusal alone cannot distinguish (a) a write that genuinely requires a completed ``27`` unlock, (b) phase 1's OWN
+pre-write ``27 01`` confounding it (a pending seed, or a vendor tool that sends no ``27`` for this ECU at all), or
+(c) the Hyundai/Kia Security Gateway gating write services for unauthorized testers (its documented refusal is also
+NRC ``0x33``).
+
+Phase 2 discriminates between them by repeating the write in the EXACT vendor order with NO seed request before the
+write (``READ 22 0103 -> 10 03 -> 2E no-op -> re-read``), then sending ONE ``27 01`` after the write purely as a data
+point (is the seed still static across runs?). An accepted write (``6E 0103``) means the pre-write seed was the
+confounder and the write path works without an unlock; ``7F 2E 33`` again means the gate is real and needs the key
+algorithm / gateway work. The phase is selected by the ``phase`` key in ``state.json`` (1 = default, 2 =
+vendor-exact).
+
 Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mutation-proven)
 ----------------------------------------------------------------------------------------------
 * Enabled only by a state file: ``/data/esc-probe-0027/state.json`` with ``{"probe_enabled": true}``. Missing file
@@ -323,13 +342,22 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
   if not plan(state, ignition_key):
     return {**summary, "skip": "already done (ignition)"}
 
+  # Phase selector: 1 (default) = phase 1 (pre-write seed), 2 = vendor-exact (no pre-write seed, post-write seed sample).
+  # Anything else is inert: nothing is sent and the ignition is not consumed. A non-numeric value is treated as unknown.
+  try:
+    phase = int(state.get("phase", 1) or 1)
+  except (TypeError, ValueError):
+    phase = 0
+  if phase not in (1, 2):
+    return {**summary, "skip": "unknown phase"}
+
   gate = VehicleGate(now)
   t0 = now()
   client = EscProbeClient(can_send, can_recv, gate, now, t0 + RUN_BUDGET_S)
-  doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None,
+  doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None, "phase": phase,
               "read": None, "extended_session": None, "extended_retry": False, "current_value": None,
               "session_before_write": None,
-              "seed_request": None, "seed": None, "already_unlocked": None,
+              "seed_request": None, "seed": None, "already_unlocked": None, "seed_post": None,
               "write": None, "write_attempted": False, "reread": None, "reread_value": None,
               "value_changed": None, "tx": [], "duration_s": None, "aborted": None, "error": None,
               "mux_restored": None, "gate_speeds_moving": None}
@@ -404,16 +432,22 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
       if not sess.get("frames"):
         raise Abort("10 03 session got no response; not attempting the write")
 
-    # ---- step 2: request the 0x27 seed ONLY (never the key) --------------------------------------------------
-    r2 = client.request_seed()
-    doc["seed_request"] = r2
-    seed_resp = bytes.fromhex(r2.get("resp", "")) if r2.get("resp") else None
-    doc["seed"] = seed_resp.hex() if seed_resp is not None else None
-    if r2.get("positive") and seed_resp is not None and seed_resp[:2] == b"\x67\x01":
-      doc["already_unlocked"] = seed_resp[2:] == b"\x00\x00\x00\x00"
-    if seed_resp is None:
-      # Silence (no frame at all): the ESC is not in a state to talk. Do NOT attempt the write.
-      raise Abort("0x27 seed request got no response; not attempting the write")
+    # ---- step 2: request the 0x27 seed ONLY (never the key) — PHASE 1 ONLY -----------------------------------
+    # Phase 1's contrast is "refused seed + refused/accepted write". Phase 2 deliberately sends NO seed before the
+    # write (the exact vendor order); it samples the seed once after the write instead (step 5).
+    if phase == 1:
+      r2 = client.request_seed()
+      doc["seed_request"] = r2
+      seed_resp = bytes.fromhex(r2.get("resp", "")) if r2.get("resp") else None
+      doc["seed"] = seed_resp.hex() if seed_resp is not None else None
+      if r2.get("positive") and seed_resp is not None and seed_resp[:2] == b"\x67\x01":
+        doc["already_unlocked"] = seed_resp[2:] == b"\x00\x00\x00\x00"
+      if seed_resp is None:
+        # Silence (no frame at all): the ESC is not in a state to talk. Do NOT attempt the write.
+        raise Abort("0x27 seed request got no response; not attempting the write")
+    else:
+      # Phase 2: no pre-write seed — the write is the vendor-exact sequence with nothing in front of it.
+      doc["seed_request"] = None
 
     # ---- step 3: the no-op write — 0x2E 0x0103 + the exact bytes read in step 1 -------------------------------
     doc["write_attempted"] = True
@@ -426,6 +460,13 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     reread = parse_read_did(r4.get("resp"), DID_VARIANT_CODING)
     doc["reread_value"] = reread.hex() if reread is not None else None
     doc["value_changed"] = (reread is not None and reread != current)
+
+    # ---- step 5 (PHASE 2 ONLY): ONE post-write 0x27 01 sample, after the write actually happened -----------------
+    # Purely a data point (is the seed static across runs?). The write already happened, so silence or a refusal is
+    # recorded and never aborts. 27 02 (sendKey) is still never sent.
+    if phase == 2:
+      r5 = client.request_seed()
+      doc["seed_post"] = r5
   except Abort as e:
     doc["aborted"] = str(e)
   except SafetyViolation as e:
@@ -451,8 +492,9 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
   path = _write_result(out_dir, "result", doc, wall())
   summary.update(path=path, current_value=doc["current_value"], session_before_write=doc["session_before_write"],
                  session_before_write_positive=bool((doc["session_before_write"] or {}).get("positive")),
-                 seed=doc["seed"],
+                 phase=doc["phase"], seed=doc["seed"],
                  seed_positive=bool((doc["seed_request"] or {}).get("positive")),
+                 seed_post=doc["seed_post"], seed_post_positive=bool((doc["seed_post"] or {}).get("positive")),
                  write_attempted=doc["write_attempted"], write_positive=bool((doc["write"] or {}).get("positive")),
                  write_nrc=(doc["write"] or {}).get("nrc"), reread_value=doc["reread_value"],
                  value_changed=doc["value_changed"], aborted=doc["aborted"], error=doc["error"],

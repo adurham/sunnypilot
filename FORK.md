@@ -106,6 +106,16 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   `<Input requestvalue="07D1072E0103$…$">` (2E 0103 write) — the tool sends **no 0x27**. The probe now mirrors that
   exact order at the write (READ → SESSION → WRITE) while still asking for the 0x27 seed, so its reply remains the
   informative part. Report: `car-features/esc-probe-0027-report.md` "Update 2 — vendor-flow alignment".
+- **Phase 2 (2026-10-05, update 3):** phase 1 ran on the car (`esc-software/probe-results/20261005T214537Z-result.json`):
+  read OK, `10 03` OK, the `27 01` seed came back POSITIVE with an 8-byte static-looking value (`5AB05AB0` x4), the no-op
+  `2E` write was REFUSED (`7F 2E 33` = securityAccessDenied), re-read unchanged, mux restored, no errors. Because that
+  refusal cannot separate "the write needs an unlock" from "phase 1's OWN pre-write seed confounded it" from "the
+  Hyundai/Kia Security Gateway blocks write services (same NRC 0x33)", the probe now takes a `phase` key in
+  `state.json`: **phase 2** repeats the write in the EXACT vendor order with **NO pre-write seed** (READ → SESSION →
+  WRITE → re-read) and then sends ONE `27 01` **after** the write as a data point (recorded as `seed_post`; silence or a
+  refusal there never aborts). `phase` defaults to 1 (missing/`None`/0 → 1); anything else is inert (`skip: unknown
+  phase`). Tests: `fork/tests/test_esc_probe_0027.py` 48 (+6 phase-2); mutation **49/49** killed (2 new: pre-write seed
+  sent in phase 2, post-write sample skipped). Report: "Update 3 — phase 2 (vendor-exact, no pre-write seed)".
 - **Merge note:** intentionally fork-local; diagnostic only (removed or left inert once the question is answered).
 
 ### esc-standstill-fix: ESC read standstill definition + pre-check retry — 2026-10-05 (offline-tested; no firmware change)
