@@ -22,7 +22,11 @@ from openpilot.sunnypilot.fork import esc_probe_0027 as E
 
 CURRENT = b"\x90\x06\x03\x50"       # the known-good 0x0103 value on this car
 SEED = b"\x11\x22\x33\x44"
+SEED8 = b"\xaa\xbb\xcc\xdd\xaa\xbb\xcc\xdd"   # the 8-byte ESC seed the phase-3 battery pins the key to
 DAY = 86400.
+
+# phase-3 module request addr -> response addr (the six the battery walks)
+ADDR_RSP = {0x7D1: 0x7D9, 0x7C6: 0x7CE, 0x7E1: 0x7E9, 0x7D4: 0x7DC, 0x7C4: 0x7CC, 0x7B7: 0x7BF}
 
 
 class FW:
@@ -72,6 +76,14 @@ class FakeCar:
     self.session_refused = False
     self.session_silent = False
     self.write_refused = False
+    # phase-3 module answer config
+    self.esc_seed8 = bytes(SEED)   # 4-byte default so phases 1/2 are unchanged; phase-3 tests set the 8-byte seed
+    self.clu_seed = bytes([0x11, 0x22, 0x33, 0x44])
+    self.eps_seed = bytes([0x55, 0x66, 0x77, 0x88])
+    self.cam_seed_nrc = 0x11
+    self.auth_nrc = 0x11
+    self.routine_nrc = 0x31
+    self.key_unlock = False        # False -> 7F 27 35; True -> 67 02 (the 27 02 with key==seed unlocks)
 
   def now(self):
     return self.t
@@ -92,14 +104,44 @@ class FakeCar:
       self.sent_t.append(self.t)
       self._answer(m)
 
-  def _q(self, dat, delay=0.005):
-    self.pending.append((self.t + delay, dat.ljust(8, b"\xaa")))
+  def _q(self, dat, delay=0.005, addr=0x7D9):
+    self.pending.append((self.t + delay, dat.ljust(8, b"\xaa"), addr))
+
+  def _q_mf(self, payload, delay=0.005, addr=0x7D9, cf_delay=0.005):
+    """Queue an ISO-TP multi-frame response (first frame, flow-control, then consecutive frames)."""
+    n = len(payload)
+    self._q(bytes([0x10 | ((n >> 8) & 0xF), n & 0xFF]) + payload[:6], delay, addr)
+    self._q(bytes([0x30, 0x00, 0x00]), delay + cf_delay, addr)   # flow control
+    for i in range(0, n - 6, 7):
+      self._q(bytes([0x21]) + payload[6 + i:6 + i + 7], delay + cf_delay * (1 + i // 7 + 1), addr)
 
   def _answer(self, m):
-    if not (self.responsive and self.mux and m.src == 1 and m.address == 0x7D1):
+    if not (self.responsive and self.mux and m.src == 1):
       return
     d = bytes(m.dat)
     if d == D.FLOW_CONTROL_FRAME:
+      return
+    if d[0] == 0x21:
+      return                                        # our own consecutive frame (sendKey): nothing to answer
+    addr = m.address
+    if addr in (0x7C6, 0x7E1, 0x7D4, 0x7C4, 0x7B7):   # phase-3 non-ESC modules: 27 01 seed sweep
+      if len(d) >= 2 and d[1] == 0x27 and d[2] == 0x01:
+        if addr == 0x7C6:
+          self._q(bytes([6, 0x67, 0x01]) + bytes(self.clu_seed), addr=ADDR_RSP[addr])
+        elif addr == 0x7D4:
+          self._q(bytes([6, 0x67, 0x01]) + bytes(self.eps_seed), addr=ADDR_RSP[addr])
+        elif addr == 0x7C4:
+          self._q(bytes([3, 0x7F, 0x27, self.cam_seed_nrc]), addr=ADDR_RSP[addr])
+        # 0x7E1 (TCU) and 0x7B7 (CR): silent -> timeout, as specified
+      return
+    if addr != 0x7D1:
+      return
+    if len(d) >= 3 and d[0] == 0x10 and d[1] == 0x0A and d[2] == 0x27 and d[3] == 0x02:
+      self._q(bytes([0x30, 0x00, 0x00]))            # sendKey multi-frame: flow control, then the 27 02 result
+      if self.key_unlock:
+        self._q(bytes([2, 0x67, 0x02]))
+      else:
+        self._q(bytes([3, 0x7F, 0x27, 0x35]))
       return
     body = d[1:1 + d[0]]
     if not body:
@@ -123,13 +165,19 @@ class FakeCar:
         pass
       elif self.seed_refused:
         self._q(bytes([3, 0x7F, 0x27, 0x35]))
+      elif len(self.esc_seed8) > 4:
+        self._q_mf(bytes([0x67, 0x01]) + bytes(self.esc_seed8))    # multi-frame (e.g. 8-byte seed)
       else:
-        self._q(bytes([6, 0x67, 0x01]) + bytes(self.seed))
+        self._q(bytes([6, 0x67, 0x01]) + bytes(self.esc_seed8))
     elif svc == 0x2E:
       if self.write_refused:
         self._q(bytes([3, 0x7F, 0x2E, 0x33]))
       else:
         self._q(bytes([3, 0x6E, 0x01, 0x03]))
+    elif svc == 0x29:
+      self._q(bytes([3, 0x7F, 0x29, self.auth_nrc]))
+    elif svc == 0x31:
+      self._q(bytes([3, 0x7F, 0x31, self.routine_nrc]))
     elif svc == 0x3E:
       self._q(bytes([3, 0x7F, 0x3E, 0x7F]))
 
@@ -146,7 +194,7 @@ class FakeCar:
       pkt += [CanData(0x367, lvr12(0), 2), CanData(0x386, whl(0.), 128)]
     due = [p for p in self.pending if p[0] <= self.t]
     self.pending = [p for p in self.pending if p[0] > self.t]
-    pkt += [CanData(0x7D9, d, 1) for _, d in due]
+    pkt += [CanData(a, d, 1) for _, d, a in due]
     return [pkt]
 
 
@@ -283,7 +331,7 @@ class TestSeedOutcomes(Base):
 
   def test_all_zero_seed_already_unlocked(self):
     car = FakeCar()
-    car.seed = b"\x00\x00\x00\x00"
+    car.esc_seed8 = b"\x00\x00\x00\x00"
     s = self.run_car(car)
     self.assertTrue(s["ran"])
     self.assertIsNone(s["aborted"])
@@ -434,8 +482,8 @@ class TestPhase2(Base):
 
   def test_unknown_phase_sends_nothing(self):
     # NB: `int(state.get("phase", 1) or 1)` maps a FALSY value (missing, None, 0) to the default 1; only a value that
-    # is neither 1 nor 2 (e.g. 3, -1) or non-numeric ("banana") is unknown.
-    for phase in (3, -1, "banana"):
+    # is neither 1, 2 nor 3 (e.g. -1, 4) or non-numeric ("banana") is unknown.
+    for phase in (-1, 4, "banana"):
       with self.subTest(phase=phase):
         self.fresh_state()
         self.set_phase(phase)
@@ -562,10 +610,13 @@ class TestGuards(Base):
              if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) in
              ("_can_send", "can_send", "can_send_many", "set_safety_mode", "set_safety_model", "controlWrite",
               "set_alternative_experience", "put_bool", "put")]
-    self.assertEqual([c[1] for c in calls], ["_can_send"], calls)
-    tx = inspect.getsource(E.EscProbeClient._tx)
-    self.assertLess(tx.index("self.gate.check()"), tx.index("self._can_send("))
-    self.assertLess(tx.index("guard_frame("), tx.index("self._can_send("))
+    # _can_send appears only in EscProbeClient._tx and ._tx_at — the two documented TX sites (phase 3's non-ESC
+    # modules go through _tx_at rather than _tx, but both apply the same gate + guard_frame immediately before send).
+    self.assertEqual([c[1] for c in calls], ["_can_send", "_can_send"], calls)
+    for method in (E.EscProbeClient._tx, E.EscProbeClient._tx_at):
+      src = inspect.getsource(method)
+      self.assertLess(src.index("self.gate.check()"), src.index("self._can_send("))
+      self.assertLess(src.index("guard_frame("), src.index("self._can_send("))
     self.assertNotIn("set_safety", inspect.getsource(E))
 
 
@@ -823,3 +874,188 @@ class TestScheduling(Base):
       self.run_car(car, key=f"boot:{i}", wall=lambda i=i: car.wall() + i * DAY)
     files = [f for f in os.listdir(self.out) if f.endswith(".json") and f != "state.json"]
     self.assertLessEqual(len(files), E.KEEP_FILES)
+
+
+class TestPhase3(Base):
+  """Phase 3 (state ``{"phase": 3}``): the single-ignition discriminating battery — 6-address 27 01 seed sweep,
+  default-session no-op 2E, 29 01 + 31 01 probes, extended-session no-op 2E, ONE identity-key 27 02 attempt
+  (mechanically pinned: single attempt + key == the step-2 ESC seed), and the conditional post-unlock no-op write."""
+
+  SEED_FRAME = bytes([2, 0x27, 0x01]).ljust(8, b"\x00")
+  AUTH_FRAME = bytes([2, 0x29, 0x01]).ljust(8, b"\x00")
+  ROUTINE_FRAME = bytes([4, 0x31, 0x01, 0x00, 0x00]).ljust(8, b"\x00")
+  KEY_FIRST = bytes([0x10, 0x0A, 0x27, 0x02]) + SEED8[:4]        # 10 0A 27 02 <k0..k3>, padded to 8
+  KEY_CF = (bytes([0x21]) + SEED8[4:8]).ljust(8, b"\x00")
+  EXPECTED_TX = [bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00"),
+                 SEED_FRAME, D.FLOW_CONTROL_FRAME, SEED_FRAME, SEED_FRAME, SEED_FRAME, SEED_FRAME, SEED_FRAME,
+                 bytes([7, 0x2E, 0x01, 0x03]) + CURRENT,
+                 AUTH_FRAME, ROUTINE_FRAME,
+                 bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00"),
+                 bytes([2, 0x10, 0x03]).ljust(8, b"\x00"),
+                 bytes([7, 0x2E, 0x01, 0x03]) + CURRENT,
+                 KEY_FIRST, KEY_CF]
+
+  def setUp(self):
+    super().setUp()
+    self.set_phase(3)
+
+  def set_phase(self, phase):
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump({"probe_enabled": True, "phase": phase}, f)
+
+  def p3_car(self, **kw):
+    car = FakeCar(**kw)
+    car.esc_seed8 = SEED8
+    car.write_refused = True    # the real car refuses every 2E no-op with 7F 2E 33 (both sessions)
+    return car
+
+  def test_battery_exact_tx_order_and_outcome(self):
+    car = self.p3_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    self.assertEqual(self.tx_frames(car), self.EXPECTED_TX)
+    # six 27 01 seed frames (one per module) sit between the read and the default-session write; no key before step 9
+    services = [d[1] for d in self.tx_frames(car)]
+    self.assertEqual(services.count(0x27), 6)
+    self.assertEqual(services[:2], [0x22, 0x27])
+    self.assertEqual([d for d in self.tx_frames(car) if d[:3] == bytes([0x10, 0x0A, 0x27])], [self.KEY_FIRST])
+    self.assertTrue(self.result_doc()["steps"])
+    self.assertEqual(car.mux_calls, [True, False])
+    self.assertTrue(s["mux_restored"])
+
+  def test_battery_records_each_step_with_the_verbatim_nrc(self):
+    car = self.p3_car()
+    self.run_car(car)
+    doc = self.result_doc()
+    names = [st["name"] for st in doc["steps"]]
+    self.assertEqual(names, ["read_esc", "seed_7D1", "seed_7C6", "seed_7E1", "seed_7D4", "seed_7C4", "seed_7B7",
+                             "write_default", "auth_probe", "routine_probe", "reread_esc", "session",
+                             "write_extended", "key_attempt"])
+    self.assertEqual(doc["current_value"], "90060350")
+    self.assertEqual(doc["write_default"]["nrc"], 0x33)     # 7F 2E 33 in the DEFAULT session
+    self.assertEqual(doc["write_extended"]["nrc"], 0x33)    # and in the EXTENDED session (blanket filter?)
+    self.assertEqual(doc["auth_probe"]["nrc"], 0x11)        # 29 -> service not supported
+    self.assertEqual(doc["routine_probe"]["nrc"], 0x31)     # 31 -> requestOutOfRange (session logic answered)
+    self.assertEqual(doc["reread_value"], "90060350")
+    self.assertFalse(doc["value_changed"])
+    self.assertTrue(doc["key_attempted"])
+    self.assertEqual(doc["key"], SEED8.hex())
+    self.assertFalse(doc["unlocked"])
+    self.assertEqual(doc["key_nrc"], 0x35)
+    # every step carries a per-frame receive timestamp (ms relative to its request TX)
+    for st in doc["steps"]:
+      if st["frames"]:
+        self.assertEqual(len(st["frames_t_ms"]), len(st["frames"]), st["name"])
+        self.assertTrue(all(ms >= 0 for ms in st["frames_t_ms"]), st["name"])
+
+  def test_seed_sweep_all_six_addrs_including_timeouts(self):
+    car = self.p3_car()
+    self.run_car(car)
+    sweep = self.result_doc()["seed_sweep"]
+    self.assertEqual([r["addr"] for r in sweep], [0x7D1, 0x7C6, 0x7E1, 0x7D4, 0x7C4, 0x7B7])
+    by = {r["addr"]: r for r in sweep}
+    self.assertEqual(by[0x7D1]["resp"], "6701" + SEED8.hex())     # ESC: 8-byte seed
+    self.assertEqual(by[0x7C6]["resp"], "670111223344")           # CLU seed
+    self.assertEqual(by[0x7D4]["resp"], "670155667788")           # EPS seed
+    self.assertEqual(by[0x7C4]["nrc"], 0x11)                      # CAM: NRC 7F 27 11
+    self.assertTrue(by[0x7E1]["no_response"])                    # TCU: silence -> timeout
+    self.assertTrue(by[0x7B7]["no_response"])                    # CR:  silence -> timeout
+    self.assertIsNone(by[0x7E1].get("resp"))
+    # the sweep frames really went to the six distinct request addresses
+    addrs = [a for a, d, _ in car.sent if d[1] == 0x27]
+    self.assertEqual(addrs, [0x7D1, 0x7C6, 0x7E1, 0x7D4, 0x7C4, 0x7B7])
+
+  def test_key_unlock_then_automatic_noop_write(self):
+    car = self.p3_car()
+    car.key_unlock = True
+    car.write_refused = False        # hypothetical: once unlocked the no-op write lands (6E 0103) and the re-read changes
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    tail = [bytes([2, 0x10, 0x03]).ljust(8, b"\x00"),
+            bytes([7, 0x2E, 0x01, 0x03]) + CURRENT,
+            bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")]
+    self.assertEqual(self.tx_frames(car), self.EXPECTED_TX + tail)
+    doc = self.result_doc()
+    self.assertTrue(doc["unlocked"])
+    self.assertTrue(doc["key_result"]["positive"])
+    self.assertEqual(doc["key_result"]["resp"], "6702")
+    self.assertTrue(doc["write_unlocked"]["positive"])   # the auto step-10 write lands (6E 0103)
+    self.assertEqual(doc["reread_unlocked"]["resp"], "62010390060350")
+
+  def test_failed_key_stops_there_no_post_unlock_write(self):
+    car = self.p3_car()                                   # key_unlock False -> 7F 27 35
+    self.run_car(car)
+    # after the single 27 02 attempt there is nothing after it (the attempt is the last frame)
+    self.assertEqual(self.tx_frames(car)[-1], self.KEY_CF)
+    doc = self.result_doc()
+    self.assertFalse(doc["unlocked"])
+    self.assertIn("no further keys", doc["key_note"])
+
+  def test_sendkey_is_at_most_once(self):
+    car = self.p3_car()
+    car.set_mux(True)
+    gate = D.VehicleGate(car.now)
+    gate.feed(CanData(0x367, lvr12(0), 0))
+    gate.feed(CanData(0x386, whl(0.), 0))
+    c = E.EscProbeClient(car.can_send, car.can_recv, gate, car.now, car.now() + 99, phase=3)
+    c.send_key(SEED8)
+    self.assertEqual(c.key_attempts, 1)
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key(SEED8)                                   # a second key can never reach the bus
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x10].__len__(), 1)
+
+  def test_guard_frame_pins_key_to_step2_seed_and_single_attempt(self):
+    good_key = SEED8
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEY_FIRST, 1, phase=3, seed=None, key_attempts=0)     # no seed
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEY_FIRST, 1, phase=3, seed=good_key, key_attempts=1)  # second attempt
+    E.guard_frame(0x7D1, self.KEY_FIRST, 1, phase=3, seed=good_key, key_attempts=0)   # exactly once, right key
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEY_CF, 1, phase=3, seed=good_key, key_attempts=0)      # cf before the first frame
+    E.guard_frame(0x7D1, self.KEY_CF, 1, phase=3, seed=good_key, key_attempts=1)        # cf after the first frame
+    wrong = bytes([0x10, 0x0A, 0x27, 0x02]) + b"\x01\x02\x03\x04"
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, wrong, 1, phase=3, seed=good_key, key_attempts=0)            # wrong key
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([0x21]) + b"\x09\x09\x09\x09" + b"\x00" * 4, 1, phase=3, seed=good_key, key_attempts=1)
+    # 27 02 stays refused for phases 1/2 (phase defaults to 1: byte-identical guards)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEY_FIRST, 1, seed=good_key, key_attempts=0)
+
+  def test_send_key_requires_eight_byte_seed(self):
+    car = self.p3_car()
+    car.set_mux(True)
+    gate = D.VehicleGate(car.now)
+    gate.feed(CanData(0x367, lvr12(0), 0))
+    gate.feed(CanData(0x386, whl(0.), 0))
+    c = E.EscProbeClient(car.can_send, car.can_recv, gate, car.now, car.now() + 99, phase=3)
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key(b"\x01\x02\x03")                         # not the 8-byte step-2 seed
+
+  def test_no_sendkey_when_esc_has_no_positive_seed(self):
+    car = self.p3_car()
+    car.seed_refused = True                               # ESC 27 01 -> 7F 27 35 (no seed to pin the key to)
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    doc = self.result_doc()
+    self.assertFalse(doc["key_attempted"])
+    self.assertIn("no positive ESC seed", doc["key_note"])
+    self.assertEqual([d for d in self.tx_frames(car) if d[0] == 0x10 and len(d) > 2 and d[2] == 0x27], [])
+
+  def test_no_current_value_aborts_the_battery(self):
+    car = self.p3_car()
+    car.read_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("no current value", s["aborted"])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])   # nothing written
+    self.assertEqual(car.mux_calls, [True, False])
+    self.assertTrue(self.result_doc()["mux_restored"])
+
+  def test_phase3_budget_is_thirty_seconds(self):
+    self.assertEqual(E.RUN_BUDGET_S_PHASE3, 30.0)
+    self.assertEqual(E.RUN_BUDGET_S, 15.0)
