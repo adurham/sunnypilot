@@ -34,7 +34,11 @@ def lvr12(gear: int) -> bytes:
 
 def whl(kph: float) -> bytes:
   raw = int(round(kph / 0.03125)) & 0x3FFF
-  return sum(raw << (16 * i) for i in range(4)).to_bytes(8, "little")
+  return whl_raw([raw] * 4)
+
+
+def whl_raw(raw: list[int]) -> bytes:
+  return sum((r & 0x3FFF) << (16 * i) for i, r in enumerate(raw)).to_bytes(8, "little")
 
 
 class FakeCar:
@@ -43,6 +47,7 @@ class FakeCar:
   def __init__(self, gear=0, kph=0.):
     self.t = 1000.
     self.gear, self.kph = gear, kph
+    self.raw: list[int] | None = None   # per-wheel raw LSB; overrides kph when set
     self.mux = False
     self.mux_calls: list[bool] = []
     self.sent: list[tuple[int, bytes, int]] = []
@@ -123,7 +128,8 @@ class FakeCar:
       raise self.recv_exc
     pkt = []
     if not self.state_frozen:
-      pkt += [CanData(a, d, 0) for a, d in ((0x367, lvr12(self.gear)), (0x386, whl(self.kph))) if a not in self.freeze]
+      w = whl_raw(self.raw) if self.raw is not None else whl(self.kph)
+      pkt += [CanData(a, d, 0) for a, d in ((0x367, lvr12(self.gear)), (0x386, w)) if a not in self.freeze]
       # the same frames echoed on the camera side and as TX echoes must be ignored by the gate
       pkt += [CanData(0x367, lvr12(0), 2), CanData(0x386, whl(0.), 128)]
     due = [p for p in self.pending if p[0] <= self.t]
@@ -140,6 +146,10 @@ class Base(OpenpilotTestCase):
 
   def tearDown(self):
     self.tmp.cleanup()
+
+  def fresh_state(self):
+    """A new, empty /data/esc-uds (subtests that each need a first-ever read)."""
+    self.out = tempfile.mkdtemp(dir=self.tmp.name)
 
   def run_car(self, car, key="boot:1", ign=True, fp="HYUNDAI_ELANTRA_2022_NON_SCC", car_fw=None, verify=None, wall=None):
     return E.run(car.can_send, car.can_recv, car.set_mux, fingerprint=fp, car_fw=[FW()] if car_fw is None else car_fw,
@@ -287,10 +297,75 @@ class TestStationaryOnly(Base):
     self.assertLess(car.t - t0, 0.05)
 
   def test_rolling_in_park_sends_nothing(self):
-    car = FakeCar(kph=0.03125)       # one LSB of wheel speed
+    """Genuine creep in Park (all four wheels at 1 km/h, e.g. rolling onto the pawl on a slope): nothing is sent."""
+    car = FakeCar(kph=1.0)
     s = self.run_car(car)
     self.assertFalse(s["ran"])
     self.assertEqual(car.sent, [])
+    self.assertEqual(car.mux_calls, [])
+
+  # Parked wheel-speed noise, as logged on this car (esc-read-and-probe-fixes.md, 396 segments): single wheels read
+  # up to 59 LSB, and at most ONE wheel is ever above 8 LSB while settled in Park.
+  PARKED_NOISE = ([0, 0, 0, 1],          # the on-car skip of 2026-10-05: wheel speeds [0.0, 0.0, 0.0, 0.03125]
+                  [5, 6, 0, 3], [0, 0, 13, 0], [59, 0, 0, 0], [8, 8, 8, 8], [3, 3, 3, 3], [0, 0, 1, 3])
+
+  def test_parked_wheel_noise_does_not_block_the_read(self):
+    for raw in self.PARKED_NOISE:
+      with self.subTest(raw=raw):
+        self.fresh_state()
+        car = FakeCar()
+        car.raw = raw
+        s = self.run_car(car, key=f"noise{raw}")
+        self.assertTrue(s["ran"], s)
+        self.assertIsNone(s["aborted"])
+        self.assertGreater(len(car.sent), 0)
+
+  def test_onsite_skip_frame_regression(self):
+    """The exact WHL_SPD11 the car skipped on is standstill; the gate decodes it the same as the skip file did."""
+    gate = E.VehicleGate(lambda: 0.)
+    gate.feed(CanData(0x367, lvr12(0), 0))
+    gate.feed(CanData(0x386, whl_raw([0, 0, 0, 1]), 0))
+    self.assertEqual(gate.violation(), "")
+    self.assertEqual(E.decode_wheel_speeds(whl_raw([0, 0, 0, 1])), [0.0, 0.0, 0.0, 0.03125])
+
+  def test_standstill_definition_boundaries(self):
+    self.assertFalse(E.wheels_moving([12, 12, 12, 12]))      # all at opendbc's STANDSTILL_THRESHOLD: still
+    self.assertFalse(E.wheels_moving([13, 0, 0, 0]))         # one wheel above: noise
+    self.assertTrue(E.wheels_moving([13, 13, 0, 0]))         # two wheels above: creep
+    self.assertTrue(E.wheels_moving([0, 0, 13, 13]))
+    self.assertFalse(E.wheels_moving([96, 0, 0, 0]))
+    self.assertTrue(E.wheels_moving([97, 0, 0, 0]))          # one wheel above 3 km/h: moving regardless
+
+  def test_two_wheel_creep_in_park_sends_nothing(self):
+    for raw in ([13, 13, 0, 0], [0, 14, 0, 14], [20, 20, 20, 20], [97, 0, 0, 0]):
+      with self.subTest(raw=raw):
+        car = FakeCar()
+        car.raw = raw
+        s = self.run_car(car, key=f"creep{raw}")
+        self.assertFalse(s["ran"])
+        self.assertIn("moving", s["skip"])
+        self.assertEqual(car.sent, [])
+        self.assertEqual(car.mux_calls, [])
+
+  def test_precheck_waits_for_park_settle_bounded(self):
+    """Shifted into Park while still rolling: the read waits for standstill (bounded) instead of giving up."""
+    car = FakeCar()
+    car.raw = [20, 20, 20, 20]
+    t0 = car.t
+    car.on_recv = lambda c: setattr(c, "raw", [2, 0, 0, 0]) if c.t - t0 > 1.0 else None
+    s = self.run_car(car)
+    self.assertTrue(s["ran"], s)
+    self.assertIsNone(s["aborted"])
+    # never settles: skip after PRECHECK_WAIT_S, nothing sent
+    self.fresh_state()
+    car2 = FakeCar()
+    car2.raw = [20, 20, 20, 20]
+    t0 = car2.t
+    s2 = self.run_car(car2, key="boot:2")
+    self.assertFalse(s2["ran"])
+    self.assertEqual(car2.sent, [])
+    self.assertLessEqual(car2.t - t0, E.PRECHECK_WAIT_S + 0.05)
+    self.assertGreaterEqual(car2.t - t0, E.PRECHECK_WAIT_S - 0.05)
 
   def test_unknown_state_sends_nothing(self):
     car = FakeCar()
@@ -323,6 +398,37 @@ class TestStationaryOnly(Base):
   def test_abort_when_car_starts_moving(self):
     s = self._mid_read(lambda c: setattr(c, "kph", 1.0))
     self.assertIn("moving", s["aborted"])
+
+  def test_abort_on_two_wheel_creep_mid_read(self):
+    """The per-frame check uses the same definition as the pre-check: the smallest creep signature aborts."""
+    s = self._mid_read(lambda c: setattr(c, "raw", [13, 13, 0, 0]))
+    self.assertIn("moving", s["aborted"])
+
+  def test_tx_site_uses_the_same_standstill_definition(self):
+    """The check AT the TX site on its own (the receive-side check is a second layer): with the gate's last frames
+    showing the smallest creep signature, _tx raises and nothing reaches can_send; with parked noise it sends."""
+    for raw, moving in (([13, 13, 0, 0], True), ([97, 0, 0, 0], True), ([0, 0, 0, 1], False), ([59, 0, 0, 0], False)):
+      with self.subTest(raw=raw):
+        car = FakeCar()
+        gate = E.VehicleGate(car.now)
+        gate.feed(CanData(0x367, lvr12(0), 0))
+        gate.feed(CanData(0x386, whl_raw(raw), 0))
+        c = E.EscUdsClient(car.can_send, car.can_recv, gate, car.now, car.now() + 99)
+        frame = E.build_single_frame(bytes([0x22, 0xF1, 0x00]))
+        if moving:
+          with self.assertRaises(E.Abort):
+            c._tx(frame)
+          self.assertEqual(car.sent, [])
+        else:
+          c._tx(frame)
+          self.assertEqual(len(car.sent), 1)
+
+  def test_parked_noise_mid_read_does_not_abort(self):
+    car = FakeCar()
+    car.on_recv = lambda c: setattr(c, "raw", [0, 0, 0, 1] if len(c.sent) % 2 else [59, 0, 0, 0])
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
 
   def test_abort_when_leaving_park(self):
     s = self._mid_read(lambda c: setattr(c, "gear", 7))
@@ -472,9 +578,38 @@ class TestScheduling(Base):
       st = json.load(f)
     self.assertEqual(list(st["fw"].values())[0]["attempts"], E.MAX_FULL_ATTEMPTS)
 
+  def test_precheck_skip_does_not_burn_the_ignition(self):
+    """A pre-check skip (car out of Park when card started) leaves the cycle open: a retry in the same ignition (card
+    restarted) still reads. Only a read that passed the pre-check marks the cycle."""
+    car = FakeCar(gear=5)
+    s = self.run_car(car, key="boot:1")
+    self.assertFalse(s["ran"])
+    self.assertEqual(s["precheck_try"], 1)
+    car.gear = 0
+    s = self.run_car(car, key="boot:1")
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    n = len(car.sent)
+    self.assertFalse(self.run_car(car, key="boot:1")["ran"])   # and then once per ignition as before
+    self.assertEqual(len(car.sent), n)
+
+  def test_precheck_skips_bounded_per_ignition(self):
+    car = FakeCar(gear=5)
+    for i in range(E.MAX_PRECHECK_SKIPS):
+      self.assertEqual(self.run_car(car, key="boot:1")["precheck_try"], i + 1)
+    car.gear = 0
+    s = self.run_car(car, key="boot:1")
+    self.assertFalse(s["ran"])
+    self.assertEqual(s["skip"], "already done (ignition/firmware/day)")
+    self.assertEqual(car.sent, [])
+    self.assertTrue(self.run_car(car, key="boot:2")["ran"])     # a new ignition starts over
+
   def test_plan_pure(self):
     self.assertEqual(E.plan({}, "a", "fw", "d"), (True, True))
     self.assertEqual(E.plan({"last_ignition": "a"}, "a", "fw", "d"), (False, False))
+    self.assertEqual(E.plan({"precheck_skips": {"key": "a", "n": E.MAX_PRECHECK_SKIPS - 1}}, "a", "fw", "d"), (True, True))
+    self.assertEqual(E.plan({"precheck_skips": {"key": "a", "n": E.MAX_PRECHECK_SKIPS}}, "a", "fw", "d"), (False, False))
+    self.assertEqual(E.plan({"precheck_skips": {"key": "a", "n": 99}}, "b", "fw", "d"), (True, True))
     self.assertEqual(E.plan({"fw": {"fw": {"complete": True}}, "last_dtc_day": "d"}, "b", "fw", "d"), (False, False))
     self.assertEqual(E.plan({"fw": {"fw": {"complete": True}}, "last_dtc_day": "d"}, "b", "fw", "e"), (False, True))
 

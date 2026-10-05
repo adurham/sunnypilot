@@ -21,16 +21,24 @@ Hard rules, mechanically enforced here (tests: fork/tests/test_esc_diag.py, incl
   plus the one constant ISO-TP flow-control frame needed to receive multi-frame answers. Checked twice: per service
   (``guard_service``) before a frame is built and per frame (``guard_frame``) at the single TX call site. Address is
   fixed 0x7D1, bus fixed 1 (OBD port; never the car's C-CAN).
-* Only when stationary: gear Park (LVR12 CF_Lvr_Gear == 0) and all four wheel speeds exactly 0 (WHL_SPD11), from
-  fresh frames (< ``STATE_MAX_AGE_S``), ignition on (pandaStates). Re-checked before EVERY frame and while waiting
-  for every answer; any violation aborts at once.
+* Only when stationary: gear Park (LVR12 CF_Lvr_Gear == 0) and the wheels at standstill (WHL_SPD11, see
+  ``wheels_moving``: fewer than 2 wheels above 12 LSB = 0.375 km/h and no wheel above 96 LSB = 3 km/h), from fresh
+  frames (< ``STATE_MAX_AGE_S``), ignition on (pandaStates). The SAME definition (``VehicleGate.violation``) is the
+  pre-check and is re-checked before EVERY frame and while waiting for every answer; any violation aborts at once.
+  (Was: all four wheels exactly 0. A parked car reads single-wheel sensor noise of 1..59 LSB, so that skipped the
+  read on the car, 2026-10-05: ``precheck: moving (wheel speeds [0.0, 0.0, 0.0, 0.03125])``.)
 * Never interferes with driving: card has not created controls yet in this window (openpilot cannot be engaged, the
   panda has no car safety mode, the pedal gets no commands = driver pass-through, the stock camera is relayed). The
   OBD-multiplexing request is always returned to OFF in ``finally`` (also on SIGTERM / KeyboardInterrupt / any
   exception) and verified from pandaStates (safetyParam == 1). Every error is swallowed: this can never stop card.
-* At most once per ignition cycle (key = boot id + deviceState.startedMonoTime); the full DID read is skipped once a
-  complete read exists for this ESC firmware version (max ``MAX_FULL_ATTEMPTS`` tries per version); the DTC read
-  repeats at most once per UTC day. Hard time budget ``RUN_BUDGET_S``.
+* At most once per ignition cycle (key = boot id + deviceState.startedMonoTime). A pre-check skip does NOT consume
+  the cycle: it is recorded in ``precheck_skips{key,n}`` before the wait, and ``plan()`` retries the same ignition up
+  to ``MAX_PRECHECK_SKIPS`` tries. In Park, a not-yet-stationary car is given up to ``PRECHECK_WAIT_S`` to settle
+  (out of Park the skip is immediate, so no startup delay). ``last_ignition`` is written only once the pre-check has
+  passed, still before the multiplexer or any TX, so neither a crash nor a skipped try can lose the cycle. Within a
+  cycle the full DID read also stops once a complete read exists for this ESC firmware version (max
+  ``MAX_FULL_ATTEMPTS`` tries per version), and the DTC read repeats at most once per UTC day. Hard time budget
+  ``RUN_BUDGET_S``.
 
 Output: ``/data/esc-uds/<UTC>-<kind>.json`` (raw request/response hex per DID, NRCs, vehicle-state trace) and a
 compact ``esc_uds_read`` cloudlog event, so the result is also in that drive's rlog. Disable: touch
@@ -67,9 +75,22 @@ ESC_BUS = 1                      # OBD port (needs OBD multiplexing). Logged dri
 # Vehicle state from raw C-CAN (bus 0). Verified on route 0000012f against carState.gearShifter / vEgoRaw.
 LVR12_ADDR = 0x367               # CF_Lvr_Gear: bits 32..35 (Intel), 0 = P, 5 = D, 6 = N, 7 = R
 WHL_SPD11_ADDR = 0x386           # WHL_SPD_FL/FR/RL/RR: 14-bit Intel at bits 0/16/32/48, 0.03125 km/h
+WHEEL_SPEED_LSB_KPH = 0.03125
 CAR_BUS = 0
 GEAR_PARK = 0
 STATE_MAX_AGE_S = 0.25           # LVR12 50 Hz, WHL_SPD11 50 Hz; older than this = unknown = abort
+# Standstill (car-features/esc-read-and-probe-fixes.md; 396 rlog segments of this car, bus 0, every WHL_SPD11 frame):
+# * Parked noise (Park, >= 3 s after the last non-Park gear frame; 215,942 frames): 8.4 % of frames have a nonzero
+#   wheel, single wheels read up to 59 LSB, but NEVER 2 wheels above 8 LSB at once (0 frames).
+# * Genuine motion (131 starts from an all-zero frame that reach >= 1 km/h on all 4 wheels within 2 s): >= 2 wheels
+#   above 12 LSB fires within <= 42 frames (0.84 s), after <= 2.5 cm of travel; none missed.
+# 12 LSB = 0.375 km/h is opendbc's own Hyundai carstate STANDSTILL_THRESHOLD. A single wheel above 96 LSB (3 km/h; max
+# parked single-wheel noise seen: 59) also counts as moving (defense in depth, 0 parked frames).
+STANDSTILL_WHEEL_LSB = 12
+STANDSTILL_MIN_WHEELS = 2
+SINGLE_WHEEL_MOVING_LSB = 96
+PRECHECK_WAIT_S = 3.0            # in Park only: wait this long for the wheels to settle before skipping this try
+MAX_PRECHECK_SKIPS = 3           # pre-check skips per ignition cycle before the cycle is given up
 
 RESP_TIMEOUT_S = 0.25            # first answer frame
 PENDING_TIMEOUT_S = 2.0          # after NRC 0x78 responsePending
@@ -139,9 +160,20 @@ def decode_gear(dat: bytes) -> int:
   return (int.from_bytes(bytes(dat)[:8].ljust(8, b"\x00"), "little") >> 32) & 0xF
 
 
-def decode_wheel_speeds(dat: bytes) -> list[float]:
+def decode_wheel_speeds_raw(dat: bytes) -> list[int]:
   w = int.from_bytes(bytes(dat)[:8].ljust(8, b"\x00"), "little")
-  return [((w >> (16 * i)) & 0x3FFF) * 0.03125 for i in range(4)]
+  return [(w >> (16 * i)) & 0x3FFF for i in range(4)]
+
+
+def decode_wheel_speeds(dat: bytes) -> list[float]:
+  return [r * WHEEL_SPEED_LSB_KPH for r in decode_wheel_speeds_raw(dat)]
+
+
+def wheels_moving(raw: list[int]) -> bool:
+  """The single standstill definition (pre-check AND every per-frame check). Raw LSB, not km/h: no float compare."""
+  if sum(1 for r in raw if r > STANDSTILL_WHEEL_LSB) >= STANDSTILL_MIN_WHEELS:
+    return True
+  return any(r > SINGLE_WHEEL_MOVING_LSB for r in raw)
 
 
 class VehicleGate:
@@ -150,7 +182,7 @@ class VehicleGate:
   def __init__(self, now: Callable[[], float]):
     self.now = now
     self.gear: int | None = None
-    self.speeds: list[float] | None = None
+    self.speeds: list[int] | None = None   # raw LSB
     self.t_gear = -1e9
     self.t_speed = -1e9
     self.reason = ""
@@ -161,7 +193,7 @@ class VehicleGate:
     if msg.address == LVR12_ADDR:
       self.gear, self.t_gear = decode_gear(msg.dat), self.now()
     elif msg.address == WHL_SPD11_ADDR:
-      self.speeds, self.t_speed = decode_wheel_speeds(msg.dat), self.now()
+      self.speeds, self.t_speed = decode_wheel_speeds_raw(msg.dat), self.now()
 
   def violation(self) -> str:
     t = self.now()
@@ -171,8 +203,8 @@ class VehicleGate:
       return "wheel speed unknown/stale"
     if self.gear != GEAR_PARK:
       return f"not in Park (gear {self.gear})"
-    if any(s != 0 for s in self.speeds):
-      return f"moving (wheel speeds {self.speeds})"
+    if wheels_moving(self.speeds):
+      return f"moving (wheel speeds {[r * WHEEL_SPEED_LSB_KPH for r in self.speeds]} km/h)"
     return ""
 
   def check(self) -> None:
@@ -336,9 +368,17 @@ def esc_fw_key(car_fw) -> str:
   return "unknown"
 
 
+def precheck_skips(state: dict, ignition_key: str) -> int:
+  sk = state.get("precheck_skips") or {}
+  return int(sk.get("n", 0)) if sk.get("key") == ignition_key else 0
+
+
 def plan(state: dict, ignition_key: str, fw_key: str, day: str) -> tuple[bool, bool]:
-  """-> (do_full, do_dtc). Pure; nothing at all runs twice in one ignition cycle."""
+  """-> (do_full, do_dtc). Pure; nothing that reached the bus runs twice in one ignition cycle, and a cycle whose
+  pre-check was skipped is retried at most MAX_PRECHECK_SKIPS times in total."""
   if state.get("last_ignition") == ignition_key:
+    return False, False
+  if precheck_skips(state, ignition_key) >= MAX_PRECHECK_SKIPS:
     return False, False
   fw = state.get("fw", {}).get(fw_key, {})
   do_full = not fw.get("complete") and fw.get("attempts", 0) < MAX_FULL_ATTEMPTS
@@ -379,23 +419,39 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw, i
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
 
-  # Mark the ignition cycle BEFORE sending anything: a crash mid-read can never cause a retry loop in this cycle.
-  state["last_ignition"] = ignition_key
+  # Pre-check from live frames before touching the multiplexer, with the SAME definition the per-frame checks use.
+  # Wait until the state is KNOWN (fresh frames, normally < 20 ms). Out of Park: skip at once (no startup delay). In
+  # Park but not (yet) at standstill, e.g. still settling onto the parking pawl: keep watching for at most
+  # PRECHECK_WAIT_S, then skip this try. Count the skip BEFORE waiting, so a crash/kill mid-wait still counts.
+  state["precheck_skips"] = {"key": ignition_key, "n": precheck_skips(state, ignition_key) + 1}
   _save_state(out_dir, state)
+  t_pre = now()
+  known_by, settle_by = t_pre + 0.5, t_pre + PRECHECK_WAIT_S
 
-  # Pre-check from live frames before touching the multiplexer. Wait only until the state is KNOWN (fresh frames,
-  # normally < 20 ms); a car that is known to be moving / out of Park is skipped at once (no startup delay).
-  deadline = now() + 0.5
-  while "stale" in gate.violation() and now() < deadline:
+  def _pre_wait() -> bool:
+    v = gate.violation()
+    if "stale" in v:
+      return now() < known_by
+    return v.startswith("moving") and now() < settle_by
+
+  while _pre_wait():
     for packet in can_recv(wait_for_one=True):
       for msg in packet:
         gate.feed(msg)
   pre = gate.violation()
+  doc["precheck_wait_s"] = round(now() - t_pre, 3)
   if pre:
     doc["aborted"] = "precheck: " + pre
-    summary.update(ran=False, skip=doc["aborted"])
+    doc["precheck_try"] = state["precheck_skips"]["n"]
+    summary.update(ran=False, skip=doc["aborted"], precheck_try=doc["precheck_try"])
     _write_result(out_dir, "skipped", doc, wall())
     return summary
+
+  # Pre-check passed: NOW mark the ignition cycle, BEFORE sending anything, so a crash mid-read can never cause a
+  # retry loop in this cycle.
+  state["last_ignition"] = ignition_key
+  state.pop("precheck_skips", None)
+  _save_state(out_dir, state)
 
   summary["ran"] = True
   old_sigterm = None

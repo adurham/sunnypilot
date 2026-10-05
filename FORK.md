@@ -60,10 +60,40 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 23 | SCC fixes (fork subclasses, upstream SCC files untouched): vision output floored at MIN_V, no ENTERING below 9 m/s, already-turning → TURNING; map path ignored when > 25 m away or mapd unmatched, `scc_map_diag` cloudlog diagnostics; **throttle-only guard** releases an SCC coast with no lateral corroboration after 2 s. Adaptive follow highway factor 1.2 → 1.1 — **offline-tested only** | fix + safety net (planner) | fork-local (`fork/scc.py`); SCC bug fixes are upstream-PR candidates |
 | 24 | **Automatic read-only ESC UDS read** at every ignition (card, inside openpilot's own fingerprint window, panda still in ELM327; no firmware change): 70 identification/variant-coding DIDs once per ESC firmware, DTCs (0x19 02) once per day, only in Park at 0 km/h, at most once per ignition → `/data/esc-uds/*.json` + `esc_uds_read` rlog event. Plus route data: `scc_map_path` event logs the MapTargetVelocities list (was only in /dev/shm) | diagnostics + route data | fork-local (`fork/esc_diag.py`, `fork/scc.py`) |
 | 25 | Hyundai FCA11 rolling test **Warn gating**: in the rolling mode (bit 128, armed only by the runner) a `CF_VSM_Warn` > 0 FCA11 frame is policed like actuation — same 5-35 km/h D window, latched cut and fresh-input rules, and it shares the 1.2 s episode clock. **Inert unless bit 128 is armed**; parked mode and normal driving byte-for-byte unchanged — **TEST-GATED, offline-tested only** | safety C (tightening) | fork-local; amends #19; patch `0012`, opendbc branch `fca11-warn-0012` |
+| 26 | ESC read **standstill fix** (amends #24): "stationary" = Park + fewer than 2 wheels above 12 LSB (0.375 km/h, opendbc's Hyundai STANDSTILL_THRESHOLD) and no wheel above 96 LSB, instead of all wheels exactly 0 (parked single-wheel noise skipped the read on the car). Same definition for the pre-check and every per-frame check; a pre-check skip no longer uses up the ignition (≤ 3 tries per ignition, ≤ 3 s settle wait in Park) | diagnostics | fork-local (`fork/esc_diag.py`) |
 
 ---
 
 ## Entries
+
+### esc-standstill-fix: ESC read standstill definition + pre-check retry — 2026-10-05 (offline-tested; no firmware change)
+
+- **Why:** first on-car run (2026-10-05, parked, ignition on) wrote `/data/esc-uds/20261005T130925Z-skipped.json`:
+  `precheck: moving (wheel speeds [0.0, 0.0, 0.0, 0.03125])`. One LSB on one wheel = sensor noise. The pre-check also
+  had already saved `last_ignition`, so it would not retry until the next ignition. Analysis:
+  `car-features/esc-read-and-probe-fixes.md`.
+- **Log evidence** (396 rlog segments, bus 0, every WHL_SPD11 frame; `car-features/_standstill_eval.py`):
+  - Settled in Park (≥ 3 s after the last non-P gear frame), 215,942 frames: 8.4 % have a nonzero wheel. A single
+    wheel reads up to 59 LSB, but **2+ wheels above 8 LSB at once: 0 frames.** The old rule (`any != 0`) is false in
+    18,114 of them, in runs up to 407 frames (8 s).
+  - Genuine motion, 131 starts from an all-zero frame: **"2+ wheels > 12 LSB" fires on all 131**, within ≤ 42 frames
+    (0.84 s), after ≤ 2.5 cm of travel.
+- **Change (`fork/esc_diag.py`):**
+  - `wheels_moving(raw)`: ≥ 2 wheels > 12 LSB, or any wheel > 96 LSB (3 km/h). Computed on raw integers, not floats.
+    `VehicleGate.violation()` uses it, so the pre-check, the check before every TX and the check after every receive
+    share one definition.
+  - **In Park only,** the pre-check waits up to 3 s (`PRECHECK_WAIT_S`) for a "moving" car to settle. Out of Park it
+    still skips at once.
+  - A pre-check skip increments `precheck_skips{key,n}` (saved before the wait) and does **not** set
+    `last_ignition`. `plan()` refuses after `MAX_PRECHECK_SKIPS` = 3 skips in one ignition. `last_ignition` is
+    written only once the pre-check passed, still before the multiplexer or any TX.
+  - **Retry within an ignition** happens only when card runs again in the same ignition (card restart). There is no
+    background retry loop: the read sits in card's fingerprint window and cannot block startup longer than
+    3 s + 20 s budget.
+- **Tests:** `test_esc_diag.py` 30 → 40. New tests cover: the on-car frame, logged noise shapes, 2-wheel creep, the
+  rule boundaries, the TX-site check alone, mid-read creep and noise, the bounded settle wait, a skip not using up
+  the ignition, and the per-ignition skip bound. Mutation proof: `car-features/auto-esc-mutation.py` **40/40 killed**
+  (10 new mutants for this change).
 
 ### fca11-warn-0012: opendbc 0012 FCA11 rolling-test Warn gating — 2026-10-05 (offline-tested; one firmware build; NOT road-run)
 
@@ -102,13 +132,16 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   in that window every boot: `abs` 0x7D1 -> 0x7D9, bus 1 with OBD multiplexing). **No panda firmware change.**
   - **Read-only:** only single frames 0x22 / 0x3E / 0x10 03 / 0x19 02 FF + one fixed flow-control frame, to 0x7D1 on
     bus 1. Two guards: per service before a frame is built, and per frame at the single `can_send` site.
-  - **Stationary only:** gear P (LVR12) and all four wheel speeds exactly 0 (WHL_SPD11), from bus-0 frames < 0.25 s old.
+  - **Stationary only:** gear P (LVR12) and the wheels at standstill (WHL_SPD11; **was** all four exactly 0, see
+    esc-standstill-fix), from bus-0 frames < 0.25 s old.
     Checked before every frame and after every receive; any violation aborts at once.
   - **Startup cost and multiplexer:** openpilot cannot engage yet in this window, and the pedal gets no commands. The
     OBD multiplexer is switched back off in `finally` (SIGTERM too) and verified from pandaStates. Budget 20 s;
     stops after 4 requests in a row with no answer. Errors never propagate.
-  - **Schedule:** at most once per ignition (key saved before any send). The full DID read runs once per ESC firmware
-    version (max 3 attempts). DTCs are read once per UTC day.
+  - **Schedule:** the full DID read runs once per ESC firmware version (max 3 attempts; skipped once a complete read
+    exists). DTCs are read once per UTC day. `last_ignition` is saved once the pre-check has passed, still before any
+    send; a pre-check skip does not consume the ignition (**amended by esc-standstill-fix:** ≤ 3 tries per ignition,
+    ≤ 3 s settle wait in Park, immediate skip out of Park).
   - **Output:** `/data/esc-uds/<UTC>-{full,dtc,fulldtc,skipped}.json` (raw request/response hex, NRCs, TX log; 60 files
     max) + `esc_uds_read` cloudlog event (rlog). Disable: `touch /data/esc-uds/DISABLE`.
 - **Route data (`fork/scc.py`):** `scc_map_path` cloudlog event = the MapTargetVelocities list (lat/lon/v, ≤ 400
