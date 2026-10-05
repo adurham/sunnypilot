@@ -82,7 +82,7 @@ class LongitudinalPlannerSP:
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
     # fork: personality-dependent ramp toward a higher target (fork/setspeed_ease.py); vTarget stays raw
-    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego)
+    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego, v_cruise)
     return v_cruise_eased, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:

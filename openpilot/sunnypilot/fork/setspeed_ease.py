@@ -34,6 +34,26 @@ The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``
   shipped launch) until the launch is over: the car reaches the target (``LAUNCH_DONE_MARGIN``) or the plan has asked
   for less than ``LAUNCH_END_A`` for ``LAUNCH_END_S`` (e.g. it settled behind a lead). At that point the ramp restarts
   from the current speed.
+* Merge gate (``MergeGate``): easing is for DISCRETIONARY speed-ups (a set-speed bump, an SLA raise, a lead pulling away
+  while the car is already at road speed). It steps aside, and the target is passed through exactly as upstream, while
+  the car is well below a highway-class speed: an on-ramp / merge / catching up to highway traffic is not discretionary.
+  Reference speed, from signals the fork already has (no new capnp field):
+    - highway evidence (max of): ``liveMapDataSP.roadType`` highway/interstate (its limit, or 55 mph without one); a
+      valid map limit >= 55 mph; the car's own limit (``carStateSP.speedLimit``, the cluster / camera sign) >= 55 mph;
+      a valid map limit AHEAD >= 55 mph within ``MERGE_AHEAD_DIST`` (an on-ramp is often an unnamed OSM link without a
+      limit; the highway's limit is the next one). 55 mph = ``road_type_classifier.HIGHWAY_SPEED_THRESHOLD``, the same
+      threshold the fork's road-type classifier uses. ``ref = min(highway speed, set speed)``; merging while
+      ``v_ego < ref - MERGE_DEFICIT`` (15 mph). So the gate needs BOTH a highway-class road AND a target >= 15 mph
+      above the car: a +5/+10 mph bump never trips it.
+    - else positive non-highway evidence (roadType urban, or a valid map / car limit under 55 mph): no merge, ease.
+    - else NO data at all (fail safe): the set speed stands in for the road's speed when it is highway-class: merging
+      while ``v_ego < v_set - NODATA_DEFICIT`` (25 mph; a +10 mph bump never reaches that).
+  The set speed (``v_cruise`` before the SCC / SLA arbitration) is used, not the arbitrated target: a curve on the ramp
+  (SCC) dipping the target must not end the merge mid-ramp. While merging the ARBITRATED target is passed through, so
+  a curve / SLA still limits exactly as upstream.
+  Hysteresis ``MERGE_HYST``. While merging ``v_ease`` = target; on leaving, the leash hands over at
+  ``v_ego + rate * LEASH_S``, so the request steps down to ~1.5 x rate (close to the upstream ceiling at highway
+  speed), not to zero, and then tapers in at the personality rate.
 * Personality is the ONLY input that changes the feel: relaxed gentlest, standard middle, aggressive ~= upstream.
   When the drive-mode CAN signal is decoded, Eco/Normal/Sport -> relaxed/standard/aggressive feed this same input.
 
@@ -53,6 +73,7 @@ from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.sunnypilot.mapd.lib.road_type_classifier import HIGHWAY_SPEED_THRESHOLD, RoadType
 
 Personality = log.LongitudinalPersonality
 
@@ -71,16 +92,85 @@ LAUNCH_END_A = 0.3        # m/s^2; ... or once the plan asked for less than this
 LAUNCH_END_S = 1.0        # s ... for this long
 RAMP_LOG_MIN_GAP = 1.0    # m/s; target - v_ease above this = "ramping" (diagnostics event on each edge)
 
+MPH = 0.44704
+# merge gate (see the module doc): pass the target through while the car is well below a highway-class speed
+MERGE_DEFICIT = 15 * MPH   # m/s; merging while v_ego < highway reference - this (owner's bumps are +5/+10 mph)
+NODATA_DEFICIT = 25 * MPH  # m/s; no map / car limit at all: merging while v_ego < v_target - this (highway-class target)
+MERGE_HYST = 3 * MPH       # m/s; leave the merge only once v_ego >= ref - (deficit - this)
+MERGE_AHEAD_DIST = 500.    # m; a highway-class map limit this close ahead counts (on-ramp onto it)
+HIGHWAY_ROAD_TYPES = ('highway', 'interstate')
+_ROAD_TYPE_NAMES = {v: k for k, v in RoadType.schema.enumerants.items()}  # int -> name
+
+
+def road_type_name(road_type) -> str:
+  """liveMapDataSP.roadType arrives as a capnp enum (str() = name), classify_road_type returns the raw int, tests use
+  text. Normalize to the name; anything unrecognised -> 'unknown' (the fail-safe branch)."""
+  if isinstance(road_type, int):
+    return _ROAD_TYPE_NAMES.get(road_type, 'unknown')
+  return str(road_type)
+
 
 def personality_id(personality) -> int:
   """selfdriveState.personality is a capnp _DynamicEnum, which equals the int but does NOT hash like it (a dict lookup
-  with it misses). Normalize to the raw int."""
-  return int(getattr(personality, 'raw', personality))
+  with it misses). Normalize to the raw int. Anything that does not cast (a renamed / non-numeric enum) -> standard."""
+  try:
+    return int(getattr(personality, 'raw', personality))
+  except (TypeError, ValueError):
+    return int(Personality.standard)
 
 
 def get_rate(personality, v_ego: float) -> float:
-  table = RATE_V.get(personality_id(personality), RATE_V[Personality.standard])  # unknown -> standard
+  # an unknown personality (a value cereal adds later) gets the STANDARD table: the middle, never the un-eased one
+  table = RATE_V.get(personality_id(personality), RATE_V[Personality.standard])
   return float(np.interp(v_ego, RATE_BP, table))
+
+
+def merge_reference(road_type, map_limit: float, map_limit_valid: bool, ahead_limit: float, ahead_valid: bool,
+                    ahead_dist: float, car_limit: float, v_set: float) -> tuple[float, float]:
+  """(reference speed, deficit) for the merge gate; (0, 0) = no merge context. All speeds m/s. See the module doc.
+  v_set = the cruise set speed (before the SCC curve / SLA arbitration: a curve on the ramp must not end the merge)."""
+  map_limit = map_limit if map_limit_valid and map_limit > 0. else 0.
+  car_limit = car_limit if car_limit > 0. else 0.
+  hw = 0.
+  road_type = road_type_name(road_type)
+  if road_type in HIGHWAY_ROAD_TYPES:
+    hw = map_limit if map_limit > 0. else HIGHWAY_SPEED_THRESHOLD
+  for lim in (map_limit, car_limit):
+    if lim >= HIGHWAY_SPEED_THRESHOLD:
+      hw = max(hw, lim)
+  if ahead_valid and ahead_limit >= HIGHWAY_SPEED_THRESHOLD and 0. <= ahead_dist <= MERGE_AHEAD_DIST:
+    hw = max(hw, ahead_limit)
+  if hw > 0.:
+    # capped at the driver's set speed: the car never needs to "merge" past what the driver asked for, so a +5/+10 mph
+    # bump on a highway driven below its limit (traffic, weather) is still eased
+    return min(hw, v_set), MERGE_DEFICIT
+  if road_type == 'urban' or map_limit > 0. or car_limit > 0.:
+    return 0., 0.                                             # positively a non-highway road: ease
+  if v_set >= HIGHWAY_SPEED_THRESHOLD:
+    return v_set, NODATA_DEFICIT                              # no data at all: fail safe toward not easing
+  return 0., 0.
+
+
+class MergeGate:
+  """True while the car is merging onto / catching up to a highway-class speed (easing steps aside). Hysteresis only."""
+
+  def __init__(self):
+    self.merging = False
+
+  def update(self, ref: float, deficit: float, v_ego: float) -> bool:
+    if ref <= 0.:
+      self.merging = False
+    elif self.merging:
+      self.merging = v_ego < ref - (deficit - MERGE_HYST)
+    else:
+      self.merging = v_ego < ref - deficit
+    return self.merging
+
+  def update_sm(self, sm, v_set: float, v_ego: float) -> bool:
+    lm = sm['liveMapDataSP']
+    ref, deficit = merge_reference(lm.roadType, lm.speedLimit, lm.speedLimitValid, lm.speedLimitAhead, lm.speedLimitAheadValid,
+                                   lm.speedLimitAheadDistance, sm['carStateSP'].speedLimit, v_set)
+    return self.update(ref, deficit, v_ego)
 
 
 class SetSpeedEase:
@@ -92,9 +182,12 @@ class SetSpeedEase:
     self.launching = False
     self._low_accel_t = 0.
     self.ramping = False
+    self.merge_gate = MergeGate()
+    self.merging = False
 
-  def step(self, v_target: float, v_ego: float, personality, active: bool, a_plan: float = 0.) -> float:
-    """Pure update. active = longitudinal engaged and the driver not overriding; a_plan = last plan accel."""
+  def step(self, v_target: float, v_ego: float, personality, active: bool, a_plan: float = 0., merging: bool = False) -> float:
+    """Pure update. active = longitudinal engaged and the driver not overriding; a_plan = last plan accel;
+    merging = MergeGate output (target passed through, like a launch)."""
     if not active:
       # not engaged / overriding: pass the target through (identical to upstream) and arm the ramp at the current speed
       self.launching = False
@@ -110,8 +203,10 @@ class SetSpeedEase:
         self.launching = False
         self.v_ease = None                                      # launch over: ramp from here, not from the target
 
-    if self.launching:
-      v_ease = v_target                                         # shipped launch behaviour
+    if self.launching or merging:
+      # shipped launch / merge behaviour (raw target). After a merge the ramp's own leash hands over at
+      # v_ego + rate * LEASH_S: the request steps down to ~1.5 x rate, never to zero
+      v_ease = v_target
     elif self.v_ease is None:
       v_ease = min(v_ego, v_target)
     else:
@@ -121,14 +216,20 @@ class SetSpeedEase:
     self.v_ease = min(v_ease, v_target)                         # down is immediate; never above the target
     return self.v_ease
 
-  def update(self, sm, v_target: float, long_enabled: bool, long_override: bool, a_plan: float) -> float:
+  def update(self, sm, v_target: float, long_enabled: bool, long_override: bool, a_plan: float,
+             v_set: float | None = None) -> float:
+    """v_target = arbitrated target (cruise / SCC / SLA min); v_set = the cruise set speed (merge-gate cap)."""
     cs = sm['carState']
+    v_set = v_target if v_set is None else max(v_set, v_target)
     active = long_enabled and not long_override and sm['controlsState'].longControlState != LongCtrlState.off
     personality = sm['selfdriveState'].personality
-    v = self.step(v_target, cs.vEgo, personality, active, a_plan)
+    merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo)
+    if not active:
+      self.merge_gate.merging = False
+    v = self.step(v_target, cs.vEgo, personality, active, a_plan, merging)
     ramping = active and (v_target - v) > RAMP_LOG_MIN_GAP
-    if ramping != self.ramping:
-      self.ramping = ramping
-      cloudlog.event("setspeed_ease", ramping=ramping, v_ego=round(float(cs.vEgo), 2), v_target=round(float(v_target), 2),
-                     v_ease=round(float(v), 2), personality=personality_id(personality))
+    if ramping != self.ramping or merging != self.merging:
+      self.ramping, self.merging = ramping, merging
+      cloudlog.event("setspeed_ease", ramping=ramping, merging=merging, v_ego=round(float(cs.vEgo), 2),
+                     v_target=round(float(v_target), 2), v_ease=round(float(v), 2), personality=personality_id(personality))
     return v

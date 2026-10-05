@@ -67,6 +67,12 @@ class TestRate(OpenpilotTestCase):
   def test_unknown_personality_is_standard(self):
     self.assertEqual(se.get_rate(7, 20.), se.get_rate(P.standard, 20.))
 
+  def test_uncastable_personality_is_standard(self):
+    # a renamed / non-numeric enum must not raise inside the planner: it falls back to standard
+    for bad in ('sport', None, object()):
+      self.assertEqual(se.personality_id(bad), int(P.standard))
+      self.assertEqual(se.get_rate(bad, 20.), se.get_rate(P.standard, 20.))
+
 
 class TestStep(OpenpilotTestCase):
   def test_ramps_at_rate(self):
@@ -205,8 +211,123 @@ class TestCruiseAccelBounds(OpenpilotTestCase):
         self.assertGreaterEqual(eased, min(0., up) - 1e-9)
 
 
+HWY = 55 * MPH  # road_type_classifier.HIGHWAY_SPEED_THRESHOLD
+
+
+def ref(road_type='unknown', map_limit=0., map_valid=None, ahead=0., ahead_valid=None, ahead_dist=0., car=0., v_set=75 * MPH):
+  return se.merge_reference(road_type, map_limit, map_limit > 0. if map_valid is None else map_valid, ahead,
+                            ahead > 0. if ahead_valid is None else ahead_valid, ahead_dist, car, v_set)
+
+
+class TestMergeReference(OpenpilotTestCase):
+  """merge_reference: which signals say 'highway-class road' (merge gate) vs 'normal road' (ease) vs no data."""
+
+  def test_threshold_is_the_road_type_classifier_one(self):
+    from openpilot.sunnypilot.mapd.lib import road_type_classifier as rtc
+    self.assertEqual(se.HIGHWAY_SPEED_THRESHOLD, rtc.HIGHWAY_SPEED_THRESHOLD)
+
+  def test_highway_road_type(self):
+    for rt in ('highway', 'interstate'):
+      self.assertEqual(ref(rt, 70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+      self.assertEqual(ref(rt), (HWY, se.MERGE_DEFICIT))                  # highway without a limit: 55 mph floor
+
+  def test_highway_class_map_limit(self):
+    self.assertEqual(ref('unknown', 65 * MPH), (65 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', HWY), (HWY, se.MERGE_DEFICIT))           # inclusive at 55 mph, like the classifier
+    self.assertEqual(ref('unknown', 70 * MPH, map_valid=False), (75 * MPH, se.NODATA_DEFICIT))  # invalid limit = no data
+    self.assertEqual(ref('unknown', 70 * MPH, map_valid=False, v_set=40 * MPH), (0., 0.))
+
+  def test_car_limit(self):
+    # carStateSP.speedLimit (cluster / camera): 12f @686 and 134 @157 have no map way match but the car reads 70
+    self.assertEqual(ref('unknown', car=70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', 35 * MPH, car=70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('unknown', car=45 * MPH, v_set=75 * MPH), (0., 0.))  # a non-highway car limit: ease
+
+  def test_highway_limit_ahead(self):
+    # an on-ramp is often an unnamed OSM link without a limit: the highway's limit is the next one
+    self.assertEqual(ref(ahead=70 * MPH, ahead_dist=378.), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref(ahead=70 * MPH, ahead_dist=se.MERGE_AHEAD_DIST + 1., v_set=50 * MPH), (0., 0.))
+    self.assertEqual(ref(ahead=70 * MPH, ahead_valid=False, ahead_dist=100., v_set=50 * MPH), (0., 0.))
+    self.assertEqual(ref(ahead=45 * MPH, ahead_dist=100., v_set=50 * MPH), (0., 0.))
+
+  def test_reference_capped_at_set_speed(self):
+    # driving 50 on a 70 mph highway, +10 to 60: reference 60, deficit 10 mph < MERGE_DEFICIT -> eased, not a merge
+    self.assertEqual(ref('highway', 70 * MPH, v_set=60 * MPH), (60 * MPH, se.MERGE_DEFICIT))
+    g = se.MergeGate()
+    self.assertFalse(g.update(*ref('highway', 70 * MPH, v_set=60 * MPH), 50 * MPH))
+
+  def test_highest_highway_evidence_wins(self):
+    self.assertEqual(ref('highway', 55 * MPH, car=65 * MPH, ahead=70 * MPH, ahead_dist=100.)[0], 70 * MPH)
+
+  def test_normal_road_never_merges(self):
+    for kw in ({'road_type': 'urban'}, {'map_limit': 45 * MPH}, {'car': 35 * MPH}, {'road_type': 'urban', 'map_limit': 50 * MPH}):
+      self.assertEqual(ref(v_set=80 * MPH, **kw), (0., 0.), kw)
+
+  def test_no_data_fails_safe_on_highway_class_target(self):
+    self.assertEqual(ref(v_set=75 * MPH), (75 * MPH, se.NODATA_DEFICIT))
+    self.assertEqual(ref(v_set=HWY), (HWY, se.NODATA_DEFICIT))
+    self.assertEqual(ref(v_set=50 * MPH), (0., 0.))
+    # roadType is a capnp enum on the car: compared as text
+    lm = messaging.new_message('liveMapDataSP').liveMapDataSP
+    lm.roadType = 'interstate'
+    self.assertEqual(ref(lm.roadType)[0], HWY)
+    # ... and the classifier's own return value (a raw int)
+    from openpilot.sunnypilot.mapd.lib.road_type_classifier import classify_road_type
+    self.assertEqual(ref(classify_road_type('I-94', 0.))[0], HWY)
+    self.assertEqual(ref(classify_road_type('Main Street', 0.), v_set=80 * MPH), (0., 0.))
+    self.assertEqual(se.road_type_name(99), 'unknown')
+
+  def test_deficits(self):
+    # a +10 mph discretionary bump must stay eased in both the map and the no-data case
+    self.assertGreater(se.MERGE_DEFICIT, 10 * MPH + se.MERGE_HYST)
+    self.assertGreater(se.NODATA_DEFICIT, se.MERGE_DEFICIT)
+
+
+class TestMergeGate(OpenpilotTestCase):
+  def test_enter_exit_hysteresis(self):
+    g = se.MergeGate()
+    r = 70 * MPH
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT))           # exactly at the edge: not merging
+    self.assertTrue(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT - 0.01))
+    self.assertTrue(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + se.MERGE_HYST - 0.01))  # inside the band
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + se.MERGE_HYST))
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + 0.5))      # no re-entry inside the band
+
+  def test_no_reference_clears(self):
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    self.assertFalse(g.update(0., 0., 10.))
+
+
+class TestMergeStep(OpenpilotTestCase):
+  def test_merging_passes_target_through(self):
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 12., p)
+      self.assertEqual(e.step(31., 12., p, True, 0.5, merging=True), 31.)
+
+  def test_merge_exit_hands_over_at_the_leash(self):
+    # leaving the merge: v_ease continues from v_ego + rate * LEASH_S (no drop of the request to zero, no step to target)
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 12., p)
+      e.step(31., 22., p, True, 0.5, merging=True)
+      lim = 22. + se.get_rate(p, 22.) * se.LEASH_S
+      v = e.step(31., 22., p, True, 0.5, merging=False)
+      self.assertAlmostEqual(v, lim, places=6)
+      self.assertLess(v, 31.)
+
+  def test_merge_never_above_target(self):
+    e = engaged(se.SetSpeedEase(), 20.)
+    e.step(20.5, 20., P.standard, True, 0.5, merging=True)
+    self.assertLessEqual(e.v_ease, 20.5)
+
+  def test_down_still_immediate_after_merge(self):
+    e = engaged(se.SetSpeedEase(), 12.)
+    e.step(31., 20., P.relaxed, True, 0.5, merging=True)
+    self.assertEqual(e.step(18., 20., P.relaxed, True, 0.5), 18.)
+
+
 def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, lcs=LongCtrlState.pid, override=False,
-               lead=None):
+               lead=None, road_type=None, map_limit=0., car_limit=0.):
   N = len(ModelConstants.T_IDXS)
   md = messaging.new_message('modelV2').modelV2
   md.position.x = [v_ego * t for t in ModelConstants.T_IDXS]
@@ -238,6 +359,12 @@ def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, 
   sm = {'modelV2': md, 'carState': cs, 'carControl': cc, 'controlsState': ctl, 'selfdriveState': sd, 'radarState': rs}
   for w in ('liveMapDataSP', 'vehicleParameters', 'carStateSP', 'gpsLocation', 'gpsLocationExternal', 'selfdriveStateSP'):
     sm[w] = getattr(messaging.new_message(w), w)
+  if road_type is not None:
+    sm['liveMapDataSP'].roadType = road_type
+  if map_limit > 0.:
+    sm['liveMapDataSP'].speedLimit = map_limit
+    sm['liveMapDataSP'].speedLimitValid = True
+  sm['carStateSP'].speedLimit = car_limit
   return sm
 
 
@@ -365,3 +492,71 @@ class TestUpstreamHooks(OpenpilotTestCase):
       e.update(planner_sm(20., 72.), 20., True, False, 0.)
       self.assertEqual(ev.call_count, 2)
       self.assertFalse(ev.call_args.kwargs['ramping'])
+
+  def test_end_to_end_onramp_not_eased(self):
+    # on-ramp (12f @686 shape): 30 mph, set 75 mph, the car reads a 70 mph limit (no map way match): upstream ceiling
+    v = 30 * MPH
+    for road in ({'car_limit': 70 * MPH}, {'road_type': 'highway', 'map_limit': 70 * MPH}, {}):
+      for p in PERSONALITIES:
+        planner = make_planner()
+        self._run(planner, 5, v, 30 * 1.609344, personality=p, **road)
+        self._run(planner, 40, v, 75 * 1.609344, personality=p, **road)
+        self.assertTrue(planner.setspeed_ease.merging, (road, p))
+        self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v)), places=3, msg=str((road, p)))
+
+  def test_end_to_end_bump_on_normal_road_still_eased(self):
+    # +10 mph at 45 mph on an urban 45 mph road, and +10 mph at 65 mph on a 70 mph highway: eased (discretionary)
+    for v_mph, road in ((45, {'road_type': 'urban', 'map_limit': 45 * MPH}), (65, {'road_type': 'highway', 'map_limit': 70 * MPH}),
+                        (45, {}), (50, {'road_type': 'highway', 'map_limit': 70 * MPH})):
+      planner = make_planner()
+      v = v_mph * MPH
+      self._run(planner, 5, v, v_mph * 1.609344, personality=P.relaxed, **road)
+      self._run(planner, 40, v, (v_mph + 10) * 1.609344, personality=P.relaxed, **road)
+      self.assertFalse(planner.setspeed_ease.merging, road)
+      self.assertLessEqual(planner.a_cruise, se.get_rate(P.relaxed, v) * se.LEASH_S + 1e-6, road)
+
+  def test_end_to_end_override_resets_ramp(self):
+    # mid-ramp the driver presses the gas to 25 m/s: the planner gets the raw target and v_ease re-arms at vEgo;
+    # after the release the ramp restarts from the (new) current speed, not from where it was
+    v = 45 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 45 * 1.609344)
+    self._run(planner, 20, v, 65 * 1.609344)
+    self.assertGreater(planner.setspeed_ease.v_ease, v)
+    self._run(planner, 5, 25., 65 * 1.609344, override=True)
+    self.assertEqual(planner.setspeed_ease.v_ease, 25.)
+    v_out, _ = planner.update_targets(planner_sm(25., 65 * 1.609344, override=True), 25., 0., 65 * 1.609344 / 3.6)
+    self.assertAlmostEqual(v_out, 65 * 1.609344 / 3.6, places=4)
+    self._run(planner, 1, 25., 65 * 1.609344)
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease, 25. + se.get_rate(P.standard, 25.) * DT_MDL, places=4)
+
+  def test_diagnostics_event_on_merge_edges(self):
+    e = se.SetSpeedEase()
+    with mock.patch.object(se.cloudlog, 'event') as ev:
+      e.update(planner_sm(13., 120., car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertTrue(ev.call_args.kwargs['merging'])
+      e.update(planner_sm(13., 120., car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertEqual(ev.call_count, 1)
+      e.update(planner_sm(13., 120., lcs=LongCtrlState.off, car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertFalse(e.merge_gate.merging)   # inactive clears the gate
+
+  def test_merge_survives_a_lower_arbitrated_target(self):
+    # on the ramp an SCC curve target (arbitrated v_target) dips to 15 m/s while the set speed stays 75 mph: the gate
+    # keys off the SET speed, stays merging, and passes the (lower) arbitrated target through unchanged
+    e = se.SetSpeedEase()
+    sm = planner_sm(12., 75 * 1.609344, car_limit=70 * MPH)
+    self.assertEqual(e.update(sm, 33., True, False, 0.5, 33.), 33.)
+    self.assertTrue(e.merging)
+    self.assertEqual(e.update(sm, 15., True, False, 0.5, 33.), 15.)
+    self.assertTrue(e.merging)
+    # without the set speed (default) the arbitrated target is the cap: 15 m/s is no merge -> eased
+    e2 = se.SetSpeedEase()
+    e2.update(sm, 33., True, False, 0.5)
+    self.assertLess(e2.update(sm, 15., True, False, 0.5), 15.)
+    self.assertFalse(e2.merging)
+
+  def test_hook_passes_the_set_speed(self):
+    planner = make_planner()
+    with mock.patch.object(planner.setspeed_ease, 'update', wraps=planner.setspeed_ease.update) as up:
+      planner.update(planner_sm(20., 100.))
+      self.assertAlmostEqual(up.call_args.args[5], 100. / 3.6, places=3)

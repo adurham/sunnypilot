@@ -63,7 +63,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 26 | ESC read **standstill fix** (amends #24): "stationary" = Park + fewer than 2 wheels above 12 LSB (0.375 km/h, opendbc's Hyundai STANDSTILL_THRESHOLD) and no wheel above 96 LSB, instead of all wheels exactly 0 (parked single-wheel noise skipped the read on the car). Same definition for the pre-check and every per-frame check; a pre-check skip no longer uses up the ignition (≤ 3 tries per ignition, ≤ 3 s settle wait in Park) | diagnostics | fork-local (`fork/esc_diag.py`) |
 | 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, **enter extended session (10 03 — the vendor's own write flow, decoded GIT VariantCodingTable)**, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". **Phase 3 update:** a `phase` key selects 1 (pre-write seed), 2 (vendor-exact, no pre-write seed) or **3 = the discriminating battery** (6-address `27 01` seed sweep across ESC/CLU/TCU/EPS/CAM/CR, default- AND extended-session no-op `2E`, `29 01` auth + `31 01` routine probes, and **exactly ONE** `27 02` identity-key attempt mechanically pinned to the step-2 ESC seed). Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`) |
 | 28 | Hyundai FCA11 rolling test **decel cap 0.10 g → 0.30 g** for the dose-response (scaling) test, **rolling mode only** (bits 64\|128, armed only by the runner); window, 1.2 s clock, latched cut, freshness, camera hand-back, HBA/StopReq block and check_relay unchanged; parked mode keeps 0.10 g; with the bits unset no decel is transmittable — **TEST-GATED, offline-tested only** | safety C (test-mode widening) | fork-local; amends #19/#25; patch `0013`, opendbc branch `fca11-scale-0013` |
-| 29 | **Set-speed easing** (personality-dependent): the planner's cruise candidate chases an eased speed that ramps toward a raised set speed / SLA limit / released SCC target (relaxed 0.55→0.33, standard 0.75→0.40, aggressive 1.2→0.8 m/s per s over 10→29 m/s, leashed to 1.5 s of ramp ahead of vEgo), down immediate, never below vEgo, pass-through while not in control, launches from a stop un-eased. Lead (MPC) and e2e candidates untouched — **offline-tested + closed-loop sim only** | feel (planner) | fork-local (`fork/setspeed_ease.py`) |
+| 29 | **Set-speed easing** (personality-dependent): the planner's cruise candidate chases an eased speed that ramps toward a raised set speed / SLA limit / released SCC target (relaxed 0.55→0.33, standard 0.75→0.40, aggressive 1.2→0.8 m/s per s over 10→29 m/s, leashed to 1.5 s of ramp ahead of vEgo), down immediate, never below vEgo, pass-through while not in control, launches from a stop un-eased. **Merge gate:** un-eased (upstream) while the car is ≥ 15 mph below a highway-class speed (roadType highway/interstate, a map / car speed limit ≥ 55 mph, or a ≥ 55 mph map limit ≤ 500 m ahead; capped at the set speed), or, with no map / car limit at all, ≥ 25 mph below a ≥ 55 mph set speed. Lead (MPC) and e2e candidates untouched — **offline-tested + closed-loop sim only** | feel (planner) | fork-local (`fork/setspeed_ease.py`) |
 
 ---
 
@@ -75,8 +75,9 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 > away no longer gets the full 1.0-1.2 m/s² (2.0 in experimental) at once. The car eases up to the new speed, and the
 > personality (distance button) now sets how fast: **relaxed** gentle (~0.35-0.55 m/s²), **standard** moderate
 > (~0.40-0.75), **aggressive** about like before. Lowering the set speed still takes effect immediately. Launches from a
-> stop are unchanged. Braking for a lead is unchanged. On-ramp merges are slower in relaxed/standard. Use aggressive for
-> a merge.
+> stop are unchanged. Braking for a lead is unchanged. **Merging onto a highway is NOT eased**: while the car is well
+> below a highway-class speed (on-ramp, catching up to highway traffic) it accelerates exactly as before, in every
+> personality, and the gentle ramp takes over only for the last ~15 mph.
 
 - **Why:** `car-features/drive-133-134-report.md` §A ("robotic" chase of a raised target; personality-independent
   `A_CRUISE_MAX` / `ACCEL_MAX` step).
@@ -86,13 +87,25 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   `v_ease ≤ vEgo + 1.5·rate`; `min(vEgo, target) ≤ v_ease ≤ target` (down immediate, eased request ∈
   [min(0, upstream), upstream]); pass-through + re-arm at vEgo while not engaged/overriding; launch latch below 3 m/s
   until within 1 m/s of target or plan < 0.3 m/s² for 1 s; capnp personality enum normalized (a raw dict lookup silently
-  fell back to standard). `setspeed_ease` cloudlog event on each ramp edge.
+  fell back to standard); an unknown personality value (one cereal adds later) or one that does not cast to int uses
+  the **standard** table (never the un-eased one). `setspeed_ease` cloudlog event on each ramp / merge edge.
+- **Merge gate (`MergeGate`, `merge_reference`)** — easing is for discretionary speed-ups only. Highway evidence, from
+  signals the fork already has (no capnp change): `liveMapDataSP.roadType` highway/interstate (its limit, else 55 mph),
+  a valid map limit ≥ 55 mph, `carStateSP.speedLimit` (cluster / camera) ≥ 55 mph, or a valid map limit ≥ 55 mph within
+  500 m ahead (on-ramps are usually unnamed OSM links with no limit). 55 mph =
+  `road_type_classifier.HIGHWAY_SPEED_THRESHOLD`. Reference = min(highway speed, set speed); merging while
+  vEgo < ref − 15 mph (3 mph hysteresis). Positive non-highway evidence (urban, or a limit < 55 mph) → never a merge.
+  No data at all → fail safe: merging while vEgo < set − 25 mph if the set speed is ≥ 55 mph. The gate keys off the
+  SET speed (`v_cruise`), not the SCC/SLA-arbitrated target, so a curve on the ramp does not end the merge; while
+  merging the arbitrated target is passed through unchanged. On exit the leash hands over at vEgo + 1.5·rate.
 - **Drive-mode hook:** personality is the only input; Eco/Normal/Sport → relaxed/standard/aggressive can feed
   `selfdriveState.personality` once the mode signal is decoded.
-- **Verification:** fork tests 122 passed (29 new incl. end-to-end through the real `LongitudinalPlanner` and a
+- **Verification:** fork tests 187 passed on the branch (52 new incl. end-to-end through the real `LongitudinalPlanner` and a
   `TestUpstreamHooks` pin of `get_cruise_accel` / `update_targets` signatures and the planner call sites). Mutation
-  25/25 killed (`car-features/setspeed-ease-mutation.py`). Known cost: on-ramp merge +6.2 s (standard) / +13.5 s
-  (relaxed) to 20 m/s; aggressive+e2e cut-in min gap up to 2.6 m smaller than upstream e2e (still >= upstream ACC). Closed-loop pedal sim (v3 DCT plant, shipped 0011 pedal law,
+  58/58 killed (`car-features/setspeed-ease-mutation.py`, incl. 27 merge-gate / hook / enum-cast mutants). Sim: 12f
+  on-ramp time to 20 m/s identical to upstream in every personality (was +13.5 s relaxed / +6.2 s standard before the
+  gate); +10 mph bumps on normal roads unchanged from the un-gated ease; aggressive+e2e cut-in min gap up to 2.6 m smaller
+  than upstream e2e (still >= upstream ACC). Closed-loop pedal sim (v3 DCT plant, shipped 0011 pedal law,
   real planner/LongControl): see `car-features/setspeed-ease-report.md`.
 
 ### esc-probe-0027: ESC 0x27 seed probe + no-op 0x2E write of the current 0x0103 — 2026-10-05 (offline-tested; source only, no firmware/opendbc change)
