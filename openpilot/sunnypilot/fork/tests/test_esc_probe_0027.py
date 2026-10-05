@@ -69,6 +69,8 @@ class FakeCar:
     self.read_silent = False
     self.seed_refused = False
     self.seed_silent = False
+    self.session_refused = False
+    self.session_silent = False
     self.write_refused = False
 
   def now(self):
@@ -110,7 +112,12 @@ class FakeCar:
       else:
         self._q(bytes([3, 0x7F, 0x22, 0x31]))
     elif svc == 0x10:
-      self._q(bytes([6, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]))
+      if self.session_silent:
+        pass
+      elif self.session_refused:
+        self._q(bytes([3, 0x7F, 0x10, 0x12]))
+      else:
+        self._q(bytes([6, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]))
     elif svc == 0x27:
       if self.seed_silent:
         pass
@@ -187,13 +194,26 @@ class TestHappyPath(Base):
     self.assertIsNone(s["error"])
     self.assertEqual(car.mux_calls, [True, False])
     self.assertTrue(s["mux_restored"])
-    # sequence: read 0x0103, request seed, write no-op, re-read
-    services = [d[1] for d in self.tx_frames(car)]
-    self.assertEqual(services, [0x22, 0x27, 0x2E, 0x22])
+    # vendor-confirmed sequence: read 0x0103 -> 10 03 extended session -> request seed -> write no-op -> re-read
+    frames = self.tx_frames(car)
+    self.assertEqual(frames, [bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00"),
+                              bytes([2, 0x10, 0x03]).ljust(8, b"\x00"),
+                              bytes([2, 0x27, 0x01]).ljust(8, b"\x00"),
+                              bytes([7, 0x2E, 0x01, 0x03]) + CURRENT,
+                              bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")])
+    services = [d[1] for d in frames]
+    self.assertEqual(services, [0x22, 0x10, 0x27, 0x2E, 0x22])
+    # the 10 03 session frame sits between the read and the write (the vendor's own order)
+    i_read, i_sess = services.index(0x22), services.index(0x10)
+    i_write = services.index(0x2E)
+    self.assertLess(i_read, i_sess)
+    self.assertLess(i_sess, i_write)
+    self.assertNotIn(0x22, services[i_sess + 1:i_write])       # no second read between session and write
     # no key is ever sent
     self.assertNotIn(0x02, [d[2] for d in self.tx_frames(car) if d[1] == 0x27])
     doc = self.result_doc()
     self.assertEqual(doc["current_value"], "90060350")
+    self.assertTrue(doc["session_before_write"]["positive"])   # 10 03 was answered (50 03)
     self.assertEqual(doc["seed"], "670111223344")
     self.assertFalse(doc["already_unlocked"])
     self.assertTrue(doc["write_attempted"])
@@ -201,6 +221,7 @@ class TestHappyPath(Base):
     self.assertEqual(doc["reread_value"], "90060350")
     self.assertFalse(doc["value_changed"])
     self.assertEqual(self.events[-1][0], "esc_probe_0027")
+    self.assertTrue(s["session_before_write_positive"])
     self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S)
 
   def test_write_payload_is_the_readback_value(self):
@@ -273,6 +294,40 @@ class TestSeedOutcomes(Base):
     self.assertEqual(len(self.write_frames(car)), 1)
 
 
+class TestSessionBeforeWrite(Base):
+  """The vendor-confirmed 10 03 step between the 0x0103 read and the no-op 0x2E write."""
+
+  def test_session_silent_no_write(self):
+    car = FakeCar()
+    car.session_silent = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("session", s["aborted"])            # the abort names the missing 10 03 answer
+    self.assertFalse(s["write_attempted"])
+    self.assertEqual(self.write_frames(car), [])
+    services = [d[1] for d in self.tx_frames(car)]
+    self.assertNotIn(0x2E, services)                  # silence -> no write frame at all
+    self.assertEqual(services.count(0x10), 1)         # the session frame was sent exactly once
+    doc = self.result_doc()
+    self.assertTrue(doc["session_before_write"]["no_response"])
+    self.assertIsNone(doc["session_before_write"].get("resp"))
+
+  def test_session_refused_still_writes(self):
+    car = FakeCar()
+    car.session_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])                   # a refused 10 03 (7F 10 12) does NOT stop the vendor write
+    self.assertIsNone(s["error"])
+    self.assertTrue(s["write_attempted"])
+    self.assertEqual(len(self.write_frames(car)), 1)
+    self.assertEqual([d[1] for d in self.tx_frames(car)].count(0x10), 1)
+    doc = self.result_doc()
+    self.assertEqual(doc["session_before_write"]["nrc"], 0x12)
+    self.assertIsNone(doc["session_before_write"].get("positive"))
+    self.assertEqual(doc["reread_value"], "90060350")
+
+
 class TestReadGate(Base):
   def test_read_refused_no_write(self):
     car = FakeCar()
@@ -287,6 +342,9 @@ class TestReadGate(Base):
     doc = self.result_doc()
     self.assertEqual(doc["extended_session"]["positive"], True)
     self.assertTrue(doc["extended_retry"])
+    # the retry already entered extended, so no SECOND 10 03 is sent before the (never-reached) write
+    self.assertEqual([d[1] for d in self.tx_frames(car)].count(0x10), 1)
+    self.assertIsNone(doc["session_before_write"])           # the write's session step was skipped: read aborted first
 
   def test_read_silent_no_write(self):
     car = FakeCar()

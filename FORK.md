@@ -61,7 +61,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 24 | **Automatic read-only ESC UDS read** at every ignition (card, inside openpilot's own fingerprint window, panda still in ELM327; no firmware change): 70 identification/variant-coding DIDs once per ESC firmware, DTCs (0x19 02) once per day, only in Park at 0 km/h, at most once per ignition → `/data/esc-uds/*.json` + `esc_uds_read` rlog event. Plus route data: `scc_map_path` event logs the MapTargetVelocities list (was only in /dev/shm) | diagnostics + route data | fork-local (`fork/esc_diag.py`, `fork/scc.py`) |
 | 25 | Hyundai FCA11 rolling test **Warn gating**: in the rolling mode (bit 128, armed only by the runner) a `CF_VSM_Warn` > 0 FCA11 frame is policed like actuation — same 5-35 km/h D window, latched cut and fresh-input rules, and it shares the 1.2 s episode clock. **Inert unless bit 128 is armed**; parked mode and normal driving byte-for-byte unchanged — **TEST-GATED, offline-tested only** | safety C (tightening) | fork-local; amends #19; patch `0012`, opendbc branch `fca11-warn-0012` |
 | 26 | ESC read **standstill fix** (amends #24): "stationary" = Park + fewer than 2 wheels above 12 LSB (0.375 km/h, opendbc's Hyundai STANDSTILL_THRESHOLD) and no wheel above 96 LSB, instead of all wheels exactly 0 (parked single-wheel noise skipped the read on the car). Same definition for the pre-check and every per-frame check; a pre-check skip no longer uses up the ignition (≤ 3 tries per ignition, ≤ 3 s settle wait in Park) | diagnostics | fork-local (`fork/esc_diag.py`) |
-| 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`) |
+| 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, **enter extended session (10 03 — the vendor's own write flow, decoded GIT VariantCodingTable)**, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`) |
 
 ---
 
@@ -79,8 +79,11 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Enabled by a file:** `/data/esc-probe-0027/state.json` with `{"probe_enabled": true}`; missing file/flag = inert
   (`skip: not enabled`). `touch /data/esc-probe-0027/DISABLE` forces off. At most ONE probe per ignition
   (`done_ignition` written once the standstill pre-check passes, before the multiplexer).
-- **Sequence:** `0x22 0x0103` (extended-session retry once if refused with NRC 0x31/0x7F) → `0x27 0x01` requestSeed
-  only (**sendKey 0x02 is never sent**) → `0x2E 0x0103 <read-back>` (no-op) → `0x22 0x0103` re-read.
+- **Sequence (vendor-confirmed):** `0x22 0x0103` (extended-session retry once if refused with NRC 0x31/0x7F) →
+  `10 03` enter extended session (SKIPPED if the read's retry already entered it; any answer continues, true silence
+  aborts before the write) → `0x27 0x01` requestSeed only (**sendKey 0x02 is never sent**) → `0x2E 0x0103 <read-back>`
+  (no-op) → `0x22 0x0103` re-read. The read→session→write order mirrors the vendor tool itself (see the follow-up
+  bullet below).
 - **Safety, mechanically enforced:** `guard_service` allows exactly {0x22, 0x3E, 0x10 sub 0x03, 0x27 sub 0x01, 0x2E DID
   0x0103}; `guard_frame` admits only those single frames + one flow-control frame, and a 0x2E frame is admitted only
   when its 4 data bytes equal the step-1 read-back. The write is attempted ONLY if step 1 returned exactly
@@ -91,10 +94,17 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   recorded in the result JSON, never raised into card.
 - **Output:** `/data/esc-probe-0027/<UTC>-result.json` (read value, seed response verbatim, write request/response,
   re-read, TX log, duration, aborted/error, mux_restored; 60 files max) + an `esc_probe_0027` cloudlog event (rlog).
-- **Tests:** `fork/tests/test_esc_probe_0027.py` (40, fake ESC through the real `run()` path). Mutation proof:
-  `car-features/auto-esc-mutation.py` ESC_WT=the probe worktree **45/45 killed** (5 new probe mutants: 0x27 sub 0x02
+- **Tests:** `fork/tests/test_esc_probe_0027.py` (42, fake ESC through the real `run()` path). Mutation proof:
+  `car-features/auto-esc-mutation.py` ESC_WT=the probe worktree **47/47 killed** (7 probe mutants: 0x27 sub 0x02
   admitted, 0x2E DID 0x0104 admitted, constant payload instead of the read-back, gate check removed before TX, write
-  attempted when the read was refused). Demo: `car-features/esc-probe-0027-offline-demo.out`.
+  attempted when the read was refused, **10 03 session step removed**, **write attempted when the session was
+  silent**). Demo: `car-features/esc-probe-0027-offline-demo.out`.
+- **Vendor-flow alignment (2026-10-05, update 2):** the vendor's own `VariantCodingTable_HY.git.xml` (decoded; the
+  CN7N/"Elantra N" ESC block, `<Security SecuritySupported="0" .../>`) exposes the authoritative write as
+  `<Backup requestvalue="07D103220103">` (read) → `<Input requestvalue="07D1021003">` (**10 03 extended session**) →
+  `<Input requestvalue="07D1072E0103$…$">` (2E 0103 write) — the tool sends **no 0x27**. The probe now mirrors that
+  exact order at the write (READ → SESSION → WRITE) while still asking for the 0x27 seed, so its reply remains the
+  informative part. Report: `car-features/esc-probe-0027-report.md` "Update 2 — vendor-flow alignment".
 - **Merge note:** intentionally fork-local; diagnostic only (removed or left inert once the question is answered).
 
 ### esc-standstill-fix: ESC read standstill definition + pre-check retry — 2026-10-05 (offline-tested; no firmware change)

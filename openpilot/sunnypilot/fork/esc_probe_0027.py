@@ -16,6 +16,20 @@ configuration; what is informative is the *reply*:
 
 Phase 1 never sends the key (0x27 sub 0x02) — asking is the whole probe.
 
+Vendor-confirmed write flow (GIT VariantCodingTable, decoded 2026-10-05; CN7N ESC block SecuritySupported=0)
+------------------------------------------------------------------------------------------------------------
+The vendor's own variant-coding table for THIS car's ESC (GIT VariantCodingTable_HY.git.xml, the CN7N/"Elantra N"
+block — HECU 58910-IB000, CAN IDs 0x7D1/0x7D9) exposes the authoritative write sequence as plain request hex:
+
+    <Backup requestvalue="07D103220103">          -> 0x7D1: 03 22 01 03      read the current 0x0103 value
+    <Input  requestvalue="07D1021003">            -> 0x7D1: 02 10 03         ENTER EXTENDED SESSION
+    <Input  requestvalue="07D1072E0103$01$$02$$03$$04$"> -> 0x7D1: 07 2E 01 03 <4 code bytes>   write
+
+and `<Security SecuritySupported="0" Securityindex="0" CANID="07D1"/>` — the vendor tool never sends 0x27 for this
+ECU (the 27 01 templates exist only for the Kia CONTI/MANDO entries with security indexes 26300/270100). This probe
+still ASKS for the 0x27 seed (that contrast is informative), but mirrors the vendor exactly at the write: read 0x0103
+-> 10 03 extended session -> 2E 0103 no-op.
+
 Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mutation-proven)
 ----------------------------------------------------------------------------------------------
 * Enabled only by a state file: ``/data/esc-probe-0027/state.json`` with ``{"probe_enabled": true}``. Missing file
@@ -23,7 +37,8 @@ Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mu
 * At most ONE probe per ignition cycle: ``done_ignition`` is written once the standstill pre-check passes, BEFORE
   the multiplexer or any TX, so neither a crash nor a killed process can lose the cycle.
 * Allowlist (checked twice: ``guard_service`` before a frame is built, ``guard_frame`` at the single TX site):
-  0x22 ReadDataByIdentifier, 0x3E TesterPresent, 0x10 sub 0x03 (extended, only to retry a refused read),
+  0x22 ReadDataByIdentifier, 0x3E TesterPresent, 0x10 sub 0x03 (extended: retry a refused read, or the
+  vendor-confirmed session step before the write),
   0x27 sub 0x01 ONLY (sendKey 0x02 raises), 0x2E with DID 0x0103 ONLY — and the 0x2E payload bytes MUST equal
   the bytes read back from 0x0103 in step 1 (an argument to the request, asserted at the TX site too).
 * Only when stationary: the SAME definition as esc_diag — gear Park (LVR12) and the wheels at standstill
@@ -313,6 +328,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
   client = EscProbeClient(can_send, can_recv, gate, now, t0 + RUN_BUDGET_S)
   doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None,
               "read": None, "extended_session": None, "extended_retry": False, "current_value": None,
+              "session_before_write": None,
               "seed_request": None, "seed": None, "already_unlocked": None,
               "write": None, "write_attempted": False, "reread": None, "reread_value": None,
               "value_changed": None, "tx": [], "duration_s": None, "aborted": None, "error": None,
@@ -377,6 +393,17 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
       # No usable read -> nothing is written. (The no-op write is only meaningful against the value we just read.)
       raise Abort("step-1 read of 0x0103 refused/missing; refusing to write")
 
+    # ---- step 1.5: enter extended session (10 03) before the write --------------------------------------------
+    # The vendor VariantCodingTable for this ECU writes as READ 22 0103 -> 10 03 -> 2E 0103. The read above ran in the
+    # default session; if the retry path already entered extended (extended_retry), we are already there — do not send
+    # 10 03 twice. A 10 03 that gets ANY answer (positive 50 03 or negative 7F 10 ..) continues; true silence (no frame
+    # at all) means the ESC will not hold a write session, so abort before the write.
+    if not doc["extended_retry"]:
+      sess = client.extended_session()
+      doc["session_before_write"] = sess
+      if not sess.get("frames"):
+        raise Abort("10 03 session got no response; not attempting the write")
+
     # ---- step 2: request the 0x27 seed ONLY (never the key) --------------------------------------------------
     r2 = client.request_seed()
     doc["seed_request"] = r2
@@ -422,7 +449,9 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
   if precheck_failed:
     summary.update(ran=False, skip=doc["aborted"])
   path = _write_result(out_dir, "result", doc, wall())
-  summary.update(path=path, current_value=doc["current_value"], seed=doc["seed"],
+  summary.update(path=path, current_value=doc["current_value"], session_before_write=doc["session_before_write"],
+                 session_before_write_positive=bool((doc["session_before_write"] or {}).get("positive")),
+                 seed=doc["seed"],
                  seed_positive=bool((doc["seed_request"] or {}).get("positive")),
                  write_attempted=doc["write_attempted"], write_positive=bool((doc["write"] or {}).get("positive")),
                  write_nrc=(doc["write"] or {}).get("nrc"), reread_value=doc["reread_value"],
