@@ -1,0 +1,180 @@
+From 935e5ed32656106cf7b873375d35354ff10dafe8 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sun, 4 Oct 2026 12:19:39 -0500
+Subject: [PATCH] hyundai: FCA11 rolling test: police CF_VSM_Warn-only frames
+ with the rolling window and the 1.2 s clock
+
+A Warn-only FCA11 frame (CF_VSM_Warn != 0, no actuation bits) bypassed the rolling window: while armed the panda
+passed Warn 1-3 at any speed, with a pedal pressed, or after a latched cut, raising a dash FCW anywhere. Any frame
+with Warn > 0 now needs the same window as actuation and runs the same continuous-episode clock (a Warn lead-in plus
+actuation is one episode, capped at 1.2 s). Parked mode (64 without 128) is unchanged.
+---
+ opendbc/safety/modes/hyundai.h       |  13 ++--
+ opendbc/safety/tests/test_hyundai.py | 104 ++++++++++++++++++++++++++-
+ 2 files changed, 111 insertions(+), 6 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index a1f9aa0f..ee099d70 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -514,17 +514,22 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       violation |= FCA_StopReq;
+       if (hyundai_fca11_rolling_test) {
+         uint32_t ts = microsecond_timer_get();
++        // CF_VSM_Warn (bits 3-4) raises the dash FCW: in the rolling mode a Warn-only frame (no actuation bits) is
++        // policed exactly like actuation: same rolling window, same latched cut, and it runs the same 1.2 s clock
++        // (a Warn lead-in followed by actuation counts as ONE continuous episode)
++        bool CF_VSM_Warn = ((msg->data[0] >> 3) & 0x3U) != 0U;
++        bool gated = actuation || CF_VSM_Warn;
+         violation |= hyundai_fca11_roll_camera_owns;  // real camera request: never a second FCA11 source
+-        violation |= actuation && !hyundai_fca11_rolling_window_ok();
+-        violation |= actuation && hyundai_fca11_roll_act_active &&
++        violation |= gated && !hyundai_fca11_rolling_window_ok();
++        violation |= gated && hyundai_fca11_roll_act_active &&
+                      (safety_get_ts_elapsed(ts, hyundai_fca11_roll_ts_act) > HYUNDAI_FCA11_ROLL_MAX_ACT_US);
+         if (!violation) {
+           hyundai_fca11_roll_tx_seen = true;
+           hyundai_fca11_roll_ts_tx = ts;
+-          if (actuation && !hyundai_fca11_roll_act_active) {
++          if (gated && !hyundai_fca11_roll_act_active) {
+             hyundai_fca11_roll_act_active = true;
+             hyundai_fca11_roll_ts_act = ts;
+-          } else if (!actuation) {
++          } else if (!gated) {
+             hyundai_fca11_roll_act_active = false;
+           } else {
+           }
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 4ad58d87..f4fbd301 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -1643,10 +1643,10 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+   def _test_sp(self) -> int:
+     return HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST | self.SAFETY_PARAM_SP
+ 
+-  def _fca11(self, dec=0, prefill=0, hba=0, cmd_act=0, dec_cmd_act=0, stop_req=0):
++  def _fca11(self, dec=0, prefill=0, hba=0, cmd_act=0, dec_cmd_act=0, stop_req=0, warn=0):
+     # dec is RAW CR_VSM_DecCmd (0.01 g/LSB); +0.25 LSB so float scaling can't truncate n*0.01/0.01 down to n-1
+     values = {"CR_VSM_DecCmd": (dec + 0.25) * 0.01 if dec else 0, "CF_VSM_Prefill": prefill, "CF_VSM_HBACmd": hba, "FCA_CmdAct": cmd_act,
+-              "CF_VSM_DecCmdAct": dec_cmd_act, "FCA_StopReq": stop_req, "FCA_Status": 2}
++              "CF_VSM_DecCmdAct": dec_cmd_act, "FCA_StopReq": stop_req, "FCA_Status": 2, "CF_VSM_Warn": warn}
+     return self.packer.make_can_msg_safety("FCA11", 0, values)
+ 
+   def _brake_cmd(self, dec):
+@@ -2162,6 +2162,103 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+     self.assertTrue(self._tx(self._fca11()))        # a passive frame ends the actuation ...
+     self.assertTrue(self._tx(self._brake_cmd(5)))   # ... and a new one may start
+ 
++  # *** CF_VSM_Warn (dash FCW) is policed like actuation in the rolling mode ***
++
++  def test_warn_helper_bits(self):
++    # guards the helper: warn lands in byte0 bits 3-4 (what the panda reads), nothing else set
++    for warn in (0, 1, 2, 3):
++      msg = self._fca11(warn=warn)
++      self.assertEqual(warn << 3, msg[0].data[0])
++      self.assertEqual(0, msg[0].data[1])
++
++  def test_warn_only_allowed_in_window(self):
++    for warn in (1, 2, 3):
++      with self.subTest(warn=warn):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._fca11(warn=warn)))
++
++  def test_warn_only_blocked_outside_window(self):
++    lo = HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH * self.RAW_PER_KPH
++    hi = HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH * self.RAW_PER_KPH
++    for warn in (1, 2, 3):
++      for raw in (0, lo, hi + 1):
++        with self.subTest(warn=warn, raw=raw):
++          self._rearm()
++          self._open_window(raw)
++          self.assertFalse(self._tx(self._fca11(warn=warn)))
++          self.assertTrue(self._tx(self._fca11()))   # passive carrier still flows
++      for c in ("brake", "gas", "gear"):
++        with self.subTest(warn=warn, cut=c):
++          self._rearm()
++          self._open_window()
++          self.assertTrue(self._tx(self._fca11(warn=warn)))
++          {"brake": lambda: self._rx(self._user_brake_msg(True)), "gas": lambda: self._rx(self._user_gas_msg(1)),
++           "gear": lambda: self._rx(self._gear_msg(4))}[c]()
++          self.assertFalse(self._tx(self._fca11(warn=warn)))
++          self._open_window()   # restored, but the cut is latched until re-arm
++          self.assertFalse(self._tx(self._fca11(warn=warn)))
++
++  def test_warn_only_needs_fresh_inputs(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    self.safety.set_timer(1000000 + 100001)
++    self.assertFalse(self._tx(self._fca11(warn=1)))
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    self._rearm()
++    self.safety.set_timer(50000)   # nothing seen since this arm: blocked even though timestamps look fresh
++    self.assertFalse(self._tx(self._fca11(warn=1)))
++
++  def test_warn_only_blocked_after_camera_request(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=2)))
++    self._rx(self._cam_fca11(CF_VSM_Warn=1))
++    self.assertFalse(self._tx(self._fca11(warn=2)))
++
++  def test_warn_only_runs_clock(self):
++    # Warn-only alone is capped at 1.2 s
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    self.safety.set_timer(1000000 + 1200000)
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    self.safety.set_timer(1000000 + 1200001)
++    self._open_window()
++    self.assertFalse(self._tx(self._fca11(warn=1)))
++    self.assertTrue(self._tx(self._fca11()))        # passive ends the episode ...
++    self.assertTrue(self._tx(self._fca11(warn=1)))  # ... a new one may start
++
++  def test_warn_leadin_shares_clock_with_actuation(self):
++    # a 0.5 s Warn=1 lead-in then Warn=2 + DecCmdAct: ONE episode, 1.2 s total from the first Warn frame
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(warn=1)))
++    self.safety.set_timer(1000000 + 500000)
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(dec=10, prefill=1, dec_cmd_act=1, warn=2)))
++    self.safety.set_timer(1000000 + 1200000)
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11(dec=10, prefill=1, dec_cmd_act=1, warn=2)))
++    self.safety.set_timer(1000000 + 1200001)
++    self._open_window()
++    self.assertFalse(self._tx(self._fca11(dec=10, prefill=1, dec_cmd_act=1, warn=2)))
++    self.assertFalse(self._tx(self._fca11(warn=1)))   # dropping back to Warn-only does not reset the clock
++
++  def test_variant_frames_allowed_in_window(self):
++    # the two next-test variants: A = Warn 2 + DecCmdAct, B = Warn 3 + FCA_CmdAct (DecCmd 10, Prefill 1)
++    for kw in ({"warn": 2, "dec_cmd_act": 1}, {"warn": 3, "cmd_act": 1}):
++      with self.subTest(kw=kw):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._fca11(dec=HYUNDAI_FCA11_TEST_MAX_DEC, prefill=1, **kw)))
++        self._rearm()
++        self._open_window(0)
++        self.assertFalse(self._tx(self._fca11(dec=HYUNDAI_FCA11_TEST_MAX_DEC, prefill=1, **kw)))
++
+   # *** gating ***
+ 
+   def test_rolling_bit_alone_ignored(self):
+@@ -2177,6 +2274,9 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+     self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
+     self._open_window()
+     self.assertFalse(self._tx(self._brake_cmd(1)))
++    # 0012 Warn gating is rolling-only: the parked mode's Warn handling is byte-for-byte what it was (not inspected)
++    for warn in (1, 2, 3):
++      self.assertTrue(self._tx(self._fca11(warn=warn)))
+     self._rx(self._wheel_msg(0))
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+ 
+-- 
+2.54.0 (Apple Git-157)
+

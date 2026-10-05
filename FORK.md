@@ -59,10 +59,38 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 22 | Hyundai pedal **speed-scheduled gain** (0.10 → 0.36 over 0-22 m/s) + hold table in command units, **jerk-based** rise limit (2.0 m/s³ × gain) instead of the fixed 0.75/s — identical to the old law at ≥ 22 m/s; cap 0.35, launch ceiling and panda ceiling unchanged (**no firmware change**) — **offline-tested only** | tune (car layer, Python only) | fork-local; amends #15/#20; patch `0011`, opendbc branch `pedal-tune-12ef` |
 | 23 | SCC fixes (fork subclasses, upstream SCC files untouched): vision output floored at MIN_V, no ENTERING below 9 m/s, already-turning → TURNING; map path ignored when > 25 m away or mapd unmatched, `scc_map_diag` cloudlog diagnostics; **throttle-only guard** releases an SCC coast with no lateral corroboration after 2 s. Adaptive follow highway factor 1.2 → 1.1 — **offline-tested only** | fix + safety net (planner) | fork-local (`fork/scc.py`); SCC bug fixes are upstream-PR candidates |
 | 24 | **Automatic read-only ESC UDS read** at every ignition (card, inside openpilot's own fingerprint window, panda still in ELM327; no firmware change): 70 identification/variant-coding DIDs once per ESC firmware, DTCs (0x19 02) once per day, only in Park at 0 km/h, at most once per ignition → `/data/esc-uds/*.json` + `esc_uds_read` rlog event. Plus route data: `scc_map_path` event logs the MapTargetVelocities list (was only in /dev/shm) | diagnostics + route data | fork-local (`fork/esc_diag.py`, `fork/scc.py`) |
+| 25 | Hyundai FCA11 rolling test **Warn gating**: in the rolling mode (bit 128, armed only by the runner) a `CF_VSM_Warn` > 0 FCA11 frame is policed like actuation — same 5-35 km/h D window, latched cut and fresh-input rules, and it shares the 1.2 s episode clock. **Inert unless bit 128 is armed**; parked mode and normal driving byte-for-byte unchanged — **TEST-GATED, offline-tested only** | safety C (tightening) | fork-local; amends #19; patch `0012`, opendbc branch `fca11-warn-0012` |
 
 ---
 
 ## Entries
+
+### fca11-warn-0012: opendbc 0012 FCA11 rolling-test Warn gating — 2026-10-05 (offline-tested; one firmware build; NOT road-run)
+
+- **Why:** the rolling brake test's next variants send `CF_VSM_Warn` (dash FCW) with and before the decel. In the
+  rolling mode the window/clock applied only to *actuation* frames, so while armed a Warn-only frame (Warn 1-3, no
+  actuation bits) passed at any speed, with a pedal pressed or after a latched cut. The fix existed only as opendbc
+  `fca11-rolling-warn` @ `1546f434` on the OLD base `f265f992`; its firmware (`824039ad…`) lacks buttons-v3, the 0.35
+  ceiling and the timed factory-cruise cancel, so flashing it would have downgraded the daily-driver safety. This
+  carries the one commit onto the deployed stack as patch `0012` instead.
+- **What (`opendbc/safety/modes/hyundai.h`, rolling branch of the FCA11 TX check only):** `gated = actuation ||
+  CF_VSM_Warn != 0` replaces `actuation` in the window check, the 1.2 s clock check and the clock start/stop. A Warn
+  lead-in followed by actuation is ONE episode (1.2 s total). Nothing outside `if (hyundai_fca11_rolling_test)` changed:
+  normal driving (no bit 64), the parked test mode (64 without 128) and every pedal/cruise path are untouched.
+- **opendbc:** `fca11-warn-0012` @ `935e5ed3` = `1546f434` cherry-picked onto `pedal-tune-12ef` @ `f5fc1256` (clean,
+  identical `git patch-id`; one test comment renumbered 0011 → 0012). Patch
+  `0012-hyundai-fca11-rolling-warn-gate.patch` (`git format-patch`, submodule-relative) sha256
+  `2d2d0ef24eab299f8e01eff855fea2235c3008c42b28b10aac547d35e10fcb39`.
+- **Verification:** 0001-0012 apply clean on pristine `f95f996f` (12/12, 0 fuzz/offset), tree `620a3fd7` == branch tip.
+  `test_gas_interceptor` + `test_hyundai` + `test_release_build`: **2432 passed, 321 skipped, 2125 subtests** (base
+  f5fc1256: 2416 / 321 / 2079); per-test outcome diff vs base = exactly the 16 new Warn tests added as PASSED, no
+  other test changed outcome, no new skips. Mutations **9/9 killed** (`car-features/fca11-rolling-warn-mutation.py
+  fca11-warn-0012`). MISRA/cppcheck 2.21.0: 0 findings.
+- **Firmware:** panda `74a0adce`, arm-none-eabi 13.2.1, CI recipe → `panda_h7.bin.signed` sha256
+  **`65d3692f5bfc6c0850a1a779b0b4590374f439de4c41267d44a9c17c27c7db4e`**, 109,340 B, `DEV-74a0adce-DEBUG`, 0
+  warnings; two clean `git archive` builds and the patch-series (CI-path) tree build byte-identical; control
+  `f5fc1256` reproduces the deployed `d0f5396c…`. **Merging this changes the firmware → one panda reflash.**
+- **Report:** `car-features/fca11-warn-0012-report.md`.
 
 ### auto-esc-read: automatic read-only ESC UDS read + MapTargetVelocities in the rlog — 2026-10-04 (offline-tested; no firmware change)
 
