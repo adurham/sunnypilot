@@ -58,10 +58,37 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 21 | Hyundai pedal **timed factory-cruise CANCEL** backstop: if factory cruise goes ACTIVE (EMS16 `CRUISE_LAMP_S`) under engaged openpilot long, panda itself sends CLU11 button-4 frames right after cluster CLU11 frames (4×3 max, 15 ms rate cap, 2 s give-up); CLU11 stays out of the USB TX list; openpilot long is still dropped by the MAIN lockout and alerts **"Cruise Fault"** if factory cruise is still on after 2.5 s. Should rarely fire. **ECM acceptance unproven until the road test** — **offline-tested only** | safety net (safety C + car) | fork-local; amends #16/#18; patch `0009`, opendbc branch `timed-cancel` (fbc82f9c) → `integration-3` |
 | 22 | Hyundai pedal **speed-scheduled gain** (0.10 → 0.36 over 0-22 m/s) + hold table in command units, **jerk-based** rise limit (2.0 m/s³ × gain) instead of the fixed 0.75/s — identical to the old law at ≥ 22 m/s; cap 0.35, launch ceiling and panda ceiling unchanged (**no firmware change**) — **offline-tested only** | tune (car layer, Python only) | fork-local; amends #15/#20; patch `0011`, opendbc branch `pedal-tune-12ef` |
 | 23 | SCC fixes (fork subclasses, upstream SCC files untouched): vision output floored at MIN_V, no ENTERING below 9 m/s, already-turning → TURNING; map path ignored when > 25 m away or mapd unmatched, `scc_map_diag` cloudlog diagnostics; **throttle-only guard** releases an SCC coast with no lateral corroboration after 2 s. Adaptive follow highway factor 1.2 → 1.1 — **offline-tested only** | fix + safety net (planner) | fork-local (`fork/scc.py`); SCC bug fixes are upstream-PR candidates |
+| 24 | **Automatic read-only ESC UDS read** at every ignition (card, inside openpilot's own fingerprint window, panda still in ELM327; no firmware change): 70 identification/variant-coding DIDs once per ESC firmware, DTCs (0x19 02) once per day, only in Park at 0 km/h, at most once per ignition → `/data/esc-uds/*.json` + `esc_uds_read` rlog event. Plus route data: `scc_map_path` event logs the MapTargetVelocities list (was only in /dev/shm) | diagnostics + route data | fork-local (`fork/esc_diag.py`, `fork/scc.py`) |
 
 ---
 
 ## Entries
+
+### auto-esc-read: automatic read-only ESC UDS read + MapTargetVelocities in the rlog — 2026-10-04 (offline-tested; no firmware change)
+
+- **Why:** `car-features/auto-esc-read-brief.md` / `auto-esc-read-report.md`. The FCA11/AEB work needs the ESC's
+  identification + variant-coding DIDs and stored DTCs. The SCC-Map analyses had to fake the map turn path because
+  `MapTargetVelocities` only lives in `/dev/shm` params.
+- **ESC read (`openpilot/sunnypilot/fork/esc_diag.py`, one call in `selfdrive/car/card.py`):** runs after `get_car()` and
+  before `FirmwareQueryDone`. The panda is still in ELM327 safety then (openpilot's own fw query talks to this ESC
+  in that window every boot: `abs` 0x7D1 -> 0x7D9, bus 1 with OBD multiplexing). **No panda firmware change.**
+  - **Read-only:** only single frames 0x22 / 0x3E / 0x10 03 / 0x19 02 FF + one fixed flow-control frame, to 0x7D1 on
+    bus 1. Two guards: per service before a frame is built, and per frame at the single `can_send` site.
+  - **Stationary only:** gear P (LVR12) and all four wheel speeds exactly 0 (WHL_SPD11), from bus-0 frames < 0.25 s old.
+    Checked before every frame and after every receive; any violation aborts at once.
+  - **Startup cost and multiplexer:** openpilot cannot engage yet in this window, and the pedal gets no commands. The
+    OBD multiplexer is switched back off in `finally` (SIGTERM too) and verified from pandaStates. Budget 20 s;
+    stops after 4 requests in a row with no answer. Errors never propagate.
+  - **Schedule:** at most once per ignition (key saved before any send). The full DID read runs once per ESC firmware
+    version (max 3 attempts). DTCs are read once per UTC day.
+  - **Output:** `/data/esc-uds/<UTC>-{full,dtc,fulldtc,skipped}.json` (raw request/response hex, NRCs, TX log; 60 files
+    max) + `esc_uds_read` cloudlog event (rlog). Disable: `touch /data/esc-uds/DISABLE`.
+- **Route data (`fork/scc.py`):** `scc_map_path` cloudlog event = the MapTargetVelocities list (lat/lon/v, ≤ 400
+  points). Logged only when its content changes and at most once per 2 s, engaged or not.
+- **Tests:** `fork/tests/test_esc_diag.py` (30, fake car through the real `run()` path) + 2 new in `test_scc.py`.
+  Mutation proof: `car-features/auto-esc-mutation.py`, **30/30 mutants killed** (one per hard rule).
+- **Not done / open:** N drive mode is NOT broadcast on C-CAN (`car-features/n-drive-mode-decode.md`); it needs a
+  labeled capture. First on-car run will show whether every DID fits the fixed flow-control frame (BS 0 = no limit).
 
 ### pedal-tune-12ef: drive 12e/12f fixes — opendbc 0011 pedal gain/jerk + SCC fixes + throttle-only SCC guard + follow 1.1 — 2026-10-04 (offline-tested, NOT road-validated; no firmware change)
 

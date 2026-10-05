@@ -24,6 +24,7 @@ from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_cap
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.fork.esc_diag import run_from_card as run_esc_diag_from_card
 
 REPLAY = "REPLAY" in os.environ
 
@@ -115,6 +116,9 @@ class Car:
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP, self.CI.CP_SP)
       self.CP = self.CI.CP
       self.CP_SP = self.CI.CP_SP
+
+      # fork: read-only ESC UDS read while the panda is still in the fingerprint (ELM327) window (fork/esc_diag.py)
+      run_esc_diag_from_card(self.CP, self.can_callbacks, obd_callback(self.params))
 
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)

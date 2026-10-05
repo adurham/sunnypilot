@@ -249,6 +249,39 @@ class TestMap(OpenpilotTestCase):
     self.assertFalse([x for x in ev.call_args_list if x.args and x.args[0] == "scc_map_diag"])
 
 
+  def test_map_path_logged_when_it_changes(self):
+    """Route data: MapTargetVelocities is only in /dev/shm params; scc_map_path puts it in the rlog (engaged or not),
+    only when its content changes, rate-capped."""
+    put_path(self.params, 0., RAMP_PATH)
+    with mock.patch.object(fscc.cloudlog, "event") as ev:
+      c = fscc.ForkSCCMap()
+      for _ in range(int(5. / DT_MDL)):
+        c.update(False, False, 20., 0., 30.)
+    paths = [x.kwargs for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"]
+    self.assertEqual(len(paths), 1)  # unchanged path -> logged once
+    self.assertEqual(paths[0]["n"], len(RAMP_PATH))
+    self.assertEqual(len(paths[0]["points"]), len(RAMP_PATH))
+    self.assertEqual([p[2] for p in paths[0]["points"]], [v for _, v in RAMP_PATH])
+    # a new path is logged again, but not faster than MAP_PATH_MIN_GAP_S
+    with mock.patch.object(fscc.cloudlog, "event") as ev:
+      for i in range(int(4. / DT_MDL)):
+        put_path(self.params, float(i % 7), RAMP_PATH)  # content changes every cycle
+        c.update(False, False, 20., 0., 30.)
+    paths = [x for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"]
+    self.assertGreaterEqual(len(paths), 1)
+    self.assertLessEqual(len(paths), int(4. / fscc.MAP_PATH_MIN_GAP_S) + 1)
+
+  def test_map_path_capped(self):
+    big = [{"latitude": LAT0 + i * 1e-5, "longitude": LON0, "velocity": 20.} for i in range(fscc.MAP_PATH_MAX_POINTS + 50)]
+    self.params.put("MapTargetVelocities", json.dumps(big), block=True)
+    with mock.patch.object(fscc.cloudlog, "event") as ev:
+      c = fscc.ForkSCCMap()
+      c.update(False, False, 20., 0., 30.)
+    p = [x.kwargs for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"][0]
+    self.assertEqual(p["n"], len(big))
+    self.assertTrue(p["truncated"])
+    self.assertEqual(len(p["points"]), fscc.MAP_PATH_MAX_POINTS)
+
 class TestGuardUnit(OpenpilotTestCase):
   def _feed(self, g, n, **kw):
     a = {"long_enabled": True, "v_ego": 20.7, "a_prev": -1.2, "raw_v_targets": (V_CRUISE_UNSET, 14.93),

@@ -52,6 +52,7 @@ hook is in ``LongitudinalPlannerSP.__init__`` (``self.scc = ForkSmartCruiseContr
 members are pinned by ``fork/tests/test_scc.py::TestUpstreamHooks`` so a rename upstream fails a test instead of
 silently dropping the fix.
 """
+import json
 import math
 
 import openpilot.cereal.messaging as messaging
@@ -74,6 +75,8 @@ MAP_MAX_NEAREST_DIST = 25.             # m; nearest MapTargetVelocities point fa
 MAP_REJECT_HOLD_S = 1.0                # s of continuous rejection before an ACTIVE SCC-M is dropped
 MAP_DIAG_PERIOD_S = 1.0                # periodic diagnostics while engaged
 MAP_DIAG_MIN_GAP_S = 0.2               # cap on change-triggered diagnostics
+MAP_PATH_MIN_GAP_S = 2.0               # route data: at most one scc_map_path event per this, only when the path changed
+MAP_PATH_MAX_POINTS = 400              # route data: cap per event (~12 KB worst case)
 
 # --- throttle-only guard ---
 GUARD_UNCORROBORATED_S = 2.0           # s of uncorroborated SCC coast before the SCC targets are released
@@ -122,6 +125,8 @@ class ForkSCCMap(SmartCruiseControlMap):
     self._reject_frames = 0
     self._last_diag_frame = -10 ** 9
     self._last_diag_key = None
+    self._last_path_frame = -10 ** 9
+    self._last_path_key = hash(json.dumps([]))  # an empty path is not logged until a real one appears
 
   def _nearest(self) -> tuple[float, int]:
     if not self.target_velocities or self.last_position is None:
@@ -199,9 +204,27 @@ class ForkSCCMap(SmartCruiseControlMap):
       self._last_diag_frame = self.frame
       self._last_diag_key = key
 
+  def _log_path(self) -> None:
+    """Route data: the MapTargetVelocities list lives only in /dev/shm params (not in the rlog), so offline replays had
+    to fake SCC-M's input. Log the list itself, whenever its content changes, engaged or not (rate-capped,
+    coordinates rounded to ~0.1 m). Bounded storage: <= 1 event / MAP_PATH_MIN_GAP_S, <= MAP_PATH_MAX_POINTS points."""
+    tv = self.target_velocities or []
+    try:
+      pts = [[round(float(p["latitude"]), 6), round(float(p["longitude"]), 6), round(float(p["velocity"]), 2)]
+             for p in tv[:MAP_PATH_MAX_POINTS]]
+    except (KeyError, TypeError, ValueError):
+      pts = []
+    key = hash(json.dumps(pts))
+    if key == self._last_path_key or self.frame - self._last_path_frame < int(round(MAP_PATH_MIN_GAP_S / DT_MDL)):
+      return
+    cloudlog.event("scc_map_path", n=len(tv), truncated=len(tv) > MAP_PATH_MAX_POINTS, points=pts)
+    self._last_path_key = key
+    self._last_path_frame = self.frame
+
   def update(self, long_enabled: bool, long_override: bool, v_ego, a_ego, v_cruise) -> None:
     super().update(long_enabled, long_override, v_ego, a_ego, v_cruise)
     self._log_diag()
+    self._log_path()
 
 
 class ThrottleOnlySCCGuard:
