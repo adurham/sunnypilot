@@ -45,13 +45,30 @@ The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``
       threshold the fork's road-type classifier uses. ``ref = min(highway speed, set speed)``; merging while
       ``v_ego < ref - MERGE_DEFICIT`` (15 mph). So the gate needs BOTH a highway-class road AND a target >= 15 mph
       above the car: a +5/+10 mph bump never trips it.
-    - else positive non-highway evidence (roadType urban, or a valid map / car limit under 55 mph): no merge, ease.
+    - else positive non-highway evidence (roadType urban, or a valid map / car limit under 55 mph) and NOT a valid
+      highway-class limit within ``MERGE_AHEAD_DIST`` ahead: no merge, ease. (A >= 55 mph limit within 500 m ahead
+      deliberately overrides ``roadType`` urban: approaching a highway from a surface street / frontage road IS the
+      on-ramp case, so this is checked before the urban exclusion below.)
     - else NO data at all (fail safe): the set speed stands in for the road's speed when it is highway-class: merging
       while ``v_ego < v_set - NODATA_DEFICIT`` (25 mph; a +10 mph bump never reaches that).
+  ``carStateSP.speedLimit`` staleness (known, benign): the car's own limit (the Hyundai cluster / camera sign) is a
+  LAST-SEEN display value, read live from a CAN signal; ``CarStateSP`` carries only a bare ``Float32`` (no validity
+  bit, no timestamp), so it has no freshness channel and it persists after the car leaves the sign. A lone stale
+  >= 55 mph reading can therefore keep the gate active on a normal road while the car is > 15 mph below a
+  highway-class set speed. The effect is benign by construction: the gate only SUPPRESSES easing, i.e. restores
+  exact upstream behaviour; it never adds acceleration or weakens braking. A freshness guard was investigated and
+  rejected: it cannot be built from the signals available (no age / valid field on the message) and an
+  evidence-veto version would suppress the gate on the real 134 on-ramp merge (``roadType`` reads ``urban`` at merge
+  start), breaking the "never suppress a real merge" constraint. Proper remediation is upstream: add a validity /
+  age field to ``CarStateSP.speedLimit``. (The map limit is read directly from ``liveMapDataSP`` -- with its
+  ``speedLimitValid`` -- bypassing the resolver's GPS-age gate, so a frozen valid map limit can suppress easing the
+  same benign way.)
   The set speed (``v_cruise`` before the SCC / SLA arbitration) is used, not the arbitrated target: a curve on the ramp
   (SCC) dipping the target must not end the merge mid-ramp. While merging the ARBITRATED target is passed through, so
   a curve / SLA still limits exactly as upstream.
-  Hysteresis ``MERGE_HYST``. While merging ``v_ease`` = target; on leaving, the leash hands over at
+  Hysteresis ``MERGE_HYST`` on the speed boundary, and a ``MERGE_REF_HOLD_S`` debounce on the reference boundary (a
+  flapping ``roadType`` / limit-valid must not toggle ``merging`` tick-to-tick; holding suppresses easing slightly
+  longer, the benign direction). While merging ``v_ease`` = target; on leaving, the leash hands over at
   ``v_ego + rate * LEASH_S``, so the request steps down to ~1.5 x rate (close to the upstream ceiling at highway
   speed), not to zero, and then tapers in at the personality rate.
 * Personality is the ONLY input that changes the feel: relaxed gentlest, standard middle, aggressive ~= upstream.
@@ -97,6 +114,9 @@ MPH = 0.44704
 MERGE_DEFICIT = 15 * MPH   # m/s; merging while v_ego < highway reference - this (owner's bumps are +5/+10 mph)
 NODATA_DEFICIT = 25 * MPH  # m/s; no map / car limit at all: merging while v_ego < v_target - this (highway-class target)
 MERGE_HYST = 3 * MPH       # m/s; leave the merge only once v_ego >= ref - (deficit - this)
+MERGE_REF_HOLD_S = 0.5     # s; ref-boundary debounce: a ref that drops away must stay away this long before easing
+                           # resumes (a flapping roadType / limit-valid must not toggle merging tick-to-tick). Keeping the
+                           # gate up suppresses easing = upstream behaviour, the benign direction.
 MERGE_AHEAD_DIST = 500.    # m; a highway-class map limit this close ahead counts (on-ramp onto it)
 HIGHWAY_ROAD_TYPES = ('highway', 'interstate')
 _ROAD_TYPE_NAMES = {v: k for k, v in RoadType.schema.enumerants.items()}  # int -> name
@@ -152,25 +172,38 @@ def merge_reference(road_type, map_limit: float, map_limit_valid: bool, ahead_li
 
 
 class MergeGate:
-  """True while the car is merging onto / catching up to a highway-class speed (easing steps aside). Hysteresis only."""
+  """True while the car is merging onto / catching up to a highway-class speed (easing steps aside). Speed hysteresis
+  (``MERGE_HYST``) plus a reference-hold debounce (``MERGE_REF_HOLD_S``) so a flapping ref cannot toggle ``merging``
+  tick-to-tick; both only ever keep the gate UP (suppress easing = upstream behaviour), never down."""
 
   def __init__(self):
     self.merging = False
+    self._no_ref_t = 0.
 
-  def update(self, ref: float, deficit: float, v_ego: float) -> bool:
+  def reset(self) -> None:
+    self.merging = False
+    self._no_ref_t = 0.
+
+  def update(self, ref: float, deficit: float, v_ego: float, dt: float = DT_MDL) -> bool:
     if ref <= 0.:
-      self.merging = False
-    elif self.merging:
-      self.merging = v_ego < ref - (deficit - MERGE_HYST)
+      # the highway reference dropped away: hold the gate briefly. A flapping roadType / limit-valid must not hand the
+      # target back to the ease every other tick (holding suppresses easing = upstream behaviour, the benign direction).
+      self._no_ref_t += dt
+      if self._no_ref_t >= MERGE_REF_HOLD_S:
+        self.merging = False
     else:
-      self.merging = v_ego < ref - deficit
+      self._no_ref_t = 0.
+      if self.merging:
+        self.merging = v_ego < ref - (deficit - MERGE_HYST)
+      else:
+        self.merging = v_ego < ref - deficit
     return self.merging
 
-  def update_sm(self, sm, v_set: float, v_ego: float) -> bool:
+  def update_sm(self, sm, v_set: float, v_ego: float, dt: float = DT_MDL) -> bool:
     lm = sm['liveMapDataSP']
     ref, deficit = merge_reference(lm.roadType, lm.speedLimit, lm.speedLimitValid, lm.speedLimitAhead, lm.speedLimitAheadValid,
                                    lm.speedLimitAheadDistance, sm['carStateSP'].speedLimit, v_set)
-    return self.update(ref, deficit, v_ego)
+    return self.update(ref, deficit, v_ego, dt)
 
 
 class SetSpeedEase:
@@ -223,9 +256,9 @@ class SetSpeedEase:
     v_set = v_target if v_set is None else max(v_set, v_target)
     active = long_enabled and not long_override and sm['controlsState'].longControlState != LongCtrlState.off
     personality = sm['selfdriveState'].personality
-    merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo)
+    merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo, self.dt)
     if not active:
-      self.merge_gate.merging = False
+      self.merge_gate.reset()
     v = self.step(v_target, cs.vEgo, personality, active, a_plan, merging)
     ramping = active and (v_target - v) > RAMP_LOG_MIN_GAP
     if ramping != self.ramping or merging != self.merging:

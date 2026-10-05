@@ -250,6 +250,13 @@ class TestMergeReference(OpenpilotTestCase):
     self.assertEqual(ref(ahead=70 * MPH, ahead_valid=False, ahead_dist=100., v_set=50 * MPH), (0., 0.))
     self.assertEqual(ref(ahead=45 * MPH, ahead_dist=100., v_set=50 * MPH), (0., 0.))
 
+  def test_ahead_limit_overrides_urban(self):
+    # approaching a highway from a city street / frontage road: a >= 55 mph limit within MERGE_AHEAD_DIST ahead wins
+    # over roadType urban (this is the on-ramp case; see the module doc). Only a highway-class one, and only in range.
+    self.assertEqual(ref('urban', 35 * MPH, ahead=70 * MPH, ahead_dist=100.), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', 35 * MPH, ahead=70 * MPH, ahead_dist=se.MERGE_AHEAD_DIST + 1.), (0., 0.))
+    self.assertEqual(ref('urban', 35 * MPH, ahead=45 * MPH, ahead_dist=100.), (0., 0.))
+
   def test_reference_capped_at_set_speed(self):
     # driving 50 on a 70 mph highway, +10 to 60: reference 60, deficit 10 mph < MERGE_DEFICIT -> eased, not a merge
     self.assertEqual(ref('highway', 70 * MPH, v_set=60 * MPH), (60 * MPH, se.MERGE_DEFICIT))
@@ -294,9 +301,50 @@ class TestMergeGate(OpenpilotTestCase):
     self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + 0.5))      # no re-entry inside the band
 
   def test_no_reference_clears(self):
+    # a ref that drops away holds the gate for MERGE_REF_HOLD_S before easing resumes (nit: ref-boundary debounce)
     g = se.MergeGate()
     self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(1.0 / DT_MDL)):           # > MERGE_REF_HOLD_S of no ref: well past the hold
+      g.update(0., 0., 10.)
     self.assertFalse(g.update(0., 0., 10.))
+
+  def test_ref_boundary_debounce(self):
+    # a flapping ref (roadType / limit-valid dropping in and out) must not toggle `merging` tick-to-tick: a short gap
+    # (< MERGE_REF_HOLD_S) keeps the gate UP. Holding = suppress easing = upstream behaviour, the benign direction.
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(0.3 / DT_MDL)):           # 0.3 s < MERGE_REF_HOLD_S of no ref
+      self.assertTrue(g.update(0., 0., 10.))
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))  # a ref returning inside the hold keeps it up
+    self.assertTrue(g.merging)
+
+  def test_ref_debounce_expires_and_rearms(self):
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(1.0 / DT_MDL)):           # > MERGE_REF_HOLD_S of no ref: the hold expires, easing resumes
+      g.update(0., 0., 10.)
+    self.assertFalse(g.update(0., 0., 10.))
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))  # a fresh ref re-gates from the speed boundary
+
+  def test_reset_clears_the_gate(self):
+    # disengage (inactive) resets the gate: easing resumes, and the hold timer is not left running
+    e = se.SetSpeedEase()
+    sm = planner_sm(10., 120., car_limit=70 * MPH)
+    e.update(sm, 33., True, False, 0.)
+    self.assertTrue(e.merge_gate.merging)
+    e.update(sm, 33., True, True, 0.)                      # driver override -> inactive
+    self.assertFalse(e.merge_gate.merging)
+
+  def test_car_limit_staleness_is_documented(self):
+    # should-fix: carStateSP.speedLimit is a last-seen display with NO freshness channel. This pins the two facts a
+    # future maintainer must not lose: the capnp struct exposes only a bare Float32, and the module documents staleness.
+    import inspect
+    lm = messaging.new_message('carStateSP').carStateSP
+    self.assertEqual([f.proto.name for f in lm.schema.fields_list], ['speedLimit'])  # no valid / age field exists
+    doc = inspect.getdoc(se)
+    self.assertIn('staleness', doc)
+    self.assertIn('last-seen', doc.lower())
+    self.assertIn('never adds acceleration', doc)
 
 
 class TestMergeStep(OpenpilotTestCase):
