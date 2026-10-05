@@ -17,6 +17,7 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.fork.adaptive_follow import AdaptiveFollow, is_throttle_only
 from openpilot.sunnypilot.fork.scc import ForkSmartCruiseControl
+from openpilot.sunnypilot.fork.setspeed_ease import SetSpeedEase
 
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
@@ -34,6 +35,7 @@ class LongitudinalPlannerSP:
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
     self.adaptive_follow = AdaptiveFollow(is_throttle_only(CP, CP_SP))
+    self.setspeed_ease = SetSpeedEase()  # fork: gentler, personality-dependent chase of a raised target
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -79,7 +81,9 @@ class LongitudinalPlannerSP:
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
-    return self.output_v_target, self.output_a_target
+    # fork: personality-dependent ramp toward a higher target (fork/setspeed_ease.py); vTarget stays raw
+    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego)
+    return v_cruise_eased, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.events_sp.clear()

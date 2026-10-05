@@ -63,10 +63,37 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 26 | ESC read **standstill fix** (amends #24): "stationary" = Park + fewer than 2 wheels above 12 LSB (0.375 km/h, opendbc's Hyundai STANDSTILL_THRESHOLD) and no wheel above 96 LSB, instead of all wheels exactly 0 (parked single-wheel noise skipped the read on the car). Same definition for the pre-check and every per-frame check; a pre-check skip no longer uses up the ignition (≤ 3 tries per ignition, ≤ 3 s settle wait in Park) | diagnostics | fork-local (`fork/esc_diag.py`) |
 | 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, **enter extended session (10 03 — the vendor's own write flow, decoded GIT VariantCodingTable)**, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". **Phase 3 update:** a `phase` key selects 1 (pre-write seed), 2 (vendor-exact, no pre-write seed) or **3 = the discriminating battery** (6-address `27 01` seed sweep across ESC/CLU/TCU/EPS/CAM/CR, default- AND extended-session no-op `2E`, `29 01` auth + `31 01` routine probes, and **exactly ONE** `27 02` identity-key attempt mechanically pinned to the step-2 ESC seed). Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`) |
 | 28 | Hyundai FCA11 rolling test **decel cap 0.10 g → 0.30 g** for the dose-response (scaling) test, **rolling mode only** (bits 64\|128, armed only by the runner); window, 1.2 s clock, latched cut, freshness, camera hand-back, HBA/StopReq block and check_relay unchanged; parked mode keeps 0.10 g; with the bits unset no decel is transmittable — **TEST-GATED, offline-tested only** | safety C (test-mode widening) | fork-local; amends #19/#25; patch `0013`, opendbc branch `fca11-scale-0013` |
+| 29 | **Set-speed easing** (personality-dependent): the planner's cruise candidate chases an eased speed that ramps toward a raised set speed / SLA limit / released SCC target (relaxed 0.55→0.33, standard 0.75→0.40, aggressive 1.2→0.8 m/s per s over 10→29 m/s, leashed to 1.5 s of ramp ahead of vEgo), down immediate, never below vEgo, pass-through while not in control, launches from a stop un-eased. Lead (MPC) and e2e candidates untouched — **offline-tested + closed-loop sim only** | feel (planner) | fork-local (`fork/setspeed_ease.py`) |
 
 ---
 
 ## Entries
+
+### setspeed-ease: personality-dependent easing toward a raised set speed — 2026-10-05 (offline-tested + closed-loop sim; NOT road-run; no firmware change)
+
+> **Driver notes:** raising the set speed (button, Speed Limit Assist, long-press-down to current speed) or a lead pulling
+> away no longer gets the full 1.0-1.2 m/s² (2.0 in experimental) at once. The car eases up to the new speed, and the
+> personality (distance button) now sets how fast: **relaxed** gentle (~0.35-0.55 m/s²), **standard** moderate
+> (~0.40-0.75), **aggressive** about like before. Lowering the set speed still takes effect immediately. Launches from a
+> stop are unchanged. Braking for a lead is unchanged. On-ramp merges are slower in relaxed/standard. Use aggressive for
+> a merge.
+
+- **Why:** `car-features/drive-133-134-report.md` §A ("robotic" chase of a raised target; personality-independent
+  `A_CRUISE_MAX` / `ACCEL_MAX` step).
+- **What:** `openpilot/sunnypilot/fork/setspeed_ease.py` `SetSpeedEase`. One hook in `LongitudinalPlannerSP.update_targets`.
+  The returned cruise speed is eased, while `longitudinalPlanSP.vTarget` stays raw. Upstream `longitudinal_planner.py`,
+  `get_cruise_accel` and `cruise.py` are untouched. Rules: ramp at `rate(v, personality)`; leash
+  `v_ease ≤ vEgo + 1.5·rate`; `min(vEgo, target) ≤ v_ease ≤ target` (down immediate, eased request ∈
+  [min(0, upstream), upstream]); pass-through + re-arm at vEgo while not engaged/overriding; launch latch below 3 m/s
+  until within 1 m/s of target or plan < 0.3 m/s² for 1 s; capnp personality enum normalized (a raw dict lookup silently
+  fell back to standard). `setspeed_ease` cloudlog event on each ramp edge.
+- **Drive-mode hook:** personality is the only input; Eco/Normal/Sport → relaxed/standard/aggressive can feed
+  `selfdriveState.personality` once the mode signal is decoded.
+- **Verification:** fork tests 122 passed (29 new incl. end-to-end through the real `LongitudinalPlanner` and a
+  `TestUpstreamHooks` pin of `get_cruise_accel` / `update_targets` signatures and the planner call sites). Mutation
+  25/25 killed (`car-features/setspeed-ease-mutation.py`). Known cost: on-ramp merge +6.2 s (standard) / +13.5 s
+  (relaxed) to 20 m/s; aggressive+e2e cut-in min gap up to 2.6 m smaller than upstream e2e (still >= upstream ACC). Closed-loop pedal sim (v3 DCT plant, shipped 0011 pedal law,
+  real planner/LongControl): see `car-features/setspeed-ease-report.md`.
 
 ### esc-probe-0027: ESC 0x27 seed probe + no-op 0x2E write of the current 0x0103 — 2026-10-05 (offline-tested; source only, no firmware/opendbc change)
 
