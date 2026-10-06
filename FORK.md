@@ -69,6 +69,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 32 | ESC 0x27 probe **phase 5 — READ-ONLY capability battery** (amends #27, same fingerprint window): `state.json` `{"phase": 5}` runs ONE parked, read-only ignition — a FIXED frame list (0xF100 canary, 0x0103 read, `10 03`, three `27 01` seed samples, ten 2-byte sub-probes `27 03/05/07/09/0B/0D/0F/11/41/61`, seven bare 1-byte service probes `23/29/31/34/35/36/37`, 0x0103 re-read, and two extra-address `10 03` peeks at 0x770/0x7A0) that records every response/NRC/timeout/latency and adds seed-stability + fp_canary + value_start/value_end summary fields. **NO `27 02`, NO `2E`, no multi-frame TX** — the guards admit only the exact frames above | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-4 byte-identical |
 | 33 | ESC 0x27 probe **phase 6 - security-policy matrix + DID sweep** (amends #27/#32, same fingerprint window): `state.json` `{"phase": 6}` (60 s budget) maps the attempt/session policy in ONE parked ignition - `22 0103` (value_start) -> `10 03` -> `27 01` x2 (S1/S2 seed stability) -> **`27 02` ZERO key (`00`x8)** -> R1; a `0x36`/`0x37` NRC sets `lockout_seen` and jumps to the reset; else adaptive `27 01`+`27 02` -> S3/R2 then S4/R3 (<=3 pre-cycle attempts); then **ALWAYS** `10 01` -> `10 03` -> `27 01`+`27 02` -> S5/**R4** (cycle-reset test; the only 4th attempt, ever); then the identification-DID sweep (`22 F186/F187/F190/F199/F18A/F18C/F191/F195`) -> `10 02` programming probe (+ `27 01` S6 only if positive, NO key) -> `19 02 A5` -> `10 01` leave -> `22 0103` (value_end). Records every frame; adds S1..S6 / R1..R4 / seed_stable_pre / seed_after_fail / lockout_seen / cycle_reset / dids{} / prog_session_1002 / dtc_19_02_a5. **NO `2E` ever; `27 02` admissible ONLY in phase 6, ONLY zero key, ONLY immediately after a `27 01`, and at most 4 times** | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-5 byte-identical |
 | 34 | Hyundai Elantra N (CN7 non-SCC) **LKAS11 torque ramp-up 3 -> 4/frame**, STEER_MAX unchanged at 384. Param-gated by platform fingerprint (`HYUNDAI_ELANTRA_2022_NON_SCC`) **only** — every other HKG car keeps 2/3. Car layer: `CarControllerParams.STEER_DELTA_UP = 4` + card sets panda SP bit 1024 `CN7_STEER_RAMP`. Panda: `HYUNDAI_STEERING_LIMITS_CN7_RAMP = HYUNDAI_LIMITS(384, 4, 7)`, honored only with `NON_SCC` and never over `ALT_LIMITS`/`ALT_LIMITS_2`; rate-down (7), max torque (384), rt delta (112) and the driver allowance are unchanged. Bit number is 1024 because 0014's `FCA11_LONG` took 256 and steer-test's unshipped `LKAS_PARK_TEST` reserves 512 (all three coexist). Logged EPS output saturates near a 270-300 command, so this only reaches the EPS maximum sooner (0->270 in 0.68 s vs 0.90 s) — it does **not** raise steady force. **A panda firmware rebuild + reflash is REQUIRED or the panda rejects every +4 step.** Not yet road-validated; the parked EPS ladder (Phase 0) comes first — **offline-tested only (safety + car unit + mutation + MISRA)** | feature (safety C + car) | fork-local; patch `0015`, opendbc branch `steer-torque` (47143643); NOT on main |
+| 35 | Hyundai **parked LKAS11 steering sweep**, TEST-ONLY bit 512 `LKAS_PARK_TEST`: armed only by `car-features/steer-test/steer_park_test.py` with openpilot stopped (openpilot never steers below 0.3 m/s), panda allows LKAS11 (0x340) as its ONLY TX, only parked (gear P/N == the arm's gear, every wheel ≤ 0.375 km/h, fresh inputs), |torque| ≤ 384 with the +3/-7 rate law + 112/250 ms, 60 s cap per arm, latched cut on any MDPS12 fault bit / driver torque > 5 Nm / angle > 85° / gas / motion / gear change; camera LKAS11 handed back within one frame when panda would refuse ours. **Inert unless armed; normal driving byte-for-byte unchanged with the bit unset** — **TEST-GATED, NOT FOR ROAD USE, offline-tested only** | research (safety C only) | fork-local; patch `0016`, opendbc branch `steer-test` |
 
 ---
 
@@ -1073,6 +1074,35 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   Upstream alternative if ever wanted: PR the two fields into the existing platform.
 
 ---
+
+### 35. Hyundai parked LKAS11 steering sweep (TEST-ONLY, panda bit 512) — patch `0016`
+
+> **TEST-GATED, NOT FOR ROAD USE.** Inert unless the steer-test runner arms bit 512 over USB with openpilot stopped.
+> With the bit unset the Hyundai safety mode is byte-for-byte the 0001-0015 behaviour (i.e. the shipped CN7 ramp, #34,
+> is untouched — the parked sweep keeps its own +3/-7 law and never adopts the ramp's +4).
+
+- **Why:** the steering report (`car-features/steer-torque-report.md`) needs the EPS command -> `CR_Mdps_OutTq` curve
+  per N steering mode; at speed the output pins ~17.4 while the creep law is ~0.065 × command. openpilot cannot measure
+  it parked: controlsd forces `latActive` off at `vEgo <= 0.3` (Hyundai has no `steerAtStandstill`) and MADS pauses on
+  Park, so the runner sends LKAS11 itself and the panda is the only enforcer.
+- **What (opendbc branch `steer-test`, patched by `0016-hyundai-lkas-park-steer-test.patch`, on top of `0015` CN7 steer ramp):**
+  - `hyundai_common.h`: `HYUNDAI_PARAM_SP_LKAS_PARK_TEST = 512`; honoured only on non-SCC ICE with no openpilot
+    longitudinal, never together with the FCA11 test bits (64/128 win); removes the pedal (and so FCA11 long) while set.
+    CAN-FD and legacy clear it.
+  - `hyundai.h`: TX list = `{0x340, check_relay, disable_static_blocking}` only; RX checks add LVR12 (gear) and SAS11
+    (6 bytes on this car, not the DBC's 5). `hyundai_lkas_park_tx`: every frame needs the parked state (gear P/N equal
+    to the arm's first gear, every wheel ≤ 12 raw, gear+wheel fresh) and ≤ 60 s since the arm; actuating frames also
+    need |torque| ≤ 384, `CF_Lkas_ActToi` with torque, +3/-7 per frame (crossing ≤ 3) + 112/250 ms, every input seen
+    and fresh, no gas, no latched cut. `hyundai_lkas_park_rx` latches the cut on any MDPS12 Def/ToiUnavail/ToiFlt/
+    FailStat/SErr, |StrTq| > 5 Nm, |SAS_Angle| > 85°, gas, wheel motion, gear change. `hyundai_fwd_hook`: the camera's
+    LKAS11 is blocked only while panda transmitted within 100 ms AND would accept the next frame.
+  - `values.py`: `HyundaiSafetyFlagsSP.LKAS_PARK_TEST` + `HYUNDAI_LKAS_PARK_*` mirrors (unit-tested against the C).
+  - `test_hyundai.py`: `TestHyundaiNonSCCLkasParkTestSafety`.
+- **Proof:** full opendbc safety + hyundai car suites green; MISRA/cppcheck 0 findings; mutation driver
+  `car-features/steer-test/mutations/mutate.py` (firmware + runner mutants, all must die); firmware built from the
+  patch series and from two clean exports (byte-identical), with the deployed/0012/0014 control builds reproduced. See
+  `car-features/steer-test-build.md`.
+- **Not done:** nothing reached the car. First on-car step is the `--probe-only` run in P (runbook).
 
 ## Sync mechanics notes
 
