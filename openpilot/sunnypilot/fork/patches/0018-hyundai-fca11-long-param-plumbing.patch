@@ -1,0 +1,40 @@
+From d8e132ace022ba78776441a35f7bddb359faa9bf Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 16:53:09 -0500
+Subject: [PATCH] hyundai: FCA11 long arm gate accepts the python bool (Params
+ BOOL)
+
+Route 149 showed HyundaiFca11Brake=1 in the UI but carParamsSP.fca11Brake=False on every segment and
+safetyParam bit 256 (FCA11_LONG) clear. Two defects, both fixed in patch 0018:
+
+1. Params.get() returns a python bool for a BOOL key (openpilot/common/params.py CPP_2_PYTHON[BOOL] =
+   lambda v: v == b"1"), but this gate armed only on str(raw) == "1" -- and str(True) == "True". Accept
+   the bool True as well as the raw string "1" (libparams C-string form).
+
+2. (superproject, same commit) initialize_params() never read HyundaiFca11Brake, so the key never
+   reached params_dict at all. The superproject test test_fca11_param_plumbing.py drives the real path.
+
+Anything but True/"1" (0, absent, junk, stale-libparams None) stays OFF -- the defensive default is
+unchanged.
+---
+ opendbc/sunnypilot/car/interfaces.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index 6c243ac5..c8a5f3cd 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -129,7 +129,9 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   fca11_raw = params_dict.get("HyundaiFca11Brake")
+   if isinstance(fca11_raw, bytes):
+     fca11_raw = fca11_raw.decode(errors="ignore")
+-  if str(fca11_raw or "0").strip() == "1":
++  # Params.get() returns a python bool for a BOOL key (openpilot/common/params.py CPP_2_PYTHON), while the raw libparams
++  # value is the string "1"/"0" -- accept both. Anything else (key missing on a stale libparams -> None, or junk) is OFF.
++  if fca11_raw is True or str(fca11_raw or "0").strip() == "1":
+     CP_SP.fca11Brake = True
+     CP_SP.safetyParam |= HyundaiSafetyFlagsSP.FCA11_LONG
+ 
+-- 
+2.54.0 (Apple Git-157)
+

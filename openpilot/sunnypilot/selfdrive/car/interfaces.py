@@ -158,4 +158,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiGasInterceptorIDSet param unknown to libparams (not rebuilt?); using auto pedal ID detection")
 
+  # fork: FCA11 longitudinal braking opt-in. Same stale-libparams hazard as the pedal keys; a missing key just leaves the
+  # feature off (opendbc treats anything but a clean "1" as OFF and never defaults it ON).
+  try:
+    params_list.append({"HyundaiFca11Brake": params.get("HyundaiFca11Brake", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11Brake param unknown to libparams (not rebuilt?); FCA11 braking stays disabled")
+
   return params_list

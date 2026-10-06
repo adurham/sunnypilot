@@ -76,10 +76,50 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 39 | **Offroad power budget raised 30 -> 55 Wh** (`CAR_BATTERY_CAPACITY_uWh` 30e6 -> 55e6 uWh in `power_monitoring.py`): the 30 Wh virtual budget ended the offroad session far short of the owner's MaxTimeOffroad (1800 min = 30 h) at the ~1.74 W offroad draw, and the new comma Prime offroad route uploads (logs + video over LTE) add draw on top, so the window has to last long enough for them to finish while parked. `CarBatteryCapacity` still refills while driving (45 W `CAR_CHARGING_RATE_W`, unchanged); **`VBATT_PAUSE_CHARGING = 11.8` is unchanged and remains the real battery protection**; `MAX_TIME_OFFROAD_S`, `CAR_CHARGING_RATE_W` and `DisablePowerDown` untouched (DisablePowerDown would also disable the voltage cutoff, so it stays out of this). Python-only, no firmware change; reversible (one constant) | tune (Python only) | fork-local; PR candidate |
 | 40 | ESC 0x27 probe **phase 9 -- door-B candidate walk with the time-reset recipe** (amends #27/#32/#33/#36/#37, same fingerprint window): the phase-8 run found the WORKABLE recipe (a wrong key -> wait >= 25 s -> `10 01` -> `10 03` -> `27 11` -> `27 12` IS re-evaluated; a bare cycle alone does NOT clear the counter), so `state.json` `{"phase": 9, "p9_candidates": [...], "p9_wait_s": 25.0}` (420 s budget; default the 8 door-B algorithm tokens incl. the three NEW `algo8w_26400`/`algo8w_26800`/`algo8w_26600`; first 10 kept; unknown names dropped; all-invalid -> inert) walks 8-10 candidates in ONE parked ignition (~30 s/slot) - `22 0103` (value_start) -> `10 03` -> for each slot: (k>0) sleep `p9_wait_s` then `10 01`; `10 03`, then `27 11` -> fresh seed -> `27 12` + the resolved 8-byte candidate: a positive `67 12` -> WIN PATH (the ONE no-op `2E 0103` == value_start + re-read, STOP); a `0x36`/`0x37` -> wait+cycle then ONE same-candidate retry, a still-locked retry sets `hard_lock` + STOP; a `0x35` -> next slot; then `10 01` -> `22 0103` (value_end). New tokens: `algo8w_26400`/`algo8w_26800`/`algo8w_26600` = `cal_26400/26800/26600(seed[:2])[:2]` repeated x4; `cal_26600` (CRC-16/0xC0A3, Securityindex 26600) added to `fork/esc_probe_seedkey.py`. Adds `attempts9`/`seeds9`/`unlocked9`/`write9`/`value_after_write9`/`hard_lock`/`hard_lock_slot`/`p9_wait_s`. Guards: `27 12` ONLY 8-byte keys, ONLY right after a POSITIVE `27 11` in the SAME session (`p9_seed` sentinel, cleared on any `10`), <=12 keys; `27 11` <=14; `27 01`/`27 02`/`29`/`31`/`34`-`37` NOT admissible; the ONE `2E` pinned to value_start; `22` only 0103; `10` only {01,03}; NO extra addrs; phases 1-8 byte-identical. Tests **201** (+21 phase-9); mutation **84/84** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-8 byte-identical |
 | 41 | ESC 0x27 probe **phase 9 extension -- the 4 remaining offline candidate tokens + raised caps** (amends #40, same fingerprint window): the phase-9 run evaluated 6 candidates (all `7F 27 35`) and stopped at the 12-attempt cap with `algo8_26300`/`lit270100` still on the list (they stay queued via state, no code change). FOUR offline constructions were still NEVER built as tokens, so this closes the whole offline space in ONE parked ignition -- `PHASE9_CANDIDATES` += `algo8w_26300` (`cal_26300(seed[:4])[:2]` x4 = `[00,HI]x4`), `algo8w_27400` (`cal_27400(seed[:4])[:2]` x4), `algo8_27400` (`cal_27400(seed[:4])` x2, the 4-byte key doubled), `algo8w_40000` (`cal_40000(seed[:4])[:2]` x4); the optional `cal_40000` (Securityindex 40000, fixed lookup, 2-byte key) is now ported into `fork/esc_probe_seedkey.py` and registered in `_ALGOS`/`candidates()`. `PHASE9_DEFAULT_CANDIDATES` -> `("algo8_26300","lit270100","algo8w_26300","algo8w_27400","algo8_27400","algo8w_40000")` (the 6 leftovers); caps `PHASE9_MAX_KEY_ATTEMPTS` 12 -> **16**, `PHASE9_MAX_SEEDS` 14 -> **20** (budget stays `RUN_BUDGET_S_PHASE9` 420 s -- 6 slots x ~55 s fits). Guards otherwise unchanged: `27 12` ONLY 8-byte keys pinned EXACTLY to the pinned candidate, ONLY after a POSITIVE same-session `27 11`, only in phase 9; phases 1-8 byte-identical. Tests **204** (+3 net; the default-walk test retargeted 8 -> 6 slots + the new exact-wire-byte tests); mutation **89/89** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py` + `fork/esc_probe_seedkey.py`); phases 1-8 byte-identical |
+| 42 | **FCA11-long param plumbing fix** (amends #31, route 149 finding): the `HyundaiFca11Brake` toggle read ON in the UI but the feature came up **NOT armed** on the road (`carParamsSP.fca11Brake=False` every seg, panda `safetyParam` bit 256 clear, zero 0x38D TX). Two defects: (a) `openpilot/sunnypilot/selfdrive/car/interfaces.py::initialize_params()` never read the key, so it never reached opendbc's `params_dict`; (b) opendbc's arm gate compared `str(raw) == "1"` but `Params.get()` returns a python **bool** for a BOOL key, and `str(True) == "True"`. Fix: read the key with the same `UnknownKeyName` guard as the pedal keys (missing -> OFF), and accept the python bool as well as the raw string `"1"`. Toggle OFF/absent/junk/stale-libparams stays byte-for-byte today's. Patch `0018` (opendbc gate), superproject `initialize_params` + new real-path E2E test `test_fca11_param_plumbing.py`. **No firmware impact** (deployed `00e086b9` stays valid, no reflash) | fix (car plumbing, Python only) | fork-local; amends #31; patch `0018`; NOT on main |
 
 ---
 
 ## Entries
+
+### fca11-plumbing: FCA11-long param never armed (initialize_params + bool gate) — 2026-10-06 (offline-tested; Python-only, no firmware change)
+
+- **Symptom (route 149):** `HyundaiFca11Brake=1` was ON in the UI and stored in Params, but on the road the
+  feature was **never armed**: `carParamsSP.fca11Brake=False` on every segment, panda `safetyParam=1086`
+  with bit 256 (`FCA11_LONG`) **clear**, **zero** `0x38D` frames in `sendcan`, **zero** `FCA_ACK`. The
+  owner's "no dash warning" was simply because nothing was ever transmitted.
+- **Root cause — two defects, both on the arm path:**
+  1. `openpilot/sunnypilot/selfdrive/car/interfaces.py::initialize_params()` (the list `card.py:113` hands to
+     opendbc's `get_car(...) -> setup_interfaces(...)`) read `HyundaiLongitudinalTuning`, `HyundaiGasInterceptor`
+     and `HyundaiGasInterceptorIDSet` — but **not** `HyundaiFca11Brake`. So `params_dict` never contained the
+     key and opendbc's `params_dict.get("HyundaiFca11Brake")` was always `None`.
+  2. Even once the key is present: the opendbc gate at `opendbc/sunnypilot/car/interfaces.py` armed on
+     `str(fca11_raw) == "1"`, but `Params.get()` returns a python **bool** for a BOOL key
+     (`openpilot/common/params.py` `CPP_2_PYTHON[BOOL] = lambda v: v == b"1"`), and `str(True) == "True"` != `"1"`.
+- **Why the existing tests missed it:** `test_fca11_long.py` / `test_gas_interceptor.py` inject
+  `{"HyundaiFca11Brake": ...}` straight into `params_list` as the string `"1"`, bypassing
+  `initialize_params()` and the `Params` type conversion entirely — the exact two things that were broken.
+- **Fix:**
+  - Superproject `initialize_params()`: read `HyundaiFca11Brake` with the same
+    `try/except UnknownKeyName` guard as the pedal keys (stale libparams -> missing key -> feature OFF, no
+    raise). `opendbc` gate unchanged in spirit: anything but `"1"` is OFF and it never defaults ON.
+  - Patch `0018-hyundai-fca11-long-param-plumbing.patch` (amends `0014`): accept the python bool `True` as
+    well as the raw string `"1"` (`if fca11_raw is True or str(fca11_raw or "0").strip() == "1":`).
+- **Files:** `openpilot/sunnypilot/selfdrive/car/interfaces.py`,
+  `openpilot/sunnypilot/fork/patches/0018-hyundai-fca11-long-param-plumbing.patch`,
+  `openpilot/sunnypilot/selfdrive/car/tests/test_fca11_param_plumbing.py` (new),
+  `opendbc_repo/opendbc/sunnypilot/car/interfaces.py` (via 0018).
+- **Verification:** new real-path E2E test `test_fca11_param_plumbing.py` drives
+  `Params -> initialize_params() -> setup_interfaces()` and asserts `CP_SP.fca11Brake` + bit 256 are set for
+  `1` and clear for `0`/absent — **red on the unfixed code (3 failed) -> green after (6 passed)**. Targeted
+  suites: `test_fca11_long.py` + `test_gas_interceptor.py` **158 passed**; opendbc hyundai car tests
+  **13 passed / 2 skipped (388 subtests)**; superproject card/param tests **31 passed**. Patch series
+  rehearsal: pristine `f95f996f` + **0001-0018 applied, zero fuzz** (18/18). **No firmware impact:**
+  `opendbc/safety/*` tree hash identical with and without 0018; no `panda/*` in the change set — deployed
+  firmware `00e086b9` stays valid, **no reflash**.
+- **Merge note:** fork-local bug fix; amends #31. Patch `0018` + the superproject change. NOT pushed, device
+  untouched. Re-run the route-149 brake question only after confirming seg 0 shows `carParamsSP.fca11Brake=True`
+  and `safetyParam & 256`.
 
 ### power-budget: raise the offroad power budget 30 -> 55 Wh so uploads survive a 30 h park — 2026-10-06 (offline-tested; Python-only, no firmware change)
 
