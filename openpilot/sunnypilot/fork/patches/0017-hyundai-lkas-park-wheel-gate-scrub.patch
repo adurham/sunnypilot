@@ -1,0 +1,79 @@
+From 88dbfc746d8aaeceafbc25f673b7308478cdc28e Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 11:03:57 -0500
+Subject: [PATCH] hyundai: LKAS_PARK_TEST wheel gate 12 -> 160 raw (0.375 ->
+ 5.0 km/h) for tire scrub at standstill
+
+On-car (2026-10-06): steering torque at standstill scrubs the front tire and
+WHL_SPD11 transiently reads 0.47-1.66 km/h, so the old standstill gate (every
+wheel <= 12 raw = 0.375 km/h) refused frames and latched the wheel-motion cut;
+the left side could not pass +250. Owner authorized relaxing the gate: raise the
+shared HYUNDAI_LKAS_PARK_WHEEL_MAX to 160 raw = 5.0 km/h (still well below any
+real movement; Park pawl + handbrake are the physical backstop). One constant
+drives both the per-frame parked check and the latched cut. No other wheel rule
+(FCA11 floors, freshness) touched.
+---
+ opendbc/safety/modes/hyundai.h           | 6 +++++-
+ opendbc/safety/tests/test_hyundai.py     | 2 +-
+ opendbc/sunnypilot/car/hyundai/values.py | 8 ++++----
+ 3 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 2e3a465d..1dd3eb65 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -370,7 +370,11 @@ static void hyundai_fca11_rolling_rx(const CANPacket_t *msg) {
+ #define HYUNDAI_LKAS_PARK_MAX_ARM_US 60000000U // hard cap: 60 s after the arm (init); then EVERY 0x340 is refused
+ #define HYUNDAI_LKAS_PARK_RX_MAX_AGE_US 100000U  // every window input fresh within 100 ms of each actuating frame
+ #define HYUNDAI_LKAS_PARK_TX_STALE_US 100000U  // camera LKAS11 forwarded again 100 ms after our last accepted frame
+-#define HYUNDAI_LKAS_PARK_WHEEL_MAX 12U        // raw WHL_SPD11 (0.03125 km/h): EVERY wheel <= 0.375 km/h (STANDSTILL_THRSLD)
++// 5.0 km/h per wheel (raw WHL_SPD11, 0.03125 km/h/LSB). Was 12U = 0.375 km/h (STANDSTILL_THRSLD): on-car, steering
++// torque at standstill scrubs the front tire and WHL_SPD11 spikes to 0.47-1.66 km/h, so the old standstill gate refused
++// frames and latched the cut. Owner-authorized 2026-10-06 to relax it for the parked sweep; Park pawl + handbrake are
++// the compensating control. Still far below any real movement.
++#define HYUNDAI_LKAS_PARK_WHEEL_MAX 160U
+ #define HYUNDAI_LKAS_PARK_MAX_ANGLE 850        // raw SAS_Angle (0.1 deg): |angle| > 85 deg latches the cut
+ #define HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ 500    // raw CR_Mdps_StrTq (0.01 Nm): |tq| > 5.00 Nm latches the cut
+ #define HYUNDAI_LKAS_PARK_GEAR_P 0U            // LVR12 CF_Lvr_Gear
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index d93297ca..798add0d 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -3407,7 +3407,7 @@ class TestHyundaiNonSCCLkasParkTestSafety(TestHyundaiNonSCCSafety):
+           w[i] = raw
+           self._rx(self._wheel_msg(*w))
+           self.assertEqual(ok, self._tx(self._lkas(3)))
+-          self.assertEqual(ok, self._tx(self._lkas(0)))   # passive too: never transmit while moving
++          self.assertEqual(ok, self._tx(self._lkas(0)))   # passive frames obey the same wheel gate
+ 
+   def test_gear_rules(self):
+     for gear in (4, 5, 7, 8, 12):
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index b19652cb..bfa70de6 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -34,9 +34,9 @@ class HyundaiSafetyFlagsSP:
+   # HYUNDAI_PARAM_SP_FCA11_LONG.
+   FCA11_LONG = 256
+   # TEST-ONLY, NOT FOR ROAD USE: parked LKAS11 (0x340) steering-torque sweep, armed only by the steer-test runner with
+-  # openpilot stopped. Panda honors it only on non-SCC ICE without openpilot longitudinal and never together with the
+-  # FCA11 test bits; while armed LKAS11 is the ONLY transmittable message, only parked (gear P/N, every wheel at
+-  # standstill, fresh inputs), |torque| <= HYUNDAI_LKAS_PARK_MAX_TORQUE with the +3/-7 rate law, a 60 s cap per arm and
++  # LKAS_PARK_TEST. Panda honors it only on non-SCC ICE without openpilot longitudinal and never together with the
++  # FCA11 test bits; while armed LKAS11 is the ONLY transmittable message, only parked (gear P/N, every wheel
++  # <= 5.0 km/h, fresh inputs), |torque| <= HYUNDAI_LKAS_PARK_MAX_TORQUE with the +3/-7 rate law, a 60 s cap per arm and
+   # a latched cut on any MDPS12 fault bit / driver torque / gas / motion / gear change / angle. No car-layer code sets
+   # it. C mirror: HYUNDAI_PARAM_SP_LKAS_PARK_TEST.
+   LKAS_PARK_TEST = 512
+@@ -70,7 +70,7 @@ HYUNDAI_LKAS_PARK_MAX_TORQUE = 384      # = CarControllerParams STEER_MAX
+ HYUNDAI_LKAS_PARK_RATE_UP = 3           # = STEER_DELTA_UP
+ HYUNDAI_LKAS_PARK_RATE_DOWN = 7         # = STEER_DELTA_DOWN
+ HYUNDAI_LKAS_PARK_MAX_ARM_S = 60.0      # per-arm hard cap (C: HYUNDAI_LKAS_PARK_MAX_ARM_US)
+-HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW = 12    # every wheel <= 12 raw (0.375 km/h)
++HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW = 160   # every wheel <= 160 raw (5.0 km/h). Tire scrub at standstill (owner-authorized 2026-10-06)
+ HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG = 85.0  # |SAS_Angle| above this latches the firmware cut
+ HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM = 5.0  # |CR_Mdps_StrTq| above this latches the firmware cut
+ 
+-- 
+2.54.0 (Apple Git-157)
+

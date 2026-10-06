@@ -72,6 +72,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 35 | Hyundai **parked LKAS11 steering sweep**, TEST-ONLY bit 512 `LKAS_PARK_TEST`: armed only by `car-features/steer-test/steer_park_test.py` with openpilot stopped (openpilot never steers below 0.3 m/s), panda allows LKAS11 (0x340) as its ONLY TX, only parked (gear P/N == the arm's gear, every wheel ≤ 0.375 km/h, fresh inputs), |torque| ≤ 384 with the +3/-7 rate law + 112/250 ms, 60 s cap per arm, latched cut on any MDPS12 fault bit / driver torque > 5 Nm / angle > 85° / gas / motion / gear change; camera LKAS11 handed back within one frame when panda would refuse ours. **Inert unless armed; normal driving byte-for-byte unchanged with the bit unset** — **TEST-GATED, NOT FOR ROAD USE, offline-tested only** | research (safety C only) | fork-local; patch `0016`, opendbc branch `steer-test` |
 | 36 | ESC 0x27 probe **phase 7 -- ASK-family probe** (amends #27/#32/#33, same fingerprint window): after the read-only battery found a SECOND security sub-family live (`27 11` -> `67 11` + an 8-byte `[16-bit]x4` seed), `state.json` `{"phase": 7, "p7_candidates": [...]}` (60 s budget, default `["zero8"]`, first 4 kept) completes the other door in ONE parked ignition - `22 0103` (value_start) -> `10 03` -> up to 4 FRESH `27 11` seeds, each immediately followed by exactly ONE `27 12` with the resolved 8-byte candidate (`zero8`/`identity8`/`algo8w_27100`/`algo8_27100`/`algo8_26700`/`algo8_26300`; seeds re-randomise, so each candidate gets its own ask), stopping early on a positive `67 12`, on NRC `0x36`/`0x37`, or on a negative/silent `27 11`; a positive `67 12` IMMEDIATELY does the ONE no-op `2E 0103` (payload == value_start) + re-read `22 0103` -> then bare `29 01`, `22 F100` single frames to 0x770/0x7A0, `10 01`, `22 0103` (value_end). Adds `seeds_ask`/`cands_ask`/`unlocked_ask`/`write_ask`/`value_after_ask`/`lockout_ask`/`a29_01`/`f100_770`/`f100_7a0`. Guards: `27 12` ONLY 8-byte keys, ONLY right after a POSITIVE `27 11` (`p7_seed` sentinel), max 4; `27 01`/`27 02` NOT admissible; the ONE `2E` pinned to value_start; extra addrs ONLY {0x770, 0x7A0} for `22 F100`; phases 1-6 byte-identical. Tests **158** (+25 phase-7); mutation **74/74** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-6 byte-identical |
 | 37 | ESC 0x27 probe **phase 8 -- door-B counter economics + first vendor-shape candidate** (amends #27/#32/#33/#36, same fingerprint window): the phase-7 run proved door B = ONE free `27 12` key per session (a 2nd in the same session -> `7F 27 36`), so `state.json` `{"phase": 8, "p8_candidates": [...]}` (140 s budget, default `["lit270100","algo8w_27100","algo8_27100"]`, first 4 kept) asks whether a session cycle (`10 01` -> `10 03`) or a ~25 s wait resets the counter, in ONE parked ignition - `22 0103` (value_start) -> `10 03` -> **A1** (fresh `27 11` -> S0 ; `27 12` cand0): a positive `67 12` goes straight to the WIN PATH (ONE no-op `2E 0103` == value_start + re-read); a `0x36`/`0x37` sets `lockout_at_start`, does a 30 s time-reset test (`10 01`/`10 03`/`27 11` -> S1b / `27 12` -> A1b -> `time_reset_after_lockout`) then STOPS (no walk); a `0x35` proceeds to the CYCLE TEST **A2** (`10 01`; `10 03`; `27 11` -> S1 ; `27 12` cand0) -- `0x35` -> `cycle_clears` + a <=3-candidate WALK (each after a fresh cycle), `0x36`/`0x37` -> `cycle_clears=False` + a 25 s wait -> **A2b** -> `time_reset`; then bare `29 05` -> `10 01` -> `22 0103` (value_end). New token `lit270100` = `00 32 37 30 31 30 30 00` (the CN7N.git.xml Type-3 ASK key template `0A 27 12 'X270100X'`). Adds `seeds8`/`cands8`/`unlocked8`/`write8`/`value_after_write8`/`lockout_at_start`/`cycle_clears`/`time_reset`/`time_reset_after_lockout`/`a29_05`. Guards: `27 12` ONLY 8-byte keys, ONLY right after a POSITIVE `27 11` in the SAME session (`p8_seed` sentinel, cleared on any `10`), <=6 keys; `27 11` <=8; `27 01`/`27 02` NOT admissible; the ONE `2E` pinned to value_start; `22` only 0103; `29` only sub 05; NO extra addrs; no `31`/`34`-`37`; phases 1-7 byte-identical. Tests **180** (+22 phase-8); mutation **79/79** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-7 byte-identical |
+| 38 | Hyundai **parked LKAS11 sweep: relax the standstill wheel gate** for tire scrub (amends #35, TEST-ONLY, same panda bit 512 `LKAS_PARK_TEST`): the first on-car sessions showed steering torque at standstill scrubs the front tire and `WHL_SPD11` transiently reads 0.47-1.66 km/h, tripping the old standstill gate (every wheel <= 12 raw = 0.375 km/h) which refused frames and latched the wheel-motion cut. `HYUNDAI_LKAS_PARK_WHEEL_MAX` 12 -> **160 raw (5.0 km/h)** -- ONE constant driving both the per-frame parked check and the latched wheel cut; runner `WHEEL_MAX_KPH` 5.0; **every other rule unchanged** (FCA11 floors, freshness, SAS11/gear/gas latches); Park pawl + handbrake are the physical backstop. Inert unless armed | research (safety C only) | fork-local; patch `0017`, opendbc branch `steer-test` @ `88dbfc74` |
 
 ---
 
@@ -1149,6 +1150,33 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   patch series and from two clean exports (byte-identical), with the deployed/0012/0014 control builds reproduced. See
   `car-features/steer-test-build.md`.
 - **Not done:** nothing reached the car. First on-car step is the `--probe-only` run in P (runbook).
+
+---
+
+### 38. Hyundai parked LKAS11 sweep: relax the standstill wheel gate for tire scrub — patch `0017`
+
+> **TEST-GATED, NOT FOR ROAD USE.** Same panda bit 512 as #35 (section) / #35 row. `0017` only widens the parked wheel gate; with the bit
+> unset the Hyundai mode is byte-for-byte unchanged, and every FCA11 rule (floors, freshness) is untouched.
+
+- **Why:** the first on-car Normal-mode sessions (2026-10-06) ran the parked ladder. Steering torque at standstill
+  scrubs the front tire and `WHL_SPD11` transiently reads 0.47–1.66 km/h, so the old standstill gate (every wheel
+  ≤ 12 raw = 0.375 km/h) refused frames and latched the wheel-motion cut: the right side ran clean to −384
+  (plateau −19.5) but the left side could not pass +250. Owner authorized relaxing the gate; Park pawl + handbrake are
+  the physical backstop.
+- **What (opendbc branch `steer-test` @ `88dbfc74`, patched by `0017-hyundai-lkas-park-wheel-gate-scrub.patch`, on top of `0016`):**
+  - `hyundai.h`: `HYUNDAI_LKAS_PARK_WHEEL_MAX` 12 → **160 raw** (0.375 → 5.0 km/h). ONE constant drives both the
+    per-frame parked check (`hyundai_lkas_park_parked`) and the latched wheel-motion cut (`hyundai_lkas_park_rx`), so
+    both relax together. Nothing else changed: FCA11 floors, freshness windows, and the SAS11/gear/gas latches stay.
+  - `values.py`: mirror `HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW` 12 → 160 (pinned against the C by the unit test).
+  - `test_hyundai.py`: parked wheel boundary tests already use the exported constant, so the accepted/refused raw and
+    the latched-cut cases move with it.
+- **Runner:** `car-features/steer-test/steer_park_test.py` `WHEEL_MAX_KPH` 0.375 → 5.0 (raw 160), plus its
+  `REQUIRED_SHA` and the `fca11-fw-identity.sh` / `fca11-parked-probe.py` firmware-identity pins.
+- **Proof:** full opendbc safety suite green (2943 passed, incl. the whole `LkasPark` class at the new boundary);
+  runner harness 46 passed; every firmware + runner mutant killed; MISRA/cppcheck 0 findings; rehearsal
+  pristine `f95f996f` + `0001-0017` → tree `1146c7ec` (0 fuzz) == branch tip tree; firmware from two clean exports
+  byte-identical. See `car-features/steer-test-scrub-gate.md`.
+- **Not done:** nothing reached the car yet; `0017` is staged for the same parked ladder.
 
 ## Sync mechanics notes
 
