@@ -23,6 +23,7 @@ from openpilot.sunnypilot.fork import esc_probe_0027 as E
 CURRENT = b"\x90\x06\x03\x50"       # the known-good 0x0103 value on this car
 SEED = b"\x11\x22\x33\x44"
 SEED8 = b"\xaa\xbb\xcc\xdd\xaa\xbb\xcc\xdd"   # the 8-byte ESC seed the phase-3 battery pins the key to
+PHASE4_SEED = bytes.fromhex("5AB05AB05AB05AB0")   # the real car's 8-byte seed (a 2-byte value repeated 4x)
 DAY = 86400.
 
 # phase-3 module request addr -> response addr (the six the battery walks)
@@ -84,6 +85,8 @@ class FakeCar:
     self.auth_nrc = 0x11
     self.routine_nrc = 0x31
     self.key_unlock = False        # False -> 7F 27 35; True -> 67 02 (the 27 02 with key==seed unlocks)
+    self.key_nrc = 0x35            # the NRC returned when key_unlock is False (35 invalidKey / 36 / 37)
+    self.key_silent = False        # phase 4: no answer at all to the 27 02
 
   def now(self):
     return self.t
@@ -138,10 +141,21 @@ class FakeCar:
       return
     if len(d) >= 3 and d[0] == 0x10 and d[1] == 0x0A and d[2] == 0x27 and d[3] == 0x02:
       self._q(bytes([0x30, 0x00, 0x00]))            # sendKey multi-frame: flow control, then the 27 02 result
+      if self.key_silent:
+        return
       if self.key_unlock:
         self._q(bytes([2, 0x67, 0x02]))
       else:
-        self._q(bytes([3, 0x7F, 0x27, 0x35]))
+        self._q(bytes([3, 0x7F, 0x27, self.key_nrc]))
+      return
+    if len(d) >= 3 and d[0] in (4, 6) and d[1] == 0x27 and d[2] == 0x02:
+      # phase 4: a 2- or 4-byte candidate key as a single frame (04 27 02 K1K2 / 06 27 02 K1..K4)
+      if self.key_silent:
+        return
+      if self.key_unlock:
+        self._q(bytes([2, 0x67, 0x02]))
+      else:
+        self._q(bytes([3, 0x7F, 0x27, self.key_nrc]))
       return
     body = d[1:1 + d[0]]
     if not body:
@@ -482,8 +496,8 @@ class TestPhase2(Base):
 
   def test_unknown_phase_sends_nothing(self):
     # NB: `int(state.get("phase", 1) or 1)` maps a FALSY value (missing, None, 0) to the default 1; only a value that
-    # is neither 1, 2 nor 3 (e.g. -1, 4) or non-numeric ("banana") is unknown.
-    for phase in (-1, 4, "banana"):
+    # is neither 1, 2, 3 nor 4 (e.g. -1, 5) or non-numeric ("banana") is unknown.
+    for phase in (-1, 5, "banana"):
       with self.subTest(phase=phase):
         self.fresh_state()
         self.set_phase(phase)
@@ -1059,3 +1073,338 @@ class TestPhase3(Base):
   def test_phase3_budget_is_thirty_seconds(self):
     self.assertEqual(E.RUN_BUDGET_S_PHASE3, 30.0)
     self.assertEqual(E.RUN_BUDGET_S, 15.0)
+
+
+class TestPhase4(Base):
+  """Phase 4 (state ``{"probe_enabled": true, "phase": 4, "key_mode": ...}``): the sendKey attempt.
+  read 22 0103 -> 10 03 (REQUIRED positive, seeds are session-gated) -> 27 01 seed (REQUIRED positive, >=2 bytes)
+  -> ~500 ms -> ONE 27 02 with the RESOLVED candidate key (identity2/identity4/identity8/algo/hex) -> only on 67 02
+  the no-op 2E + re-read. Mechanically single-attempt and pinned to the resolved bytes."""
+
+  READ = bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")
+  SESSION = bytes([2, 0x10, 0x03]).ljust(8, b"\x00")
+  SEED01 = bytes([2, 0x27, 0x01]).ljust(8, b"\x00")
+  FC = D.FLOW_CONTROL_FRAME                                          # sent for the multi-frame 67 01 seed answer
+  WRITE = bytes([7, 0x2E, 0x01, 0x03]) + CURRENT
+  KEY2 = (bytes([4, 0x27, 0x02]) + PHASE4_SEED[:2]).ljust(8, b"\x00")                  # 04 27 02 5A B0
+  KEY4 = (bytes([6, 0x27, 0x02]) + PHASE4_SEED[:4]).ljust(8, b"\x00")                  # 06 27 02 5A B0 5A B0
+  KEY8_FF = bytes([0x10, 0x0A, 0x27, 0x02]) + PHASE4_SEED[:4]                          # 10 0A 27 02 5A B0 5A B0
+  KEY8_CF = (bytes([0x21]) + PHASE4_SEED[4:8]).ljust(8, b"\x00")                       # 21 5A B0 5A B0
+
+  def setUp(self):
+    super().setUp()
+
+  def set_state(self, phase=4, **extra):
+    st = {"probe_enabled": True, "phase": phase, **extra}
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump(st, f)
+
+  def p4_car(self, **kw):
+    car = FakeCar(**kw)
+    car.esc_seed8 = PHASE4_SEED   # the real car's 8-byte seed (2-byte value x4)
+    return car
+
+  def client4(self, car):
+    car.set_mux(True)
+    gate = D.VehicleGate(car.now)
+    gate.feed(CanData(0x367, lvr12(0), 0))
+    gate.feed(CanData(0x386, whl(0.), 0))
+    return E.EscProbeClient(car.can_send, car.can_recv, gate, car.now, car.now() + 99, phase=4)
+
+  # ---- (a) happy identity2: extended seed -> key 5AB0 -> 67 02 -> automatic 2E no-op -> reread -------------------
+  def test_phase4_identity2_unlock_then_auto_noop_write(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False          # once unlocked the no-op write lands (6E 0103)
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    # exact TX order INCLUDING the automatic step-7 write + re-read
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, self.KEY2, self.WRITE, self.READ])
+    self.assertEqual([d[1] for d in self.tx_frames(car) if d != self.FC], [0x22, 0x10, 0x27, 0x27, 0x2E, 0x22])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [self.KEY2])   # exactly one 27 02
+    self.assertEqual(car.mux_calls, [True, False])
+    doc = self.result_doc()
+    self.assertEqual(doc["phase"], 4)
+    self.assertEqual(doc["key_mode"], "identity2")
+    self.assertEqual(doc["seed"], PHASE4_SEED.hex())
+    self.assertEqual(doc["key"], "5ab0")
+    self.assertTrue(doc["key_attempted"])
+    self.assertTrue(doc["unlocked"])
+    self.assertTrue(doc["key_result"]["positive"])
+    self.assertEqual(doc["key_result"]["resp"], "6702")
+    self.assertTrue(doc["write_unlocked"]["positive"])            # the auto step-7 write landed
+    self.assertEqual(doc["reread_unlocked"]["resp"], "62010390060350")
+    self.assertEqual(doc["reread_unlocked_value"], "90060350")
+    self.assertTrue(s["key_attempted"])
+    self.assertTrue(s["unlocked"])
+    self.assertTrue(s["write_unlocked_positive"])
+    self.assertEqual(self.events[-1][0], "esc_probe_0027")
+
+  # ---- (b) identity4 frame shape 06 27 02 5AB05AB0 ---------------------------------------------------------------
+  def test_phase4_identity4_single_frame_shape(self):
+    self.set_state(key_mode="identity4")
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, self.KEY4, self.WRITE, self.READ])
+    keys = [d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02]
+    self.assertEqual(keys, [self.KEY4])
+    self.assertEqual(keys[0][:7], bytes([6, 0x27, 0x02, 0x5A, 0xB0, 0x5A, 0xB0]))
+    doc = self.result_doc()
+    self.assertEqual(doc["key"], "5ab05ab0")
+    self.assertTrue(doc["unlocked"])
+
+  # ---- (c) identity8 multiframe shapes 10 0A 27 02 . + 21 . ------------------------------------------------------
+  def test_phase4_identity8_multiframe_shapes(self):
+    self.set_state(key_mode="identity8")
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, self.KEY8_FF, self.KEY8_CF, self.WRITE, self.READ])
+    self.assertEqual([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])], [self.KEY8_FF])
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x21], [self.KEY8_CF])
+    self.assertEqual(self.KEY8_FF, bytes([0x10, 0x0A, 0x27, 0x02, 0x5A, 0xB0, 0x5A, 0xB0]))
+    self.assertEqual(self.KEY8_CF, bytes([0x21, 0x5A, 0xB0, 0x5A, 0xB0]).ljust(8, b"\x00"))
+    doc = self.result_doc()
+    self.assertEqual(doc["key"], PHASE4_SEED.hex())
+    self.assertTrue(doc["unlocked"])
+
+  # ---- (d) invalidKey 7F 27 35 -> recorded, NO 2E frame in tx ---------------------------------------------------
+  def test_phase4_invalid_key_records_and_no_write(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()                    # key_unlock False -> 7F 27 35
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    self.assertFalse(s["unlocked"])
+    self.assertEqual(self.write_frames(car), [])          # NO 2E frame at all after a failed key
+    self.assertEqual(self.tx_frames(car), [self.READ, self.SESSION, self.SEED01, self.FC, self.KEY2])
+    doc = self.result_doc()
+    self.assertEqual(doc["key_nrc"], 0x35)
+    self.assertFalse(doc["key_positive"])
+    self.assertIn("no further keys", doc["key_note"])
+    self.assertIsNone(doc["write_unlocked"])
+
+  def test_phase4_invalid_key_nrc_classes_recorded(self):
+    for nrc in (0x35, 0x36, 0x37):        # invalidKey / exceededNumberOfAttempts / requiredTimeDelayNotExpired
+      with self.subTest(nrc=nrc):
+        self.fresh_state()
+        self.set_state(key_mode="identity2")
+        car = self.p4_car()
+        car.key_nrc = nrc
+        s = self.run_car(car, key=f"nrc{nrc}")
+        self.assertTrue(s["ran"])
+        self.assertEqual(self.result_doc()["key_nrc"], nrc)
+        self.assertEqual(self.write_frames(car), [])
+
+  # ---- (e) key silence -> recorded, no 2E -----------------------------------------------------------------------
+  def test_phase4_key_silent_no_write(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.key_silent = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["error"])
+    self.assertFalse(s["unlocked"])
+    self.assertEqual(self.write_frames(car), [])
+    doc = self.result_doc()
+    self.assertTrue(doc["key_result"]["no_response"])
+    self.assertFalse(doc["key_attempted"] is None)      # it was attempted; only the answer was silent
+    self.assertIn("no further keys", doc["key_note"])
+
+  # ---- (f) seed refused (7F 27 7F) -> abort; no key, no write ----------------------------------------------------
+  def test_phase4_seed_refused_aborts_before_key(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.seed_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("seed not positive", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertFalse(s["write_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+    self.assertEqual(self.write_frames(car), [])
+    self.assertEqual(self.tx_frames(car), [self.READ, self.SESSION, self.SEED01])
+    self.assertEqual(car.mux_calls, [True, False])
+
+  def test_phase4_seed_silent_aborts_before_key(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.seed_silent = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("seed not positive", s["aborted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+
+  # ---- (g) 10 03 refused -> abort -------------------------------------------------------------------------------
+  def test_phase4_session_refused_aborts(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.session_refused = True            # 7F 10 12 - phase 4 REQUIRES a positive 50 03
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("extended session", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertFalse(s["write_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+    self.assertEqual(self.tx_frames(car), [self.READ, self.SESSION])
+    self.assertEqual(car.mux_calls, [True, False])
+
+  def test_phase4_session_silent_aborts(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.session_silent = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("extended session", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+
+  # ---- (h) second 27 02 raises ----------------------------------------------------------------------------------
+  def test_phase4_second_send_key_raises(self):
+    car = self.p4_car()
+    c = self.client4(car)
+    c.send_key_candidate(PHASE4_SEED[:2])
+    self.assertEqual(c.key_attempts, 1)
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key_candidate(PHASE4_SEED[:2])          # a second 27 02 can never reach the bus
+    self.assertEqual(len([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02]), 1)
+
+  def test_phase4_send_key_rejects_other_lengths(self):
+    car = self.p4_car()
+    c = self.client4(car)
+    for bad in (b"\x01", b"\x01\x02\x03", b"\x01\x02\x03\x04\x05", b"\x01" * 6, b""):
+      with self.assertRaises(D.SafetyViolation):
+        c.send_key_candidate(bad)
+
+  # ---- (i) wrong key raises (guard pinned to the resolved candidate) --------------------------------------------
+  def test_phase4_guard_frame_pins_key_to_resolved_candidate(self):
+    good = (bytes([4, 0x27, 0x02]) + PHASE4_SEED[:2]).ljust(8, b"\x00")
+    E.guard_frame(0x7D1, good, 1, phase=4, key=PHASE4_SEED[:2], key_attempts=0)      # exactly right key
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([4, 0x27, 0x02, 0x11, 0x22]).ljust(8, b"\x00"), 1, phase=4, key=PHASE4_SEED[:2])
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, good, 1, phase=4, key=PHASE4_SEED[:2], key_attempts=1)   # second attempt
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, good, 1, phase=4, key=None)                             # no resolved key
+    # frame length vs key length must agree (04 needs 2 key bytes, 06 needs 4)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([6, 0x27, 0x02, 0x5A, 0xB0, 0x00]).ljust(8, b"\x00"), 1, phase=4,
+                    key=PHASE4_SEED[:2], key_attempts=0)
+    # a 2-byte key never goes out for phase 3 (whose pin is the 8-byte seed), and 27 02 never for phases 1/2
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, good, 1, phase=3, seed=PHASE4_SEED, key_attempts=0)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, good, 1, phase=1, key=PHASE4_SEED[:2], key_attempts=0)
+
+  def test_phase4_guard_service_admits_sendkey_only_in_phases_3_and_4(self):
+    for phase in (3, 4):
+      E.guard_service(0x27, 0x02, None, phase=phase)     # admitted
+    for phase in (1, 2):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x27, 0x02, None, phase=phase)
+
+  # ---- (j) bad key_mode -> skip/abort; bad hex -> recorded abort ------------------------------------------------
+  def test_phase4_unknown_key_mode_skips(self):
+    for mode in ("bogus", "", 5, "identity3", "IDENTITY2"):
+      with self.subTest(mode=mode):
+        self.fresh_state()
+        self.set_state(key_mode=mode)
+        car = self.p4_car()
+        s = self.run_car(car, key=f"km{mode}")
+        self.assertFalse(s["ran"])
+        self.assertIn("unknown key_mode", s["skip"])
+        self.assertEqual(car.sent, [])
+        self.assertEqual(car.mux_calls, [])
+
+  def test_phase4_default_key_mode_is_identity2(self):
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump({"probe_enabled": True, "phase": 4}, f)    # no key_mode at all
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertEqual(self.result_doc()["key"], "5ab0")
+    self.assertEqual(self.result_doc()["key_mode"], "identity2")
+
+  def test_phase4_hex_mode_uses_key_hex(self):
+    self.set_state(key_mode="hex", key_hex="a1b2c3d4")      # 4-byte key
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key4 = (bytes([6, 0x27, 0x02, 0xA1, 0xB2, 0xC3, 0xD4])).ljust(8, b"\x00")
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [key4])
+    self.assertEqual(self.result_doc()["key"], "a1b2c3d4")
+
+  def test_phase4_hex_mode_bad_hex_aborts_recorded(self):
+    self.set_state(key_mode="hex", key_hex="zz")
+    car = self.p4_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("bad key_hex", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+
+  def test_phase4_hex_mode_wrong_length_aborts(self):
+    self.set_state(key_mode="hex", key_hex="a1b2c3")        # 3 bytes: never admissible
+    car = self.p4_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("resolved key length", s["aborted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+
+  def test_phase4_algo_mode_missing_module_aborts(self):
+    # esc_probe_seedkey does not exist in this tree: algo must abort (recorded), never send an unpinned key.
+    self.set_state(key_mode="algo")
+    car = self.p4_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("algo module missing/failed", s["aborted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+    self.assertEqual(self.write_frames(car), [])
+
+  def test_phase4_algo_mode_uses_resolved_key(self):
+    from types import SimpleNamespace
+    import sys
+    fake = SimpleNamespace(key_for=lambda seed: bytes(seed)[:2])
+    self.set_state(key_mode="algo")
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    with mock.patch.dict(sys.modules, {"openpilot.sunnypilot.fork.esc_probe_seedkey": fake}):
+      s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertEqual(self.result_doc()["key"], "5ab0")
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [self.KEY2])
+
+  def test_phase4_budget_is_thirty_seconds(self):
+    # phase 4 shares the phase-3 budget (the added 500 ms delay + key step)
+    self.assertEqual(E.RUN_BUDGET_S_PHASE3, 30.0)
+
+  def test_phase4_no_current_value_aborts(self):
+    self.set_state(key_mode="identity2")
+    car = self.p4_car()
+    car.read_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("step-1 read", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])

@@ -82,6 +82,35 @@ Phase 3 uses a 30 s budget (``RUN_BUDGET_S_PHASE3``); phases 1/2 keep 15 s. Per-
 unchanged. Phases 1/2 remain byte-identical: the 0x29/0x31/0x27-0x02 service/frame shapes are admitted only when
 ``phase == 3``, and the client only walks extra request addresses in the battery.
 
+Phase 4 result / rationale
+--------------------------
+Phase 3 ran on the car (2026-10-05 23:21Z; result
+``car-features/esc-software/probe-results/20261005T232115Z-result.json``): in the DEFAULT session the ESC refused EVERY
+probe — ``27 01`` -> ``7F 27 7F`` (serviceNotSupportedInActiveSession), ``29 01`` -> ``7F 29 7F``, ``31 01 0000`` ->
+``7F 31 33``, and the no-op ``2E`` -> ``7F 2E 33`` in BOTH the default and the extended session. The seed is
+SESSION-GATED: it only answers in the EXTENDED session (phase 1/2 proved ``67 01`` there). The one thing never tried is
+the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
+
+  1. read ``22 0103`` (default; the extended-retry rules are the phase-1/2 ones; no usable read -> abort, no key,
+     no write);
+  2. ensure the EXTENDED session (``10 03``; skipped only if the read's retry already entered it). Phase 4 REQUIRES a
+     POSITIVE ``50 03``: silence OR a negative -> abort (recorded), no key, no write (stricter than phase 3's
+     "any answer continues", because seeds never answer outside the extended session);
+  3. ``27 01`` requestSeed IN EXTENDED. REQUIRES a positive ``67 01`` with >=2 seed bytes; otherwise abort (recorded);
+  4. wait ~500 ms (the vendor ``delaytime``);
+  5. resolve the candidate key bytes from the seed: ``identity2`` = seed[:2], ``identity4`` = seed[:4], ``identity8`` =
+     the whole seed, ``algo`` = ``openpilot.sunnypilot.fork.esc_probe_seedkey.key_for(seed)`` (a missing/failing module
+     aborts, recorded), ``hex`` = ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible;
+  6. send ``27 02`` ONCE: 2-byte key -> ``04 27 02 K1 K2``; 4-byte -> ``06 27 02 K1..K4``; 8-byte -> the ISO-TP
+     multi-frame ``10 0A 27 02 K1..K4`` + one consecutive frame ``21 K5..K8`` (the phase-3 machinery);
+  7. on ``67 02``: the no-op ``2E 0103 <readback>`` (the SAME readback guard as always) then a re-read — the payoff.
+     ``7F 27 35/36/37`` (invalidKey / exceeded attempts / required time delay) or silence -> recorded, STOP (no write).
+
+The key_mode is the ``key_mode`` state key (default ``identity2`` when absent). A phase-4 ``27 02`` frame is admissible
+ONLY when ``phase == 4``, ONLY as the first key of the run (the same counter phase 3 uses), and ONLY when its key bytes
+equal the RESOLVED candidate (``guard_frame`` takes the resolved bytes and re-checks them at the single TX site). Phase 3
+keeps its own identity-key path unchanged. A malformed ``key_mode`` is inert (``skip: unknown key_mode``).
+
 Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mutation-proven)
 ----------------------------------------------------------------------------------------------
 * Enabled only by a state file: ``/data/esc-probe-0027/state.json`` with ``{"probe_enabled": true}``. Missing file
@@ -91,8 +120,9 @@ Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mu
 * Allowlist (checked twice: ``guard_service`` before a frame is built, ``guard_frame`` at the single TX site):
   0x22 ReadDataByIdentifier, 0x3E TesterPresent, 0x10 sub 0x03 (extended: retry a refused read, or the
   vendor-confirmed session step before the write),
-  0x27 sub 0x01 ONLY (sendKey 0x02 raises), 0x2E with DID 0x0103 ONLY — and the 0x2E payload bytes MUST equal
-  the bytes read back from 0x0103 in step 1 (an argument to the request, asserted at the TX site too).
+  0x27 sub 0x01 ONLY in phases 1/2 (sendKey 0x02 raises there; phases 3/4 admit the single pinned key attempt),
+  0x2E with DID 0x0103 ONLY — and the 0x2E payload bytes MUST equal the bytes read back from 0x0103 in step 1 (an
+  argument to the request, asserted at the TX site too).
 * Only when stationary: the SAME definition as esc_diag — gear Park (LVR12) and the wheels at standstill
   (WHL_SPD11; ``esc_diag.wheels_moving``), from fresh bus-0 frames. ``VehicleGate`` is IMPORTED, not copied, so
   there is exactly one standstill definition in the tree. Re-checked before every frame and while waiting for
@@ -133,7 +163,9 @@ ALLOWED_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSIO
 ALLOWED_PHASE3_SERVICES = frozenset({SVC_AUTHENTICATION, SVC_ROUTINE_CONTROL})
 ALLOWED_SESSION_SUBFUNC = 0x03   # extended only (used to retry a refused 0x0103 read)
 ALLOWED_SEC_SUBFUNC = 0x01       # requestSeed; sendKey (0x02) is admitted ONLY in the phase-3 battery (single attempt)
-ALLOWED_SEC_SUBFUNC_KEY = 0x02   # sendKey — phase 3 only, mechanically pinned to the step-2 ESC seed
+ALLOWED_SEC_SUBFUNC_KEY = 0x02   # sendKey — phase 3 (identity key == the step-2 seed) and phase 4 (resolved candidate)
+ALLOWED_KEY_LENGTHS = (2, 4, 8)  # phase 4: the ONLY admissible candidate-key sizes (2/4 -> single frame, 8 -> ISO-TP)
+KEY_MODES = ("identity2", "identity4", "identity8", "algo", "hex")   # phase-4 candidate-key derivation modes
 ALLOWED_AUTH_SUBFUNC = 0x01      # Authentication (0x29) start — phase 3 only
 ALLOWED_ROUTINE_SUBFUNC = 0x01   # RoutineControl (0x31) start — phase 3 only
 ROUTINE_CONTROL_ID = 0x0000      # the "is any routine even answered" probe
@@ -177,15 +209,17 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
 
   Phase 3 additionally admits the two discriminating services and the single 27 02 sendKey. Phases 1/2 are byte-identical:
   with ``phase != 3`` the allowlist is exactly the original, so 0x29/0x31/0x27 sub 0x02 raise exactly as before.
+
+  Phase 4 admits 0x27 sub 0x02 too (its whole point), under the same ``phase in (3, 4)`` gate.
   """
-  if service not in ALLOWED_SERVICES and not (phase == 3 and service in ALLOWED_PHASE3_SERVICES):
+  if service not in ALLOWED_SERVICES and not (phase in (3, 4) and service in ALLOWED_PHASE3_SERVICES):
     raise SafetyViolation(f"service 0x{service:02X} is not in the probe allowlist")
   if service == SVC_DIAGNOSTIC_SESSION_CONTROL and subfunc != ALLOWED_SESSION_SUBFUNC:
     raise SafetyViolation(f"session control sub-function {subfunc!r} refused (only 0x03 extended)")
   if service == SVC_SECURITY_ACCESS:
-    allowed_sec = (ALLOWED_SEC_SUBFUNC, ALLOWED_SEC_SUBFUNC_KEY) if phase == 3 else (ALLOWED_SEC_SUBFUNC,)
+    allowed_sec = (ALLOWED_SEC_SUBFUNC, ALLOWED_SEC_SUBFUNC_KEY) if phase in (3, 4) else (ALLOWED_SEC_SUBFUNC,)
     if subfunc not in allowed_sec:
-      extra = "; 0x02 sendKey in phase 3" if phase == 3 else ""
+      extra = "; 0x02 sendKey in phases 3/4" if phase in (3, 4) else ""
       raise SafetyViolation(f"security-access sub-function {subfunc!r} refused (only 0x01 requestSeed{extra})")
   if service == SVC_AUTHENTICATION and subfunc != ALLOWED_AUTH_SUBFUNC:
     raise SafetyViolation(f"authentication sub-function {subfunc!r} refused (only 0x01 start)")
@@ -196,7 +230,7 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
 
 
 def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, *, phase: int = 1,
-                seed: bytes | None = None, key_attempts: int = 0) -> None:
+                seed: bytes | None = None, key_attempts: int = 0, key: bytes | None = None) -> None:
   """Layer 2: the exact frame shapes this module may emit, checked immediately before can_send.
 
   ``readback`` is the 4 bytes read from 0x0103 in step 1: a 0x2E frame is admitted only when its data bytes are
@@ -208,14 +242,19 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
   * exactly ONE ``27 02`` sendKey: its 8 key bytes MUST equal ``seed`` (the step-2 ESC seed) and it MUST be the first
     (``key_attempts == 0``) — any second attempt or any other key raises. It is sent as ISO-TP multi-frame: the first
     frame ``10 0A 27 02 <4 key bytes>`` and the one consecutive frame ``21 <4 key bytes>``.
+
+  Phase 4 adds the candidate-key sendKey: ``key`` is the RESOLVED key bytes (2/4/8), and a phase-4 ``27 02`` frame is
+  admitted ONLY when ``key_attempts == 0`` and its key bytes equal ``key`` exactly. A 2- or 4-byte key is a single
+  frame (``04 27 02 K1K2`` / ``06 27 02 K1..K4``); an 8-byte key is the ISO-TP multi-frame shape. The phase-3
+  multi-frame path stays reachable (a phase-4 run may also resolve an 8-byte candidate that must equal ``seed``).
   """
   dat = bytes(dat)
   if addr not in ALLOWED_REQ_ADDRS or bus != ESC_BUS or len(dat) != 8:
     raise SafetyViolation(f"frame 0x{addr:X} bus {bus} len {len(dat)} refused")
   if dat == FLOW_CONTROL_FRAME:
     return
-  # --- phase-3-only frame shapes: multi-frame sendKey first (it is NOT a single frame) ---
-  if phase == 3 and dat[0] == 0x10 and dat[1] == 0x0A and dat[2] == SVC_SECURITY_ACCESS and dat[3] == ALLOWED_SEC_SUBFUNC_KEY:
+  # --- phase-3/4 multi-frame sendKey (8-byte key) first: it is NOT a single frame ---
+  if phase in (3, 4) and dat[0] == 0x10 and dat[1] == 0x0A and dat[2] == SVC_SECURITY_ACCESS and dat[3] == ALLOWED_SEC_SUBFUNC_KEY:
     if seed is None:
       raise SafetyViolation("27 02 sendKey without the step-2 seed")
     if key_attempts != 0:
@@ -223,7 +262,7 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
     if dat[4:8] != bytes(seed)[:4]:
       raise SafetyViolation(f"27 02 first frame key {dat[4:8].hex()} != step-2 seed {bytes(seed)[:4].hex()}")
     return
-  if phase == 3 and dat[0] == 0x21:
+  if phase in (3, 4) and dat[0] == 0x21:
     if seed is None:
       raise SafetyViolation("27 02 consecutive frame without the step-2 seed")
     if key_attempts != 1:
@@ -241,6 +280,17 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
   if svc == SVC_DIAGNOSTIC_SESSION_CONTROL and ln == 2 and dat[2] == ALLOWED_SESSION_SUBFUNC:
     return
   if svc == SVC_SECURITY_ACCESS and ln == 2 and dat[2] == ALLOWED_SEC_SUBFUNC:
+    return
+  if phase == 4 and svc == SVC_SECURITY_ACCESS and dat[2] == ALLOWED_SEC_SUBFUNC_KEY:
+    # phase-4 sendKey: a 2- or 4-byte candidate key as a single frame. Pinned to the RESOLVED key bytes.
+    if key is None:
+      raise SafetyViolation("27 02 sendKey without the resolved candidate key")
+    if key_attempts != 0:
+      raise SafetyViolation(f"27 02 single-frame sendKey refused: already attempted this run ({key_attempts})")
+    if ln not in (4, 6) or len(key) != ln - 2:
+      raise SafetyViolation(f"27 02 frame len {ln} does not match a {len(key)}-byte candidate key")
+    if dat[3:1 + ln] != bytes(key):
+      raise SafetyViolation(f"27 02 key {dat[3:1 + ln].hex()} != resolved candidate {bytes(key).hex()}")
     return
   if phase == 3 and svc == SVC_AUTHENTICATION and ln == 2 and dat[2] == ALLOWED_AUTH_SUBFUNC:
     return
@@ -269,6 +319,41 @@ def parse_read_did(resp_hex: str | None, did: int) -> bytes | None:
   return None
 
 
+def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None) -> bytes:
+  """Phase 4 step 5: derive the candidate key bytes from the step-3 seed (2, 4 or 8 bytes only).
+
+  identity2 = the seed's first 2 bytes; identity4 = first 4; identity8 = the whole seed; algo = the separate
+  ``esc_probe_seedkey`` module's ``key_for(seed)``; hex = the operator-supplied ``key_hex``. A missing/failing algo
+  module, an unparseable hex string, or any length other than 2/4/8 aborts the run (recorded).
+  """
+  if key_mode == "identity2":
+    key = bytes(seed)[:2]
+  elif key_mode == "identity4":
+    key = bytes(seed)[:4]
+  elif key_mode == "identity8":
+    key = bytes(seed)
+  elif key_mode == "algo":
+    try:
+      import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
+      key = bytes(sk.key_for(bytes(seed)))
+    except Exception as e:  # missing module, import error, or the algorithm raising -> recorded abort
+      raise Abort(f"algo module missing/failed: {e!r}") from e
+  elif key_mode == "hex":
+    try:
+      key = bytes.fromhex((key_hex or "").strip())
+    except ValueError as e:
+      raise Abort(f"hex key_mode: bad key_hex {key_hex!r}") from e
+  else:
+    raise Abort(f"unknown key_mode {key_mode!r}")
+  if len(key) not in ALLOWED_KEY_LENGTHS:
+    raise Abort(f"resolved key length {len(key)} not in {ALLOWED_KEY_LENGTHS}")
+  return key
+
+
+# The phase-4 sequence (one key attempt, mechanically pinned). Kept here so the demo / tests can reference it verbatim.
+KEY_MODES_PHASE4 = KEY_MODES
+
+
 class EscProbeClient:
   """Minimal UDS client for the probe. ``_tx`` is the ONLY place a frame is handed to can_send.
 
@@ -289,11 +374,13 @@ class EscProbeClient:
     self.key_attempts = 0            # 27 02 sendKey: hard single-attempt counter (guard_frame enforces it)
     self.rx: dict[int, list[tuple[float, bytes]]] = {a: [] for a in ALL_RESP_ADDRS}
 
-  def _tx(self, dat: bytes, readback: bytes | None = None, *, seed: bytes | None = None) -> None:
+  def _tx(self, dat: bytes, readback: bytes | None = None, *, seed: bytes | None = None,
+          key: bytes | None = None) -> None:
     self.gate.check()
     if self.now() > self.deadline:
       raise Abort("time budget exhausted")
-    guard_frame(ESC_REQ_ADDR, dat, ESC_BUS, readback, phase=self.phase, seed=seed, key_attempts=self.key_attempts)
+    guard_frame(ESC_REQ_ADDR, dat, ESC_BUS, readback, phase=self.phase, seed=seed, key_attempts=self.key_attempts,
+                key=key)
     self._can_send([CanData(ESC_REQ_ADDR, bytes(dat), ESC_BUS)])
     self.tx_log.append(bytes(dat).hex())
 
@@ -328,16 +415,25 @@ class EscProbeClient:
   def drain(self) -> None:
     self._rx_frames()
 
-  def request(self, service, subfunc, payload=b"", did=None, readback=None, *, addr=ESC_REQ_ADDR, rsp=None, timeout=None):
+  def wait(self, seconds: float) -> None:
+    """Phase-4 step 4: honour the vendor ``delaytime`` (~500 ms) before the key. Pumping the bus keeps the state fresh."""
+    t_end = self.now() + seconds
+    while self.now() < t_end:
+      self._rx_frames()
+
+  def request(self, service, subfunc, payload=b"", did=None, readback=None, *, addr=ESC_REQ_ADDR, rsp=None,
+              timeout=None, key=None):
     rsp_addr = rsp if rsp is not None else RESP_OF_REQ[addr]
     guard_service(service, subfunc, did, phase=self.phase)
     req = bytes([service]) + (bytes([subfunc]) if subfunc is not None else b"") + bytes(payload)
     frame = build_single_frame(req)
     self.drain()
     if addr == ESC_REQ_ADDR:
-      self._tx(frame, readback)
+      self._tx(frame, readback, key=key)
     else:
       self._tx_at(addr, frame)
+    if key is not None:
+      self.key_attempts = 1     # phase-4 single-frame sendKey consumed: a second 27 02 can never reach the bus
     t_tx = self.now()
     res: dict = {"req": frame.hex(), "addr": addr, "rsp_addr": rsp_addr, "frames": [], "frames_t_ms": []}
     seen: set[str] = set()
@@ -461,6 +557,71 @@ class EscProbeClient:
         if kind == 3:                                        # ESC flow control -> send the ONE consecutive frame
           if not cf_sent:
             self._tx(cf, seed=seed)
+            cf_sent = True
+            seen.add(cf.hex())
+            res["frames"].append(cf.hex())
+            res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+            t_end = self.now() + RESP_TIMEOUT_S
+          continue
+        if kind == 0:
+          body = f[1:1 + (f[0] & 0xF)]
+          return self._finish(res, SVC_SECURITY_ACCESS, body)
+        if kind == 1:
+          expect = ((f[0] & 0xF) << 8) | f[1]
+          data = f[2:8]
+          self._tx(FLOW_CONTROL_FRAME)
+          t_end = self.now() + CF_TIMEOUT_S
+        elif expect is not None and kind == 2:
+          data += f[1:8]
+          if len(data) >= expect:
+            return self._finish(res, SVC_SECURITY_ACCESS, data[:expect])
+      if not took:
+        self._rx_frames()
+    res["no_response" if not cf_sent else "incomplete"] = True
+    return res
+
+  def send_key_candidate(self, key: bytes) -> dict:
+    """Phase 4 step 6 (ONCE): 27 02 sendKey with the RESOLVED candidate key (2/4/8 bytes).
+
+    Mechanically pinned exactly like phase 3: ``key`` must be the resolved candidate bytes and this is the first 27 02
+    of the run. A 2- or 4-byte key is a single frame; an 8-byte key is the ISO-TP multi-frame shape (first frame +
+    the ESC's flow-control frame + one consecutive frame). The guard admits ONLY frames whose key bytes equal ``key``.
+    """
+    key = bytes(key)
+    if len(key) not in ALLOWED_KEY_LENGTHS:
+      raise SafetyViolation(f"sendKey key must be 2, 4 or 8 bytes, got {len(key)}")
+    if self.key_attempts != 0:
+      raise SafetyViolation("sendKey refused: already attempted this run")
+    if len(key) in (2, 4):
+      return self.request(SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC_KEY, key, did=None, key=key)
+    # 8-byte key: the phase-3 multi-frame machinery (first frame, ESC flow control, one consecutive frame)
+    req = bytes([SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC_KEY]) + key   # 10 bytes -> multi-frame
+    first = bytes([0x10, len(req)]) + req[:6]                # FF: 10 0A 27 02 <k0..k3> (8-byte CAN frame)
+    cf = (bytes([0x21]) + key[4:8]).ljust(8, b"\x00")        # CF: 21 <k4..k7> + pad (8-byte CAN frame)
+    self.drain()
+    self.rx[ESC_RSP_ADDR] = []
+    t_tx = self.now()
+    self._tx(first, seed=key)                                # guard_frame(seed=key, key_attempts=0) admits it
+    self.key_attempts = 1                                    # consumed: the consecutive frame requires ==1; a 2nd key raises
+    res: dict = {"req": first.hex(), "addr": ESC_REQ_ADDR, "rsp_addr": ESC_RSP_ADDR, "frames": [first.hex()],
+                 "frames_t_ms": [0.0]}
+    seen: set[str] = set(res["frames"])
+    cf_sent = False
+    data = b""
+    expect = None
+    t_end = t_tx + CF_TIMEOUT_S
+    while self.now() < t_end:
+      took = False
+      for f in self._rx_for(ESC_RSP_ADDR):
+        took = True
+        if f.hex() not in seen:
+          seen.add(f.hex())
+          res["frames"].append(f.hex())
+          res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+        kind = f[0] >> 4
+        if kind == 3:                                        # ESC flow control -> send the ONE consecutive frame
+          if not cf_sent:
+            self._tx(cf, seed=key)
             cf_sent = True
             seen.add(cf.hex())
             res["frames"].append(cf.hex())
@@ -642,6 +803,97 @@ def _run_phase3_battery(client: "EscProbeClient", doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Phase-4 sequence — ONE extended-session seed -> ONE candidate sendKey -> conditional no-op write (see docstring)
+# ---------------------------------------------------------------------------------------------------------------------
+def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, current: bytes) -> None:
+  """The exact phase-4 sequence. Raises Abort on a hard stop; records every step in ``doc``.
+
+  Stricter than phase 3: seeds only answer in the extended session, so the extended session (10 03) and the 27 01 seed
+  MUST both answer POSITIVELY. Silence or a negative at either stops the run before any key.
+  """
+
+  def step(name: str, res: dict) -> None:
+    doc["steps"].append({"name": name, "addr": ESC_REQ_ADDR, "req": res.get("req"),
+                         "frames": list(res.get("frames", [])), "frames_t_ms": list(res.get("frames_t_ms", [])),
+                         "resp": res.get("resp"), "nrc": res.get("nrc"), "positive": bool(res.get("positive")),
+                         "no_response": bool(res.get("no_response")), "timeout": bool(res.get("no_response")),
+                         "incomplete": bool(res.get("incomplete"))})
+
+  # ---- 1. read the current 0x0103 value (default session; extended retry unchanged) -------------------------------
+  step("read_esc", doc["read"])
+
+  # ---- 2. ensure the EXTENDED session (10 03). Positive 50 03 REQUIRED. -----------------------------------------
+  if not doc["extended_retry"]:
+    sess = client.extended_session()
+    doc["session_before_write"] = sess
+    step("session", sess)
+  if not (doc["session_before_write"] or {}).get("positive"):
+    raise Abort("phase4: extended session (10 03) not positive; no key, no write")
+
+  # ---- 3. 27 01 requestSeed IN THE EXTENDED SESSION. Positive 67 01 with >=2 seed bytes REQUIRED. -----------------
+  seed_res = client.request_seed()
+  doc["seed_request"] = seed_res
+  pos_seed = None
+  if seed_res.get("positive") and (seed_res.get("resp") or "").startswith("6701"):
+    pos_seed = bytes.fromhex(seed_res["resp"])[2:]
+  doc["seed"] = pos_seed.hex() if pos_seed is not None else None
+  step("seed", seed_res)
+  if pos_seed is None or len(pos_seed) < 2:
+    raise Abort("phase4: 27 01 seed not positive with >=2 bytes; no key, no write")
+
+  # ---- 4. vendor delaytime: wait ~500 ms before the key -----------------------------------------------------------
+  client.wait(0.5)
+
+  # ---- 5. resolve the candidate key bytes from the seed -----------------------------------------------------------
+  key_mode = state.get("key_mode") or "identity2"
+  doc["key_mode"] = key_mode
+  key = resolve_key(pos_seed, key_mode, state.get("key_hex"))   # Abort (recorded) on bad mode/hex/algo/length
+  doc["key"] = key.hex()
+  doc["key_attempted"] = True
+
+  # ---- 6. send 27 02 ONCE, with EXACTLY those bytes ---------------------------------------------------------------
+  r6 = client.send_key_candidate(key)
+  doc["key_result"] = r6
+  doc["key_frames"] = list(r6.get("frames", []))
+  doc["key_positive"] = bool(r6.get("positive"))
+  doc["key_nrc"] = r6.get("nrc")
+  doc["unlocked"] = bool(r6.get("positive"))
+  step("key_attempt", r6)
+
+  # ---- 7. on 67 02 (unlocked): the no-op write + re-read. Any 7F 27 xx / silence: STOP. ---------------------------
+  if not r6.get("positive"):
+    doc["key_note"] = "sendKey refused/silent: no further keys, no write"
+    return
+  r7 = client.write_did(DID_VARIANT_CODING, current, current)
+  doc["write_unlocked"] = r7
+  step("write_unlocked", r7)
+  r8 = client.read_did(DID_VARIANT_CODING)
+  doc["reread_unlocked"] = r8
+  reread = parse_read_did(r8.get("resp"), DID_VARIANT_CODING)
+  doc["reread_unlocked_value"] = reread.hex() if reread is not None else None
+  step("reread_unlocked", r8)
+
+
+def _run_phase4_read(client: "EscProbeClient", doc: dict) -> bytes:
+  """Phase-4 step 1: read 0x0103 (extended-retry rules unchanged). No usable read -> Abort; no key, no write."""
+  r1 = client.read_did(DID_VARIANT_CODING)
+  doc["read"] = r1
+  current = parse_read_did(r1.get("resp"), DID_VARIANT_CODING)
+  if current is None and r1.get("nrc") in (0x31, 0x7F):
+    ext = client.extended_session()
+    doc["extended_session"] = ext
+    if ext.get("positive"):
+      doc["extended_retry"] = True
+      r1 = client.read_did(DID_VARIANT_CODING)
+      doc["read"] = r1
+      current = parse_read_did(r1.get("resp"), DID_VARIANT_CODING)
+  doc["current_value"] = current.hex() if current is not None else None
+  if current is None:
+    raise Abort("phase4: step-1 read of 0x0103 refused/missing; refusing to write")
+  return current
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # Core (dependency-injected, so the tests drive the real code path)
 # ---------------------------------------------------------------------------------------------------------------------
 def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=None, ignition_key: str | None,
@@ -667,17 +919,23 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     return {**summary, "skip": "already done (ignition)"}
 
   # Phase selector: 1 (default) = phase 1 (pre-write seed), 2 = vendor-exact (no pre-write seed, post-write seed
-  # sample), 3 = the discriminating battery. Anything else is inert: nothing is sent and the ignition is not consumed.
+  # sample), 3 = the discriminating battery, 4 = sendKey (extended seed -> ONE candidate key -> conditional no-op
+  # write). Anything else is inert: nothing is sent and the ignition is not consumed.
   try:
     phase = int(state.get("phase", 1) or 1)
   except (TypeError, ValueError):
     phase = 0
-  if phase not in (1, 2, 3):
+  key_mode = state.get("key_mode")
+  if key_mode is None:
+    key_mode = "identity2"
+  if phase == 4 and key_mode not in KEY_MODES:
+    return {**summary, "skip": f"unknown key_mode {key_mode!r}"}
+  if phase not in (1, 2, 3, 4):
     return {**summary, "skip": "unknown phase"}
 
   gate = VehicleGate(now)
   t0 = now()
-  budget = RUN_BUDGET_S_PHASE3 if phase == 3 else RUN_BUDGET_S
+  budget = RUN_BUDGET_S_PHASE3 if phase in (3, 4) else RUN_BUDGET_S
   client = EscProbeClient(can_send, can_recv, gate, now, t0 + budget, phase=phase)
   doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None, "phase": phase,
               "read": None, "extended_session": None, "extended_retry": False, "current_value": None,
@@ -685,11 +943,14 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
               "seed_request": None, "seed": None, "already_unlocked": None, "seed_post": None,
               "write": None, "write_attempted": False, "reread": None, "reread_value": None,
               "value_changed": None, "tx": [], "duration_s": None, "aborted": None, "error": None,
-              "mux_restored": None, "gate_speeds_moving": None,
+              "mux_restored": None, "gate_speeds_moving": None, "current": None,
               # phase-3 battery only (kept None/empty for phases 1/2, so those results are unchanged)
               "steps": [], "seed_sweep": None, "write_default": None, "auth_probe": None, "routine_probe": None,
               "session": None, "write_extended": None, "key_attempted": False, "key": None, "unlocked": None,
-              "unlock_session": None, "write_unlocked": None, "reread_unlocked": None, "key_note": None}
+              "unlock_session": None, "write_unlocked": None, "reread_unlocked": None, "key_note": None,
+              # phase-4 only
+              "key_mode": None, "key_result": None, "key_frames": None, "key_positive": None, "key_nrc": None,
+              "reread_unlocked_value": None}
   for fw in car_fw or []:
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
@@ -737,6 +998,11 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     if phase == 3:
       # ---- PHASE 3: the single-ignition discriminating battery (exact scripted order) -----------------------------
       _run_phase3_battery(client, doc)
+    elif phase == 4:
+      # ---- PHASE 4: read -> extended seed (REQUIRED positive) -> ONE candidate sendKey -> conditional no-op write --
+      current = _run_phase4_read(client, doc)
+      doc["current"] = current.hex()
+      _run_phase4_sequence(client, doc, state, current)
     else:
       # ---- step 1: read the CURRENT 0x0103 value (default session; extended retry only if refused) -------------
       r1 = client.read_did(DID_VARIANT_CODING)
@@ -840,7 +1106,10 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
                               "positive": bool(r.get("positive")), "no_response": bool(r.get("no_response"))}
                              for r in (doc["seed_sweep"] or [])],
                  key_attempted=doc["key_attempted"], key=doc["key"], unlocked=doc["unlocked"],
-                 key_nrc=doc.get("key_nrc"), key_note=doc["key_note"])
+                 key_nrc=doc.get("key_nrc"), key_note=doc["key_note"], key_mode=doc.get("key_mode"),
+                 write_unlocked_nrc=(doc["write_unlocked"] or {}).get("nrc"),
+                 write_unlocked_positive=bool((doc["write_unlocked"] or {}).get("positive")),
+                 reread_unlocked_value=doc.get("reread_unlocked_value"))
   if log_event is not None:
     log_event("esc_probe_0027", **summary)
   return summary
