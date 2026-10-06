@@ -1,5 +1,5 @@
 """
-Fork: ESC (HECU) security-access PROBE — request the 0x27 seed and write the CURRENT 0x0103 variant-coding
+Fork: ESC (HECU) security-access PROBE -- request the 0x27 seed and write the CURRENT 0x0103 variant-coding
 value straight back (a no-op by construction), inside openpilot's own fingerprint window.
 (adurham/sunnypilot; car-features/esc-probe-0027-report.md)
 
@@ -14,18 +14,18 @@ configuration; what is informative is the *reply*:
   * a refused seed + an ACCEPTED write -> the ESC takes 0x2E without an unlock (the gate is elsewhere/absent);
   * an all-zero seed                 -> "already unlocked", the write is attempted anyway to see if it lands.
 
-Phase 1 never sends the key (0x27 sub 0x02) — asking is the whole probe.
+Phase 1 never sends the key (0x27 sub 0x02) -- asking is the whole probe.
 
 Vendor-confirmed write flow (GIT VariantCodingTable, decoded 2026-10-05; CN7N ESC block SecuritySupported=0)
 ------------------------------------------------------------------------------------------------------------
 The vendor's own variant-coding table for THIS car's ESC (GIT VariantCodingTable_HY.git.xml, the CN7N/"Elantra N"
-block — HECU 58910-IB000, CAN IDs 0x7D1/0x7D9) exposes the authoritative write sequence as plain request hex:
+block -- HECU 58910-IB000, CAN IDs 0x7D1/0x7D9) exposes the authoritative write sequence as plain request hex:
 
     <Backup requestvalue="07D103220103">          -> 0x7D1: 03 22 01 03      read the current 0x0103 value
     <Input  requestvalue="07D1021003">            -> 0x7D1: 02 10 03         ENTER EXTENDED SESSION
     <Input  requestvalue="07D1072E0103$01$$02$$03$$04$"> -> 0x7D1: 07 2E 01 03 <4 code bytes>   write
 
-and `<Security SecuritySupported="0" Securityindex="0" CANID="07D1"/>` — the vendor tool never sends 0x27 for this
+and `<Security SecuritySupported="0" Securityindex="0" CANID="07D1"/>` -- the vendor tool never sends 0x27 for this
 ECU (the 27 01 templates exist only for the Kia CONTI/MANDO entries with security indexes 26300/270100). This probe
 still ASKS for the 0x27 seed (that contrast is informative), but mirrors the vendor exactly at the write: read 0x0103
 -> 10 03 extended session -> 2E 0103 no-op.
@@ -61,20 +61,20 @@ rejects the service outright in any session.
 
 Phase 3 is a single-ignition "battery" (state ``{"probe_enabled": true, "phase": 3}``) that discriminates those:
   1. read 0x0103 (must parse, else the battery aborts with ``battery: no current value``);
-  2. a 6-address ``27 01`` seed sweep — ESC 0x7D1, CLU 0x7C6, TCU 0x7E1, EPS 0x7D4, CAM 0x7C4, CR 0x7B7 (300 ms
+  2. a 6-address ``27 01`` seed sweep -- ESC 0x7D1, CLU 0x7C6, TCU 0x7E1, EPS 0x7D4, CAM 0x7C4, CR 0x7B7 (300 ms
      each). Identical static seeds from several no-security modules would point at a gateway answering on the
      modules' behalf (an SGW that relays/relays-blocking would produce uniform replies);
-  3. the no-op ``2E 0103`` in the DEFAULT session (no ``10 03``) — same idempotent write;
-  4. ``29 01`` (Authentication) to the ESC — a live UDS auth service changes the picture;
-  5. ``31 01 0000`` (RoutineControl start, routine 0x0000) — ``7F 31 31`` (requestOutOfRange) means the module's own
+  3. the no-op ``2E 0103`` in the DEFAULT session (no ``10 03``) -- same idempotent write;
+  4. ``29 01`` (Authentication) to the ESC -- a live UDS auth service changes the picture;
+  5. ``31 01 0000`` (RoutineControl start, routine 0x0000) -- ``7F 31 31`` (requestOutOfRange) means the module's own
      session logic answered, whereas ``33`` would mean the same blanket filter as the write;
   6. re-read 0x0103 (confirm unchanged);
   7. ``10 03`` extended session;
-  8. the SAME no-op ``2E`` again in extended — ``7F 2E 33`` in BOTH sessions is the signature of a blanket filter;
+  8. the SAME no-op ``2E`` again in extended -- ``7F 2E 33`` in BOTH sessions is the signature of a blanket filter;
   9. LAST and exactly ONCE: ``27 02`` sendKey with the IDENTITY key = the exact 8 seed bytes the ESC returned in step
      2 (the cheapest candidate algorithm; if the ESC's key == seed this unlocks). It is ISO-TP multi-frame (10-byte
      payload: first frame + flow control + one consecutive frame). Mechanically enforced: the guard admits a ``27 02``
-     only when it is the first of the run AND the key bytes equal the step-2 ESC seed — any other key or a second
+     only when it is the first of the run AND the key bytes equal the step-2 ESC seed -- any other key or a second
      attempt raises ``SafetyViolation``. ``67 02`` -> step 10; ``7F 27 xx`` -> STOP (no more keys, no write);
   10. only if step 9 returned ``67 02``: ``10 03`` -> the no-op ``2E`` -> re-read (still the no-op by construction).
 
@@ -86,7 +86,7 @@ Phase 4 result / rationale
 --------------------------
 Phase 3 ran on the car (2026-10-05 23:21Z; result
 ``car-features/esc-software/probe-results/20261005T232115Z-result.json``): in the DEFAULT session the ESC refused EVERY
-probe — ``27 01`` -> ``7F 27 7F`` (serviceNotSupportedInActiveSession), ``29 01`` -> ``7F 29 7F``, ``31 01 0000`` ->
+probe -- ``27 01`` -> ``7F 27 7F`` (serviceNotSupportedInActiveSession), ``29 01`` -> ``7F 29 7F``, ``31 01 0000`` ->
 ``7F 31 33``, and the no-op ``2E`` -> ``7F 2E 33`` in BOTH the default and the extended session. The seed is
 SESSION-GATED: it only answers in the EXTENDED session (phase 1/2 proved ``67 01`` there). The one thing never tried is
 the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
@@ -104,22 +104,54 @@ the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
      unknown ``algo``, or a zero-byte seed that the vendor path bails on aborts, recorded), ``hex`` =
      ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible. The 8-byte CONSTRUCTION modes wrap the
      same resolvers into exactly 8 wire bytes, because the car proved ``27 02`` wants an 8-byte key (a 4-byte key drew
-     ``7F 27 13`` incorrect-length; the 8-byte seed-as-key drew ``7F 27 35`` invalidKey — so 8 bytes is the accepted
+     ``7F 27 13`` incorrect-length; the 8-byte seed-as-key drew ``7F 27 35`` invalidKey -- so 8 bytes is the accepted
      LENGTH and VALUE iteration begins): ``algo8`` = the algo key repeated to fill 8 (2-byte k -> k*4, 4-byte -> k*2);
-     ``algo8w`` = the algo key's FIRST TWO BYTES repeated to fill 8 (``k[:2]*4`` = ``[lo,hi]x4`` — the wire shape of
+     ``algo8w`` = the algo key's FIRST TWO BYTES repeated to fill 8 (``k[:2]*4`` = ``[lo,hi]x4`` -- the wire shape of
      the on-car seed, in case the layer repeats the underlying 2-byte value rather than the whole 4-byte render);
      ``algo8p`` = the algo key + zero padding (2-byte -> k+6 zeros, 4-byte -> k+4 zeros); ``repeat8`` = the seed's own
      2-byte value repeated (``seed[:2]*4``); ``hex8`` = exactly 8 bytes from ``state["key_hex"]`` (any other length
-     aborts — stricter than ``hex``);
+     aborts -- stricter than ``hex``);
   6. send ``27 02`` ONCE: 2-byte key -> ``04 27 02 K1 K2``; 4-byte -> ``06 27 02 K1..K4``; 8-byte -> the ISO-TP
      multi-frame ``10 0A 27 02 K1..K4`` + one consecutive frame ``21 K5..K8`` (the phase-3 machinery);
-  7. on ``67 02``: the no-op ``2E 0103 <readback>`` (the SAME readback guard as always) then a re-read — the payoff.
+  7. on ``67 02``: the no-op ``2E 0103 <readback>`` (the SAME readback guard as always) then a re-read -- the payoff.
      ``7F 27 35/36/37`` (invalidKey / exceeded attempts / required time delay) or silence -> recorded, STOP (no write).
 
 The key_mode is the ``key_mode`` state key (default ``identity2`` when absent). A phase-4 ``27 02`` frame is admissible
 ONLY when ``phase == 4``, ONLY as the first key of the run (the same counter phase 3 uses), and ONLY when its key bytes
 equal the RESOLVED candidate (``guard_frame`` takes the resolved bytes and re-checks them at the single TX site). Phase 3
 keeps its own identity-key path unchanged. A malformed ``key_mode`` is inert (``skip: unknown key_mode``).
+
+Phase 5 -- the READ-ONLY capability battery (state ``{"probe_enabled": true, "phase": 5}``)
+-------------------------------------------------------------------------------------------
+Phase 4 iterates KEY VALUES; phase 5 instead maps what the ESC will even TALK ABOUT, parked, without ever reaching a key
+or a write. It is a FIXED, read-only frame list, one ignition, budget ``RUN_BUDGET_S_PHASE5`` = 40 s, and it NEVER
+aborts on a refusal -- it records every frame's request/response/NRC/timeout/latency and moves on:
+
+  1. ``fp_canary``: ``22 F1 00`` -- the functional-read canary DID;
+  2. ``read_esc``: ``22 01 03`` -- the current 0x0103 value (start);
+  3. ``session``: ``10 03`` -- enter the extended session;
+  4. ``seed1`` / ``seed2``: two ``27 01`` requestSeed samples;
+  5. ten 2-byte sub-probes ``27 03/05/07/09/0B/0D/0F/11/41/61`` (the other requestSeed-shaped sub-functions);
+  6. seven 1-byte service probes ``23/29/31/34/35/36/37`` (bare, no sub-function);
+  7. ``seed3``: a third ``27 01`` sample;
+  8. ``read_esc_end``: re-read ``22 01 03`` (confirm unchanged);
+  9. two extra-address peeks: a single ``10 03`` to request addr 0x770 (listen 0x778) and to 0x7A0 (listen 0x7A8) --
+     do OTHER OBD addresses answer, or is the ESC's own 0x7D1 the only talker?
+
+The summary adds: ``seed1``/``seed2``/``seed3`` hex, ``seed_stable_12`` (seed1 == seed2), ``seed_stable_all`` (all
+three), ``fp_canary_hex``, ``value_start``, ``value_end``. Guards, mechanically enforced for phase 5 (``SafetyViolation``
+raised BEFORE any frame is built):
+
+  * ONLY the exact frames above are admissible; anything else raises;
+  * ``27``: ONLY sub 0x01 (2-byte frame) and the exact ten sub-probes (2-byte frames); NO ``27 02`` EVER in phase 5;
+  * ``10``: only sub 0x03; the extra request addresses are ONLY {0x770, 0x7A0} and ONLY for the ``10 03`` frame;
+  * ``22``: only DIDs {F100, 0103};
+  * services 23/29/31/34/35/36/37 only as the bare 1-byte frame;
+  * NO ``2E``, no ``31`` sub 0x01, no ``29`` sub 0x01, and NO multi-frame sends at all (RX multi-frame is fine);
+  * phases 1-4 stay byte-identical (the phase-5 shapes are admitted only when ``phase == 5``);
+  * phase 5 respects ``done_ignition`` (never runs twice per ignition).
+
+Phase 5 adds no new services to the base allowlist; it is a strict, self-contained subset.
 
 In ``algo``/``algo8``/``algo8w``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
 ``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
@@ -137,9 +169,9 @@ Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mu
   0x22 ReadDataByIdentifier, 0x3E TesterPresent, 0x10 sub 0x03 (extended: retry a refused read, or the
   vendor-confirmed session step before the write),
   0x27 sub 0x01 ONLY in phases 1/2 (sendKey 0x02 raises there; phases 3/4 admit the single pinned key attempt),
-  0x2E with DID 0x0103 ONLY — and the 0x2E payload bytes MUST equal the bytes read back from 0x0103 in step 1 (an
+  0x2E with DID 0x0103 ONLY -- and the 0x2E payload bytes MUST equal the bytes read back from 0x0103 in step 1 (an
   argument to the request, asserted at the TX site too).
-* Only when stationary: the SAME definition as esc_diag — gear Park (LVR12) and the wheels at standstill
+* Only when stationary: the SAME definition as esc_diag -- gear Park (LVR12) and the wheels at standstill
   (WHL_SPD11; ``esc_diag.wheels_moving``), from fresh bus-0 frames. ``VehicleGate`` is IMPORTED, not copied, so
   there is exactly one standstill definition in the tree. Re-checked before every frame and while waiting for
   every answer; any violation aborts at once.
@@ -163,7 +195,7 @@ from openpilot.sunnypilot.fork.esc_diag import Abort, FLOW_CONTROL_FRAME, Safety
   build_single_frame, wheels_moving
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Probe allowlist — a strict superset of esc_diag's read set (0x27/0x2E added) and nothing else.
+# Probe allowlist -- a strict superset of esc_diag's read set (0x27/0x2E added) and nothing else.
 # ---------------------------------------------------------------------------------------------------------------------
 SVC_READ_DATA_BY_IDENTIFIER = 0x22
 SVC_DIAGNOSTIC_SESSION_CONTROL = 0x10
@@ -179,16 +211,16 @@ ALLOWED_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSIO
 ALLOWED_PHASE3_SERVICES = frozenset({SVC_AUTHENTICATION, SVC_ROUTINE_CONTROL})
 ALLOWED_SESSION_SUBFUNC = 0x03   # extended only (used to retry a refused 0x0103 read)
 ALLOWED_SEC_SUBFUNC = 0x01       # requestSeed; sendKey (0x02) is admitted ONLY in the phase-3 battery (single attempt)
-ALLOWED_SEC_SUBFUNC_KEY = 0x02   # sendKey — phase 3 (identity key == the step-2 seed) and phase 4 (resolved candidate)
+ALLOWED_SEC_SUBFUNC_KEY = 0x02   # sendKey -- phase 3 (identity key == the step-2 seed) and phase 4 (resolved candidate)
 ALLOWED_KEY_LENGTHS = (2, 4, 8)  # phase 4: the ONLY admissible candidate-key sizes (2/4 -> single frame, 8 -> ISO-TP)
 # phase-4 candidate-key derivation modes. The 8-byte CONSTRUCTION modes ("algo8"/"algo8p"/"repeat8"/"hex8") were added
 # after the on-car run proved 27 02 wants an 8-byte key: a 4-byte key drew 7F 27 13 (incorrect length) and the
-# 8-byte seed-as-key (identity8) drew 7F 27 35 (invalidKey) — so 8 bytes is the accepted LENGTH and VALUE iteration
+# 8-byte seed-as-key (identity8) drew 7F 27 35 (invalidKey) -- so 8 bytes is the accepted LENGTH and VALUE iteration
 # can begin. Each of the new modes resolves to exactly 8 wire bytes (see resolve_key).
 KEY_MODES = ("identity2", "identity4", "identity8", "algo", "hex",
              "algo8", "algo8w", "algo8p", "repeat8", "hex8")   # phase-4 candidate-key derivation modes
-ALLOWED_AUTH_SUBFUNC = 0x01      # Authentication (0x29) start — phase 3 only
-ALLOWED_ROUTINE_SUBFUNC = 0x01   # RoutineControl (0x31) start — phase 3 only
+ALLOWED_AUTH_SUBFUNC = 0x01      # Authentication (0x29) start -- phase 3 only
+ALLOWED_ROUTINE_SUBFUNC = 0x01   # RoutineControl (0x31) start -- phase 3 only
 ROUTINE_CONTROL_ID = 0x0000      # the "is any routine even answered" probe
 DID_VARIANT_CODING = 0x0103      # the ESC's variant-coding DID; the ONLY DID this module may write
 WRITE_DID = DID_VARIANT_CODING
@@ -199,7 +231,7 @@ ESC_BUS = 1                      # OBD port (needs OBD multiplexing); the ESC ne
 
 # Phase 3 walks the same OBD bus to five more modules (request addr -> response addr). Every one is reached with OBD
 # multiplexing on, bus 1, 8-byte ISO-TP frames; the request allowlist stays closed over exactly these pairs.
-ADDR_PAIRS = ((0x7D1, 0x7D9),   # ESC  (HECU)   — the write target
+ADDR_PAIRS = ((0x7D1, 0x7D9),   # ESC  (HECU)   -- the write target
               (0x7C6, 0x7CE),   # CLU  (cluster)
               (0x7E1, 0x7E9),   # TCU  (transmission)
               (0x7D4, 0x7DC),   # EPS  (steering)
@@ -211,12 +243,38 @@ RESP_OF_REQ = dict(ADDR_PAIRS)
 REQ_OF_RESP = {rsp: req for req, rsp in ADDR_PAIRS}
 SEED_SWEEP_ADDRS = tuple(req for req, _ in ADDR_PAIRS)
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 5 -- the READ-ONLY capability battery. It answers "what does this ESC actually support / how far can a parked
+# tester get" WITHOUT ever reaching a key or a write. One ignition, a FIXED scripted frame list to the ESC (0x7D1) plus
+# two single-frame peeks at OTHER request addresses (0x770, 0x7A0) that stay strictly bounded to the `10 03` frame.
+# The admissible set is closed HERE so the guards can enforce it mechanically (no 27 02, no 2E, no multi-frame TX).
+# ---------------------------------------------------------------------------------------------------------------------
+PHASE5_DID_FP_CANARY = 0xF100     # functional-read canary DID
+PHASE5_RESP_DEFAULT = RESP_OF_REQ[ESC_REQ_ADDR]
+# the ten 27 03/05/07/09/0B/0D/0F/11/41/61 sub-probes (2-byte frames, requestSeed-shaped sub-functions)
+PHASE5_SEC_SUB_PROBES = (0x03, 0x05, 0x07, 0x09, 0x0B, 0x0D, 0x0F, 0x11, 0x41, 0x61)
+PHASE5_SVC_PROBES = (0x23, 0x29, 0x31, 0x34, 0x35, 0x36, 0x37)   # bare 1-byte service probes
+PHASE5_EXTRA_ADDRS = ((0x770, 0x778), (0x7A0, 0x7A8))           # extra request addr -> listen addr (10 03 only)
+PHASE5_EXTRA_REQ_ADDRS = frozenset(req for req, _ in PHASE5_EXTRA_ADDRS)
+PHASE5_EXTRA_RESP_OF_REQ = dict(PHASE5_EXTRA_ADDRS)
+# The phase-5 27 sub-functions: requestSeed (0x01) plus the ten 2-byte sub-probes. sendKey (0x02) is NEVER admissible.
+PHASE5_SEC_SUBFUNCS = frozenset({ALLOWED_SEC_SUBFUNC, *PHASE5_SEC_SUB_PROBES})
+# The phase-5 DIDs: the canary functional read and the variant-coding read, nothing else.
+PHASE5_DIDS = frozenset({PHASE5_DID_FP_CANARY, DID_VARIANT_CODING})
+# The phase-5 service allowlist: a strict SUBSET of the base set (note: 0x2E is absent, and so is 0x3E) plus the bare
+# 1-byte probes. Kept as its own frozenset so phases 1-4 stay byte-identical.
+ALLOWED_PHASE5_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSION_CONTROL,
+                                     SVC_SECURITY_ACCESS, *PHASE5_SVC_PROBES})
+# Every phase-5 exchange is a single ISO-TP frame (1- or 2-byte payload) -- there is NO multi-frame TX in phase 5.
+PHASE5_MAX_FRAMES = 1
+
 RESP_TIMEOUT_S = 0.25            # first answer frame
 SEED_SWEEP_TIMEOUT_S = 0.3       # the 6-address 27 01 sweep waits up to 300 ms per module
 PENDING_TIMEOUT_S = 2.0          # after NRC 0x78 responsePending
 CF_TIMEOUT_S = 0.5               # between consecutive frames
 RUN_BUDGET_S = 15.0              # hard cap on phases 1/2
 RUN_BUDGET_S_PHASE3 = 30.0       # hard cap on the phase-3 battery (6-address sweep + one sendKey)
+RUN_BUDGET_S_PHASE5 = 40.0       # hard cap on the phase-5 READ-ONLY capability battery (26 frames + 2 extra addrs)
 SILENT_ABORT_N = 3               # consecutive requests with no answer at all = module not reachable, stop
 STATE_KNOWN_WAIT_S = 0.5         # wait this long for the first fresh gear/wheel frames before the pre-check
 KEEP_FILES = 60
@@ -232,7 +290,23 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
   with ``phase != 3`` the allowlist is exactly the original, so 0x29/0x31/0x27 sub 0x02 raise exactly as before.
 
   Phase 4 admits 0x27 sub 0x02 too (its whole point), under the same ``phase in (3, 4)`` gate.
+
+  Phase 5 is READ-ONLY and STRICTER than everything else: a closed subset of services (0x2E and 0x3E are NOT admissible),
+  0x27 restricted to requestSeed + the exact ten 2-byte sub-probes (sendKey 0x02 NEVER), 0x10 only sub 0x03, 0x22 only
+  DIDs {F100, 0103}, and services 23/29/31/34/35/36/37 only as the bare sub-function-absent frame.
   """
+  if phase == 5:
+    if service not in ALLOWED_PHASE5_SERVICES:
+      raise SafetyViolation(f"phase5: service 0x{service:02X} is not in the read-only battery allowlist")
+    if service == SVC_DIAGNOSTIC_SESSION_CONTROL and subfunc != ALLOWED_SESSION_SUBFUNC:
+      raise SafetyViolation(f"phase5: session control sub-function {subfunc!r} refused (only 0x03 extended)")
+    if service == SVC_SECURITY_ACCESS and subfunc not in PHASE5_SEC_SUBFUNCS:
+      raise SafetyViolation(f"phase5: security-access sub {subfunc!r} refused (requestSeed 0x01 + the 27 sub-probes; NO 27 02)")
+    if service == SVC_READ_DATA_BY_IDENTIFIER and did not in PHASE5_DIDS:
+      raise SafetyViolation(f"phase5: read of DID {did!r} refused (only 0xF100 canary and 0x0103)")
+    if service in PHASE5_SVC_PROBES and subfunc is not None:
+      raise SafetyViolation(f"phase5: service 0x{service:02X} is admissible only as the bare 1-byte frame, not sub {subfunc!r}")
+    return
   if service not in ALLOWED_SERVICES and not (phase in (3, 4) and service in ALLOWED_PHASE3_SERVICES):
     raise SafetyViolation(f"service 0x{service:02X} is not in the probe allowlist")
   if service == SVC_DIAGNOSTIC_SESSION_CONTROL and subfunc != ALLOWED_SESSION_SUBFUNC:
@@ -255,13 +329,13 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
   """Layer 2: the exact frame shapes this module may emit, checked immediately before can_send.
 
   ``readback`` is the 4 bytes read from 0x0103 in step 1: a 0x2E frame is admitted only when its data bytes are
-  byte-identical to it — the write is a no-op by construction.
+  byte-identical to it -- the write is a no-op by construction.
 
   Phase 3 adds three shapes, each mechanically enforced:
   * request addresses are the six OBD pairs in ``ALLOWED_REQ_ADDRS`` (still bus 1, 8 bytes);
   * ``29 01`` and ``31 01 00 00`` (the auth / routine probes);
   * exactly ONE ``27 02`` sendKey: its 8 key bytes MUST equal ``seed`` (the step-2 ESC seed) and it MUST be the first
-    (``key_attempts == 0``) — any second attempt or any other key raises. It is sent as ISO-TP multi-frame: the first
+    (``key_attempts == 0``) -- any second attempt or any other key raises. It is sent as ISO-TP multi-frame: the first
     frame ``10 0A 27 02 <4 key bytes>`` and the one consecutive frame ``21 <4 key bytes>``.
 
   Phase 4 adds the candidate-key sendKey: ``key`` is the RESOLVED key bytes (2/4/8), and a phase-4 ``27 02`` frame is
@@ -270,6 +344,33 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
   multi-frame path stays reachable (a phase-4 run may also resolve an 8-byte candidate that must equal ``seed``).
   """
   dat = bytes(dat)
+  if phase == 5:
+    # ---- PHASE 5: the READ-ONLY battery. Single frames only; the fixed flow-control frame is the one exemption (it
+    # completes an RX multi-frame answer). No 27 02, no 2E, no multi-frame TX. Request addresses are the ESC (0x7D1)
+    # plus the two bounded extra peek addresses, which admit ONLY the 10 03 session frame.
+    if bus != ESC_BUS or len(dat) != 8:
+      raise SafetyViolation(f"phase5: frame 0x{addr:X} bus {bus} len {len(dat)} refused")
+    if dat == FLOW_CONTROL_FRAME:
+      return
+    if addr != ESC_REQ_ADDR:
+      if addr in PHASE5_EXTRA_REQ_ADDRS and dat[:3] == bytes([2, SVC_DIAGNOSTIC_SESSION_CONTROL, ALLOWED_SESSION_SUBFUNC]):
+        return
+      raise SafetyViolation(f"phase5: frame 0x{addr:X} refused (only 0x7D1, and 0x770/0x7A0 for 10 03): {dat.hex()}")
+    if dat[0] >> 4 != 0 or not 1 <= dat[0] <= 7:
+      raise SafetyViolation(f"phase5: only ISO-TP single frames may be sent: {dat.hex()}")
+    ln, svc = dat[0], dat[1]
+    if svc == SVC_READ_DATA_BY_IDENTIFIER and ln == 3:
+      did = (dat[2] << 8) | dat[3]
+      if did not in PHASE5_DIDS:
+        raise SafetyViolation(f"phase5: read of DID 0x{did:04X} refused (only 0xF100 and 0x0103)")
+      return
+    if svc == SVC_DIAGNOSTIC_SESSION_CONTROL and ln == 2 and dat[2] == ALLOWED_SESSION_SUBFUNC:
+      return
+    if svc == SVC_SECURITY_ACCESS and ln == 2 and dat[2] in PHASE5_SEC_SUBFUNCS:
+      return
+    if ln == 1 and svc in PHASE5_SVC_PROBES:
+      return
+    raise SafetyViolation(f"phase5: frame {dat.hex()} is not an allowlisted read-only battery request")
   if addr not in ALLOWED_REQ_ADDRS or bus != ESC_BUS or len(dat) != 8:
     raise SafetyViolation(f"frame 0x{addr:X} bus {bus} len {len(dat)} refused")
   if dat == FLOW_CONTROL_FRAME:
@@ -344,7 +445,7 @@ def _resolve_algo_key(seed: bytes, algo: str | None) -> bytes:
   """Shared algo resolution for the ``algo``/``algo8``/``algo8p`` modes: ``key_for(seed, algo)``.
 
   Aborts (recorded) on a missing/failing module, an unknown algo name, or the vendor zero-byte bail (``key_for`` ->
-  None) — identical semantics in all three modes, so a zero-byte seed can never reach the bus unpinned.
+  None) -- identical semantics in all three modes, so a zero-byte seed can never reach the bus unpinned.
   """
   try:
     import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
@@ -366,13 +467,13 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: st
   than 2/4/8 aborts the run (recorded).
 
   The 8-byte CONSTRUCTION modes wrap the same resolvers into exactly 8 wire bytes (the car proved 27 02 wants an 8-byte
-  key — 4 bytes drew NRC 0x13, the full seed drew 0x35):
+  key -- 4 bytes drew NRC 0x13, the full seed drew 0x35):
     * algo8  = the algo key repeated to fill 8 (2-byte k -> k*4; 4-byte k -> k*2);
     * algo8w = the algo key's FIRST TWO BYTES repeated to fill 8 (``k[:2] * 4`` = ``[lo,hi]x4``);
     * algo8p = the algo key + zero padding (2-byte -> k + 6 zeros; 4-byte -> k + 4 zeros);
-    * repeat8 = the seed's own 2-byte value repeated (seed[:2] * 4) — same bytes as identity2-as-8B, kept distinct for
+    * repeat8 = the seed's own 2-byte value repeated (seed[:2] * 4) -- same bytes as identity2-as-8B, kept distinct for
       construction clarity;
-    * hex8   = exactly 8 bytes from ``key_hex`` (any other length aborts — stricter than ``hex``).
+    * hex8   = exactly 8 bytes from ``key_hex`` (any other length aborts -- stricter than ``hex``).
   """
   if key_mode == "identity2":
     key = bytes(seed)[:2]
@@ -441,6 +542,10 @@ class EscProbeClient:
     self.silent = 0
     self.key_attempts = 0            # 27 02 sendKey: hard single-attempt counter (guard_frame enforces it)
     self.rx: dict[int, list[tuple[float, bytes]]] = {a: [] for a in ALL_RESP_ADDRS}
+    if phase == 5:
+      # phase 5 also listens on the two extra peek addresses (0x778/0x7A8) so a response OR silence is timestamped
+      for _req, rsp in PHASE5_EXTRA_ADDRS:
+        self.rx.setdefault(rsp, [])
 
   def _tx(self, dat: bytes, readback: bytes | None = None, *, seed: bytes | None = None,
           key: bytes | None = None) -> None:
@@ -467,7 +572,7 @@ class EscProbeClient:
     for packet in self._can_recv(wait_for_one=True):
       for msg in packet:
         self.gate.feed(msg)
-        if msg.src == ESC_BUS and msg.address in ALL_RESP_ADDRS:
+        if msg.src == ESC_BUS and msg.address in self.rx:
           dat = bytes(msg.dat)
           self.rx[msg.address].append((self.now(), dat))
           out.append(dat)
@@ -563,6 +668,16 @@ class EscProbeClient:
   def extended_session(self) -> dict:
     return self.request(SVC_DIAGNOSTIC_SESSION_CONTROL, ALLOWED_SESSION_SUBFUNC)
 
+  def request_probe(self, service, subfunc=None, payload=b"", did=None, *, addr=ESC_REQ_ADDR, rsp=None, timeout=None) -> dict:
+    """Phase 5: one bare read-only probe frame (1- or 2-byte) to the ESC or to a bounded extra peek address.
+
+    ``request()``'s default response address comes from ``RESP_OF_REQ`` (the ESC's six known modules); the two phase-5
+    peek addresses (0x770/0x7A0) are not in that table, so their listen address is supplied explicitly here.
+    """
+    rsp_addr = rsp if rsp is not None else (PHASE5_EXTRA_RESP_OF_REQ[addr] if addr in PHASE5_EXTRA_RESP_OF_REQ
+                                            else RESP_OF_REQ[addr])
+    return self.request(service, subfunc, payload, did=did, addr=addr, rsp=rsp_addr, timeout=timeout)
+
   def request_seed(self) -> dict:
     return self.request(SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC, did=None)
 
@@ -579,11 +694,11 @@ class EscProbeClient:
     return out
 
   def auth_probe(self) -> dict:
-    """Phase 3 step 4: 29 01 (Authentication start) to the ESC — is the UDS auth service live?"""
+    """Phase 3 step 4: 29 01 (Authentication start) to the ESC -- is the UDS auth service live?"""
     return self.request(SVC_AUTHENTICATION, ALLOWED_AUTH_SUBFUNC, did=None)
 
   def routine_probe(self) -> dict:
-    """Phase 3 step 5: 31 01 0000 (RoutineControl start, routine 0x0000) — session logic answered vs blanket filter?"""
+    """Phase 3 step 5: 31 01 0000 (RoutineControl start, routine 0x0000) -- session logic answered vs blanket filter?"""
     return self.request(SVC_ROUTINE_CONTROL, ALLOWED_ROUTINE_SUBFUNC, ROUTINE_CONTROL_ID.to_bytes(2, "big"))
 
   def send_key(self, seed: bytes) -> dict:
@@ -772,7 +887,7 @@ def _raise_keyboard_interrupt(signum, frame):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Phase-3 battery — ONE ignition, a scripted discriminating sequence (see the module docstring / report "Update 4")
+# Phase-3 battery -- ONE ignition, a scripted discriminating sequence (see the module docstring / report "Update 4")
 # ---------------------------------------------------------------------------------------------------------------------
 def _run_phase3_battery(client: "EscProbeClient", doc: dict) -> None:
   """The exact phase-3 sequence. Raises Abort on a hard stop; records every step in ``doc['steps']``."""
@@ -871,7 +986,7 @@ def _run_phase3_battery(client: "EscProbeClient", doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Phase-4 sequence — ONE extended-session seed -> ONE candidate sendKey -> conditional no-op write (see docstring)
+# Phase-4 sequence -- ONE extended-session seed -> ONE candidate sendKey -> conditional no-op write (see docstring)
 # ---------------------------------------------------------------------------------------------------------------------
 def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, current: bytes) -> None:
   """The exact phase-4 sequence. Raises Abort on a hard stop; records every step in ``doc``.
@@ -945,6 +1060,104 @@ def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, curre
   step("reread_unlocked", r8)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase-5 battery -- ONE ignition, a FIXED read-only frame list (see the module docstring / report "Update 8").
+# ---------------------------------------------------------------------------------------------------------------------
+def _seed_hex(resp: str | None) -> str | None:
+  """The seed bytes of a positive 67 01 answer (everything after the first two response bytes), else None."""
+  if not resp or not resp.startswith("6701"):
+    return None
+  return resp[4:]
+
+
+def _run_phase5_battery(client: "EscProbeClient", doc: dict) -> None:
+  """The exact phase-5 sequence. Read-only: records every frame's req/resp/nrc/timeout/ms; never aborts on a refusal.
+
+  The frame list is FIXED (the guards enforce it): fp_canary -> read_esc -> session -> seed1 -> seed2 -> ten 2-byte
+  sub-probes -> seven bare service probes -> seed3 -> read_esc_end -> the two extra-address `10 03` peeks. No keys, no
+  writes (there is no 27 02 and no 2E anywhere in this phase), and NO multi-frame TX.
+  """
+
+  def step(name: str, res: dict) -> None:
+    doc["steps"].append({"name": name, "addr": res.get("addr"), "resp_addr": res.get("rsp_addr"),
+                         "req": res.get("req"), "frames": list(res.get("frames", [])),
+                         "frames_t_ms": list(res.get("frames_t_ms", [])), "resp": res.get("resp"),
+                         "nrc": res.get("nrc"), "positive": bool(res.get("positive")),
+                         "no_response": bool(res.get("no_response")), "timeout": bool(res.get("no_response")),
+                         "incomplete": bool(res.get("incomplete"))})
+
+  # ---- 1. fp_canary: a functional-style read of 0xF100 (the ESC's functional-read canary) ---------------------------
+  r_canary = client.request_probe(SVC_READ_DATA_BY_IDENTIFIER, None,
+                                  bytes([PHASE5_DID_FP_CANARY >> 8, PHASE5_DID_FP_CANARY & 0xFF]),
+                                  did=PHASE5_DID_FP_CANARY)
+  doc["fp_canary"] = r_canary
+  doc["fp_canary_hex"] = r_canary.get("resp")
+  step("fp_canary", r_canary)
+
+  # ---- 2. read_esc: the current 0x0103 variant-coding value (start) ------------------------------------------------
+  r_read = client.read_did(DID_VARIANT_CODING)
+  doc["read"] = r_read
+  value_start = parse_read_did(r_read.get("resp"), DID_VARIANT_CODING)
+  doc["value_start"] = value_start.hex() if value_start is not None else None
+  doc["current_value"] = doc["value_start"]
+  step("read_esc", r_read)
+
+  # ---- 3. session: 10 03 extended (the vendor step; any answer continues) ------------------------------------------
+  r_sess = client.extended_session()
+  doc["session"] = r_sess
+  doc["session_before_write"] = r_sess
+  step("session", r_sess)
+
+  # ---- 4/5. seed1, seed2: two 27 01 requestSeed samples (is the seed stable across two asks?) ----------------------
+  r_seed1 = client.request_seed()
+  doc["seed1"] = r_seed1
+  step("seed1", r_seed1)
+  r_seed2 = client.request_seed()
+  doc["seed2"] = r_seed2
+  step("seed2", r_seed2)
+
+  # ---- 6. the ten 2-byte sub-probes 27 03/05/07/09/0B/0D/0F/11/41/61 ----------------------------------------------
+  for sub in PHASE5_SEC_SUB_PROBES:
+    r = client.request_probe(SVC_SECURITY_ACCESS, sub)
+    doc["sub_probes"].append({"sub": sub, **r})
+    step(f"sub_{sub:02X}", r)
+
+  # ---- 7. the seven bare 1-byte service probes 23/29/31/34/35/36/37 -----------------------------------------------
+  for svc in PHASE5_SVC_PROBES:
+    r = client.request_probe(svc)
+    doc["svc_probes"].append({"svc": svc, **r})
+    step(f"svc_{svc:02X}", r)
+
+  # ---- 8. seed3: a third 27 01 sample -----------------------------------------------------------------------------
+  r_seed3 = client.request_seed()
+  doc["seed3"] = r_seed3
+  step("seed3", r_seed3)
+
+  # ---- 9. read_esc_end: re-read 0x0103 (confirm unchanged) --------------------------------------------------------
+  r_end = client.read_did(DID_VARIANT_CODING)
+  doc["read_end"] = r_end
+  value_end = parse_read_did(r_end.get("resp"), DID_VARIANT_CODING)
+  doc["value_end"] = value_end.hex() if value_end is not None else None
+  doc["reread"] = r_end
+  doc["reread_value"] = doc["value_end"]
+  doc["value_changed"] = (value_start is not None and value_end is not None and value_end != value_start)
+  step("read_esc_end", r_end)
+
+  # ---- 10. extra-address probes: a single 10 03 to req 0x770 (listen 0x778) and req 0x7A0 (listen 0x7A8) -----------
+  for req, rsp in PHASE5_EXTRA_ADDRS:
+    r = client.request_probe(SVC_DIAGNOSTIC_SESSION_CONTROL, ALLOWED_SESSION_SUBFUNC, addr=req, rsp=rsp, timeout=RESP_TIMEOUT_S)
+    doc["extra_probes"].append({"req_addr": req, "rsp_addr": rsp, **r})
+    step(f"extra_{req:03X}", r)
+
+  # ---- summary fields ---------------------------------------------------------------------------------------------
+  s1, s2, s3 = (_seed_hex(r_seed1.get("resp")), _seed_hex(r_seed2.get("resp")), _seed_hex(r_seed3.get("resp")))
+  doc["seed1_hex"], doc["seed2_hex"], doc["seed3_hex"] = s1, s2, s3
+  doc["seed_stable_12"] = (s1 is not None and s1 == s2)
+  doc["seed_stable_all"] = (s1 is not None and s1 == s2 == s3)
+  doc["key_attempted"] = False            # phase 5 never attempts a key
+  doc["write_attempted"] = False          # phase 5 never writes
+
+
 def _run_phase4_read(client: "EscProbeClient", doc: dict) -> bytes:
   """Phase-4 step 1: read 0x0103 (extended-retry rules unchanged). No usable read -> Abort; no key, no write."""
   r1 = client.read_did(DID_VARIANT_CODING)
@@ -1001,12 +1214,12 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     key_mode = "identity2"
   if phase == 4 and key_mode not in KEY_MODES:
     return {**summary, "skip": f"unknown key_mode {key_mode!r}"}
-  if phase not in (1, 2, 3, 4):
+  if phase not in (1, 2, 3, 4, 5):
     return {**summary, "skip": "unknown phase"}
 
   gate = VehicleGate(now)
   t0 = now()
-  budget = RUN_BUDGET_S_PHASE3 if phase in (3, 4) else RUN_BUDGET_S
+  budget = RUN_BUDGET_S_PHASE5 if phase == 5 else (RUN_BUDGET_S_PHASE3 if phase in (3, 4) else RUN_BUDGET_S)
   client = EscProbeClient(can_send, can_recv, gate, now, t0 + budget, phase=phase)
   doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None, "phase": phase,
               "read": None, "extended_session": None, "extended_retry": False, "current_value": None,
@@ -1021,7 +1234,12 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
               "unlock_session": None, "write_unlocked": None, "reread_unlocked": None, "key_note": None,
               # phase-4 only
               "key_mode": None, "key_result": None, "key_frames": None, "key_positive": None, "key_nrc": None,
-              "algo": None, "key_bytes": None, "reread_unlocked_value": None}
+              "algo": None, "key_bytes": None, "reread_unlocked_value": None,
+              # phase-5 only (kept None/empty for phases 1-4, so those results are unchanged)
+              "fp_canary": None, "fp_canary_hex": None, "value_start": None, "value_end": None,
+              "seed1": None, "seed2": None, "seed3": None, "seed1_hex": None, "seed2_hex": None, "seed3_hex": None,
+              "seed_stable_12": None, "seed_stable_all": None, "sub_probes": [], "svc_probes": [],
+              "extra_probes": [], "read_end": None}
   for fw in car_fw or []:
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
@@ -1031,7 +1249,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
   precheck_failed = False
   mux_on = False
   old_sigterm = None
-  current = None            # phase 3 sets this inside the battery; phases 1/2 inside their branch — sentinel for except
+  current = None            # phase 3 sets this inside the battery; phases 1/2 inside their branch -- sentinel for except
   summary["ran"] = True
   try:
     try:
@@ -1074,6 +1292,9 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
       current = _run_phase4_read(client, doc)
       doc["current"] = current.hex()
       _run_phase4_sequence(client, doc, state, current)
+    elif phase == 5:
+      # ---- PHASE 5: the READ-ONLY capability battery (fixed frame list; no keys, no writes, no multi-frame TX) ----
+      _run_phase5_battery(client, doc)
     else:
       # ---- step 1: read the CURRENT 0x0103 value (default session; extended retry only if refused) -------------
       r1 = client.read_did(DID_VARIANT_CODING)
@@ -1094,7 +1315,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
 
       # ---- step 1.5: enter extended session (10 03) before the write --------------------------------------------
       # The vendor VariantCodingTable for this ECU writes as READ 22 0103 -> 10 03 -> 2E 0103. The read above ran in the
-      # default session; if the retry path already entered extended (extended_retry), we are already there — do not send
+      # default session; if the retry path already entered extended (extended_retry), we are already there -- do not send
       # 10 03 twice. A 10 03 that gets ANY answer (positive 50 03 or negative 7F 10 ..) continues; true silence (no frame
       # at all) means the ESC will not hold a write session, so abort before the write.
       if not doc["extended_retry"]:
@@ -1103,7 +1324,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
         if not sess.get("frames"):
           raise Abort("10 03 session got no response; not attempting the write")
 
-      # ---- step 2: request the 0x27 seed ONLY (never the key) — PHASE 1 ONLY -----------------------------------
+      # ---- step 2: request the 0x27 seed ONLY (never the key) -- PHASE 1 ONLY -----------------------------------
       # Phase 1's contrast is "refused seed + refused/accepted write". Phase 2 deliberately sends NO seed before the
       # write (the exact vendor order); it samples the seed once after the write instead (step 5).
       if phase == 1:
@@ -1117,10 +1338,10 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
           # Silence (no frame at all): the ESC is not in a state to talk. Do NOT attempt the write.
           raise Abort("0x27 seed request got no response; not attempting the write")
       else:
-        # Phase 2: no pre-write seed — the write is the vendor-exact sequence with nothing in front of it.
+        # Phase 2: no pre-write seed -- the write is the vendor-exact sequence with nothing in front of it.
         doc["seed_request"] = None
 
-      # ---- step 3: the no-op write — 0x2E 0x0103 + the exact bytes read in step 1 -------------------------------
+      # ---- step 3: the no-op write -- 0x2E 0x0103 + the exact bytes read in step 1 -------------------------------
       doc["write_attempted"] = True
       r3 = client.write_did(DID_VARIANT_CODING, current, current)
       doc["write"] = r3
@@ -1181,7 +1402,19 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
                  algo=doc.get("algo"), key_bytes=doc.get("key_bytes"),
                  write_unlocked_nrc=(doc["write_unlocked"] or {}).get("nrc"),
                  write_unlocked_positive=bool((doc["write_unlocked"] or {}).get("positive")),
-                 reread_unlocked_value=doc.get("reread_unlocked_value"))
+                 reread_unlocked_value=doc.get("reread_unlocked_value"),
+                 # phase-5 (read-only battery)
+                 fp_canary_hex=doc.get("fp_canary_hex"), value_start=doc.get("value_start"), value_end=doc.get("value_end"),
+                 seed1=doc.get("seed1_hex"), seed2=doc.get("seed2_hex"), seed3=doc.get("seed3_hex"),
+                 seed_stable_12=doc.get("seed_stable_12"), seed_stable_all=doc.get("seed_stable_all"),
+                 sub_probes=[{"sub": r["sub"], "resp": r.get("resp"), "nrc": r.get("nrc"),
+                              "no_response": bool(r.get("no_response"))} for r in (doc.get("sub_probes") or [])],
+                 svc_probes=[{"svc": r["svc"], "resp": r.get("resp"), "nrc": r.get("nrc"),
+                              "no_response": bool(r.get("no_response"))} for r in (doc.get("svc_probes") or [])],
+                 extra_probes=[{"req_addr": r["req_addr"], "rsp_addr": r["rsp_addr"], "resp": r.get("resp"),
+                                "nrc": r.get("nrc"), "no_response": bool(r.get("no_response"))}
+                               for r in (doc.get("extra_probes") or [])],
+                 read_end_value=(doc.get("read_end") or {}).get("resp"))
   if log_event is not None:
     log_event("esc_probe_0027", **summary)
   return summary
