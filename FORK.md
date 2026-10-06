@@ -312,10 +312,11 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   86 (+4 algo); mutation **58/58** killed (2 new). Report: "Update 6 — algo mode wired".
 - **8-byte key constructions — algo8/algo8p/repeat8/hex8 (2026-10-05, update 7):** the car proved `27 02` wants an
   8-byte key (a 4-byte key drew `7F 27 13` incorrect-length; the 8-byte seed-as-key drew `7F 27 35` invalidKey), so
-  phase-4 gains four modes that resolve to exactly 8 wire bytes: `algo8` = the algo key repeated to fill (2-byte -> x4,
-  4-byte -> x2), `algo8p` = the algo key + zero padding, `repeat8` = `seed[:2]*4`, `hex8` = exactly 8 bytes of
-  `state["key_hex"]` (any other length aborts). Same `guard_frame` single-attempt + candidate-pin; `algo8`/`algo8p`
-  share `algo`'s import/zero-bail abort semantics. Tests: 94 (+8); mutation **60/60** killed (2 new). Report:
+  phase-4 gains five modes that resolve to exactly 8 wire bytes: `algo8` = the algo key repeated to fill (2-byte -> x4,
+  4-byte -> x2), `algo8w` = the algo key's first two bytes repeated to fill (`[lo,hi]x4` — the seed's own wire shape),
+  `algo8p` = the algo key + zero padding, `repeat8` = `seed[:2]*4`, `hex8` = exactly 8 bytes of
+  `state["key_hex"]` (any other length aborts). Same `guard_frame` single-attempt + candidate-pin; `algo8`/`algo8w`/`algo8p`
+  share `algo`'s import/zero-bail abort semantics. Tests: 95 (+9); mutation **60/60** killed (anchor retargeted only). Report:
   "Update 7 — 8-byte key constructions".
 - **Merge note:** intentionally fork-local; diagnostic only (removed or left inert once the question is answered).
 

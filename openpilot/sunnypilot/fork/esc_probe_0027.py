@@ -106,6 +106,8 @@ the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
      same resolvers into exactly 8 wire bytes, because the car proved ``27 02`` wants an 8-byte key (a 4-byte key drew
      ``7F 27 13`` incorrect-length; the 8-byte seed-as-key drew ``7F 27 35`` invalidKey — so 8 bytes is the accepted
      LENGTH and VALUE iteration begins): ``algo8`` = the algo key repeated to fill 8 (2-byte k -> k*4, 4-byte -> k*2);
+     ``algo8w`` = the algo key's FIRST TWO BYTES repeated to fill 8 (``k[:2]*4`` = ``[lo,hi]x4`` — the wire shape of
+     the on-car seed, in case the layer repeats the underlying 2-byte value rather than the whole 4-byte render);
      ``algo8p`` = the algo key + zero padding (2-byte -> k+6 zeros, 4-byte -> k+4 zeros); ``repeat8`` = the seed's own
      2-byte value repeated (``seed[:2]*4``); ``hex8`` = exactly 8 bytes from ``state["key_hex"]`` (any other length
      aborts — stricter than ``hex``);
@@ -119,7 +121,7 @@ ONLY when ``phase == 4``, ONLY as the first key of the run (the same counter pha
 equal the RESOLVED candidate (``guard_frame`` takes the resolved bytes and re-checks them at the single TX site). Phase 3
 keeps its own identity-key path unchanged. A malformed ``key_mode`` is inert (``skip: unknown key_mode``).
 
-In ``algo``/``algo8``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
+In ``algo``/``algo8``/``algo8w``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
 ``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
 The resolved candidate hex is recorded as ``key_bytes`` (and the selector as ``algo``) in the result JSON and the
 summary/cloudlog, BEFORE the ``27 02`` is sent, so a refused/silent key is still fully attributable. Every recovered
@@ -184,7 +186,7 @@ ALLOWED_KEY_LENGTHS = (2, 4, 8)  # phase 4: the ONLY admissible candidate-key si
 # 8-byte seed-as-key (identity8) drew 7F 27 35 (invalidKey) — so 8 bytes is the accepted LENGTH and VALUE iteration
 # can begin. Each of the new modes resolves to exactly 8 wire bytes (see resolve_key).
 KEY_MODES = ("identity2", "identity4", "identity8", "algo", "hex",
-             "algo8", "algo8p", "repeat8", "hex8")   # phase-4 candidate-key derivation modes
+             "algo8", "algo8w", "algo8p", "repeat8", "hex8")   # phase-4 candidate-key derivation modes
 ALLOWED_AUTH_SUBFUNC = 0x01      # Authentication (0x29) start — phase 3 only
 ALLOWED_ROUTINE_SUBFUNC = 0x01   # RoutineControl (0x31) start — phase 3 only
 ROUTINE_CONTROL_ID = 0x0000      # the "is any routine even answered" probe
@@ -366,6 +368,7 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: st
   The 8-byte CONSTRUCTION modes wrap the same resolvers into exactly 8 wire bytes (the car proved 27 02 wants an 8-byte
   key — 4 bytes drew NRC 0x13, the full seed drew 0x35):
     * algo8  = the algo key repeated to fill 8 (2-byte k -> k*4; 4-byte k -> k*2);
+    * algo8w = the algo key's FIRST TWO BYTES repeated to fill 8 (``k[:2] * 4`` = ``[lo,hi]x4``);
     * algo8p = the algo key + zero padding (2-byte -> k + 6 zeros; 4-byte -> k + 4 zeros);
     * repeat8 = the seed's own 2-byte value repeated (seed[:2] * 4) — same bytes as identity2-as-8B, kept distinct for
       construction clarity;
@@ -384,6 +387,11 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: st
     if len(k) not in (2, 4):
       raise Abort(f"algo8: algo key length {len(k)} is not 2 or 4")
     key = (k * 4)[:8] if len(k) == 2 else k * 2
+  elif key_mode == "algo8w":
+    k = _resolve_algo_key(seed, algo)
+    if len(k) not in (2, 4):
+      raise Abort(f"algo8w: algo key length {len(k)} is not 2 or 4")
+    key = k[:2] * 4                    # first two key bytes repeated to fill 8: the seed's own [v0,v1]x4 wire shape
   elif key_mode == "algo8p":
     k = _resolve_algo_key(seed, algo)
     if len(k) not in (2, 4):
@@ -907,7 +915,7 @@ def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, curre
   # ---- 5. resolve the candidate key bytes from the seed -----------------------------------------------------------
   key_mode = state.get("key_mode") or "identity2"
   doc["key_mode"] = key_mode
-  algo = state.get("algo") if key_mode in ("algo", "algo8", "algo8p") else None   # selector (None -> key_for default)
+  algo = state.get("algo") if key_mode in ("algo", "algo8", "algo8w", "algo8p") else None   # selector (None -> key_for default)
   key = resolve_key(pos_seed, key_mode, state.get("key_hex"), algo)   # Abort (recorded) on bad mode/hex/algo/length/None
   doc["algo"] = algo
   doc["key"] = key.hex()

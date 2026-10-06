@@ -1475,6 +1475,11 @@ class TestPhase4(Base):
   # (invalidKey), so 8 bytes is the accepted LENGTH and VALUE iteration begins. Every new mode resolves to exactly 8
   # wire bytes -> the ISO-TP multi-frame shape (10 0A 27 02 K1..K4 + 21 K5..K8).
   ALGO_26400_KEY = bytes.fromhex("37e2")          # key_for(1122334455667788, "26400") (2-byte algo output)
+  # 27100's vendor key is the 4-byte f30f0000 (double sprintf+concat — see esc_probe_seedkey.py).
+  #   algo8  (full-output repeat k*2) = f30f0000f30f0000
+  #   algo8w (first TWO bytes [lo,hi]=f30f repeated x4) = f30ff30ff30ff30f  <- the on-car seed's own wire shape
+  ALGO_27100_ALGO8 = bytes.fromhex("f30f0000f30f0000")    # key_for(1122334455667788,"27100") * 2
+  ALGO_27100_WIRE8 = bytes.fromhex("f30ff30ff30ff30f")    # key_for(1122334455667788,"27100")[:2] * 4 = [lo,hi]x4
 
   def test_phase4_algo8_2byte_algo_repeats_to_8(self):
     # (a) algo8 with a 2-byte algorithm (26400): k = cal_26400(seed[:2]) -> repeated to fill: k*4 = 8 bytes
@@ -1525,6 +1530,37 @@ class TestPhase4(Base):
     self.assertEqual(doc["algo"], "26700")
     self.assertEqual(doc["key"], "2375f3602375f360")
     self.assertEqual(doc["key_bytes"], "2375f3602375f360")
+
+  def test_phase4_algo8w_27100_first_two_bytes_repeated(self):
+    # algo8w: the resolved key's FIRST TWO BYTES repeated to fill 8. 27100's vendor output is the 4-byte
+    # f30f0000 (double sprintf+concat — see esc_probe_seedkey.py), so algo8w = [lo,hi]x4 = f30f x4 =
+    # f30ff30ff30ff30f, sent as ISO-TP FF 10 0A 27 02 F30FF30F + CF 21 F30FF30F. algo8 (full-output
+    # repeat) is the DISTINCT f30f0000f30f0000 — both compared against the 4-byte vendor key f30f0000.
+    self.assertEqual(SK.key_for(self.ALGO_SEED, "27100"), bytes.fromhex("f30f0000"))       # 4-byte vendor key
+    self.assertEqual(E.resolve_key(self.ALGO_SEED, "algo8", None, "27100"), self.ALGO_27100_ALGO8)
+    self.set_state(key_mode="algo8w", algo="27100")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    key8 = self.ALGO_27100_WIRE8
+    self.assertEqual(key8.hex(), "f30ff30ff30ff30f")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]              # FF: 10 0A 27 02 F3 0F F3 0F
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")           # CF: 21 F3 0F F3 0F
+    self.assertEqual(ff, bytes([0x10, 0x0A, 0x27, 0x02, 0xF3, 0x0F, 0xF3, 0x0F]))
+    self.assertEqual(cf, bytes([0x21, 0xF3, 0x0F, 0xF3, 0x0F]).ljust(8, b"\x00"))
+    self.assertEqual([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])], [ff])
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x21], [cf])
+    doc = self.result_doc()
+    self.assertEqual(doc["key_mode"], "algo8w")
+    self.assertEqual(doc["algo"], "27100")
+    self.assertEqual(doc["key"], "f30ff30ff30ff30f")
+    self.assertEqual(doc["key_bytes"], "f30ff30ff30ff30f")
+    self.assertTrue(doc["unlocked"])
 
   def test_phase4_algo8p_4byte_algo_pads_to_8(self):
     # (c) algo8p with a 4-byte algorithm (26700): k4 + 0000 (zero padding to 8)

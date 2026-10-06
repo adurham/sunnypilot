@@ -57,9 +57,18 @@ def _lfsr16_step(st: int) -> int:
 # CalKeyAlgorithm_27100 — fcn @ 0x71a00, Securityindex 24000 [confirmed 0x71aa0-0x71cdc]
 #   Seed b0..b3 (= seed[0:4]); bail (None) if ANY of b0..b3 == 0.
 #   Final key = 4 wire bytes [bitsum(lo), bitsum(hi), 0x00, 0x00] (06 27 02 k0..k3).
+#   Emission is TWO sprintf calls CONCATENATED (CString operator+, bl 0x22c70): the first
+#   sprintf("%02x%02x", bitsum(lo), bitsum(hi)) at 0x71c24-0x71c30 -> "lohi", then a SECOND
+#   sprintf("%02x%02x", 0, 0) at 0x71c44-0x71c50 -> "0000"; concat at 0x71c70 -> "lohi"+"0000".
+#   The format literal is "%02x%02x" (str @ 0x31f904), so each sprintf emits 2 bytes; the 4-byte key
+#   is the two 2-byte renders joined. (An earlier reading that stopped after the FIRST sprintf wrongly
+#   concluded "2 wire bytes" — the second call + the concat are the rest of the vendor body.)
 # ----------------------------------------------------------------------------
 def cal_27100(seed4: bytes) -> bytes | None:
-  """4 seed bytes in -> 4 key bytes out (vendor-exact, 06 27 02 k0..k3).
+  """4 seed bytes in -> 4 key bytes out [bitsum(lo), bitsum(hi), 0x00, 0x00] (vendor-exact, 06 27 02 k0..k3).
+
+  Vendor fcn emits them as sprintf("%02x%02x", bitsum(lo), bitsum(hi)) + sprintf("%02x%02x", 0, 0)
+  concatenated (0x71c24-0x71c30, 0x71c44-0x71c50, bl 0x22c70) — 2 + 2 bytes, NOT a 2-byte return.
   None if any seed byte is 0 (vendor bails to the default/empty path)."""
   if len(seed4) != 4:
     raise ValueError("cal_27100 expects exactly 4 seed bytes (seed[0:4])")
@@ -85,11 +94,17 @@ def cal_27100(seed4: bytes) -> bytes | None:
 # ----------------------------------------------------------------------------
 # CalKeyAlgorithm_26300 — fcn @ 0x71e40, Securityindex 26300 [confirmed 0x71ef0-0x72028]
 #   Seed b0..b3; bail (None) if any byte == 0.
-#   val = (b2 << 24) | (b3 << 16) | (b0 << 8) | b1;  key16 = val % 0xC503
-#   Output 4 wire bytes [0x00, HI, 0x00, LO] ("00HI00LO", 06 27 02).
+#   val = (b2 << 24) | (b3 << 16) | (b0 << 8) | b1;  key16 = val % 0xC503  (magic-div 0x4CA6779F)
+#   Output = TWO sprintf calls CONCATENATED (bl 0x22c70): sprintf("%02x%02x", 0, HI) at 0x71fd4-0x71fec
+#   -> "00HI", then sprintf("%02x%02x", 0, LO) at 0x71ffc-0x7200c -> "00LO"; concat at 0x72028 ->
+#   "00HI"+"00LO" = 4 wire bytes [0x00, HI, 0x00, LO] ("00HI00LO", 06 27 02). Same double-sprintf +
+#   CString-concat pattern as 27100 (format "%02x%02x" @ 0x31f904) — 2 + 2 bytes, NOT a 2-byte return.
 # ----------------------------------------------------------------------------
 def cal_26300(seed4: bytes) -> bytes | None:
-  """4 seed bytes in -> 4 key bytes out [00, HI, 00, LO] (06 27 02)."""
+  """4 seed bytes in -> 4 key bytes out [0x00, HI, 0x00, LO] (06 27 02).
+
+  Vendor emits "00HI" + "00LO" via two sprintf("%02x%02x") calls + CString concat (0x71fd4, 0x71ffc,
+  bl 0x22c70). None if any seed byte is 0."""
   if len(seed4) != 4:
     raise ValueError("cal_26300 expects exactly 4 seed bytes (seed[0:4])")
   b0, b1, b2, b3 = seed4
