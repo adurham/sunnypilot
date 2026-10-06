@@ -153,6 +153,41 @@ raised BEFORE any frame is built):
 
 Phase 5 adds no new services to the base allowlist; it is a strict, self-contained subset.
 
+Phase 6 -- the SECURITY-POLICY MATRIX + DID SWEEP (state ``{"probe_enabled": true, "phase": 6}``)
+-----------------------------------------------------------------------------------------------
+Phase 5 maps what the ESC will TALK ABOUT read-only; phase 6 maps its ATTEMPT/SESSION policy: how many ``27 02`` key
+attempts it tolerates, whether a session reset (``10 01`` -> ``10 03``) clears an exhaustion lockout, whether the seed
+changes after a failed key, and what the identification DIDs say (the SW-ID/supplier/serial strings that index Hyundai's
+security DB). One ignition, budget ``RUN_BUDGET_S_PHASE6`` = 60 s, every frame to the ESC (0x7D1 -> 0x7D9):
+
+  1. ``22 01 03`` -> ``value_start`` (the only abort gate: no usable read stops the run);
+  2. ``10 03`` extended session (record; if refused/silent the key part is skipped but the DID sweep still runs);
+  3. ``27 01`` -> S1;  4. ``27 01`` -> S2  (seed stability before any key);
+  5. ``27 02`` + ZERO key (``00``x8) -> R1; a ``0x36``/``0x37`` NRC sets ``lockout_seen`` and jumps to step 8;
+  6. (adaptive) ``27 01`` -> S3; ``27 02`` zero key -> R2;  7. (adaptive) ``27 01`` -> S4; ``27 02`` zero key -> R3
+     -- at most 3 pre-cycle key attempts;
+  8. ALWAYS: ``10 01``; ``10 03``; ``27 01`` -> S5; ``27 02`` zero key -> R4  (the cycle-reset test; the ONLY 4th attempt);
+  9. DID sweep (extended): ``22 F186``; ``22 F187``; ``22 F190``; ``22 F199``; ``22 F18A``; ``22 F18C``; ``22 F191``;
+     ``22 F195``;
+  10. ``10 02`` programming-session probe -> record; if POSITIVE, ``27 01`` -> S6 (NO key in the programming session);
+  11. ``19 02 A5`` -> record (is a security DTC visible?);
+  12. clean leave ``10 01``; then ``22 01 03`` -> ``value_end``.
+
+Every frame is recorded (req hex, resp hex or silence, nrc, timeout, ms). Summary fields: ``S1``..``S6``, ``R1``..``R4``
+(nrc + resp + positive), ``seed_stable_pre`` (S1 == S2), ``seed_after_fail`` (S3 equals S1/S2, or ``new:...``),
+``lockout_seen``, ``cycle_reset`` (R4 not 0x36/0x37 after a lockout was seen), ``dids`` (six-hex -> resp),
+``prog_session_1002``, ``dtc_19_02_a5``, ``value_start``, ``value_end``. Guards, mechanically enforced for phase 6
+(``SafetyViolation`` raised BEFORE any frame is built):
+
+  * ONLY the frames above are admissible; ``0x2E`` and ``0x3E`` are NOT in the phase-6 allowlist; no ``29``/``31`` ever;
+  * ``27 02`` is admissible ONLY in phase 6, ONLY with key == the ZERO key (``00``x8), ONLY when a ``27 01`` requestSeed
+    immediately preceded it (``guard_frame``'s ``seed == PHASE6_KEY`` sentinel / the client's ``_p6_seed_precedes`` flag),
+    and at most ``PHASE6_MAX_KEY_ATTEMPTS`` (4) times per run -- the ONE 4th attempt being the step-8 cycle-reset;
+  * ``10``: only sub ``01``/``02``/``03``;  ``22``: only DIDs {0103 + the exact eight-DID sweep};  ``19``: only sub
+    ``02`` with mask ``A5``;  ``23``/``31``/``34``/``35``/``36``/``37`` are not admissible at all;
+  * phase 6 NEVER writes (no ``2E``) and never runs ``31`` sub ``01`` / ``29`` sub ``01``;
+  * phases 1-4 stay byte-identical and phase 5 keeps its own closed read-only allowlist (still NO ``27 02``).
+
 In ``algo``/``algo8``/``algo8w``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
 ``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
 The resolved candidate hex is recorded as ``key_bytes`` (and the selector as ``algo``) in the result JSON and the
@@ -193,6 +228,8 @@ from opendbc.car.can_definitions import CanData
 # The standstill definition lives in exactly one place: esc_diag. Import it, do not copy it.
 from openpilot.sunnypilot.fork.esc_diag import Abort, FLOW_CONTROL_FRAME, SafetyViolation, VehicleGate, \
   build_single_frame, wheels_moving
+# The DTC service constant also comes from esc_diag (one definition): phase 6's 19 02 A5 probe reuses it.
+from openpilot.sunnypilot.fork.esc_diag import SVC_READ_DTC_INFORMATION
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Probe allowlist -- a strict superset of esc_diag's read set (0x27/0x2E added) and nothing else.
@@ -268,6 +305,29 @@ ALLOWED_PHASE5_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC
 # Every phase-5 exchange is a single ISO-TP frame (1- or 2-byte payload) -- there is NO multi-frame TX in phase 5.
 PHASE5_MAX_FRAMES = 1
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 6 -- the SECURITY-POLICY MATRIX + DID SWEEP battery. One ignition, all frames to the ESC (0x7D1 -> 0x7D9),
+# budget RUN_BUDGET_S_PHASE6. It maps the ESC's ATTEMPT/SESSION policy with a ZERO key (8x00) and then sweeps the
+# identification DIDs (the string that indexes Hyundai's security DB: SW-ID / supplier / serial, Mando vs Conti).
+# The zero key is mechanically pinned: 27 02 is admissible ONLY in phase 6, ONLY with key == 8x00, ONLY immediately
+# after a 27 01 requestSeed, and at most PHASE6_MAX_KEY_ATTEMPTS (4) times per run. The ONE 4th attempt is always the
+# cycle-reset step (10 01 -> 10 03 -> 27 01 -> 27 02), so the matrix can never exceed four keys, ever.
+# ---------------------------------------------------------------------------------------------------------------------
+SESSION_SUBFUNC_DEFAULT = 0x01        # 10 01 default session (the cycle-reset's leave/enter, and the clean leave)
+SESSION_SUBFUNC_PROGRAMMING = 0x02    # 10 02 programming session (probe only -- no key in it)
+PHASE6_SESSION_SUBFUNCS = frozenset({SESSION_SUBFUNC_DEFAULT, SESSION_SUBFUNC_PROGRAMMING, ALLOWED_SESSION_SUBFUNC})
+PHASE6_KEY = bytes(8)                 # the zero key the phase-6 matrix sends: exactly 8 zero bytes (00 x8)
+PHASE6_MAX_KEY_ATTEMPTS = 4           # hard cap on 27 02 per run; the ONE 4th attempt is always the cycle-reset step
+PHASE6_LOCKOUT_NRCS = (0x36, 0x37)    # exceededNumberOfAttempts / requiredTimeDelayNotExpired -> lockout flag
+PHASE6_SWEEP_DIDS = (0xF186, 0xF187, 0xF190, 0xF199, 0xF18A, 0xF18C, 0xF191, 0xF195)   # SW-ID / supplier / serial
+PHASE6_DIDS = frozenset({DID_VARIANT_CODING, *PHASE6_SWEEP_DIDS})   # 0x0103 (value_start/end) + the exact sweep
+PHASE6_DTC_SUBFUNC = 0x02             # ReadDTCByStatusMask; the ONLY 0x19 sub phase 6 may send
+PHASE6_DTC_MASK = 0xA5                # the ONLY status mask phase 6 may send
+# The phase-6 service allowlist: a STRICT subset -- 0x2E (write) and 0x3E (tester present) are absent, and there is no
+# 0x29/0x31 anywhere. Kept as its own frozenset so phases 1-5 stay byte-identical.
+ALLOWED_PHASE6_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSION_CONTROL,
+                                     SVC_SECURITY_ACCESS, SVC_READ_DTC_INFORMATION})
+
 RESP_TIMEOUT_S = 0.25            # first answer frame
 SEED_SWEEP_TIMEOUT_S = 0.3       # the 6-address 27 01 sweep waits up to 300 ms per module
 PENDING_TIMEOUT_S = 2.0          # after NRC 0x78 responsePending
@@ -275,6 +335,7 @@ CF_TIMEOUT_S = 0.5               # between consecutive frames
 RUN_BUDGET_S = 15.0              # hard cap on phases 1/2
 RUN_BUDGET_S_PHASE3 = 30.0       # hard cap on the phase-3 battery (6-address sweep + one sendKey)
 RUN_BUDGET_S_PHASE5 = 40.0       # hard cap on the phase-5 READ-ONLY capability battery (26 frames + 2 extra addrs)
+RUN_BUDGET_S_PHASE6 = 60.0       # hard cap on the phase-6 policy matrix + DID sweep (~25 frames, incl. 4 zero keys)
 SILENT_ABORT_N = 3               # consecutive requests with no answer at all = module not reachable, stop
 STATE_KNOWN_WAIT_S = 0.5         # wait this long for the first fresh gear/wheel frames before the pre-check
 KEEP_FILES = 60
@@ -294,7 +355,23 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
   Phase 5 is READ-ONLY and STRICTER than everything else: a closed subset of services (0x2E and 0x3E are NOT admissible),
   0x27 restricted to requestSeed + the exact ten 2-byte sub-probes (sendKey 0x02 NEVER), 0x10 only sub 0x03, 0x22 only
   DIDs {F100, 0103}, and services 23/29/31/34/35/36/37 only as the bare sub-function-absent frame.
+
+  Phase 6 is the SECURITY-POLICY MATRIX + DID SWEEP: 0x22 only DIDs {0103 + the exact eight-DID sweep}, 0x10 only subs
+  {01, 02, 03}, 0x27 only requestSeed (0x01) / the phase-6 zero-key sendKey (0x02), and 0x19 only sub 0x02 (A5 mask).
+  0x2E and 0x3E are NOT admissible; there is no 0x29/0x31 anywhere.
   """
+  if phase == 6:
+    if service not in ALLOWED_PHASE6_SERVICES:
+      raise SafetyViolation(f"phase6: service 0x{service:02X} is not in the policy-matrix allowlist")
+    if service == SVC_DIAGNOSTIC_SESSION_CONTROL and subfunc not in PHASE6_SESSION_SUBFUNCS:
+      raise SafetyViolation(f"phase6: session control sub-function {subfunc!r} refused (only 0x01/0x02/0x03)")
+    if service == SVC_SECURITY_ACCESS and subfunc not in (ALLOWED_SEC_SUBFUNC, ALLOWED_SEC_SUBFUNC_KEY):
+      raise SafetyViolation(f"phase6: security-access sub {subfunc!r} refused (only requestSeed 0x01 / zero-key sendKey 0x02)")
+    if service == SVC_READ_DATA_BY_IDENTIFIER and did not in PHASE6_DIDS:
+      raise SafetyViolation(f"phase6: read of DID {did!r} refused (0x0103 + the exact F186/F187/F190/F199/F18A/F18C/F191/F195 sweep)")
+    if service == SVC_READ_DTC_INFORMATION and subfunc != PHASE6_DTC_SUBFUNC:
+      raise SafetyViolation(f"phase6: DTC sub-function {subfunc!r} refused (only 0x02 ReadDTCByStatusMask)")
+    return
   if phase == 5:
     if service not in ALLOWED_PHASE5_SERVICES:
       raise SafetyViolation(f"phase5: service 0x{service:02X} is not in the read-only battery allowlist")
@@ -325,7 +402,8 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
 
 
 def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, *, phase: int = 1,
-                seed: bytes | None = None, key_attempts: int = 0, key: bytes | None = None) -> None:
+                seed: bytes | None = None, key_attempts: int = 0, key: bytes | None = None,
+                p6_seed: bool = False) -> None:
   """Layer 2: the exact frame shapes this module may emit, checked immediately before can_send.
 
   ``readback`` is the 4 bytes read from 0x0103 in step 1: a 0x2E frame is admitted only when its data bytes are
@@ -371,6 +449,44 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
     if ln == 1 and svc in PHASE5_SVC_PROBES:
       return
     raise SafetyViolation(f"phase5: frame {dat.hex()} is not an allowlisted read-only battery request")
+  if phase == 6:
+    # ---- PHASE 6: the security-policy matrix + DID sweep. All frames to the ESC; single frames for everything except
+    # the zero-key sendKey's ISO-TP multi-frame. No 2E/3E/29/31. The 27 02 is pinned to the zero key AND to a
+    # requestSeed immediately before it: ``p6_seed`` is the ordering sentinel the caller passes right after a 27 01, so
+    # a 27 02 with no preceding 27 01 raises HERE. The attempt counter is capped HERE too; the ONE 0x21 consecutive
+    # frame must carry the zero-key tail.
+    if addr != ESC_REQ_ADDR or bus != ESC_BUS or len(dat) != 8:
+      raise SafetyViolation(f"phase6: frame 0x{addr:X} bus {bus} len {len(dat)} refused (only 0x7D1 on bus 1)")
+    if dat == FLOW_CONTROL_FRAME:
+      return
+    # --- the zero-key sendKey's ISO-TP first frame (its byte 1 is a length, not a service) ---
+    if dat[0] == 0x10 and dat[1] == 0x0A and dat[2] == SVC_SECURITY_ACCESS and dat[3] == ALLOWED_SEC_SUBFUNC_KEY:
+      if not p6_seed:
+        raise SafetyViolation("phase6: 27 02 sendKey without the required immediately-preceding 27 01 (zero key pinned)")
+      if key_attempts >= PHASE6_MAX_KEY_ATTEMPTS:
+        raise SafetyViolation(f"phase6: 27 02 refused: {key_attempts} key attempts already (max {PHASE6_MAX_KEY_ATTEMPTS})")
+      if dat[4:8] != PHASE6_KEY[:4]:
+        raise SafetyViolation(f"phase6: 27 02 first frame key {dat[4:8].hex()} != zero key {PHASE6_KEY[:4].hex()}")
+      return
+    if dat[0] == 0x21:
+      if dat[1:5] != PHASE6_KEY[4:8]:
+        raise SafetyViolation(f"phase6: 27 02 consecutive frame key {dat[1:5].hex()} != zero-key tail {PHASE6_KEY[4:8].hex()}")
+      return
+    if dat[0] >> 4 != 0 or not 1 <= dat[0] <= 7:
+      raise SafetyViolation(f"phase6: only ISO-TP single frames may be sent: {dat.hex()}")
+    ln, svc = dat[0], dat[1]
+    if svc == SVC_READ_DATA_BY_IDENTIFIER and ln == 3:
+      did = (dat[2] << 8) | dat[3]
+      if did not in PHASE6_DIDS:
+        raise SafetyViolation(f"phase6: read of DID 0x{did:04X} refused (0x0103 + the exact DidSweep set)")
+      return
+    if svc == SVC_DIAGNOSTIC_SESSION_CONTROL and ln == 2 and dat[2] in PHASE6_SESSION_SUBFUNCS:
+      return
+    if svc == SVC_SECURITY_ACCESS and ln == 2 and dat[2] == ALLOWED_SEC_SUBFUNC:
+      return
+    if svc == SVC_READ_DTC_INFORMATION and ln == 3 and dat[2] == PHASE6_DTC_SUBFUNC and dat[3] == PHASE6_DTC_MASK:
+      return
+    raise SafetyViolation(f"phase6: frame {dat.hex()} is not an allowlisted policy-matrix request")
   if addr not in ALLOWED_REQ_ADDRS or bus != ESC_BUS or len(dat) != 8:
     raise SafetyViolation(f"frame 0x{addr:X} bus {bus} len {len(dat)} refused")
   if dat == FLOW_CONTROL_FRAME:
@@ -541,6 +657,7 @@ class EscProbeClient:
     self.tx_log: list[str] = []
     self.silent = 0
     self.key_attempts = 0            # 27 02 sendKey: hard single-attempt counter (guard_frame enforces it)
+    self._p6_seed_precedes = False   # phase 6: True for exactly one frame after a 27 01; guards the 27 02 ordering
     self.rx: dict[int, list[tuple[float, bytes]]] = {a: [] for a in ALL_RESP_ADDRS}
     if phase == 5:
       # phase 5 also listens on the two extra peek addresses (0x778/0x7A8) so a response OR silence is timestamped
@@ -548,12 +665,12 @@ class EscProbeClient:
         self.rx.setdefault(rsp, [])
 
   def _tx(self, dat: bytes, readback: bytes | None = None, *, seed: bytes | None = None,
-          key: bytes | None = None) -> None:
+          key: bytes | None = None, p6_seed: bool = False) -> None:
     self.gate.check()
     if self.now() > self.deadline:
       raise Abort("time budget exhausted")
     guard_frame(ESC_REQ_ADDR, dat, ESC_BUS, readback, phase=self.phase, seed=seed, key_attempts=self.key_attempts,
-                key=key)
+                key=key, p6_seed=p6_seed)
     self._can_send([CanData(ESC_REQ_ADDR, bytes(dat), ESC_BUS)])
     self.tx_log.append(bytes(dat).hex())
 
@@ -679,7 +796,11 @@ class EscProbeClient:
     return self.request(service, subfunc, payload, did=did, addr=addr, rsp=rsp_addr, timeout=timeout)
 
   def request_seed(self) -> dict:
-    return self.request(SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC, did=None)
+    r = self.request(SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC, did=None)
+    if self.phase == 6:
+      # phase 6: a requestSeed was just sent, so a 27 02 may immediately follow it (the zero-key ordering sentinel)
+      self._p6_seed_precedes = True
+    return r
 
   def request_seed_at(self, addr: int) -> dict:
     """Phase 3: request the 0x27 seed from any of the six modules, waiting up to SEED_SWEEP_TIMEOUT_S."""
@@ -828,9 +949,77 @@ class EscProbeClient:
     res["no_response" if not cf_sent else "incomplete"] = True
     return res
 
+  def _tx_phase6_key(self, key: bytes, rsp_addr: int) -> dict:
+    """Phase 6: the ONE zero-key ``27 02`` sendKey, as ISO-TP (an 8-byte key: FF ``10 0A 27 02 00 00 00 00`` + one CF).
+
+    This method only consumes the ordering sentinel and forwards it to ``_tx``/``guard_frame``; the ENFORCEMENT of
+    "zero key only / immediately after a 27 01 / max ``PHASE6_MAX_KEY_ATTEMPTS`` attempts" lives solely in
+    ``guard_frame``. The attempt counter is incremented by the caller (``send_key_phase6``) after ``_tx`` returns.
+    """
+    p6_seed = self._p6_seed_precedes          # the ordering sentinel: True only if a 27 01 immediately preceded
+    self._p6_seed_precedes = False            # consume it; guard_frame is the SOLE enforcer (raises if False)
+    key = bytes(key)
+    req = bytes([SVC_SECURITY_ACCESS, ALLOWED_SEC_SUBFUNC_KEY]) + key   # 10 bytes -> multi-frame
+    first = bytes([0x10, len(req)]) + req[:6]                          # FF: 10 0A 27 02 <k0..k3>
+    cf = (bytes([0x21]) + key[4:8]).ljust(8, b"\x00")                  # CF: 21 <k4..k7> + pad
+    self.drain()
+    self.rx[rsp_addr] = []
+    t_tx = self.now()
+    self._tx(first, seed=PHASE6_KEY, p6_seed=p6_seed)
+    res: dict = {"req": first.hex(), "addr": ESC_REQ_ADDR, "rsp_addr": rsp_addr, "frames": [first.hex()],
+                 "frames_t_ms": [0.0]}
+    seen: set[str] = set(res["frames"])
+    cf_sent = False
+    data = b""
+    expect = None
+    t_end = t_tx + CF_TIMEOUT_S
+    while self.now() < t_end:
+      took = False
+      for f in self._rx_for(rsp_addr):
+        took = True
+        if f.hex() not in seen:
+          seen.add(f.hex())
+          res["frames"].append(f.hex())
+          res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+        kind = f[0] >> 4
+        if kind == 3:                                                  # ESC flow control -> the ONE consecutive frame
+          if not cf_sent:
+            self._tx(cf, seed=PHASE6_KEY)
+            cf_sent = True
+            seen.add(cf.hex())
+            res["frames"].append(cf.hex())
+            res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+            t_end = self.now() + RESP_TIMEOUT_S
+          continue
+        if kind == 0:
+          return self._finish(res, SVC_SECURITY_ACCESS, f[1:1 + (f[0] & 0xF)])
+        if kind == 1:
+          expect = ((f[0] & 0xF) << 8) | f[1]
+          data = f[2:8]
+          self._tx(FLOW_CONTROL_FRAME)
+          t_end = self.now() + CF_TIMEOUT_S
+        elif expect is not None and kind == 2:
+          data += f[1:8]
+          if len(data) >= expect:
+            return self._finish(res, SVC_SECURITY_ACCESS, data[:expect])
+      if not took:
+        self._rx_frames()
+    res["no_response" if not cf_sent else "incomplete"] = True
+    return res
+
+  def send_key_phase6(self, key: bytes) -> dict:
+    """The ONE documented phase-6 public entry to a zero-key ``27 02``. It consumes the ordering sentinel and forwards
+    it to ``guard_frame`` (the SOLE enforcer of "zero key only / immediately after a 27 01 / max 4 attempts"), then
+    increments the attempt counter ONLY after the frame reached the bus. Tests drive THIS (never ``_tx_phase6_key``
+    alone) to prove a 5th attempt is refused and a 27 02 without a preceding 27 01 is refused."""
+    if bytes(key) != PHASE6_KEY:
+      raise SafetyViolation(f"phase6: send_key_phase6 key must be the zero key {PHASE6_KEY.hex()}")
+    res = self._tx_phase6_key(PHASE6_KEY, ESC_RSP_ADDR)
+    self.key_attempts += 1            # consume the attempt only once the zero key actually reached the bus
+    return res
+
   def write_did(self, did: int, value: bytes, readback: bytes) -> dict:
     """The ONLY write this module can make. ``value`` is mechanically forced to equal the step-1 read-back."""
-    value, readback = bytes(value), bytes(readback)
     if did != WRITE_DID:
       raise SafetyViolation(f"write to DID {did!r} refused (only 0x0103)")
     if len(value) != 4:
@@ -1070,6 +1259,14 @@ def _seed_hex(resp: str | None) -> str | None:
   return resp[4:]
 
 
+def _p6_r(res: dict | None) -> dict | None:
+  """Phase 6: a compact R1..R4 record (nrc + resp + positive) for the summary/cloudlog, else None."""
+  if not res:
+    return None
+  return {"nrc": res.get("nrc"), "resp": res.get("resp"), "positive": bool(res.get("positive")),
+          "no_response": bool(res.get("no_response"))}
+
+
 def _run_phase5_battery(client: "EscProbeClient", doc: dict) -> None:
   """The exact phase-5 sequence. Read-only: records every frame's req/resp/nrc/timeout/ms; never aborts on a refusal.
 
@@ -1158,6 +1355,147 @@ def _run_phase5_battery(client: "EscProbeClient", doc: dict) -> None:
   doc["write_attempted"] = False          # phase 5 never writes
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase-6 battery -- ONE ignition, the security-policy matrix + DID sweep (see the module docstring / report "Update 9").
+# ---------------------------------------------------------------------------------------------------------------------
+def _run_phase6_battery(client: "EscProbeClient", doc: dict) -> None:
+  """The exact phase-6 sequence. Records every frame in ``doc['steps']``; NEVER aborts on a refusal (except the
+  step-1 0x0103 read gate). The zero-key ``27 02`` is mechanically pinned (phase 6 only / zero key only / immediately
+  after a ``27 01`` / at most ``PHASE6_MAX_KEY_ATTEMPTS`` total, the ONE 4th being the cycle-reset step)."""
+  key_attempts = 0        # this local mirror + client.key_attempts are the enforced cap; the ONE 4th attempt is the reset
+
+  def step(name: str, res: dict) -> None:
+    doc["steps"].append({"name": name, "addr": res.get("addr", ESC_REQ_ADDR),
+                         "resp_addr": res.get("rsp_addr", ESC_RSP_ADDR), "req": res.get("req"),
+                         "frames": list(res.get("frames", [])), "frames_t_ms": list(res.get("frames_t_ms", [])),
+                         "resp": res.get("resp"), "nrc": res.get("nrc"), "positive": bool(res.get("positive")),
+                         "no_response": bool(res.get("no_response")), "timeout": bool(res.get("no_response")),
+                         "incomplete": bool(res.get("incomplete"))})
+
+  def record_seed(tag: str, res: dict) -> dict:
+    """Record a 27 01 sample under ``tag`` and flag that a requestSeed now immediately precedes a possible 27 02."""
+    doc[tag] = res
+    client._p6_seed_precedes = True
+    step(tag, res)
+    return res
+
+  def record_key(tag: str, res: dict) -> dict:
+    doc[tag] = res
+    step(tag, res)
+    return res
+
+  def seed_hex_of(res: dict) -> str | None:
+    return _seed_hex(res.get("resp"))
+
+  def nrc_in_lockout(res: dict) -> bool:
+    return res.get("nrc") in PHASE6_LOCKOUT_NRCS
+
+  # ---- 1. read 0x0103 -> value_start (the value_start gate: no usable read -> abort, nothing else runs) -------------
+  r_read = client.read_did(DID_VARIANT_CODING)
+  doc["read"] = r_read
+  value_start = parse_read_did(r_read.get("resp"), DID_VARIANT_CODING)
+  doc["value_start"] = value_start.hex() if value_start is not None else None
+  doc["current_value"] = doc["value_start"]
+  step("read_esc", r_read)
+  if value_start is None:
+    raise Abort("phase6: step-1 read of 0x0103 refused/missing; nothing else runs")
+
+  # ---- 2. 10 03 extended session (record; if refused/silent skip the key part, still run the DID sweep) ------------
+  r_sess = client.extended_session()
+  doc["session_before_write"] = r_sess
+  step("session", r_sess)
+  extended_ok = bool(r_sess.get("positive"))
+
+  # ---- 3/4. two 27 01 samples -> S1, S2 (seed stability) ----------------------------------------------------------
+  s1 = record_seed("S1", client.request_seed())
+  s2 = record_seed("S2", client.request_seed())
+  seed_stable_pre = (seed_hex_of(s1) is not None and seed_hex_of(s1) == seed_hex_of(s2))
+  doc["seed_stable_pre"] = seed_stable_pre
+
+  lockout_seen = False
+  cycle_reset = False
+  key_attempted = False
+
+  # ---- 5. 27 02 zero key -> R1; a 0x36/0x37 NRC marks lockout and skips straight to the cycle-reset (step 8) ------
+  if extended_ok and client.key_attempts < PHASE6_MAX_KEY_ATTEMPTS:
+    r1 = record_key("R1", client.send_key_phase6(PHASE6_KEY))
+    key_attempts += 1
+    key_attempted = True
+    if nrc_in_lockout(r1):
+      lockout_seen = True
+      doc["lockout_seen"] = True
+
+  # ---- 6/7. adaptive: 27 01 -> S3 -> R2, then 27 01 -> S4 -> R3 (only while no lockout; <= 3 pre-cycle attempts) ---
+  if extended_ok and not lockout_seen:
+    if client.key_attempts < PHASE6_MAX_KEY_ATTEMPTS:
+      s3 = record_seed("S3", client.request_seed())
+      doc["seed_after_fail"] = None
+      s3_hex = seed_hex_of(s3)
+      if s3_hex is not None:
+        if s3_hex == seed_hex_of(s2) or s3_hex == seed_hex_of(s1):
+          doc["seed_after_fail"] = s3_hex
+        else:
+          doc["seed_after_fail"] = "new:" + s3_hex
+      record_key("R2", client.send_key_phase6(PHASE6_KEY))
+      key_attempts += 1
+    if client.key_attempts < PHASE6_MAX_KEY_ATTEMPTS:
+      record_seed("S4", client.request_seed())
+      record_key("R3", client.send_key_phase6(PHASE6_KEY))
+      key_attempts += 1
+
+  # ---- 8. ALWAYS: the cycle-reset test -- 10 01; 10 03; 27 01 -> S5; 27 02 zero key -> R4 (the ONLY 4th key, ever) -
+  if client.key_attempts < PHASE6_MAX_KEY_ATTEMPTS:
+    doc["reset_session_default"] = client.request(SVC_DIAGNOSTIC_SESSION_CONTROL, SESSION_SUBFUNC_DEFAULT)
+    step("reset_session_default", doc["reset_session_default"])
+    doc["reset_session_extended"] = client.extended_session()
+    step("reset_session_extended", doc["reset_session_extended"])
+    record_seed("S5", client.request_seed())
+    r4 = record_key("R4", client.send_key_phase6(PHASE6_KEY))
+    key_attempts += 1
+    if not nrc_in_lockout(r4):
+      cycle_reset = True
+  doc["cycle_reset"] = cycle_reset
+  doc["lockout_seen"] = lockout_seen
+
+  # ---- 9. DID sweep (the extended session; each recorded; refusals are fine) ---------------------------------------
+  for did in PHASE6_SWEEP_DIDS:
+    tag = f"did_{did:04X}"
+    r = client.read_did(did)
+    doc["dids"][f"{did:04X}"] = {"resp": r.get("resp"), "nrc": r.get("nrc"), "positive": bool(r.get("positive")),
+                                 "no_response": bool(r.get("no_response"))}
+    step(tag, r)
+
+  # ---- 10. 10 02 programming-session probe -> record; if positive, 27 01 -> S6 (NO key in the programming session) -
+  r_prog = client.request(SVC_DIAGNOSTIC_SESSION_CONTROL, SESSION_SUBFUNC_PROGRAMMING)
+  doc["prog_session_1002"] = r_prog
+  step("prog_session_1002", r_prog)
+  if r_prog.get("positive"):
+    record_seed("S6", client.request_seed())
+
+  # ---- 11. 19 02 A5 (security DTC visible?) ----------------------------------------------------------------------
+  r_dtc = client.request(SVC_READ_DTC_INFORMATION, PHASE6_DTC_SUBFUNC, bytes([PHASE6_DTC_MASK]))
+  doc["dtc_19_02_a5"] = r_dtc
+  step("dtc_19_02_a5", r_dtc)
+
+  # ---- 12. clean leave: 10 01, then 22 0103 -> value_end -----------------------------------------------------------
+  r_leave = client.request(SVC_DIAGNOSTIC_SESSION_CONTROL, SESSION_SUBFUNC_DEFAULT)
+  doc["leave_session"] = r_leave
+  step("leave_session", r_leave)
+  r_end = client.read_did(DID_VARIANT_CODING)
+  doc["read_end"] = r_end
+  value_end = parse_read_did(r_end.get("resp"), DID_VARIANT_CODING)
+  doc["value_end"] = value_end.hex() if value_end is not None else None
+  doc["reread"] = r_end
+  doc["reread_value"] = doc["value_end"]
+  doc["value_changed"] = (value_start is not None and value_end is not None and value_end != value_start)
+  step("read_esc_end", r_end)
+
+  # ---- summary fields --------------------------------------------------------------------------------------------
+  doc["key_attempted"] = key_attempted or client.key_attempts > 0
+  doc["write_attempted"] = False          # phase 6 NEVER writes (no 2E anywhere)
+  doc["unlocked"] = bool(doc.get("R4", {}) and doc["R4"].get("positive")) if doc.get("R4") else False
+
+
 def _run_phase4_read(client: "EscProbeClient", doc: dict) -> bytes:
   """Phase-4 step 1: read 0x0103 (extended-retry rules unchanged). No usable read -> Abort; no key, no write."""
   r1 = client.read_did(DID_VARIANT_CODING)
@@ -1214,12 +1552,14 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     key_mode = "identity2"
   if phase == 4 and key_mode not in KEY_MODES:
     return {**summary, "skip": f"unknown key_mode {key_mode!r}"}
-  if phase not in (1, 2, 3, 4, 5):
+  if phase not in (1, 2, 3, 4, 5, 6):
     return {**summary, "skip": "unknown phase"}
 
   gate = VehicleGate(now)
   t0 = now()
-  budget = RUN_BUDGET_S_PHASE5 if phase == 5 else (RUN_BUDGET_S_PHASE3 if phase in (3, 4) else RUN_BUDGET_S)
+  budget = (RUN_BUDGET_S_PHASE6 if phase == 6 else
+            RUN_BUDGET_S_PHASE5 if phase == 5 else
+            (RUN_BUDGET_S_PHASE3 if phase in (3, 4) else RUN_BUDGET_S))
   client = EscProbeClient(can_send, can_recv, gate, now, t0 + budget, phase=phase)
   doc: dict = {"ignition_key": ignition_key, "fingerprint": fingerprint, "car_fw_abs": None, "phase": phase,
               "read": None, "extended_session": None, "extended_retry": False, "current_value": None,
@@ -1239,7 +1579,13 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
               "fp_canary": None, "fp_canary_hex": None, "value_start": None, "value_end": None,
               "seed1": None, "seed2": None, "seed3": None, "seed1_hex": None, "seed2_hex": None, "seed3_hex": None,
               "seed_stable_12": None, "seed_stable_all": None, "sub_probes": [], "svc_probes": [],
-              "extra_probes": [], "read_end": None}
+              "extra_probes": [], "read_end": None,
+              # phase-6 only (kept None/empty for phases 1-5, so those results are unchanged)
+              "S1": None, "S2": None, "S3": None, "S4": None, "S5": None, "S6": None,
+              "R1": None, "R2": None, "R3": None, "R4": None, "seed_stable_pre": None,
+              "seed_after_fail": None, "lockout_seen": None, "cycle_reset": None, "dids": {},
+              "prog_session_1002": None, "dtc_19_02_a5": None, "reset_session_default": None,
+              "reset_session_extended": None, "leave_session": None}
   for fw in car_fw or []:
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
@@ -1295,6 +1641,9 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     elif phase == 5:
       # ---- PHASE 5: the READ-ONLY capability battery (fixed frame list; no keys, no writes, no multi-frame TX) ----
       _run_phase5_battery(client, doc)
+    elif phase == 6:
+      # ---- PHASE 6: the security-policy matrix + DID sweep (zero key ONLY; pinned 27 02 ordering; never writes) ----
+      _run_phase6_battery(client, doc)
     else:
       # ---- step 1: read the CURRENT 0x0103 value (default session; extended retry only if refused) -------------
       r1 = client.read_did(DID_VARIANT_CODING)
@@ -1414,7 +1763,21 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
                  extra_probes=[{"req_addr": r["req_addr"], "rsp_addr": r["rsp_addr"], "resp": r.get("resp"),
                                 "nrc": r.get("nrc"), "no_response": bool(r.get("no_response"))}
                                for r in (doc.get("extra_probes") or [])],
-                 read_end_value=(doc.get("read_end") or {}).get("resp"))
+                 read_end_value=(doc.get("read_end") or {}).get("resp"),
+                 # phase-6 (security-policy matrix + DID sweep)
+                 S1=_seed_hex((doc.get("S1") or {}).get("resp")), S2=_seed_hex((doc.get("S2") or {}).get("resp")),
+                 S3=_seed_hex((doc.get("S3") or {}).get("resp")), S4=_seed_hex((doc.get("S4") or {}).get("resp")),
+                 S5=_seed_hex((doc.get("S5") or {}).get("resp")), S6=_seed_hex((doc.get("S6") or {}).get("resp")),
+                 R1=_p6_r(doc.get("R1")), R2=_p6_r(doc.get("R2")), R3=_p6_r(doc.get("R3")), R4=_p6_r(doc.get("R4")),
+                 seed_stable_pre=doc.get("seed_stable_pre"), seed_after_fail=doc.get("seed_after_fail"),
+                 lockout_seen=doc.get("lockout_seen"), cycle_reset=doc.get("cycle_reset"),
+                 dids={k: (v.get("resp") if v.get("resp") else (None if not v.get("no_response") else "silent"))
+                       for k, v in (doc.get("dids") or {}).items()},
+                 dids_nrc={k: v.get("nrc") for k, v in (doc.get("dids") or {}).items()},
+                 prog_session_1002=(doc.get("prog_session_1002") or {}).get("resp"),
+                 prog_session_1002_positive=bool((doc.get("prog_session_1002") or {}).get("positive")),
+                 dtc_19_02_a5=(doc.get("dtc_19_02_a5") or {}).get("resp"),
+                 dtc_19_02_a5_nrc=(doc.get("dtc_19_02_a5") or {}).get("nrc"))
   if log_event is not None:
     log_event("esc_probe_0027", **summary)
   return summary

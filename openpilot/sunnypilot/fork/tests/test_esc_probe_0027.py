@@ -96,6 +96,12 @@ class FakeCar:
     self.extra_answer = {}         # {0x770: True, 0x7A0: False}: does the extra request addr answer?
     self.seed_sequence = None      # list of seed byte-strings returned by successive 27 01 asks (None -> esc_seed8)
     self.seed_i = 0
+    # phase-6 policy-matrix answer config
+    self.prog_session_positive = True     # 10 02 -> 50 02 (True) or 7F 10 12 (False)
+    self.key_nrc_sequence = None          # NRCs returned by SUCCESSIVE key attempts (None -> key_unlock/key_nrc)
+    self.key_seen = 0
+    self.sweep_dids = {}                  # {0xF186: "62f1...": }: default -> 7F 22 31 for every sweep DID
+    self.dtc_a5_resp = "037f1931"          # 19 02 A5 -> ISO-TP 03 7f 19 31 (requestOutOfRange) by default
 
   def now(self):
     return self.t
@@ -127,6 +133,12 @@ class FakeCar:
     for i in range(0, n - 6, 7):
       self._q(bytes([0x21]) + payload[6 + i:6 + i + 7], delay + cf_delay * (1 + i // 7 + 1), addr)
 
+  def _key_nrc(self):
+    """The NRC for the NEXT key attempt: the key_nrc_sequence[i] if set (i = attempts so far), else the fixed key_nrc."""
+    if self.key_nrc_sequence is not None:
+      return self.key_nrc_sequence[min(self.key_seen, len(self.key_nrc_sequence) - 1)]
+    return self.key_nrc
+
   def _answer(self, m):
     if not (self.responsive and self.mux and m.src == 1):
       return
@@ -156,19 +168,23 @@ class FakeCar:
       self._q(bytes([0x30, 0x00, 0x00]))            # sendKey multi-frame: flow control, then the 27 02 result
       if self.key_silent:
         return
+      nrc = self._key_nrc()
+      self.key_seen += 1
       if self.key_unlock:
         self._q(bytes([2, 0x67, 0x02]))
       else:
-        self._q(bytes([3, 0x7F, 0x27, self.key_nrc]))
+        self._q(bytes([3, 0x7F, 0x27, nrc]))
       return
     if len(d) >= 3 and d[0] in (4, 6) and d[1] == 0x27 and d[2] == 0x02:
       # phase 4: a 2- or 4-byte candidate key as a single frame (04 27 02 K1K2 / 06 27 02 K1..K4)
       if self.key_silent:
         return
+      nrc = self._key_nrc()
+      self.key_seen += 1
       if self.key_unlock:
         self._q(bytes([2, 0x67, 0x02]))
       else:
-        self._q(bytes([3, 0x7F, 0x27, self.key_nrc]))
+        self._q(bytes([3, 0x7F, 0x27, nrc]))
       return
     body = d[1:1 + d[0]]
     if not body:
@@ -181,12 +197,22 @@ class FakeCar:
           self._q(bytes([7, 0x62, 0xF1, 0x00]) + bytes(self.fp_canary_value))
         else:
           self._q(bytes([3, 0x7F, 0x22, self.fp_canary_nrc]))
+      elif did in self.sweep_dids:                   # phase-6 identification sweep: verbatim configured response
+        self._q(bytes.fromhex(self.sweep_dids[did]))
       elif did == 0x0103 and not self.read_refused and not self.read_silent:
         self._q(bytes([7, 0x62, 0x01, 0x03]) + bytes(self.current))
       else:
         self._q(bytes([3, 0x7F, 0x22, 0x31]))
     elif svc == 0x10:
-      if self.session_silent:
+      sub = body[1] if len(body) > 1 else None
+      if sub == 0x01:
+        self._q(bytes([2, 0x50, 0x01]))
+      elif sub == 0x02:                              # phase-6 programming-session probe
+        if self.prog_session_positive:
+          self._q(bytes([3, 0x50, 0x02, 0x00]))
+        else:
+          self._q(bytes([3, 0x7F, 0x10, 0x12]))
+      elif self.session_silent:
         pass
       elif self.session_refused:
         self._q(bytes([3, 0x7F, 0x10, 0x12]))
@@ -214,6 +240,8 @@ class FakeCar:
         self._q(bytes([3, 0x7F, 0x2E, 0x33]))
       else:
         self._q(bytes([3, 0x6E, 0x01, 0x03]))
+    elif svc == 0x19:                                # phase-6 19 02 A5 (ReadDTCByStatusMask)
+      self._q(bytes.fromhex(self.dtc_a5_resp))
     elif svc == 0x29:
       self._q(bytes([3, 0x7F, 0x29, self.auth_nrc]))
     elif svc == 0x31:
@@ -524,8 +552,8 @@ class TestPhase2(Base):
 
   def test_unknown_phase_sends_nothing(self):
     # NB: `int(state.get("phase", 1) or 1)` maps a FALSY value (missing, None, 0) to the default 1; only a value that
-    # is neither 1, 2, 3, 4 nor 5 (e.g. -1, 6) or non-numeric ("banana") is unknown.
-    for phase in (-1, 6, "banana"):
+    # is neither 1, 2, 3, 4, 5 nor 6 (e.g. -1, 7) or non-numeric ("banana") is unknown.
+    for phase in (-1, 7, "banana"):
       with self.subTest(phase=phase):
         self.fresh_state()
         self.set_phase(phase)
@@ -1986,3 +2014,360 @@ class TestPhase5(Base):
              if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) == "_can_send"]
     self.assertEqual(calls, ["_can_send", "_can_send"])
 
+
+
+class TestPhase6(Base):
+  """Phase 6 (state ``{"probe_enabled": true, "phase": 6}``): the security-policy matrix + DID sweep. Zero-key ONLY,
+  27 02 admissible ONLY immediately after a 27 01 and at most 4 times (the ONE 4th being the cycle-reset step), no
+  write anywhere. Every guard is mechanically enforced."""
+
+  READ = bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")
+  SESSION = bytes([2, 0x10, 0x03]).ljust(8, b"\x00")
+  SESSION01 = bytes([2, 0x10, 0x01]).ljust(8, b"\x00")
+  SESSION02 = bytes([2, 0x10, 0x02]).ljust(8, b"\x00")
+  SEED = bytes([2, 0x27, 0x01]).ljust(8, b"\x00")
+  FC = D.FLOW_CONTROL_FRAME
+  KEYFF = bytes([0x10, 0x0A, 0x27, 0x02]) + bytes(4)             # 10 0A 27 02 00 00 00 00
+  KEYCF = (bytes([0x21]) + bytes(4)).ljust(8, b"\x00")           # 21 00 00 00 00 00 00 00
+  SWEEP = (0xF186, 0xF187, 0xF190, 0xF199, 0xF18A, 0xF18C, 0xF191, 0xF195)
+  DTC = bytes([3, 0x19, 0x02, 0xA5]).ljust(8, b"\x00")
+
+  def setUp(self):
+    super().setUp()
+    self.set_phase(6)
+
+  def set_phase(self, phase):
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump({"probe_enabled": True, "phase": phase}, f)
+
+  def p6_car(self, **kw):
+    car = FakeCar(**kw)
+    car.esc_seed8 = PHASE4_SEED   # a real-looking 8-byte seed (2-byte value x4) -> MF answers, one FC each
+    return car
+
+  def did_frame(self, did):
+    return bytes([3, 0x22, did >> 8, did & 0xFF]).ljust(8, b"\x00")
+
+  def expected_tx(self):
+    sweep = [self.did_frame(d) for d in self.SWEEP]
+    return [self.READ, self.SESSION,
+            self.SEED, self.FC, self.SEED, self.FC,
+            self.KEYFF, self.KEYCF,
+            self.SEED, self.FC, self.KEYFF, self.KEYCF,
+            self.SEED, self.FC, self.KEYFF, self.KEYCF,
+            self.SESSION01, self.SESSION, self.SEED, self.FC, self.KEYFF, self.KEYCF,
+            *sweep,
+            self.SESSION02, self.SEED, self.FC,      # 10 02 positive -> 27 01 -> S6 (no key)
+            self.DTC,
+            self.SESSION01, self.READ]
+
+  def step_names(self, doc):
+    return [st["name"] for st in doc["steps"]]
+
+  def client6(self, car):
+    car.set_mux(True)
+    gate = D.VehicleGate(car.now)
+    gate.feed(CanData(0x367, lvr12(0), 0))
+    gate.feed(CanData(0x386, whl(0.), 0))
+    return E.EscProbeClient(car.can_send, car.can_recv, gate, car.now, car.now() + 99, phase=6)
+
+  # ---- happy path: exact TX order + summary ----------------------------------------------------------------------
+  def test_battery_exact_tx_order_and_zero_key(self):
+    car = self.p6_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    self.assertEqual(self.tx_frames(car), self.expected_tx())
+    keys = [d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])]
+    self.assertEqual(len(keys), 4)                         # exactly FOUR key attempts, all zero key
+    for k in keys:
+      self.assertEqual(k[4:8], bytes(4))
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x2E], [])   # never writes
+    self.assertEqual(car.mux_calls, [True, False])
+    self.assertTrue(s["mux_restored"])
+    doc = self.result_doc()
+    self.assertEqual(doc["phase"], 6)
+    self.assertTrue(doc["key_attempted"])
+    self.assertFalse(doc["write_attempted"])
+    self.assertEqual(doc["value_start"], "90060350")
+    self.assertEqual(doc["value_end"], "90060350")
+    self.assertFalse(doc["value_changed"])
+    self.assertTrue(doc["seed_stable_pre"])
+    self.assertEqual([doc[k]["nrc"] for k in ("R1", "R2", "R3", "R4")], [0x35, 0x35, 0x35, 0x35])
+    self.assertFalse(doc["lockout_seen"])
+    self.assertTrue(doc["cycle_reset"])                     # R4 was not 0x36/0x37
+    self.assertEqual(self.events[-1][0], "esc_probe_0027")
+    self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE6)
+
+  def test_battery_step_names_and_order(self):
+    car = self.p6_car()
+    self.run_car(car)
+    names = self.step_names(self.result_doc())
+    self.assertEqual(names, ["read_esc", "session", "S1", "S2", "R1", "S3", "R2", "S4", "R3",
+                             "reset_session_default", "reset_session_extended", "S5", "R4",
+                             *[f"did_{d:04X}" for d in self.SWEEP],
+                             "prog_session_1002", "S6", "dtc_19_02_a5", "leave_session", "read_esc_end"])
+
+  def test_seed_samples_and_stability_fields(self):
+    car = self.p6_car()
+    self.run_car(car)
+    doc = self.result_doc()
+    for tag in ("S1", "S2", "S3", "S4", "S5", "S6"):
+      self.assertEqual(doc[tag]["resp"], "6701" + PHASE4_SEED.hex(), tag)
+    self.assertTrue(doc["seed_stable_pre"])
+    self.assertEqual(doc["seed_after_fail"], PHASE4_SEED.hex())   # S3 == S1/S2 (stable)
+
+  def test_seed_after_fail_reports_new_seed(self):
+    car = self.p6_car()
+    car.seed_sequence = [PHASE4_SEED, PHASE4_SEED, bytes([0x77]) * 8] + [PHASE4_SEED] * 5
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertTrue(doc["seed_stable_pre"])
+    self.assertEqual(doc["seed_after_fail"], "new:" + (bytes([0x77]) * 8).hex())
+
+  def test_did_sweep_records_every_did(self):
+    car = self.p6_car()
+    for did in (0xF186, 0xF190, 0xF191):
+      car.sweep_dids[did] = "07" + f"62{did:04X}".lower() + "41424344"   # ISO-TP 07 62 <did> 41 42 43 44
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(set(doc["dids"]), {f"{d:04X}" for d in self.SWEEP})
+    self.assertEqual(doc["dids"]["F186"]["resp"], "62f18641424344")
+    self.assertEqual(doc["dids"]["F190"]["resp"], "62f19041424344")
+    self.assertEqual(doc["dids"]["F187"]["resp"], "7f2231")             # unconfigured -> 7F 22 31
+    self.assertEqual(doc["dids"]["F187"]["nrc"], 0x31)
+    # the sweep frames really went to the eight DIDs, in order
+    dids = [d for _, d, _ in car.sent if d[1] == 0x22 and d[2] == 0xF1 and d[3] != 0x00]
+    self.assertEqual(dids, [self.did_frame(d) for d in self.SWEEP])
+
+  # ---- the lockout path: R1 0x36 -> skip 6/7 -> cycle reset R4 ---------------------------------------------------
+  def test_lockout_skips_pre_cycle_and_cycle_reset_clears(self):
+    car = self.p6_car()
+    car.key_nrc_sequence = [0x36, 0x35]      # R1 -> 0x36 (lockout); R4 -> 0x35 (a DIFFERENT class -> reset cleared)
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    keys = [d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])]
+    self.assertEqual(len(keys), 2)           # R1 and R4 ONLY (6/7 skipped after the lockout)
+    doc = self.result_doc()
+    self.assertEqual(doc["R1"]["nrc"], 0x36)
+    self.assertIsNone(doc["R2"])
+    self.assertIsNone(doc["R3"])
+    self.assertIsNone(doc["S3"])
+    self.assertIsNone(doc["S4"])
+    self.assertEqual(doc["R4"]["nrc"], 0x35)
+    self.assertTrue(doc["lockout_seen"])
+    self.assertTrue(doc["cycle_reset"])
+    # the DID sweep still ran even after the lockout
+    self.assertEqual(set(doc["dids"]), {f"{d:04X}" for d in self.SWEEP})
+    self.assertEqual([d[1] for d in self.tx_frames(car) if d[1] == 0x2E], [])
+
+  def test_lockout_persists_through_cycle_reset(self):
+    car = self.p6_car()
+    car.key_nrc_sequence = [0x37]            # EVERY key attempt (R1..R4) -> 0x37
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(doc["R1"]["nrc"], 0x37)
+    self.assertEqual(doc["R4"]["nrc"], 0x37)
+    self.assertTrue(doc["lockout_seen"])
+    self.assertFalse(doc["cycle_reset"])     # R4 is STILL 0x37 -> the reset did not clear the lockout
+
+  def test_positive_key_is_recorded_unlocked(self):
+    car = self.p6_car()
+    car.key_unlock = True                    # hypothetical: the zero key lands -> 67 02
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(doc["R4"]["resp"], "6702")
+    self.assertTrue(doc["unlocked"])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])   # still NO write
+
+  # ---- session / programming-session / DTC behaviours ------------------------------------------------------------
+  def test_session_refused_skips_key_part_but_still_sweeps(self):
+    car = self.p6_car()
+    car.session_refused = True               # 10 03 -> 7F 10 12: skip steps 5-7, still do the DID sweep + step 8
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    doc = self.result_doc()
+    self.assertIsNone(doc["R1"])             # no key in the (refused) extended session
+    self.assertIsNone(doc["R2"])
+    self.assertIsNone(doc["R3"])
+    self.assertEqual(set(doc["dids"]), {f"{d:04X}" for d in self.SWEEP})
+    # step 8 still ran (the reset test is ALWAYS): 10 01, 10 03, 27 01, 27 02
+    self.assertIsNotNone(doc["R4"])
+    self.assertIsNotNone(doc["S5"])
+    self.assertEqual(doc["reset_session_default"]["resp"], "5001")
+
+  def test_prog_session_positive_adds_s6_no_key(self):
+    car = self.p6_car()
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(doc["prog_session_1002"]["resp"], "500200")
+    self.assertTrue(doc["prog_session_1002"]["positive"])
+    self.assertIsNotNone(doc["S6"])
+    # S6 is a 27 01 after the 10 02 frame, and it is NOT followed by a key in the programming session
+    idx = self.step_names(doc).index("S6")
+    self.assertEqual(self.step_names(doc)[idx + 1], "dtc_19_02_a5")
+    keys = [d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])]
+    self.assertEqual(len(keys), 4)          # still only the four matrix keys
+
+  def test_prog_session_negative_no_s6(self):
+    car = self.p6_car()
+    car.prog_session_positive = False        # 10 02 -> 7F 10 12
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(doc["prog_session_1002"]["nrc"], 0x12)
+    self.assertIsNone(doc["S6"])
+    self.assertIn("prog_session_1002", self.step_names(doc))
+
+  def test_dtc_19_02_a5_recorded(self):
+    car = self.p6_car()
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertEqual(doc["dtc_19_02_a5"]["nrc"], 0x31)        # default 7f1931
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x19], [self.DTC])
+    car2 = self.p6_car()
+    car2.dtc_a5_resp = "055902ff00000000"                     # a positive DTC answer (59 02 ff 00 00)
+    self.fresh_state()
+    self.set_phase(6)
+    self.run_car(car2, key="boot:dtc")
+    self.assertTrue(self.result_doc()["dtc_19_02_a5"]["positive"])
+
+  def test_read_gate_aborts_and_sends_nothing_else(self):
+    car = self.p6_car()
+    car.read_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("0x0103", s["aborted"])
+    self.assertEqual([d[1] for d in self.tx_frames(car)], [0x22])   # only the failed read
+    self.assertEqual(car.mux_calls, [True, False])
+
+  # ---- guards (the closed phase-6 allowlist) --------------------------------------------------------------------
+  def test_guard_service_phase6_closed_set(self):
+    E.guard_service(0x22, None, 0x0103, phase=6)
+    for did in self.SWEEP:
+      E.guard_service(0x22, None, did, phase=6)
+    for sub in (0x01, 0x02, 0x03):
+      E.guard_service(0x10, sub, None, phase=6)
+    E.guard_service(0x27, 0x01, None, phase=6)
+    E.guard_service(0x27, 0x02, None, phase=6)
+    E.guard_service(0x19, 0x02, None, phase=6)
+    # 2E (write) and 3E (tester present) are NOT in the phase-6 allowlist
+    for svc in (0x2E, 0x3E, 0x29, 0x31, 0x23, 0x34, 0x35, 0x36, 0x37):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(svc, None, 0x0103 if svc == 0x2E else None, phase=6)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x10, 0x04, None, phase=6)             # 10 04 not admissible
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x10, 0x83, None, phase=6)             # 10 83 not admissible
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x22, None, 0xF188, phase=6)           # a DID outside the sweep set
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x19, 0x01, None, phase=6)             # 19 01 not admissible (only 02)
+    for sub in (0x00, 0x03, 0x04):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x27, sub, None, phase=6)
+
+  def test_guard_frame_phase6_closed_shapes(self):
+    for f in (self.READ, self.SESSION, self.SESSION01, self.SESSION02, self.SEED, self.DTC, *[self.did_frame(d) for d in self.SWEEP]):
+      E.guard_frame(0x7D1, f, 1, phase=6)
+    E.guard_frame(0x7D1, self.FC, 1, phase=6)
+    E.guard_frame(0x7D1, self.KEYFF, 1, phase=6, p6_seed=True, key_attempts=0)
+    E.guard_frame(0x7D1, self.KEYCF, 1, phase=6)
+    # wrong bus / wrong addr / wrong length
+    for addr, bus in ((0x7D1, 0), (0x7D2, 1), (0x770, 1)):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_frame(addr, self.READ, bus, phase=6)
+    # 2E never, 19 02 with the wrong mask never, 22 with a non-sweep DID never
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([7, 0x2E, 0x01, 0x03]) + CURRENT, 1, phase=6, readback=CURRENT)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([3, 0x19, 0x02, 0x01]).ljust(8, b"\x00"), 1, phase=6)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.did_frame(0xF188), 1, phase=6)
+    # a 27 02 with a NON-zero key is refused
+    bad = bytes([0x10, 0x0A, 0x27, 0x02, 0, 0, 0, 1])
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bad, 1, phase=6, p6_seed=True, key_attempts=0)
+    # a 27 02 with NO preceding 27 01 (sentinel absent) is refused
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEYFF, 1, phase=6, p6_seed=False, key_attempts=0)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEYFF, 1, phase=6, seed=E.PHASE6_KEY, key_attempts=0)
+    # a 5th key attempt (counter already at the cap) is refused
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEYFF, 1, phase=6, p6_seed=True, key_attempts=E.PHASE6_MAX_KEY_ATTEMPTS)
+    # the consecutive frame must carry the zero-key tail
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, (bytes([0x21]) + b"\x09\x09\x09\x09").ljust(8, b"\x00"), 1, phase=6)
+    # single-frame 27 02 with a non-zero key refused too
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([6, 0x27, 0x02, 0, 0, 0, 1]).ljust(8, b"\x00"), 1, phase=6, p6_seed=True, key_attempts=0)
+
+  def test_send_key_phase6_requires_zero_key_and_preceding_seed(self):
+    car = self.p6_car()
+    c = self.client6(car)
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key_phase6(b"\x01" * 8)                         # non-zero key
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key_phase6(E.PHASE6_KEY)                        # no preceding 27 01 (sentinel False)
+    self.assertEqual(car.sent, [])
+    # after a 27 01 it is admissible
+    c.request_seed()
+    c.send_key_phase6(E.PHASE6_KEY)
+    self.assertEqual(c.key_attempts, 1)
+
+  def test_fifth_key_attempt_is_refused(self):
+    car = self.p6_car()
+    c = self.client6(car)
+    for _ in range(E.PHASE6_MAX_KEY_ATTEMPTS):
+      c.request_seed()
+      c.send_key_phase6(E.PHASE6_KEY)
+    self.assertEqual(c.key_attempts, E.PHASE6_MAX_KEY_ATTEMPTS)
+    n = len([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])])
+    c.request_seed()
+    with self.assertRaises(D.SafetyViolation):
+      c.send_key_phase6(E.PHASE6_KEY)                        # the 5th key can never reach the bus
+    self.assertEqual(len([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])]), n)
+
+  def test_phase6_shapes_refused_outside_phase6(self):
+    # the phase-6-only shapes must NOT be admissible in phases 1-5
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.SESSION02, 1, phase=5)       # 10 02 programming session
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.DTC, 1, phase=4)             # 19 02 A5
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.DTC, 1, phase=5)             # 19 02 A5 not a phase-5 service
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x19, 0x02, None, phase=5)             # 0x19 not a phase-5 service
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x10, 0x02, None, phase=1)             # 10 02 not a phase-1 sub
+    # phase 5 still refuses the zero-key 27 02
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.KEYFF, 1, phase=5, p6_seed=True, key_attempts=0)
+
+  def test_phase6_never_writes_and_budget(self):
+    self.assertEqual(E.RUN_BUDGET_S_PHASE6, 60.0)
+    self.assertEqual(E.RUN_BUDGET_S, 15.0)
+    car = self.p6_car()
+    self.run_car(car)
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])
+    # no bare 29/31 probes either
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] in (0x29, 0x31)], [])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x3E], [])
+
+  def test_once_per_ignition(self):
+    car = self.p6_car()
+    self.run_car(car, key="boot:1")
+    n = len(car.sent)
+    s = self.run_car(car, key="boot:1")
+    self.assertFalse(s["ran"])
+    self.assertEqual(s["skip"], "already done (ignition)")
+    self.assertEqual(len(car.sent), n)
+
+  def test_not_in_park_sends_nothing(self):
+    car = self.p6_car(gear=5)
+    s = self.run_car(car)
+    self.assertFalse(s["ran"])
+    self.assertEqual(car.sent, [])
+    self.assertEqual(car.mux_calls, [])
