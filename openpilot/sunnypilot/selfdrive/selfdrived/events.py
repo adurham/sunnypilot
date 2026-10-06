@@ -273,4 +273,11 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.),
   },
+
+  # fork (adurham): drive mode N / N-Custom with DriveModePersonality ON. On a MADS car the log-level
+  # driveModePersonalityBlock is stripped so lateral survives, which would make the lockout silent — this is the
+  # driver-facing permanent alert, the same pattern as pedalFactoryCruiseLockout.
+  EventNameSP.driveModePersonalityLockout: {
+    ET.PERMANENT: NormalPermanentAlert("N Mode: openpilot Long Off", "Drive mode N blocks openpilot longitudinal"),
+  },
 }

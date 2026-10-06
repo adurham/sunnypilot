@@ -235,6 +235,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"HyundaiGasInterceptor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: comma pedal longitudinal (non-SCC), opt-in
     {"HyundaiGasInterceptorIDSet", {PERSISTENT | BACKUP, STRING, "auto"}},  // fork: pedal CAN IDs: auto/standard/remapped
     {"HyundaiFca11Brake", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: FCA11 longitudinal braking on the comma pedal (default OFF)
+    {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"SubaruStopAndGoManualParkingBrake", {PERSISTENT | BACKUP, BOOL, "0"}},

@@ -357,6 +357,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     pedalFactoryCruiseLockout @26;  # fork: Hyundai gas interceptor, factory cruise MAIN armed (alert only)
     pedalBelowEngageSpeed @27;  # fork: Hyundai gas interceptor, SET/RES below minEnableSpeed refused (alert only)
     fca11BrakeLowSpeed @28;  # fork: Hyundai FCA11 braking, below floor+margin while a lead closes, driver takes over
+    driveModePersonalityLockout @29;  # fork: drive mode N/N-Custom blocks openpilot longitudinal (alert only)
   }
 }
 
@@ -456,6 +457,7 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  driveMode @1 :UInt8;  # fork: raw CLU13 CF_Clu_DriveMode (1 normal/2 eco/3 sport/6 N custom/7 N), 0 unknown
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

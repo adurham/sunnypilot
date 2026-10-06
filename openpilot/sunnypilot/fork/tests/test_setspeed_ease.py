@@ -341,10 +341,16 @@ class TestMergeGate(OpenpilotTestCase):
 
   def test_car_limit_staleness_is_documented(self):
     # should-fix: carStateSP.speedLimit is a last-seen display with NO freshness channel. This pins the two facts a
-    # future maintainer must not lose: the capnp struct exposes only a bare Float32, and the module documents staleness.
+    # future maintainer must not lose: the capnp struct exposes a bare Float32 with no valid/age field, and the module
+    # documents staleness. (driveMode is a fork addition for the drive-mode-personality feature; it is a raw UInt8
+    # level too and carries no freshness channel either.)
     import inspect
     lm = messaging.new_message('carStateSP').carStateSP
-    self.assertEqual([f.proto.name for f in lm.schema.fields_list], ['speedLimit'])  # no valid / age field exists
+    fields = {f.proto.name for f in lm.schema.fields_list}
+    self.assertEqual(fields, {'speedLimit', 'driveMode'})
+    self.assertNotIn('valid', fields)         # no validity channel
+    self.assertNotIn('age', fields)           # no age/freshness channel
+    self.assertNotIn('timestamp', fields)
     doc = inspect.getdoc(se)
     self.assertIn('staleness', doc)
     self.assertIn('last-seen', doc.lower())

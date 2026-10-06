@@ -22,13 +22,19 @@ class HyundaiSettings(BrandSettings):
                                                             param="HyundaiLongitudinalTuning", inline=False)
     self.fca11_brake_toggle = toggle_item_sp(tr("FCA11 Braking (Beta)"), "", param="HyundaiFca11Brake",
                                              callback=self._on_fca11_toggle_changed)
-    self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle]
+    self.drive_mode_personality_toggle = toggle_item_sp(
+      tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
+      param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
+    self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
   def _on_tuning_selected(index):
     ui_state.params.put("HyundaiLongitudinalTuning", index)
 
   def _on_fca11_toggle_changed(self, _):
+    self.update_settings()
+
+  def _on_drive_mode_toggle_changed(self, _):
     self.update_settings()
 
   def update_settings(self):
