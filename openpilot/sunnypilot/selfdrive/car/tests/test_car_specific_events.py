@@ -26,7 +26,7 @@ def _run(v_ego: float, long_active: bool = False, interceptor: bool = True, butt
          button=ButtonType.decelCruise, non_adaptive: bool = False, resume_blocked: bool = False, min_enable=-1.):
   CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=min_enable,
                        openpilotLongitudinalControl=True)
-  CP_SP = SimpleNamespace(enableGasInterceptor=interceptor)
+  CP_SP = SimpleNamespace(enableGasInterceptor=interceptor, fca11Brake=False)
   be = [SimpleNamespace(type=button, pressed=p) for p in (True, False)]
   CS = SimpleNamespace(vEgo=v_ego, buttonEvents=be, cruiseState=SimpleNamespace(nonAdaptive=non_adaptive))
   events = Events()
