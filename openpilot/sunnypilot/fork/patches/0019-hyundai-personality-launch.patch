@@ -1,0 +1,385 @@
+From 8e28e5ff109aa65278b5acc066bbf3af990becf4 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 17:04:06 -0500
+Subject: [PATCH] hyundai: gas interceptor: personality-indexed pedal law
+ (launch ceiling / pull gain / hold / cap)
+
+The driver's LongitudinalPersonality (cereal log.LongitudinalPersonality: 0=aggressive, 1=standard, 2=relaxed) now
+scales the whole Hyundai comma-pedal law, so the feel dial is the master lever for driver-felt launch/merge response
+instead of only the MPC follow gap / easing rate (drive 149: personality=aggressive yet every launch was ceiling-bound,
+cmd/ceiling = 1.00 for the first 3 s; the launch ceiling and the 0.35 interceptor cap were personality-independent).
+
+- New CarControlSP.personality (UInt8) on the capnp struct + the opendbc structs.py mirror (default standard, so a
+  no-arg CarControlSP is never aggressive) -> the car controller reads it off CC_SP and threads it into the pedal law.
+- gas_interceptor: one feel factor per tier (relaxed 0.85, standard 1.00, aggressive 1.20, clamped to 0.30 -> 0.35);
+  the launch ceiling (LOW_SPEED_MAX_GAS_V_OFFSET: relaxed -0.02/-0.03, standard shipped, aggressive +0.04/+0.06), the
+  cruise-pull gain (PEDAL_SCALE) and the hold feedforward (HOLD_CMD) all scale. STANDARD reproduces the shipped law
+  bit-for-bit. MAX_INTERCEPTOR_GAS is NOT raised (0.35, panda ceiling A 1218/B 612 unchanged).
+- The upward slew limit is deliberately NOT personality-scaled (the comfort jerk is the same for every tier).
+- New test_gas_interceptor_personality.py and the extended test_gas_interceptor.py pins.
+
+Offline only.
+---
+ opendbc/car/hyundai/carcontroller.py          |   2 +-
+ opendbc/car/structs.py                        |   3 +
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  82 ++++++--
+ .../tests/test_gas_interceptor_personality.py | 190 ++++++++++++++++++
+ 4 files changed, 261 insertions(+), 16 deletions(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
+
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index eb56cff..0927e8c 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -145,7 +145,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+                                             stopping, hud_control, actuators, CS, CC))
+ 
+       # comma pedal (no-op unless CP_SP.enableGasInterceptor)
+-      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame, now_nanos))
++      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame, now_nanos, CC_SP.personality))
+       # engagement state the pause/resume button is judged against on the next CarState update (carstate_ext.py)
+       CS.pedal_long_engaged = CC.enabled
+ 
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index b5f7cd5..87c5d90 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -145,6 +145,9 @@ class CarControlSP:
+   leadOne: 'LeadData' = field(default_factory=lambda: LeadData())
+   leadTwo: 'LeadData' = field(default_factory=lambda: LeadData())
+   intelligentCruiseButtonManagement: 'IntelligentCruiseButtonManagement' = field(default_factory=lambda: IntelligentCruiseButtonManagement())
++  # fork (adurham): raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed) so the Hyundai pedal law can
++  # scale its ceilings/gains by the driver's feel dial. Defaults to STANDARD so no-arg construction is never aggressive.
++  personality: int = field(default=1)
+ 
+   @auto_dataclass
+   class Param:
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 51c4a7c..57fad02 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -82,6 +82,38 @@ HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
+ # with it (A 1110/B 559 -> A 1218/B 612).
+ MAX_INTERCEPTOR_GAS = 0.35
+ 
++# *** personality (adurham fork): the driver's LongitudinalPersonality is the master feel dial for the pedal law ***
++# The openpilot personality enum (cereal log.LongitudinalPersonality) is 0 = aggressive, 1 = standard, 2 = relaxed.
++# This module is opendbc and must NOT import cereal, so the mapping is pinned here as plain ints (the sunnypilot
++# CarControlSP.personality field carries the enum's raw value straight through).
++PERSONALITY_AGGRESSIVE = 0
++PERSONALITY_STANDARD = 1
++PERSONALITY_RELAXED = 2
++
++# The whole pedal law is personality-scaled by one factor per tier; STANDARD reproduces the shipped law bit-for-bit
++# (every factor 1.0), so a drive that never touches the personality button is byte-copied from before this change.
++# relaxed is 85 % of standard, standard 100 %, aggressive 120 %. The launch ceiling, the cruise-pull gain, the hold
++# feedforward and the interceptor cap are all driver-felt; scaling them together keeps the pedal-authority story
++# "relaxed is gentler, aggressive bites harder", and the 0.35 interceptor cap (the pedal firmware ceiling) is the hard
++# stop only relaxed/standard ever reach, aggressive pins on it.
++PERSONALITY_SCALE_BP = [PERSONALITY_AGGRESSIVE, PERSONALITY_STANDARD, PERSONALITY_RELAXED]  # indexes 0,1,2
++PERSONALITY_SCALE_V = [1.20, 1.00, 0.85]
++# Cap on the personality scale so a future table edit can never push a raw command past the pedal firmware ceiling
++# (HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A/B, panda raw A 1218 / B 612 = the 0.35 command; see test_gas_interceptor). The law
++# additionally clips to MAX_INTERCEPTOR_GAS below, so raising this constant alone is never enough to exceed the cap.
++MAX_PERSONALITY_SCALE = MAX_INTERCEPTOR_GAS / 0.30  # 1.1667: 0.30 * 1.1667 = 0.35
++
++
++def personality_scale(personality) -> float:
++  """Feel multiplier for a LongitudinalPersonality raw value. Unknown / missing -> STANDARD (never the un-scaled 1.2)."""
++  try:
++    pid = int(getattr(personality, 'raw', personality))
++  except (TypeError, ValueError):
++    pid = PERSONALITY_STANDARD
++  scale = PERSONALITY_SCALE_V[pid] if 0 <= pid < len(PERSONALITY_SCALE_V) else PERSONALITY_SCALE_V[PERSONALITY_STANDARD]
++  return float(min(scale, MAX_PERSONALITY_SCALE))
++
++
+ # Speed at which the launch limit (LOW_SPEED_MAX_GAS below) reaches the full cap. Only a throttle-strength limit: it is NOT
+ # an engage floor (there is none in pedal mode, CP.minEnableSpeed = -1) and nothing disengages below it.
+ LOW_SPEED_FULL_GAS_SPEED = 25. * CV.MPH_TO_MS
+@@ -117,9 +149,20 @@ HOLD_CMD_V = [0., 0.08, 0.085, 0.095, *[PEDAL_SCALE_HIGHWAY * o for o in HOLD_SP
+ # 10.0, 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6
+ # m/s^2, 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a full-cap (~3 m/s^2) jump. Full cap from 25 mph
+ # (11.18 m/s). With the speed-scheduled gain this is a bound, no longer the active limiter above ~6 m/s (12e/12f: the
+-# command sat on it 72-94 % of every launch with the scalar gain). Values unchanged (the driver likes the first metres).
++# command sat on it 72-94 % of every launch with the scalar gain).
++# Personality tiers (adurham fork, drive 149 §2): the launch ceiling was the dominant "slow off the line" lever and was
++# personality-independent. The tiers must satisfy relaxed < standard < aggressive (owner directive); STANDARD keeps the
++# shipped 0.12/0.20 exactly (so the default-personality drive is byte-identical and the change is a pure personality
++# spread), relaxed sits below it (the owner's older ~10 % backlog intent), aggressive above (drive 149 "next lever").
++# All tiers are pinned at the 0.35 interceptor cap from 25 mph. Ceiling(v) <= MAX_INTERCEPTOR_GAS always (aggressive's
++# 0.26 @5 m/s is below the cap, so only the cap binds at 25 mph).
+ LOW_SPEED_MAX_GAS_BP = [0., 5., LOW_SPEED_FULL_GAS_SPEED]  # vEgo, m/s (full cap at 25 mph)
+-LOW_SPEED_MAX_GAS_V = [0.12, 0.20, MAX_INTERCEPTOR_GAS]     # pedal fraction
++LOW_SPEED_MAX_GAS_V = [0.12, 0.20, MAX_INTERCEPTOR_GAS]     # pedal fraction (standard tier; shipped values)
++LOW_SPEED_MAX_GAS_V_OFFSET = {
++  PERSONALITY_RELAXED: [-0.02, -0.03],   # 0.10 @0, 0.17 @5 m/s
++  PERSONALITY_STANDARD: [0.00, 0.00],    # 0.12 @0, 0.20 @5 m/s (shipped)
++  PERSONALITY_AGGRESSIVE: [0.04, 0.06],  # 0.16 @0, 0.26 @5 m/s
++}
+ 
+ # Upward slew limit on the pedal command, as a JERK limit in accel units: rate_up(v) = PEDAL_JERK_UP * pedal_scale(v)
+ # pedal fraction per second (0.20/s at a standstill, 0.33/s at 12 m/s, 0.50/s at 18 m/s, 0.72/s from 22 m/s, i.e.
+@@ -130,25 +173,33 @@ LOW_SPEED_MAX_GAS_V = [0.12, 0.20, MAX_INTERCEPTOR_GAS]     # pedal fraction
+ PEDAL_JERK_UP = 2.0  # m/s^3
+ 
+ 
+-def get_pedal_scale(v_ego: float) -> float:
+-  """Pedal fraction per m/s^2 at this speed."""
+-  return float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
++def get_personality_ceiling(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++  """Launch ceiling (pedal fraction) for this personality at this speed."""
++  offset = LOW_SPEED_MAX_GAS_V_OFFSET.get(int(personality), LOW_SPEED_MAX_GAS_V_OFFSET[PERSONALITY_STANDARD])
++  vals = [LOW_SPEED_MAX_GAS_V[0] + offset[0], LOW_SPEED_MAX_GAS_V[1] + offset[1], LOW_SPEED_MAX_GAS_V[2]]
++  return min(MAX_INTERCEPTOR_GAS, float(np.interp(v_ego, LOW_SPEED_MAX_GAS_BP, vals)))
++
++
++def get_pedal_scale(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++  """Pedal fraction per m/s^2 at this speed, scaled by personality."""
++  return personality_scale(personality) * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+-def get_hold_command(v_ego: float) -> float:
+-  """Pedal fraction that holds speed on flat ground (accel request 0)."""
+-  return float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
++def get_hold_command(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++  """Pedal fraction that holds speed on flat ground (accel request 0), scaled by personality."""
++  return personality_scale(personality) * float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
+ 
+ 
+ def get_pedal_rate_up(v_ego: float) -> float:
+-  """Upward slew limit, pedal fraction per second."""
+-  return PEDAL_JERK_UP * get_pedal_scale(v_ego)
++  """Upward slew limit, pedal fraction per second. Not personality-scaled: the rise limit is the same comfort jerk for
++  every tier (a launch is ~3 s either way; personality changes where the ramp lands, not how fast it climbs)."""
++  return PEDAL_JERK_UP * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+-def get_pedal_command(accel: float, v_ego: float) -> float:
++def get_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+   """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake."""
+-  ceiling = min(MAX_INTERCEPTOR_GAS, float(np.interp(v_ego, LOW_SPEED_MAX_GAS_BP, LOW_SPEED_MAX_GAS_V)))
+-  return float(np.clip(get_pedal_scale(v_ego) * accel + get_hold_command(v_ego), 0., ceiling))
++  return float(np.clip(get_pedal_scale(v_ego, personality) * accel + get_hold_command(v_ego, personality),
++                       0., get_personality_ceiling(v_ego, personality)))
+ 
+ 
+ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float) -> float:
+@@ -225,7 +276,8 @@ class GasInterceptorCarController:
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+ 
+-  def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0) -> list[CanData]:
++  def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0,
++                         personality: int = PERSONALITY_STANDARD) -> list[CanData]:
+     can_sends: list[CanData] = []
+     if not self.CP_SP.enableGasInterceptor:
+       return can_sends
+@@ -247,7 +299,7 @@ class GasInterceptorCarController:
+     # While the FCA11 brake is active the pedal command is EXACTLY zero for this frame (hard zero, not the law's
+     # zero: the law would still add the hold feedforward at speed).
+     if active and not self.fca11_brake.braking:
+-      self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas, CS.out.vEgo)
++      self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo)
+     elif self.fca11_brake.braking:
+       self.gas = 0.
+     else:
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
+new file mode 100644
+index 0000000..f4f65a7
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
+@@ -0,0 +1,190 @@
++"""
++Personality-indexed Hyundai pedal law (adurham fork): the driver's LongitudinalPersonality scales the launch ceiling,
++the pull gain, the hold feedforward and the interceptor cap. STANDARD reproduces the shipped law bit-for-bit; relaxed
++is gentler; aggressive bites harder but is clamped below the pedal firmware ceiling.
++
++Companion to test_gas_interceptor.py (which pins the personality-independent law). This file is the patch-candidate
++regression for the personality feature.
++"""
++import numpy as np
++import pytest
++
++from opendbc.can import CANPacker
++from opendbc.car import DT_CTRL, structs
++from opendbc.car.car_helpers import interfaces
++from opendbc.car.hyundai.values import CAR
++from opendbc.sunnypilot.car import crc8_pedal, create_gas_interceptor_command
++from opendbc.sunnypilot.car.hyundai import gas_interceptor as gi
++from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
++from opendbc.sunnypilot.car.interfaces import setup_interfaces
++
++AG, ST, RE = gi.PERSONALITY_AGGRESSIVE, gi.PERSONALITY_STANDARD, gi.PERSONALITY_RELAXED
++PERSONALITIES = (AG, ST, RE)
++CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++BASE_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8}
++STD = {0x201: 6}
++STD_ADDR = 0x201  # STANDARD_IDS.sensor_addr: the plain comma pedal
++MPH = 0.44704
++
++
++def _cmd_fields(dat: bytes) -> tuple[int, int, int, int]:
++  """-> (track A, track B, ENABLE, counter)"""
++  return (dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3], dat[4] >> 7, dat[4] & 0xF
++
++
++class TestPersonalityScale:
++  def test_tiers_ordered_standard_is_one(self):
++    assert gi.PERSONALITY_SCALE_V == [1.20, 1.00, 0.85]
++    assert gi.PERSONALITY_SCALE_BP == [AG, ST, RE]
++    assert gi.personality_scale(RE) < gi.personality_scale(ST) == 1.0 < gi.personality_scale(AG)
++
++  def test_aggressive_clamped_below_pedal_ceiling(self):
++    # the aggressive feel factor is 1.20 but is clamped so a raw command can never exceed the 0.35 firmware ceiling
++    assert gi.personality_scale(AG) == pytest.approx(gi.MAX_PERSONALITY_SCALE)
++    assert gi.personality_scale(AG) * 0.30 <= gi.MAX_INTERCEPTOR_GAS + 1e-9
++
++  def test_unknown_and_missing_fall_back_to_standard(self):
++    for bad in (7, -1, 99, None, 'bogus'):
++      assert gi.personality_scale(bad) == gi.personality_scale(ST), bad
++    # a capnp _DynamicEnum-like object carrying .raw is accepted
++    class _E:
++      raw = AG
++    assert gi.personality_scale(_E()) == gi.personality_scale(AG)
++
++
++class TestPersonalityCeiling:
++  def test_ceiling_table(self):
++    # standard keeps the shipped 0.12/0.20/0.35; relaxed and aggressive offset the first two anchors only
++    assert gi.get_personality_ceiling(0., ST) == pytest.approx(0.12)
++    assert gi.get_personality_ceiling(5., ST) == pytest.approx(0.20)
++    assert gi.get_personality_ceiling(0., RE) == pytest.approx(0.10)
++    assert gi.get_personality_ceiling(5., RE) == pytest.approx(0.17)
++    assert gi.get_personality_ceiling(0., AG) == pytest.approx(0.16)
++    assert gi.get_personality_ceiling(5., AG) == pytest.approx(0.26)
++
++  def test_driver_intent_brackets(self):
++    # owner's older backlog intent (relaxed ~10 % / standard ~12 % / aggressive ~15-18 % at a standstill) and the
++    # drive-149 "next lever" (aggressive 0.16/0.26) both landed inside these brackets
++    assert 0.09 <= gi.get_personality_ceiling(0., RE) <= 0.12
++    assert gi.get_personality_ceiling(0., ST) == pytest.approx(0.12)
++    assert 0.15 <= gi.get_personality_ceiling(0., AG) <= 0.18
++
++  def test_full_cap_by_25mph_every_personality(self):
++    # the 0.35 cap by 25 mph must STAY for all tiers (only the sub-25 mph anchors move)
++    for p in PERSONALITIES:
++      assert gi.get_personality_ceiling(25. * MPH, p) == pytest.approx(gi.MAX_INTERCEPTOR_GAS)
++      assert gi.get_personality_ceiling(25., p) == pytest.approx(gi.MAX_INTERCEPTOR_GAS)
++
++  def test_monotonic_and_never_exceeds_cap(self):
++    for v in np.linspace(0., 40., 161):
++      c = [gi.get_personality_ceiling(float(v), p) for p in (RE, ST, AG)]
++      assert c[0] <= c[1] <= c[2] + 1e-12, v
++      assert all(x <= gi.MAX_INTERCEPTOR_GAS + 1e-12 for x in c), v
++
++
++class TestStandardIsShippedLaw:
++  """A drive that never touches the personality button (standard) must be byte-copied from before this feature."""
++  @staticmethod
++  def _shipped_ceiling(v):
++    return min(gi.MAX_INTERCEPTOR_GAS, float(np.interp(v, gi.LOW_SPEED_MAX_GAS_BP, gi.LOW_SPEED_MAX_GAS_V)))
++
++  def test_ceiling_identical(self):
++    for v in np.linspace(0., 40., 81):
++      assert gi.get_personality_ceiling(float(v), ST) == pytest.approx(self._shipped_ceiling(float(v)), abs=1e-12)
++
++  def test_scale_hold_command_identical(self):
++    for v in np.linspace(0., 40., 81):
++      assert gi.get_pedal_scale(float(v), ST) == pytest.approx(float(np.interp(v, gi.PEDAL_SCALE_BP, gi.PEDAL_SCALE_V)))
++      assert gi.get_hold_command(float(v), ST) == pytest.approx(float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V)))
++
++  def test_pedal_command_identical(self):
++    for v in np.linspace(0., 40., 81):
++      for a in np.linspace(-2., 3., 21):
++        shipped = float(np.clip(gi.personality_scale(ST) * (float(np.interp(v, gi.PEDAL_SCALE_BP, gi.PEDAL_SCALE_V)) * a +
++                                                            float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V))),
++                               0., self._shipped_ceiling(float(v))))
++        assert gi.get_pedal_command(float(a), float(v), ST) == pytest.approx(shipped, abs=1e-12)
++
++  def test_default_personality_is_standard(self):
++    # a direct call with no personality (sim / tests / any caller that forgets) is STANDARD, never aggressive
++    for v in (0., 5., 11.176, 20., 30.):
++      assert gi.get_pedal_command(1.0, v) == pytest.approx(gi.get_pedal_command(1.0, v, ST))
++      assert gi.get_personality_ceiling(v) == pytest.approx(gi.get_personality_ceiling(v, ST))
++
++  def test_rate_limit_is_not_personality_scaled(self):
++    # the rise limit is the same comfort jerk for every tier: get_pedal_rate_up takes no personality and is unchanged
++    for v in np.linspace(0., 40., 41):
++      assert gi.get_pedal_rate_up(float(v)) / float(np.interp(v, gi.PEDAL_SCALE_BP, gi.PEDAL_SCALE_V)) == pytest.approx(gi.PEDAL_JERK_UP)
++
++
++class TestPersonalityPedalCommand:
++  def test_order_and_cap(self):
++    for v in np.linspace(0., 40., 81):
++      for a in (0.3, 0.5, 1.0, 2.0, 5.0):
++        c = [gi.get_pedal_command(a, float(v), p) for p in (RE, ST, AG)]
++        assert c[0] <= c[1] + 1e-12 <= c[2] + 2e-12, (v, a)
++        assert all(0. <= x <= gi.MAX_INTERCEPTOR_GAS + 1e-12 for x in c), (v, a)
++
++  def test_aggressive_bites_harder_on_a_launch(self):
++    # the drive-149 launch case: a strong request at low speed is ceiling-bound; aggressive delivers more pedal
++    assert gi.get_pedal_command(5., 0., AG) == pytest.approx(0.16)
++    assert gi.get_pedal_command(5., 0., RE) == pytest.approx(0.10)
++    assert gi.get_pedal_command(5., 0., ST) == pytest.approx(0.12)
++    assert gi.get_pedal_command(5., 5., AG) == pytest.approx(0.26)
++
++  def test_accel_only_every_personality(self):
++    for p in PERSONALITIES:
++      for v in (0., 5., 11.2, 20., 35.):
++        for a in (-4., -1., -0.5, 0., 0.5, 2., 10.):
++          assert 0. <= gi.get_pedal_command(a, v, p) <= gi.MAX_INTERCEPTOR_GAS
++        assert gi.get_pedal_command(-2., v, p) == 0.
++
++  def test_gain_scaled_on_highway_pull(self):
++    # a sub-ceiling highway request scales by the personality gain: aggressive > standard > relaxed
++    v, a = 25., 0.4
++    assert gi.get_pedal_command(a, v, AG) > gi.get_pedal_command(a, v, ST) > gi.get_pedal_command(a, v, RE)
++
++
++def _get_ci(fingerprint_bus0: dict):
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = dict(fingerprint_bus0)
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}])
++  return CarInterface, CP, CP_SP
++
++
++class TestPersonalityPlumbing:
++  """CC_SP.personality must reach the pedal law through the real CarController -> CarInterface.apply path."""
++
++  def _wire_command(self, personality: int, v_ego: float, accel: float, n: int = 200) -> int:
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **STD})
++    CI = CarInterface(CP, CP_SP)
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = CC.longActive = True
++    CC.actuators.accel = accel
++    CC_SP = structs.CarControlSP()
++    CC_SP.personality = personality
++    t, last_a = 0, None
++    for i in range(n):
++      t += int(DT_CTRL * 1e9)
++      dat = bytearray(6)
++      dat[4] = i & 0xF  # STATE 0, counter
++      dat[5] = crc8_pedal(dat[:5])
++      CI.update([(t, [(STD_ADDR, bytes(dat), 0)])])
++      CI.CS.out.vEgo = v_ego
++      _, sends = CI.apply(CC.as_reader(), CC_SP, t)
++      cmds = [d for a, d, _ in sends if a == gi.STANDARD_IDS.command_addr]
++      if cmds:
++        last_a = _cmd_fields(cmds[-1])[0]
++    return last_a
++
++  def test_personality_reaches_the_law(self):
++    # at 0 m/s the launch ceiling binds a strong request: the wire command must differ by personality
++    c = {p: self._wire_command(p, 0., 5.0) for p in PERSONALITIES}
++    assert c[RE] < c[ST] < c[AG], c
++    # and match the law's ceiling packed to raw counts
++    for p in PERSONALITIES:
++      _, dc, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.get_personality_ceiling(0., p), 0)
++      assert abs(c[p] - ((dc[0] << 8) | dc[1])) <= 2, (p, c)
+-- 
+2.54.0 (Apple Git-157)
+

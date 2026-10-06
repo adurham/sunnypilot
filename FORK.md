@@ -78,10 +78,68 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 41 | ESC 0x27 probe **phase 9 extension -- the 4 remaining offline candidate tokens + raised caps** (amends #40, same fingerprint window): the phase-9 run evaluated 6 candidates (all `7F 27 35`) and stopped at the 12-attempt cap with `algo8_26300`/`lit270100` still on the list (they stay queued via state, no code change). FOUR offline constructions were still NEVER built as tokens, so this closes the whole offline space in ONE parked ignition -- `PHASE9_CANDIDATES` += `algo8w_26300` (`cal_26300(seed[:4])[:2]` x4 = `[00,HI]x4`), `algo8w_27400` (`cal_27400(seed[:4])[:2]` x4), `algo8_27400` (`cal_27400(seed[:4])` x2, the 4-byte key doubled), `algo8w_40000` (`cal_40000(seed[:4])[:2]` x4); the optional `cal_40000` (Securityindex 40000, fixed lookup, 2-byte key) is now ported into `fork/esc_probe_seedkey.py` and registered in `_ALGOS`/`candidates()`. `PHASE9_DEFAULT_CANDIDATES` -> `("algo8_26300","lit270100","algo8w_26300","algo8w_27400","algo8_27400","algo8w_40000")` (the 6 leftovers); caps `PHASE9_MAX_KEY_ATTEMPTS` 12 -> **16**, `PHASE9_MAX_SEEDS` 14 -> **20** (budget stays `RUN_BUDGET_S_PHASE9` 420 s -- 6 slots x ~55 s fits). Guards otherwise unchanged: `27 12` ONLY 8-byte keys pinned EXACTLY to the pinned candidate, ONLY after a POSITIVE same-session `27 11`, only in phase 9; phases 1-8 byte-identical. Tests **204** (+3 net; the default-walk test retargeted 8 -> 6 slots + the new exact-wire-byte tests); mutation **89/89** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py` + `fork/esc_probe_seedkey.py`); phases 1-8 byte-identical |
 | 42 | **FCA11-long param plumbing fix** (amends #31, route 149 finding): the `HyundaiFca11Brake` toggle read ON in the UI but the feature came up **NOT armed** on the road (`carParamsSP.fca11Brake=False` every seg, panda `safetyParam` bit 256 clear, zero 0x38D TX). Two defects: (a) `openpilot/sunnypilot/selfdrive/car/interfaces.py::initialize_params()` never read the key, so it never reached opendbc's `params_dict`; (b) opendbc's arm gate compared `str(raw) == "1"` but `Params.get()` returns a python **bool** for a BOOL key, and `str(True) == "True"`. Fix: read the key with the same `UnknownKeyName` guard as the pedal keys (missing -> OFF), and accept the python bool as well as the raw string `"1"`. Toggle OFF/absent/junk/stale-libparams stays byte-for-byte today's. Patch `0018` (opendbc gate), superproject `initialize_params` + new real-path E2E test `test_fca11_param_plumbing.py`. **No firmware impact** (deployed `00e086b9` stays valid, no reflash) | fix (car plumbing, Python only) | fork-local; amends #31; patch `0018`; NOT on main |
 | 43 | **SCC-Vision entry gate + merge-gate exclusion** (drive 149 "SCC vision still too touchy"): `ForkSCCVision` ENTERING now needs current-lateral corroboration (`current_lat_acc >= VISION_ENTER_CUR_LAT_ACC` = 0.9 m/s^2) or a SUSTAINED high prediction (`max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC` = 1.8 for `VISION_ENTER_PRED_HOLD_S` = 0.4 s), so a predicted-only curvature (pull-away / on-ramp merge) no longer caps accel. AND while a setspeed-ease merge window is open, a predicted-only SCC-V (cur < 0.9) is released to `V_CRUISE_UNSET` so it cannot bind the arbitrated target; a cur-corroborated curve inside the window still binds. `SetSpeedEase.merge_state` evaluates the gate once per tick and `LongitudinalPlannerSP` hands the result to `ForkSmartCruiseControl.update(..., merging=)`; a `scc_vision_supersede` cloudlog event (no capnp change) logs the exclusion edges. Drive-149 offline rlog replay: the 1247.7 on-ramp merge hold (SCC-V bound 3.2 s) and the touchy 676.8 / 685.9 caps are gone; the legit 1222 / 1938-46 / 1997 curves and the SCC-M map gate are unchanged - **offline-replay + unit tested only, NOT road-run; no firmware change** | fix (planner) | fork-local (`fork/scc.py`, `fork/setspeed_ease.py`, `sunnypilot/.../longitudinal_planner.py`) |
+| 44 | **Personality-indexed launch feel** (drive 149 §1): the driver's `LongitudinalPersonality` (cereal `log.LongitudinalPersonality`, 0 = aggressive / 1 = standard / 2 = relaxed) becomes the master lever for driver-felt launch / merge response. New `CarControlSP.personality` (UInt8) capnp field + the opendbc `structs.py` mirror (default STANDARD, so a no-arg `CarControlSP` is never aggressive); `controlsd_ext.state_control_ext` writes it every tick from `selfdriveState.personality` (a not-yet-seen `selfdriveState` falls back to STANDARD, never the capnp `0` = aggressive default) and `LongitudinalPlanner` scales the cruise-candidate ceiling `A_CRUISE_MAX` by it (`PERSONALITY_CRUISE_SCALE`: aggressive 1.15 / standard 1.00 = upstream / relaxed 0.80). opendbc patch `0019`: the Hyundai comma-pedal law scales the launch ceiling (`LOW_SPEED_MAX_GAS_V_OFFSET`: relaxed -0.02/-0.03, standard shipped, aggressive +0.04/+0.06), the cruise-pull gain (`PEDAL_SCALE`) and the hold feedforward (`HOLD_CMD`) by one feel factor per tier (relaxed 0.85 / standard 1.00 / aggressive 1.20, clamped so no raw command exceeds the 0.35 interceptor cap / panda A 1218 / B 612); the upward slew limit is deliberately NOT personality-scaled. STANDARD reproduces the shipped law bit-for-bit, so a drive that never touches the personality button is byte-identical. **COUPLING: the capnp field and the opendbc `structs.py` mirror are a matched pair — `convert_carControlSP` raises a TypeError if only one side ships, so patch `0019` + the superproject change MUST land together.** Python-only, no firmware change (no `opendbc/safety`, no `panda`) | feature (planner + car, Python only) | fork-local; patch `0019`; NOT on main |
+| 45 | **FCA11-long personality-indexed braking strength** (drive 149): the same `LongitudinalPersonality` (via `CarControlSP.personality`, patch `0019`'s channel) now owns the FCA11-long **commanded decel cap**. `fca11_long.py` gains `PERSONALITY_MAX_DEC` (relaxed 12 = 0.12 g / standard 20 = 0.20 g / aggressive 30 = 0.30 g, raw 0.01 g/LSB), `personality_max_dec()` and `clamp_dec_cmd(dec_cmd, personality)`; `Fca11LongBrake.update(..., personality)` indexes the cap and `gas_interceptor.create_gas_command` threads its personality arg into it. Unknown / out-of-range -> STANDARD (the middle, never the strongest); standard's 20 is the new default so a bare / legacy caller gets the middle. **Every tier <= the panda gate `HYUNDAI_FCA11_LONG_MAX_DEC` (30, personality-agnostic) — python-only, no `opendbc/safety` change, deployed firmware `00e086b9` stays valid.** No resume/stop change; toggle-OFF byte-for-byte inert | tune (car, Python only) | fork-local; patch `0020` (follows `0019`); NOT on main |
 
 ---
 
 ## Entries
+
+### personality-launch: personality-indexed launch feel (launch ceiling + A_CRUISE_MAX + interceptor cap) — 2026-10-06 (offline-tested; Python-only, no firmware change; **capnp field + opendbc mirror coupled**)
+
+> **Driver notes:** the personality dial now changes how the car *launches and pulls*, not just the follow gap. Relaxed
+> eases off the line and chases a raised set speed gently; aggressive bites harder and pulls more; standard is exactly
+> what you had before. Nothing changes if you leave it on standard.
+
+- **Why:** drive 149 §1 — personality was aggressive yet every launch sat on the ceiling (`cmd/ceiling` = 1.00 for the
+  first ~3 s) and the cruise candidate was capped at 0.6–0.8 m/s² regardless of the dial, so the feel control did not
+  reach the two levers the driver actually feels.
+- **What:**
+  - `openpilot/cereal/custom.capnp`: new `CarControlSP.personality @5 :UInt8` (raw `log.LongitudinalPersonality`; the
+    capnp primitive default is `0` = aggressive, so the producer always writes it and consumers clamp unknown to
+    standard).
+  - `opendbc` patch `0019`: `opendbc/car/structs.py` `CarControlSP.personality` mirror (default `1` = STANDARD so a
+    no-arg construction is never aggressive); `gas_interceptor.py` `personality_scale()` + the tier tables
+    (`PERSONALITY_SCALE_V` relaxed 0.85 / standard 1.00 / aggressive 1.20, clamped to `MAX_PERSONALITY_SCALE` = 0.35/0.30);
+    `get_personality_ceiling`, `get_pedal_scale`, `get_hold_command`, `get_pedal_command(..., personality)` and
+    `create_gas_command(..., personality)`; `carcontroller.py` passes `CC_SP.personality` through.
+  - `controlsd_ext.py`: `state_control_ext` writes `CC_SP.personality` from `selfdriveState.personality`, falling back
+    to STANDARD when `selfdriveState` has not been seen (so a missing message never reads as the capnp `0` = aggressive).
+  - `longitudinal_planner.py`: `get_max_accel(v_ego, personality)` scales the cruise-candidate ceiling `A_CRUISE_MAX`;
+    `PERSONALITY_CRUISE_SCALE` aggressive 1.15 / standard 1.00 (upstream) / relaxed 0.80; `get_cruise_accel` threads it.
+- **Coupling (integration constraint):** the capnp field (superproject) and the `structs.py` mirror (opendbc `0019`) are a
+  matched pair — `openpilot/selfdrive/car/helpers.py::convert_carControlSP` raises a `TypeError` if the structs mirror
+  is missing the field while the capnp struct carries it. They MUST ship in the same series / branch.
+- **Verification:** `test_personality_launch.py` (capnp round-trip + `convert_carControlSP` + `state_control_ext` live
+  copy + end-to-end `LongitudinalPlanner` ceiling) and the opendbc `test_gas_interceptor_personality.py`; STANDARD ==
+  upstream asserted over a grid. Series rehearsal `0001-0019` clean (see the integration report). Python-only: no
+  `opendbc/safety/*`, no `panda/*`.
+- **Merge note:** fork-local feel feature. NOT pushed, device untouched.
+
+### fca11-strength: FCA11-long personality-indexed braking strength — 2026-10-06 (offline-tested; Python-only, no firmware change)
+
+> **Driver notes:** the personality dial now also sets how firmly the car brakes for the car-ahead in the FCA11-long
+> (non-SCC) path: relaxed is gentler, aggressive is the strongest (the old fixed 0.30 g cap), standard is the middle
+> 0.20 g. No change unless the FCA11 brake feature is enabled and doing its thing.
+
+- **Why:** the feel dial already owned the pedal launch ceiling / `A_CRUISE_MAX` / interceptor cap (patch `0019`); the
+  FCA11-long **commanded decel cap** was the last driver-felt actuation lever still personality-independent.
+- **What (opendbc patch `0020`, follows `0019`):**
+  - `fca11_long.py`: `PERSONALITY_MAX_DEC` (relaxed 12 = 0.12 g / standard 20 = 0.20 g / aggressive 30 = 0.30 g, raw
+    `CR_VSM_DecCmd` 0.01 g/LSB), `personality_max_dec()` (unknown / out-of-range -> STANDARD), `clamp_dec_cmd(dec_cmd,
+    personality)` and `Fca11LongBrake.update(..., personality)` index the cap.
+  - `gas_interceptor.py`: `create_gas_command` threads its personality arg into `fca11_brake.update`.
+- **Safety envelope:** every tier is `<= HYUNDAI_FCA11_LONG_MAX_DEC` (30, the panda gate in `safety/modes/hyundai.h`,
+  which is personality-**agnostic** — it only rejects `> 30`). Indexing the cap python-side is a strict subset of the
+  firmware allow-window: **no `opendbc/safety` / `panda` change, deployed firmware `00e086b9` stays valid, no reflash.**
+  Standard's 20 is the new default so a bare / legacy caller gets the middle, never the strongest. Toggle-OFF is
+  byte-for-byte inert for every personality value.
+- **Verification:** `test_fca11_long.py` `TestPersonalityStrength` (per-tier cap + emitted frame + OFF-inert + fallback +
+  gate invariant) and `test_gas_interceptor.py` wire-path (`test_personality_reaches_gas_command`); two pre-existing
+  personality-independent pins updated to the standard default. Series rehearsal `0001-0020` clean (see the integration
+  report).
+- **Merge note:** fork-local feel feature; patch `0020` consumes `0019`'s `CC_SP.personality` channel. NOT pushed, device
+  untouched.
 
 ### fca11-plumbing: FCA11-long param never armed (initialize_params + bool gate) — 2026-10-06 (offline-tested; Python-only, no firmware change)
 
