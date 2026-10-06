@@ -64,7 +64,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 27 | ESC **0x27 seed probe + no-op 0x2E write** (adds to #24/#26, same fingerprint window): enabled only by `/data/esc-probe-0027/state.json` `{"probe_enabled": true}`, at most once per ignition — read 0x0103, **enter extended session (10 03 — the vendor's own write flow, decoded GIT VariantCodingTable)**, request the 0x27 seed (0x27 sub 0x01 ONLY; sendKey is never sent), then write the just-read bytes straight back to 0x0103 with 0x2E (no-op by construction: the allowed payload MUST equal the step-1 read-back), and re-read. Answers "does the write path need security access at all". **Phase 3 update:** a `phase` key selects 1 (pre-write seed), 2 (vendor-exact, no pre-write seed) or **3 = the discriminating battery** (6-address `27 01` seed sweep across ESC/CLU/TCU/EPS/CAM/CR, default- AND extended-session no-op `2E`, `29 01` auth + `31 01` routine probes, and **exactly ONE** `27 02` identity-key attempt mechanically pinned to the step-2 ESC seed). **Phase 4 update:** `phase: 4` (+ `key_mode` = identity2 (default) / identity4 / identity8 / algo / hex) completes the unlock — extended-session seed -> **ONE** `27 02` sendKey with the RESOLVED candidate key (2/4-byte single frame, 8-byte ISO-TP multi-frame; single-attempt + candidate-pinned in `guard_frame`), and ONLY on `67 02` the no-op `2E` + re-read. Park + standstill only, mux restored in `finally` → `/data/esc-probe-0027/*.json` + `esc_probe_0027` rlog event | diagnostics | fork-local (`fork/esc_probe_0027.py`; **algo-mode update:** `key_mode: "algo"` + optional `algo` = `"27100".."27400"` selects a recovered G-scan CalKeyAlgorithm_* from `fork/esc_probe_seedkey.py`, candidate recorded as `algo`/`key_bytes`, UNVERIFIED vs hardware) |
 | 28 | Hyundai FCA11 rolling test **decel cap 0.10 g → 0.30 g** for the dose-response (scaling) test, **rolling mode only** (bits 64\|128, armed only by the runner); window, 1.2 s clock, latched cut, freshness, camera hand-back, HBA/StopReq block and check_relay unchanged; parked mode keeps 0.10 g; with the bits unset no decel is transmittable — **TEST-GATED, offline-tested only** | safety C (test-mode widening) | fork-local; amends #19/#25; patch `0013`, opendbc branch `fca11-scale-0013` |
 | 29 | **Set-speed easing** (personality-dependent): the planner's cruise candidate chases an eased speed that ramps toward a raised set speed / SLA limit / released SCC target (relaxed 0.55→0.33, standard 0.75→0.40, aggressive 1.2→0.8 m/s per s over 10→29 m/s, leashed to 1.5 s of ramp ahead of vEgo), down immediate, never below vEgo, pass-through while not in control, launches from a stop un-eased. **Merge gate:** un-eased (upstream) while the car is ≥ 15 mph below a highway-class speed (roadType highway/interstate, a map / car speed limit ≥ 55 mph, or a ≥ 55 mph map limit ≤ 500 m ahead — the ahead limit overrides urban; capped at the set speed, 3 mph speed hysteresis + 0.5 s ref-boundary debounce), or, with no map / car limit at all, ≥ 25 mph below a ≥ 55 mph set speed. Car-limit (cluster sign) staleness is known and documented (benign: gate only suppresses easing). Lead (MPC) and e2e candidates untouched — **offline-tested + closed-loop sim only** | feel (planner) | fork-local (`fork/setspeed_ease.py`) |
-| 30 | **Cruise preferences are never deleted when openpilot longitudinal is transiently unavailable**: ExperimentalMode, DynamicExperimentalControl, CustomAccIncrementsEnabled, SmartCruiseControlVision, SmartCruiseControlMap are kept in Params no matter what the current ignition's CarParams say (the pedal interceptor being disarmed used to look exactly like a stock-ACC car and the upstream cleanup paths deleted them permanently). The UI still disables/greys the toggles and shows the STORED value while greyed, and the runtime consumers stay gated on longitudinal being active (verified) — **offline-tested only; no firmware change** | fix (car + UI + selfdrived) | fork-local (`fork/cruise_prefs.py`) |
+| 30 | **Cruise preferences are never deleted when openpilot longitudinal is transiently unavailable**: ExperimentalMode, DynamicExperimentalControl, CustomAccIncrementsEnabled, SmartCruiseControlVision, SmartCruiseControlMap are kept in Params no matter what the current ignition's CarParams say (the pedal interceptor being disarmed used to look exactly like a stock-ACC car and the upstream cleanup paths deleted them permanently). The UI still disables/greys the toggles and shows the STORED value while greyed, and the runtime consumers stay gated on longitudinal being active (verified). Enabling **lateral maneuver mode or joystick debug mode no longer overwrites the stored ExperimentalMode** — experimental mode is suppressed at runtime (`fork/cruise_prefs.experimental_active`) while either is on, so the preference is untouched by those developer toggles — **offline-tested only; no firmware change** | fix (car + UI + selfdrived) | fork-local (`fork/cruise_prefs.py`) |
 
 ---
 
@@ -86,14 +86,25 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   the set-speed buttons silently stepped 1 mph — and SCC vision/map + Experimental mode had to be
   re-toggled by hand.
 - **What:** ``openpilot/sunnypilot/fork/cruise_prefs.py``: ``preserved(key)`` (the five keys),
-  ``remove_unless_preserved(params, key)`` and ``sync_toggle(params, key, item)``. Six upstream-style
-  cleanup sites switch from ``params.remove(key)`` to the guard (one line each): ``selfdrive/car/interfaces.py``
-  ``_cleanup_unsupported_params`` (DEC/CustomAcc/SCC-V/SCC-M), ``selfdrive/ui/sunnypilot/ui_state.py``
-  ``_enforce_constraints`` (ExperimentalMode + DEC, and CustomAcc/SCC-V/SCC-M), ``selfdrive/ui/sunnypilot/
-  layouts/settings/cruise.py`` (disables + shows the stored value; no ``set_state(False)`` clobber),
-  ``selfdrive/selfdrived/selfdrived.py``, ``selfdrive/ui/layouts/settings/toggles.py`` and
-  ``selfdrive/ui/mici/layouts/settings/toggles.py`` (ExperimentalMode). Only the five keys are exempt —
-  every other cleanup (ICBM, AlphaLongitudinalEnabled, NNLC, LateralJerk, angle-steering, BSM) is unchanged.
+  ``remove_unless_preserved(params, key)``, ``sync_toggle(params, key, item)``, and the runtime gates
+  ``maneuver_mode_active(params)`` / ``experimental_active(params, openpilot_longitudinal)``. Six
+  upstream-style cleanup sites switch from ``params.remove(key)`` to the guard (one line each):
+  ``selfdrive/car/interfaces.py`` ``_cleanup_unsupported_params`` (DEC/CustomAcc/SCC-V/SCC-M),
+  ``selfdrive/ui/sunnypilot/ui_state.py`` ``_enforce_constraints`` (ExperimentalMode + DEC, and
+  CustomAcc/SCC-V/SCC-M), ``selfdrive/ui/sunnypilot/layouts/settings/cruise.py`` (disables + shows the
+  stored value; no ``set_state(False)`` clobber), ``selfdrive/selfdrived/selfdrived.py``,
+  ``selfdrive/ui/layouts/settings/toggles.py`` and ``selfdrive/ui/mici/layouts/settings/toggles.py``
+  (ExperimentalMode). Only the five keys are exempt — every other cleanup (ICBM,
+  AlphaLongitudinalEnabled, NNLC, LateralJerk, angle-steering, BSM) is unchanged.
+- **Developer toggles no longer wipe ExperimentalMode:** enabling lateral maneuver mode previously
+  wrote ``put_bool("ExperimentalMode", False)`` in both developer layouts (Qt ``selfdrive/ui/layouts/
+  settings/developer.py`` and mici ``selfdrive/ui/mici/layouts/settings/developer.py``), permanently
+  clobbering one of the five preserved keys from a path unrelated to longitudinal availability. Those
+  two writes are gone; lateral maneuver mode and joystick debug mode now force experimental OFF at
+  runtime instead (``experimental_active`` = stored param + longitudinal available + no maneuver mode),
+  so toggling either on and off leaves the stored preference exactly as the owner set it. The mici
+  ExperimentalMode button is greyed (matching the Qt path) rather than hidden, and still shows the
+  stored value.
 - **Consumers stay gated (why keeping the value is safe while unavailable):** DEC/experimental mode act
   only when ``selfdriveState.experimentalMode`` is set, which card/selfdrived compute as
   ``param and CP.openpilotLongitudinalControl``; SCC-V/SCC-M targets are only arbitrated when

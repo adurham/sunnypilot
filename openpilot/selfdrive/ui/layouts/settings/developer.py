@@ -182,7 +182,9 @@ class DeveloperLayout(Widget):
 
   def _on_lat_maneuver_mode(self, state: bool):
     self._params.put_bool("LateralManeuverMode", state, block=True)
-    self._params.put_bool("ExperimentalMode", False, block=True)
+    # fork #30: do NOT overwrite the owner's stored ExperimentalMode here. While this mode is on,
+    # experimental mode is suppressed at runtime (fork/cruise_prefs.experimental_active, consumed by
+    # card/selfdrived), so the stored preference survives toggling this on and off.
     self._params.put_bool("JoystickDebugMode", False, block=True)
     self._joystick_toggle.action_item.set_state(False)
     self._params.put_bool("LongitudinalManeuverMode", False, block=True)

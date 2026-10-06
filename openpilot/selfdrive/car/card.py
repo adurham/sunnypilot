@@ -24,6 +24,7 @@ from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_cap
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.fork.cruise_prefs import experimental_active
 from openpilot.sunnypilot.fork.esc_diag import run_from_card as run_esc_diag_from_card
 from openpilot.sunnypilot.fork.esc_probe_0027 import run_from_card as run_esc_probe_0027_from_card
 
@@ -188,7 +189,9 @@ class Car:
     self.v_cruise_helper = VCruiseHelper(self.CP, self.CP_SP)
 
     self.is_metric = self.params.get_bool("IsMetric")
-    self.experimental_mode = self.params.get_bool("ExperimentalMode")
+    # fork #30: the runtime gate, not the raw param — a developer maneuver mode suppresses
+    # experimental mode without touching the owner's stored preference.
+    self.experimental_mode = experimental_active(self.params, self.CP.openpilotLongitudinalControl)
 
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
@@ -309,10 +312,13 @@ class Car:
   def params_thread(self, evt):
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
-      self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      self.experimental_mode = experimental_active(self.params, self.CP.openpilotLongitudinalControl)
 
       # sunnypilot
-      self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")
+      # fork #30: gate DEC on longitudinal too (symmetric with selfdrived); DEC's own active() gate
+      # already requires selfdriveState.experimentalMode, so this cannot change behaviour when long
+      # IS available, it only keeps the exposed flag consistent while long is unavailable.
+      self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl") and self.CP.openpilotLongitudinalControl
       self.v_cruise_helper.read_custom_set_speed_params()
 
       time.sleep(0.1)

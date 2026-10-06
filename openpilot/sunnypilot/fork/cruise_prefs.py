@@ -86,3 +86,33 @@ def sync_toggle(params, key: str, item) -> None:
   what is actually stored.
   """
   item.action_item.set_state(params.get_bool(key))
+
+
+def maneuver_mode_active(params) -> bool:
+  """True while a developer maneuver/debug mode that must suppress experimental mode is on.
+
+  Lateral maneuver mode (controlsd still runs and steers) and joystick debug mode (controlsd does
+  not run at all) both need experimental mode OFF at runtime. Upstream enforced this by overwriting
+  the stored ``ExperimentalMode`` param from the developer UI; this fork suppresses experimental
+  mode in the consumer instead (``experimental_active``), so the owner's stored preference is never
+  destroyed by flipping those toggles.
+
+  Scope note: LongitudinalManeuverMode is deliberately NOT here — the original developer write only
+  existed in the lateral-maneuver callback, and under longitudinal maneuver mode plannerd (which
+  owns DEC/e2e) does not run at all, so experimental mode is already moot.
+  """
+  return params.get_bool("LateralManeuverMode") or params.get_bool("JoystickDebugMode")
+
+
+def experimental_active(params, openpilot_longitudinal: bool) -> bool:
+  """The runtime experimental-mode state (what card/selfdrived publish as selfdriveState.experimentalMode).
+
+  The stored preference, with two overrides applied:
+
+  * ``openpilot_longitudinal`` must be True — the pre-existing gate (a stock-ACC car ignores the
+    stored ExperimentalMode even though this fork keeps the param around); and
+  * a developer maneuver mode (lateral maneuver mode / joystick debug mode) forces experimental OFF
+    while it is active, WITHOUT touching the stored preference — so toggling the mode on and off
+    leaves the owner's ExperimentalMode exactly as he set it.
+  """
+  return params.get_bool("ExperimentalMode") and openpilot_longitudinal and not maneuver_mode_active(params)

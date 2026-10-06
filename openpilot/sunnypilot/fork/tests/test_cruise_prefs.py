@@ -162,11 +162,25 @@ class TestUpstreamGatePins(OpenpilotTestCase):
     src = self._src("openpilot.selfdrive.controls.controlsd")
     self.assertIn("self.CP.openpilotLongitudinalControl or not self.CP_SP.pcmCruiseSpeed", src)
 
-  def test_card_and_selfdrived_gate_experimental_mode_on_longitudinal(self):
+  def test_card_and_selfdrived_use_the_runtime_gate(self):
+    # both card sites (init + params_thread) and selfdrived publish the gated value, never the raw
+    # param; the gate carries the longitudinal condition and (fork #30) the maneuver-mode override.
     card = self._src("openpilot.selfdrive.car.card")
     sd = self._src("openpilot.selfdrive.selfdrived.selfdrived")
-    self.assertIn('self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl', card)
-    self.assertIn('self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl', sd)
+    gate = "experimental_active(self.params, self.CP.openpilotLongitudinalControl)"
+    self.assertGreaterEqual(card.count(gate), 2, "card init and params_thread must both use the gate")
+    self.assertIn(gate, sd)
+    self.assertNotIn('self.experimental_mode = self.params.get_bool("ExperimentalMode")', card)
+    self.assertNotIn('self.experimental_mode = self.params.get_bool("ExperimentalMode")', sd)
+    # should-fix 2: the DEC flag exposed by card is gated on longitudinal too
+    dec_read = 'self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")'
+    self.assertIn(f"{dec_read} and self.CP.openpilotLongitudinalControl", card)
+
+  def test_developer_layouts_no_longer_write_experimental_mode(self):
+    # the two unguarded overwrite sites the review flagged must be gone (both UIs)
+    for mod_path in ("openpilot.selfdrive.ui.layouts.settings.developer",
+                     "openpilot.selfdrive.ui.mici.layouts.settings.developer"):
+      self.assertNotIn('put_bool("ExperimentalMode"', self._src(mod_path), mod_path)
 
   def test_cruise_custom_increments_only_in_the_non_pcm_path(self):
     src = self._src("openpilot.selfdrive.car.cruise")
@@ -287,7 +301,7 @@ class TestUiShowsStoredValue(OpenpilotTestCase):
     self.assertFalse(layout._toggles["ExperimentalMode"].action_item.enabled)
     self.assertTrue(p.get_bool("ExperimentalMode"))
 
-  def test_mici_toggle_shows_stored_experimental_mode(self):
+  def test_mici_toggle_greyed_shows_stored_experimental_mode(self):
     from openpilot.common.params import Params
     p = Params()
     store_all(p)
@@ -296,10 +310,24 @@ class TestUiShowsStoredValue(OpenpilotTestCase):
     mod.ui_state.has_longitudinal_control = False
     layout = mod.TogglesLayoutMici()
     layout._update_toggles()
-    self.assertTrue(layout._experimental_btn._checked)
+    # should-fix 1: greyed (visible, not interactive), not hidden — matching the Qt path
+    self.assertTrue(layout._experimental_btn.is_visible)
+    self.assertFalse(layout._experimental_btn.enabled)
+    self.assertTrue(layout._experimental_btn._checked)                    # shows the STORED value
     self.assertEqual(layout._experimental_btn._checked, p.get_bool("ExperimentalMode"))
-    self.assertFalse(layout._experimental_btn.is_visible)
     self.assertTrue(p.get_bool("ExperimentalMode"))
+
+  def test_mici_toggle_enabled_when_longitudinal_available(self):
+    from openpilot.common.params import Params
+    p = Params()
+    store_all(p)
+    mod, ui = self._import_with_fake("openpilot.selfdrive.ui.mici.layouts.settings.toggles", p, has_long=True)
+    mod.ui_state.CP = ui.CP
+    mod.ui_state.has_longitudinal_control = True
+    layout = mod.TogglesLayoutMici()
+    layout._update_toggles()
+    self.assertTrue(layout._experimental_btn.is_visible)
+    self.assertTrue(layout._experimental_btn.enabled)
 
 
 # --- runtime consumers stay inert while long is unavailable ------------------------------------------
@@ -396,3 +424,90 @@ class TestConsumersInert(OpenpilotTestCase):
     helper.update_v_cruise(CS, enabled=True, is_metric=False)
     # PCM-car path: set speed mirrors the stock ACC, the custom increment never applies
     self.assertAlmostEqual(helper.v_cruise_kph, 50, delta=0.2)
+
+
+# --- developer maneuver toggles must not overwrite the stored ExperimentalMode (fork #30) -------------
+
+class TestManeuverTogglePreservesExperimentalMode(OpenpilotTestCase):
+  """Flipping Lateral Maneuver Mode / Joystick Debug Mode must not touch the stored ExperimentalMode;
+  experimental is instead forced OFF at runtime while either mode is active."""
+
+  def setUp(self):
+    from openpilot.common.params import Params
+    self.p = Params()
+    # a distinctive stored state: experimental ON, both maneuver modes OFF
+    self.p.put_bool("ExperimentalMode", True, block=True)
+    self.p.put_bool("LateralManeuverMode", False, block=True)
+    self.p.put_bool("JoystickDebugMode", False, block=True)
+    if _load_fonts() is None:
+      self.skipTest("raylib fonts unavailable headless")
+
+  def _developer_layout(self, mod_name):
+    # the REAL layout object + REAL callbacks; the Params() it owns is the same on-disk store
+    return importlib.import_module(mod_name)
+
+  def test_runtime_gate_forces_experimental_off_during_maneuver_modes(self):
+    from openpilot.sunnypilot.fork.cruise_prefs import experimental_active, maneuver_mode_active
+    P = self.p
+    self.assertTrue(experimental_active(P, True))            # stored ON + long, no maneuver mode
+    for key in ("LateralManeuverMode", "JoystickDebugMode"):
+      P.put_bool(key, True, block=True)
+      self.assertTrue(maneuver_mode_active(P), key)
+      self.assertFalse(experimental_active(P, True), key)    # runtime experimental OFF while active
+      self.assertTrue(P.get_bool("ExperimentalMode"), key)   # ... but the stored pref survives
+      P.put_bool(key, False, block=True)
+      self.assertFalse(maneuver_mode_active(P), key)
+      self.assertTrue(experimental_active(P, True), key)     # live again, untouched
+    # the longitudinal gate still wins (stock-ACC car ignores the stored value)
+    P.put_bool("ExperimentalMode", True, block=True)
+    self.assertFalse(experimental_active(P, False))
+    # ... and a stored OFF stays off
+    P.put_bool("ExperimentalMode", False, block=True)
+    self.assertFalse(experimental_active(P, True))
+
+  def test_qt_developer_callbacks_preserve_stored_experimental_mode(self):
+    layout = self._developer_layout("openpilot.selfdrive.ui.layouts.settings.developer").DeveloperLayout()
+    stored = self.p.get_bool("ExperimentalMode")
+    layout._on_lat_maneuver_mode(True)
+    self.assertTrue(self.p.get_bool("LateralManeuverMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_lat_maneuver_mode(False)
+    self.assertFalse(self.p.get_bool("LateralManeuverMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_joystick_debug_mode(True)
+    self.assertTrue(self.p.get_bool("JoystickDebugMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_joystick_debug_mode(False)
+    self.assertFalse(self.p.get_bool("JoystickDebugMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+
+  def test_mici_developer_callbacks_preserve_stored_experimental_mode(self):
+    import openpilot.selfdrive.ui.mici.layouts.settings.developer as dm
+    # the mici layout uses the module-global ui_state.params; OpenpilotPrefix gives every test its
+    # own PARAMS_ROOT, so pin that global to this test's store for the duration (and restore it).
+    old_params = dm.ui_state.params
+    dm.ui_state.params = self.p
+    self.addCleanup(lambda: setattr(dm.ui_state, "params", old_params))
+    layout = dm.DeveloperLayoutMici()
+    stored = self.p.get_bool("ExperimentalMode")
+    layout._on_lat_maneuver_mode(True)
+    self.assertTrue(self.p.get_bool("LateralManeuverMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_lat_maneuver_mode(False)
+    self.assertFalse(self.p.get_bool("LateralManeuverMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_joystick_debug_mode(True)
+    self.assertTrue(self.p.get_bool("JoystickDebugMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+    layout._on_joystick_debug_mode(False)
+    self.assertFalse(self.p.get_bool("JoystickDebugMode"))
+    self.assertEqual(self.p.get_bool("ExperimentalMode"), stored)
+
+  def test_deleting_the_write_did_not_drop_the_neighbouring_toggles(self):
+    layout = self._developer_layout("openpilot.selfdrive.ui.layouts.settings.developer").DeveloperLayout()
+    self.p.put_bool("JoystickDebugMode", True, block=True)
+    self.p.put_bool("LongitudinalManeuverMode", True, block=True)
+    layout._on_lat_maneuver_mode(True)
+    self.assertTrue(self.p.get_bool("LateralManeuverMode"))
+    self.assertFalse(self.p.get_bool("JoystickDebugMode"))         # mutual exclusion intact
+    self.assertFalse(self.p.get_bool("LongitudinalManeuverMode"))

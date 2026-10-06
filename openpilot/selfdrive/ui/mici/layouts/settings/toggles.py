@@ -104,11 +104,14 @@ class TogglesLayoutMici(NavScroller):
     if ui_state.CP is not None:
       if ui_state.has_longitudinal_control:
         self._experimental_btn.set_visible(True)
+        self._experimental_btn.set_enabled(True)
         self._personality_toggle.set_visible(True)
+        self._personality_toggle.set_enabled(True)
       else:
-        # no long for now
-        self._experimental_btn.set_visible(False)
-        self._personality_toggle.set_visible(False)
+        # no long for now: grey the button (not hide it) and keep showing the STORED value, so the
+        # screen matches Qt and the owner can still see what he saved (fork #30).
+        self._experimental_btn.set_enabled(False)
+        self._personality_toggle.set_enabled(False)
         remove_unless_preserved(ui_state.params, "ExperimentalMode")
 
     # Refresh toggles from params to mirror external changes
