@@ -10,6 +10,7 @@ from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -89,11 +90,13 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     params.remove("IntelligentCruiseButtonManagement")
 
   if not CP.openpilotLongitudinalControl and CP_SP.pcmCruiseSpeed:
+    # fork #30: these are the owner's stored cruise preferences. Keep them when longitudinal is
+    # only transiently unavailable (pedal interceptor disarmed for an ignition); the consumers
+    # are already gated on longitudinal being active, so nothing reads them while unavailable.
     cloudlog.warning("openpilot Longitudinal Control and ICBM not available, cleaning up params")
-    params.remove("DynamicExperimentalControl")
-    params.remove("CustomAccIncrementsEnabled")
-    params.remove("SmartCruiseControlVision")
-    params.remove("SmartCruiseControlMap")
+    for key in ("DynamicExperimentalControl", "CustomAccIncrementsEnabled",
+                "SmartCruiseControlVision", "SmartCruiseControlMap"):
+      remove_unless_preserved(params, key)
 
   set_speed_limit_assist_availability(CP, CP_SP, params)
 

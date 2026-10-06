@@ -28,6 +28,7 @@ from openpilot.common.hardware import HARDWARE
 
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
@@ -124,7 +125,10 @@ class SelfdriveD(CruiseHelper):
     if not self.CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
     if not self.CP.openpilotLongitudinalControl:
-      self.params.remove("ExperimentalMode")
+      # fork #30: this is the owner's stored ExperimentalMode. Keep it when longitudinal is only
+      # transiently unavailable; selfdrived gates the runtime use on openpilotLongitudinalControl
+      # (see params_thread), so it stays inert while unavailable.
+      remove_unless_preserved(self.params, "ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
