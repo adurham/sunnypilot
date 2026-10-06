@@ -58,6 +58,11 @@ class CarSpecificEventsSP:
         if CS.cruiseState.nonAdaptive:
           events_sp.add(EventNameSP.pedalFactoryCruiseLockout)
 
+        # fork: FCA11 braking (Beta) — WARNING-only hand-over as the car falls toward the 12 km/h comfort-braking floor
+        # (the controller stops asking at the floor; panda backs that at 9). The driver takes the stop, as always.
+        if self.CP_SP.fca11Brake and long_active and not CS.brakePressed and CS.vEgo * 3.6 <= 14.:
+          events_sp.add(EventNameSP.fca11BrakeLowSpeed)
+
     elif self.CP.brand == 'toyota':
       if self.CP.openpilotLongitudinalControl:
         if CS.cruiseState.standstill and not CS.brakePressed and self.CP_SP.enableGasInterceptor:

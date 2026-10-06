@@ -259,6 +259,13 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("Factory Cruise Armed: openpilot Long Off", "Press the CC button to turn it off"),
   },
 
+  # fork: Hyundai FCA11 braking below the comfort-braking floor while a lead is still closing — a WARNING only (openpilot
+  # keeps long engaged and hands the stop to the driver, as it always has below the floor): the driver must brake.
+  EventNameSP.fca11BrakeLowSpeed: {
+    ET.WARNING: Alert("FCA11: Take Over Below 12 km/h", "sunnypilot braking ends: press the brake for the stop", AlertStatus.normal,
+                      AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
   EventNameSP.bigModelReady: {
     ET.PERMANENT: Alert(
       "Big Model Ready",

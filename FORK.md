@@ -65,6 +65,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 28 | Hyundai FCA11 rolling test **decel cap 0.10 g → 0.30 g** for the dose-response (scaling) test, **rolling mode only** (bits 64\|128, armed only by the runner); window, 1.2 s clock, latched cut, freshness, camera hand-back, HBA/StopReq block and check_relay unchanged; parked mode keeps 0.10 g; with the bits unset no decel is transmittable — **TEST-GATED, offline-tested only** | safety C (test-mode widening) | fork-local; amends #19/#25; patch `0013`, opendbc branch `fca11-scale-0013` |
 | 29 | **Set-speed easing** (personality-dependent): the planner's cruise candidate chases an eased speed that ramps toward a raised set speed / SLA limit / released SCC target (relaxed 0.55→0.33, standard 0.75→0.40, aggressive 1.2→0.8 m/s per s over 10→29 m/s, leashed to 1.5 s of ramp ahead of vEgo), down immediate, never below vEgo, pass-through while not in control, launches from a stop un-eased. **Merge gate:** un-eased (upstream) while the car is ≥ 15 mph below a highway-class speed (roadType highway/interstate, a map / car speed limit ≥ 55 mph, or a ≥ 55 mph map limit ≤ 500 m ahead — the ahead limit overrides urban; capped at the set speed, 3 mph speed hysteresis + 0.5 s ref-boundary debounce), or, with no map / car limit at all, ≥ 25 mph below a ≥ 55 mph set speed. Car-limit (cluster sign) staleness is known and documented (benign: gate only suppresses easing). Lead (MPC) and e2e candidates untouched — **offline-tested + closed-loop sim only** | feel (planner) | fork-local (`fork/setspeed_ease.py`) |
 | 30 | **Cruise preferences are never deleted when openpilot longitudinal is transiently unavailable**: ExperimentalMode, DynamicExperimentalControl, CustomAccIncrementsEnabled, SmartCruiseControlVision, SmartCruiseControlMap are kept in Params no matter what the current ignition's CarParams say (the pedal interceptor being disarmed used to look exactly like a stock-ACC car and the upstream cleanup paths deleted them permanently). The UI still disables/greys the toggles and shows the STORED value while greyed, and the runtime consumers stay gated on longitudinal being active (verified). Enabling **lateral maneuver mode or joystick debug mode no longer overwrites the stored ExperimentalMode** — experimental mode is suppressed at runtime (`fork/cruise_prefs.experimental_active`) while either is on, so the preference is untouched by those developer toggles — **offline-tested only; no firmware change** | fix (car + UI + selfdrived) | fork-local (`fork/cruise_prefs.py`) |
+| 31 | Hyundai **FCA11 LONGITUDINAL braking** — production (toggle-gated) FCA11 (0x38D) decel through the ESC **on top of the comma pedal**, openpilot ENGAGED. Param `HyundaiFca11Brake` **default OFF**; when ON (and the pedal armed) the card sets panda bit 256 `FCA11_LONG` and `CP_SP.fca11Brake`. The car layer mirrors the freshest bus-2 camera 0x38D byte-for-byte and overrides ONLY the brake fields, hard-zeroing gas while braking; panda independently polices: `controls_allowed` AND `heartbeat_engaged`, gear D, no pedal, every wheel > 9 km/h (no ceiling), inputs fresh ≤ 100 ms, `CR_VSM_DecCmd` ≤ 30 (0.30 g), growth ≤ 0.04 g/camera period, a 2.5 s actuation budget + 3 s cooldown, latched cut on driver brake/gas/gear≠D/pedal fault, and same-frame camera hand-back. No auto-resume after a cut. **Toggle OFF = byte-for-byte today's pedal-only behavior.** NOT FOR ROAD USE until reviewed + the drive-mode gate (open risk R1) — **offline-tested only (safety + car unit + firmware)** | feature (safety C + car + planner limits + selfdrived alert + UI) | fork-local; patch `0014`, opendbc branch `fca11-long` (08adce5c), firmware `67c1f99e`; NOT on main |
 
 ---
 
@@ -125,6 +126,51 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Merge note:** intentionally fork-local (``fork/`` only; the six edits are one-line each). No firmware
   build. The underlying behaviour is a reasonable upstream-PR candidate (transient capability loss should
   not destroy persisted settings), but as a fork guard it needs no capnp/schema change.
+
+### fca11-long: production FCA11 longitudinal braking (toggle-gated, default OFF) — 2026-10-06 (offline-tested; one firmware build; NOT road-run)
+
+> **Driver notes (only when `HyundaiFca11Brake` is turned ON).** sunnypilot can add light braking (up to ~0.30 g,
+> comfortable ACC strength, about a third of a hard stop) on top of the comma pedal by sending the car's own FCA11
+> forward-collision message, so it no longer only lifts off for a lead — it can actually slow for one. The dash shows
+> the car's collision-braking notification while it brakes (no chime at these levels). It hands the stop back to the
+> driver below 12 km/h and at every standstill: **you still brake for the stop.** It only adds braking when openpilot
+> long is engaged (the pedal on) and never fights you — your brake or gas cancels it immediately, and after any cancel
+> it stays off until you deliberately pause/resume. **Default OFF; keep it off until reviewed for your car.**
+
+- **Why:** the on-car scaling run `roll-20261005T232357Z` proved the FCA11 variant-B shape (Prefill=1, Warn=3,
+> `CR_VSM_DecCmd`=g×100, `FCA_CmdAct`=1, `DecCmdAct`=0) brakes this car through the ESC (0.74 / 1.28 / 2.03 m/s² for
+> 0.10 / 0.20 / 0.30 g, ≈ ⅔ linear; nothing below ~8-10 km/h). This turns that research path into a production,
+> toggle-gated actuator while keeping the pedal-only car byte-for-byte unchanged when the toggle is OFF.
+- **What (opendbc branch `fca11-long`, patched by `0014-hyundai-fca11-long-brake.patch`:**
+  - `opendbc/sunnypilot/car/hyundai/fca11_long.py`: `Fca11LongBrake` (window/onset/gain/rate/mirror) +
+    `build_fca11_frame` (byte-exact camera mirror: overrides ONLY Prefill, Warn, `CR_VSM_DecCmd`, `Fca_CmdAct`,
+    `CF_VSM_DecCmdAct`, alive+1, CRC; every other byte copied, incl. the always-1 undefined byte4 bit7) +
+    `camera_requesting` (hand-back detect).
+  - `gas_interceptor.py`: `create_gas_command` calls the brake first and **hard-zeroes gas while braking**.
+  - `carstate_ext.py` / `carstate.py`: CS inputs (`fca11_cam_frame` from a raw-frame-capturing bus-2 `CANParser`,
+    `fca11_now_nanos`, `interceptor_state`); `CANParser.capture_addrs/captured` (opt-in, zero cost when off).
+  - `interface.py` (Hyundai): `get_pid_accel_limits` override — brake authority to −2.0 m/s² above 12 km/h, coast-only
+    below; `interfaces.py`: `_initialize_hyundai_gas_interceptor` arms `CP_SP.fca11Brake` + safety bit **256** from the
+    `HyundaiFca11Brake` param (defensive: any non-`"1"` value, missing/stale key → OFF).
+  - `structs.py` + `custom.capnp`: `CarParamsSP.fca11Brake @6`; `params_keys.h`: `HyundaiFca11Brake` BOOL `"0"`.
+  - `sunnypilot/selfdrive/car/car_specific.py` + `selfdrived/events.py` + `camera/custom.capnp`: WARNING-only
+    `fca11BrakeLowSpeed` hand-over alert below 14 km/h while long is engaged; UI toggle in the Hyundai vehicle settings.
+  - panda `safety/modes/hyundai.h` (`hyundai_fca11_long_*`) + `hyundai_common.h` (bit 256): the full gate/window/cap/
+    rate/budget/cooldown/cut/camera-hand-back above; `check_relay`/HBA/StopReq/DecCmdAct unchanged; legacy + CAN-FD
+    force the bit off.
+- **Verification (this pickup, 2026-10-06):** safety suite **4439 passed / 780 skipped / 0 failed** (new
+  `TestHyundaiFca11LongSafety` class: **289 passed / 16 skipped**; unchanged counts for the frozen test modes); car
+  layer `test_fca11_long.py` **23 passed**, `test_gas_interceptor.py` **135 passed**. Firmware mutations 19/19
+  non-equivalent killed + 1 equivalent (argued in the script). Closed-loop sim: see `fca11-long-integration.md` §4.
+  MISRA cppcheck **rc 0**. Firmware rebuilt from a clean export **and** the CI-path tree (pristine f95f996f + 0001-0014,
+  rehearsal tree matches the branch tree `bae30226`): sha256 **`67c1f99e1f85da9a43d3000efb194e3aa718fdd0a1e68663a4a1caf4132dd190`**
+  (113820 B, `DEV-74a0adce-DEBUG`); controls reproduce the deployed `d0f5396c` and `65d3692f`.
+- **Gotchas documented in code:** the window's gas-freshness input is **EMS16 (0x260)**, not the pedal sensor; the
+  cooldown must not fire from a fresh arm (guard `ts_act_end != 0`); the panda gates **all** 0x38D on
+  `controls_allowed`+heartbeat (there is no passive carrier we send — the camera supplies idle frames). `fca11Brake` has
+  zero C++ consumers today; the overlay CI regenerates capnp on the schema change.
+- **Merge note:** fork-local; NOT for the car until the independent review + the drive-mode gate (open risk R1 in
+  `fca11-long-integration.md`) — the feature does not yet enforce "OP long only in Eco/Normal/Sport".
 
 ### setspeed-ease: personality-dependent easing toward a raised set speed — 2026-10-05 (offline-tested + closed-loop sim; NOT road-run; no firmware change)
 

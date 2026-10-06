@@ -356,6 +356,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     bigModelReady @25;
     pedalFactoryCruiseLockout @26;  # fork: Hyundai gas interceptor, factory cruise MAIN armed (alert only)
     pedalBelowEngageSpeed @27;  # fork: Hyundai gas interceptor, SET/RES below minEnableSpeed refused (alert only)
+    fca11BrakeLowSpeed @28;  # fork: Hyundai FCA11 braking, below floor+margin while a lead closes, driver takes over
   }
 }
 
@@ -365,6 +366,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pcmCruiseSpeed @3 :Bool;
   intelligentCruiseButtonManagementAvailable @4 :Bool;
   enableGasInterceptor @5 :Bool;
+  fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
