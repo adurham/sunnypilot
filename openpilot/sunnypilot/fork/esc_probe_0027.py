@@ -99,8 +99,10 @@ the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
   3. ``27 01`` requestSeed IN EXTENDED. REQUIRES a positive ``67 01`` with >=2 seed bytes; otherwise abort (recorded);
   4. wait ~500 ms (the vendor ``delaytime``);
   5. resolve the candidate key bytes from the seed: ``identity2`` = seed[:2], ``identity4`` = seed[:4], ``identity8`` =
-     the whole seed, ``algo`` = ``openpilot.sunnypilot.fork.esc_probe_seedkey.key_for(seed)`` (a missing/failing module
-     aborts, recorded), ``hex`` = ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible;
+     the whole seed, ``algo`` = ``openpilot.sunnypilot.fork.esc_probe_seedkey.key_for(seed, state["algo"])`` (the
+     recovered G-scan CalKeyAlgorithm_* family, selectable by Securityindex 27100..27400; a missing/failing module, an
+     unknown ``algo``, or a zero-byte seed that the vendor path bails on aborts, recorded), ``hex`` =
+     ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible;
   6. send ``27 02`` ONCE: 2-byte key -> ``04 27 02 K1 K2``; 4-byte -> ``06 27 02 K1..K4``; 8-byte -> the ISO-TP
      multi-frame ``10 0A 27 02 K1..K4`` + one consecutive frame ``21 K5..K8`` (the phase-3 machinery);
   7. on ``67 02``: the no-op ``2E 0103 <readback>`` (the SAME readback guard as always) then a re-read — the payoff.
@@ -110,6 +112,12 @@ The key_mode is the ``key_mode`` state key (default ``identity2`` when absent). 
 ONLY when ``phase == 4``, ONLY as the first key of the run (the same counter phase 3 uses), and ONLY when its key bytes
 equal the RESOLVED candidate (``guard_frame`` takes the resolved bytes and re-checks them at the single TX site). Phase 3
 keeps its own identity-key path unchanged. A malformed ``key_mode`` is inert (``skip: unknown key_mode``).
+
+In ``algo`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
+``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
+The resolved candidate hex is recorded as ``key_bytes`` (and the selector as ``algo``) in the result JSON and the
+summary/cloudlog, BEFORE the ``27 02`` is sent, so a refused/silent key is still fully attributable. Every recovered
+output is UNVERIFIED against hardware (no ground-truth seed->key pair exists); a wrong key is expected to draw NRC 0x35.
 
 Safety, mechanically enforced here (tests: fork/tests/test_esc_probe_0027.py, mutation-proven)
 ----------------------------------------------------------------------------------------------
@@ -319,12 +327,14 @@ def parse_read_did(resp_hex: str | None, did: int) -> bytes | None:
   return None
 
 
-def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None) -> bytes:
+def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: str | None = None) -> bytes:
   """Phase 4 step 5: derive the candidate key bytes from the step-3 seed (2, 4 or 8 bytes only).
 
   identity2 = the seed's first 2 bytes; identity4 = first 4; identity8 = the whole seed; algo = the separate
-  ``esc_probe_seedkey`` module's ``key_for(seed)``; hex = the operator-supplied ``key_hex``. A missing/failing algo
-  module, an unparseable hex string, or any length other than 2/4/8 aborts the run (recorded).
+  ``esc_probe_seedkey`` module's ``key_for(seed, algo)`` (``algo`` names a recovered G-scan algorithm, None -> its
+  vendor-exact 27100 default); hex = the operator-supplied ``key_hex``. A missing/failing algo module, an unknown algo
+  name, a zero-byte seed the vendor path bails on (``key_for`` -> None), an unparseable hex string, or any length other
+  than 2/4/8 aborts the run (recorded).
   """
   if key_mode == "identity2":
     key = bytes(seed)[:2]
@@ -335,9 +345,12 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None) -> bytes
   elif key_mode == "algo":
     try:
       import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
-      key = bytes(sk.key_for(bytes(seed)))
-    except Exception as e:  # missing module, import error, or the algorithm raising -> recorded abort
+      resolved = sk.key_for(bytes(seed), algo)          # None = the vendor zero-byte bail, not an error
+    except Exception as e:  # missing module, import error, unknown algo, or the algorithm raising -> recorded abort
       raise Abort(f"algo module missing/failed: {e!r}") from e
+    if resolved is None:
+      raise Abort("algo returned no key for this seed (zero-byte bail)")
+    key = bytes(resolved)
   elif key_mode == "hex":
     try:
       key = bytes.fromhex((key_hex or "").strip())
@@ -847,8 +860,11 @@ def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, curre
   # ---- 5. resolve the candidate key bytes from the seed -----------------------------------------------------------
   key_mode = state.get("key_mode") or "identity2"
   doc["key_mode"] = key_mode
-  key = resolve_key(pos_seed, key_mode, state.get("key_hex"))   # Abort (recorded) on bad mode/hex/algo/length
+  algo = state.get("algo") if key_mode == "algo" else None            # optional selector (None -> key_for's default)
+  key = resolve_key(pos_seed, key_mode, state.get("key_hex"), algo)   # Abort (recorded) on bad mode/hex/algo/length/None
+  doc["algo"] = algo
   doc["key"] = key.hex()
+  doc["key_bytes"] = key.hex()          # the computed candidate hex, recorded BEFORE the 27 02 reaches the bus
   doc["key_attempted"] = True
 
   # ---- 6. send 27 02 ONCE, with EXACTLY those bytes ---------------------------------------------------------------
@@ -950,7 +966,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
               "unlock_session": None, "write_unlocked": None, "reread_unlocked": None, "key_note": None,
               # phase-4 only
               "key_mode": None, "key_result": None, "key_frames": None, "key_positive": None, "key_nrc": None,
-              "reread_unlocked_value": None}
+              "algo": None, "key_bytes": None, "reread_unlocked_value": None}
   for fw in car_fw or []:
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
@@ -1107,6 +1123,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
                              for r in (doc["seed_sweep"] or [])],
                  key_attempted=doc["key_attempted"], key=doc["key"], unlocked=doc["unlocked"],
                  key_nrc=doc.get("key_nrc"), key_note=doc["key_note"], key_mode=doc.get("key_mode"),
+                 algo=doc.get("algo"), key_bytes=doc.get("key_bytes"),
                  write_unlocked_nrc=(doc["write_unlocked"] or {}).get("nrc"),
                  write_unlocked_positive=bool((doc["write_unlocked"] or {}).get("positive")),
                  reread_unlocked_value=doc.get("reread_unlocked_value"))

@@ -19,6 +19,7 @@ from opendbc.car.can_definitions import CanData
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.fork import esc_diag as D
 from openpilot.sunnypilot.fork import esc_probe_0027 as E
+from openpilot.sunnypilot.fork import esc_probe_seedkey as SK
 
 CURRENT = b"\x90\x06\x03\x50"       # the known-good 0x0103 value on this car
 SEED = b"\x11\x22\x33\x44"
@@ -1371,10 +1372,12 @@ class TestPhase4(Base):
     self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
 
   def test_phase4_algo_mode_missing_module_aborts(self):
-    # esc_probe_seedkey does not exist in this tree: algo must abort (recorded), never send an unpinned key.
+    # A missing module (None in sys.modules) must abort (recorded), never send an unpinned key.
+    import sys
     self.set_state(key_mode="algo")
     car = self.p4_car()
-    s = self.run_car(car)
+    with mock.patch.dict(sys.modules, {"openpilot.sunnypilot.fork.esc_probe_seedkey": None}):
+      s = self.run_car(car)
     self.assertTrue(s["ran"])
     self.assertIn("algo module missing/failed", s["aborted"])
     self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
@@ -1382,18 +1385,89 @@ class TestPhase4(Base):
 
   def test_phase4_algo_mode_uses_resolved_key(self):
     from types import SimpleNamespace
+    import openpilot.sunnypilot.fork as F
     import sys
-    fake = SimpleNamespace(key_for=lambda seed: bytes(seed)[:2])
+    fake = SimpleNamespace(key_for=lambda seed, algo=None: bytes(seed)[:2])
     self.set_state(key_mode="algo")
     car = self.p4_car()
     car.key_unlock = True
     car.write_refused = False
-    with mock.patch.dict(sys.modules, {"openpilot.sunnypilot.fork.esc_probe_seedkey": fake}):
+    # `import a.b.c as x` binds x from the PARENT package attribute, so patch that too (sys.modules alone is not enough)
+    with mock.patch.dict(sys.modules, {"openpilot.sunnypilot.fork.esc_probe_seedkey": fake}), \
+         mock.patch.object(F, "esc_probe_seedkey", fake):
       s = self.run_car(car)
     self.assertTrue(s["ran"])
     self.assertIsNone(s["aborted"])
     self.assertEqual(self.result_doc()["key"], "5ab0")
     self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [self.KEY2])
+
+  # ---- (k) algo mode: the recovered G-scan CalKeyAlgorithm_* family, selectable by Securityindex -----------------
+  ALGO_SEED = bytes.fromhex("1122334455667788")    # a generic non-repeating 8-byte seed (no zero byte)
+  # Frozen literal vectors computed ONCE from esc_probe_seedkey.key_for(<seed>, <algo>) — the ported algorithms are
+  # byte-identical to car-features/esc-software/06-git/12-seedkey.py, so a future algorithm regression breaks these.
+  ALGO_27100_KEY = bytes.fromhex("f30f0000")       # key_for(1122334455667788, "27100")
+  ALGO_26700_KEY = bytes.fromhex("2375f360")       # key_for(1122334455667788, "26700")
+
+  def test_phase4_algo_27100_frame_matches_module_and_literal(self):
+    self.assertEqual(SK.key_for(self.ALGO_SEED, "27100"), self.ALGO_27100_KEY)   # module output == frozen literal
+    self.set_state(key_mode="algo", algo="27100")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED      # the fake ESC answers 27 01 with THIS 8-byte seed
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key4 = (bytes([6, 0x27, 0x02]) + self.ALGO_27100_KEY).ljust(8, b"\x00")
+    self.assertEqual(key4, bytes([6, 0x27, 0x02, 0xF3, 0x0F, 0x00, 0x00]).ljust(8, b"\x00"))
+    keys = [d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02]
+    self.assertEqual(keys, [key4])                       # exactly one 27 02, carrying the module's key bytes
+    doc = self.result_doc()
+    self.assertEqual(doc["algo"], "27100")
+    self.assertEqual(doc["key"], "f30f0000")
+    self.assertEqual(doc["key_bytes"], "f30f0000")       # recorded before TX
+    self.assertTrue(doc["unlocked"])
+    self.assertEqual(s["algo"], "27100")                 # (e) both fields surface in the summary/cloudlog too
+    self.assertEqual(s["key_bytes"], "f30f0000")
+
+  def test_phase4_algo_26700_single_frame_4byte(self):
+    self.assertEqual(SK.key_for(self.ALGO_SEED, "26700"), self.ALGO_26700_KEY)
+    self.set_state(key_mode="algo", algo="26700")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key4 = (bytes([6, 0x27, 0x02]) + self.ALGO_26700_KEY).ljust(8, b"\x00")   # 06 27 02 23 75 F3 60
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [key4])
+    doc = self.result_doc()
+    self.assertEqual(doc["algo"], "26700")
+    self.assertEqual(doc["key_bytes"], "2375f360")
+
+  def test_phase4_algo_zero_byte_seed_bails_no_frame(self):
+    # seed[0:4] = 11 00 33 44 contains a zero byte -> cal_27100's vendor bail -> key_for None -> recorded abort.
+    self.assertIsNone(SK.key_for(bytes.fromhex("1100334455667788"), "27100"))
+    self.set_state(key_mode="algo", algo="27100")
+    car = self.p4_car()
+    car.esc_seed8 = bytes.fromhex("1100334455667788")
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("algo returned no key for this seed (zero-byte bail)", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])   # NO 27 02 frame in tx
+    self.assertEqual(self.write_frames(car), [])
+
+  def test_phase4_algo_unknown_name_aborts_no_key(self):
+    self.set_state(key_mode="algo", algo="99999")     # not a recovered Securityindex
+    car = self.p4_car()
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("algo module missing/failed", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+    self.assertEqual(self.write_frames(car), [])
 
   def test_phase4_budget_is_thirty_seconds(self):
     # phase 4 shares the phase-3 budget (the added 500 ms delay + key step)
