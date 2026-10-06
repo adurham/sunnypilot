@@ -1,0 +1,335 @@
+From 47143643f781db9ec88d988d9a47a61f83b57f79 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 09:19:03 -0500
+Subject: [PATCH] hyundai: CN7 non-SCC steer ramp 3 -> 4/frame, STEER_MAX
+ unchanged (384)
+
+Logged EPS output (MDPS12 CR_Mdps_OutTq) saturates near a ~270-300 LKAS11 command on this car, so a higher
+STEER_MAX buys ~nothing; the measurable loss in sharp low-speed turns is the 3/frame ramp. 4 is the largest
+rate the panda real-time check (112 per 250 ms) admits for a continuous ramp.
+
+Rebased onto the current series-applied tip (fca11-long, patch 0014): the SP param bit moves 256 -> 1024 because
+0014 shipped HYUNDAI_PARAM_SP_FCA11_LONG = 256; 512 stays reserved for steer-test's unshipped LKAS_PARK_TEST so
+both can coexist. Diff semantics are otherwise identical to the original preparation.
+
+- CarControllerParams: STEER_DELTA_UP = 4 for HYUNDAI_ELANTRA_2022_NON_SCC only
+- interface: sets HyundaiSafetyFlagsSP.CN7_STEER_RAMP (1024) for that platform only
+- panda: HYUNDAI_STEERING_LIMITS_CN7_RAMP = HYUNDAI_LIMITS(384, 4, 7), honored only with NON_SCC and
+  never over ALT_LIMITS / ALT_LIMITS_2
+- tests: full inherited torque suite at rate-up 4, boundary/gating tests, car-layer gating + C/Python mirror
+---
+ opendbc/car/hyundai/interface.py              |   4 +
+ opendbc/car/hyundai/values.py                 |   7 ++
+ opendbc/safety/modes/hyundai.h                |   6 +-
+ opendbc/safety/modes/hyundai_common.h         |   8 ++
+ opendbc/safety/tests/test_hyundai.py          | 108 ++++++++++++++++++
+ .../car/hyundai/tests/test_cn7_steer_ramp.py  |  71 ++++++++++++
+ opendbc/sunnypilot/car/hyundai/values.py      |   4 +
+ 7 files changed, 207 insertions(+), 1 deletion(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_cn7_steer_ramp.py
+
+diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
+index 3d6019b5..d2eaa930 100644
+--- a/opendbc/car/hyundai/interface.py
++++ b/opendbc/car/hyundai/interface.py
+@@ -208,6 +208,10 @@ class CarInterface(CarInterfaceBase):
+       stock_cp.pcmCruise = True
+       ret.safetyParam |= HyundaiSafetyFlagsSP.NON_SCC
+ 
++      # Elantra N: panda permits the faster CarControllerParams.STEER_DELTA_UP (4) for this platform only
++      if stock_cp.carFingerprint == CAR.HYUNDAI_ELANTRA_2022_NON_SCC:
++        ret.safetyParam |= HyundaiSafetyFlagsSP.CN7_STEER_RAMP
++
+       # comma pedal (gas interceptor): capability ONLY. Pedal-long is activated in
+       # opendbc/sunnypilot/car/interfaces.py:_initialize_hyundai_gas_interceptor when the user ALSO enables the
+       # HyundaiGasInterceptor param; otherwise every CarParams/CarParamsSP value stays exactly as above.
+diff --git a/opendbc/car/hyundai/values.py b/opendbc/car/hyundai/values.py
+index 5f43c277..8da4fbb2 100644
+--- a/opendbc/car/hyundai/values.py
++++ b/opendbc/car/hyundai/values.py
+@@ -56,6 +56,13 @@ class CarControllerParams:
+     else:
+       self.STEER_MAX = 384
+ 
++    # CN7 Elantra N (non-SCC port): faster torque ramp-up only, ceiling unchanged. Logged EPS output (MDPS12 CR_Mdps_OutTq)
++    # saturates near a 270-300 command, so a higher STEER_MAX buys ~nothing; the measurable loss in sharp low-speed turns
++    # is the 3/frame ramp (0 -> 270 takes 0.9 s). 4 is the largest rate the panda real-time check (112 / 250 ms) permits.
++    # Panda mirror: HyundaiSafetyFlagsSP.CN7_STEER_RAMP (set in interface.py for this platform only).
++    if CP.carFingerprint == CAR.HYUNDAI_ELANTRA_2022_NON_SCC:
++      self.STEER_DELTA_UP = 4
++
+ 
+ class HyundaiSafetyFlags(IntFlag):
+   EV_GAS = 1
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index c21e4d7b..76f5467a 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -650,6 +650,8 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS = HYUNDAI_LIMITS(384, 3, 7);
+   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT = HYUNDAI_LIMITS(270, 2, 3);
+   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT_2 = HYUNDAI_LIMITS(170, 2, 3);
++  // CN7 Elantra N: same 384 ceiling, faster ramp-up (see hyundai_cn7_steer_ramp in hyundai_common.h)
++  const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_CN7_RAMP = HYUNDAI_LIMITS(384, 4, 7);
+ 
+   bool tx = true;
+ 
+@@ -818,8 +820,10 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+     int desired_torque = ((GET_BYTES(msg, 0, 4) >> 16) & 0x7ffU) - 1024U;
+     bool steer_req = GET_BIT(msg, 27U);
+ 
++    const bool cn7_ramp = hyundai_cn7_steer_ramp && hyundai_non_scc;
+     const TorqueSteeringLimits limits = hyundai_alt_limits_2 ? HYUNDAI_STEERING_LIMITS_ALT_2 :
+-                                        hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT : HYUNDAI_STEERING_LIMITS;
++                                        hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT :
++                                        cn7_ramp ? HYUNDAI_STEERING_LIMITS_CN7_RAMP : HYUNDAI_STEERING_LIMITS;
+ 
+     if (steer_torque_cmd_checks(desired_torque, steer_req, limits)) {
+       tx = false;
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index 9ed2bee5..508090f5 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -27,6 +27,7 @@ enum {
+   HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64,  // TEST-ONLY: parked FCA11 (0x38D) brake-injection research, see hyundai.h
+   HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST = 128,  // TEST-ONLY: extends 64 to a low-speed rolling window (needs 64), see hyundai.h
+   HYUNDAI_PARAM_SP_FCA11_LONG = 256,  // PRODUCTION (toggle-gated): FCA11 decel on top of the gas interceptor, see hyundai.h
++  HYUNDAI_PARAM_SP_CN7_STEER_RAMP = 1024,  // Elantra N (CN7 non-SCC): LKAS11 torque rate-up 4/frame instead of 3, see hyundai.h
+ };
+ 
+ // common state
+@@ -67,6 +68,12 @@ bool hyundai_has_lda_button = false;
+ extern bool hyundai_non_scc;
+ bool hyundai_non_scc = false;
+ 
++// CN7 (Elantra N, non-SCC) faster steering-torque ramp: max_rate_up 4 (default HKG 3). Same 384 max, same rate-down 7,
++// same max_rt_delta 112 / 250 ms (4 x 25 frames = 100 < 112, so 4 is the largest rate the real-time check permits).
++// Honored only together with NON_SCC and never with ALT_LIMITS / ALT_LIMITS_2 (see hyundai.h).
++extern bool hyundai_cn7_steer_ramp;
++bool hyundai_cn7_steer_ramp = false;
++
+ // Gas interceptor (comma pedal) longitudinal. Deliberately a separate mode from hyundai_longitudinal:
+ // hyundai_longitudinal selects the SCC11/SCC12/SCC14/FCA11/radar-UDS TX allowlist, which pedal-long must NOT get.
+ // Pedal-long only adds 0x200 (GAS_COMMAND) TX + 0x201 (GAS_SENSOR) RX, and uses button-based controls_allowed.
+@@ -363,6 +370,7 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_longitudinal_main_cruise_toggleable = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_LONGITUDINAL_MAIN_CRUISE_TOGGLEABLE);
+   hyundai_has_lda_button = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_HAS_LDA_BUTTON);
+   hyundai_non_scc = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_NON_SCC);
++  hyundai_cn7_steer_ramp = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CN7_STEER_RAMP);
+ 
+   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
+ 
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index c3c28f72..5050e51d 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -2855,6 +2855,114 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+         self.assertFalse(self._tx(self._brake_cmd(1)))
+ 
+ 
++@parameterized_class(LDA_BUTTON)
++class TestHyundaiNonSCCCN7SteerRampSafety(TestHyundaiNonSCCSafety):
++  """Elantra N (CN7 non-SCC) CN7_STEER_RAMP bit: the full inherited torque/driver/rt/steer-req suite runs with rate-up 4;
++  max torque (384), rate-down (7), rt delta (112) and the driver allowance are unchanged."""
++  MAX_RATE_UP = 4
++
++  @classmethod
++  def setUpClass(cls):
++    if cls.__name__ == "TestHyundaiNonSCCCN7SteerRampSafety":
++      cls.safety = None
++      raise unittest.SkipTest
++
++  def setUp(self):
++    self.packer = CANPackerSafety("hyundai_can_generated")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP |
++                                            self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self.safety.init_tests()
++
++  def _hooks(self, sp, param=0):
++    self.safety.set_current_safety_param_sp(sp | self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, param)
++    self.safety.init_tests()
++    self.safety.set_controls_allowed(True)
++    self._reset_torque_driver_measurement(0)
++
++  def _step_ok(self, prev, val):
++    self._set_prev_torque(prev)
++    return self._tx(self._torque_cmd_msg(val))
++
++  def test_cn7_rate_up_boundaries(self):
++    for sign in (1, -1):
++      for prev in (0, 100, 380):
++        self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++        self.assertTrue(self._step_ok(sign * prev, sign * (prev + 4)), (sign, prev))
++        self.assertFalse(self._step_ok(sign * prev, sign * (prev + 5)), (sign, prev))
++
++  def test_cn7_max_torque_unchanged(self):
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    for sign in (1, -1):
++      self.assertTrue(self._step_ok(sign * 381, sign * 384))
++      self.assertFalse(self._step_ok(sign * 381, sign * 385))
++      self.assertFalse(self._step_ok(sign * 384, sign * 385))
++
++  def test_cn7_rate_down_unchanged(self):
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    for sign in (1, -1):
++      self.assertTrue(self._step_ok(sign * 384, sign * (384 - 7)))
++      # dropping faster than 7 is allowed (toward 0); what must hold is that the down-rate did not change for the
++      # driver-limit path: with the driver opposing at max, the command must fall by at least 7 per frame
++      self._reset_torque_driver_measurement(-sign * 500)
++      self._set_prev_torque(sign * 384)
++      self.assertFalse(self._tx(self._torque_cmd_msg(sign * (384 - 7 + 1))))
++      self._reset_torque_driver_measurement(0)
++
++  def test_cn7_rt_delta_unchanged(self):
++    # 4/frame for a whole 250 ms window = 100 < 112, so a continuous max-rate ramp never trips the rt check
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    self._set_prev_torque(0)
++    for i in range(1, 29):
++      self.assertTrue(self._tx(self._torque_cmd_msg(4 * i)), i)
++    # but the rt bound itself is still 112: 113 above the rt reference is rejected even if the frame rate is legal
++    self.safety.set_rt_torque_last(0)
++    self.safety.set_desired_torque_last(110)
++    self.assertFalse(self._tx(self._torque_cmd_msg(113)))
++
++  def test_cn7_bit_requires_non_scc(self):
++    # bit without NON_SCC: default HKG limits (rate-up 3)
++    self._hooks(HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    self.assertTrue(self._step_ok(0, 3))
++    self.assertFalse(self._step_ok(0, 4))
++
++  def test_non_scc_without_bit_unchanged(self):
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC)
++    for sign in (1, -1):
++      self.assertTrue(self._step_ok(0, sign * 3))
++      self.assertFalse(self._step_ok(0, sign * 4))
++      self.assertFalse(self._step_ok(sign * 381, sign * 385))
++
++  def test_alt_limits_win_over_cn7_bit(self):
++    for param, max_t, up in ((HyundaiSafetyFlags.ALT_LIMITS, 270, 2), (HyundaiSafetyFlags.ALT_LIMITS_2, 170, 2)):
++      self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP, param)
++      self.assertTrue(self._step_ok(0, up), param)
++      self.assertFalse(self._step_ok(0, up + 1), param)
++      self.assertTrue(self._step_ok(max_t - 1, max_t), param)
++      self.assertFalse(self._step_ok(max_t - 1, max_t + 1), param)
++
++  def test_cn7_bit_reset_on_reinit(self):
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    self.assertTrue(self._step_ok(0, 4))
++    self._hooks(HyundaiSafetyFlagsSP.NON_SCC)
++    self.assertFalse(self._step_ok(0, 4))
++
++  def test_c_and_python_bit_match(self):
++    h = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai_common.h")
++    with open(h) as f:
++      m = re.search(r"HYUNDAI_PARAM_SP_CN7_STEER_RAMP\s*=\s*(\d+)", f.read())
++    self.assertIsNotNone(m)
++    self.assertEqual(int(m.group(1)), HyundaiSafetyFlagsSP.CN7_STEER_RAMP)
++    bit = HyundaiSafetyFlagsSP.CN7_STEER_RAMP
++    self.assertEqual(bit & (bit - 1), 0)  # single bit
++    self.assertEqual(bit, 1024)  # next free SP bit: 256 is FCA11_LONG (patch 0014), 512 is steer-test LKAS_PARK_TEST
++    others = [v for k, v in vars(HyundaiSafetyFlagsSP).items() if k.isupper() and k != "CN7_STEER_RAMP"]
++    self.assertNotIn(bit, others)
++    self.assertLess(bit, 1 << 15)  # Int16 safetyParam
++
++
+ @parameterized_class(ALL_NON_SCC_HEV_EV_COMBOS)
+ class TestHyundaiNonSCCSafety_HEV_EV(TestHyundaiSafety):
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_cn7_steer_ramp.py b/opendbc/sunnypilot/car/hyundai/tests/test_cn7_steer_ramp.py
+new file mode 100644
+index 00000000..1039d743
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_cn7_steer_ramp.py
+@@ -0,0 +1,71 @@
++"""Elantra N (HYUNDAI_ELANTRA_2022_NON_SCC) faster steering-torque ramp: car-layer gating and C/Python consistency.
++
++STEER_MAX stays 384 everywhere; only STEER_DELTA_UP changes (3 -> 4) and only for this platform, and the panda is told via
++HyundaiSafetyFlagsSP.CN7_STEER_RAMP, which must be set for this platform only.
++"""
++import re
++from pathlib import Path
++
++import pytest
++
++from opendbc.car import gen_empty_fingerprint
++from opendbc.car.car_helpers import interfaces
++from opendbc.car.hyundai.values import CAR, CarControllerParams
++from opendbc.car.lateral import apply_driver_steer_torque_limits
++from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
++
++CN7 = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++SAFETY = Path(__file__).resolve().parents[4] / "safety" / "modes"
++
++
++def _params(car):
++  CarInterface = interfaces[car]
++  fp = gen_empty_fingerprint()
++  CP = CarInterface.get_params(car, fp, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, car, fp, [], alpha_long=False, is_release_sp=False, docs=False)
++  return CP, CP_SP
++
++
++def test_cn7_controller_params():
++  CP, _ = _params(CN7)
++  p = CarControllerParams(CP)
++  assert (p.STEER_MAX, p.STEER_DELTA_UP, p.STEER_DELTA_DOWN) == (384, 4, 7)
++  assert (p.STEER_DRIVER_ALLOWANCE, p.STEER_DRIVER_MULTIPLIER, p.STEER_DRIVER_FACTOR) == (50, 2, 1)
++
++
++def test_cn7_sets_panda_bit():
++  _, CP_SP = _params(CN7)
++  assert CP_SP.safetyParam & HyundaiSafetyFlagsSP.CN7_STEER_RAMP
++  assert CP_SP.safetyParam & HyundaiSafetyFlagsSP.NON_SCC  # panda only honors the bit together with NON_SCC
++
++
++@pytest.mark.parametrize("car", sorted(c for c in CAR if c != CN7 and c.startswith(("HYUNDAI", "KIA", "GENESIS"))))
++def test_other_hkg_unchanged(car):
++  CP, CP_SP = _params(car)
++  p = CarControllerParams(CP)
++  assert p.STEER_DELTA_UP in (2, 3)  # 2 for CAN-FD / ALT_LIMITS*, 3 otherwise: never 4
++  assert p.STEER_MAX in (170, 255, 270, 384)
++  assert not CP_SP.safetyParam & HyundaiSafetyFlagsSP.CN7_STEER_RAMP
++
++
++def test_controller_and_panda_rate_agree():
++  src = (SAFETY / "hyundai.h").read_text()
++  m = re.search(r"HYUNDAI_STEERING_LIMITS_CN7_RAMP\s*=\s*HYUNDAI_LIMITS\((\d+),\s*(\d+),\s*(\d+)\)", src)
++  assert m is not None
++  CP, _ = _params(CN7)
++  p = CarControllerParams(CP)
++  assert tuple(int(x) for x in m.groups()) == (p.STEER_MAX, p.STEER_DELTA_UP, p.STEER_DELTA_DOWN)
++  # the real-time window must still admit a continuous max-rate ramp: 25 frames per 250 ms at 100 Hz
++  rt_m = re.search(r"\.max_rt_delta\s*=\s*(\d+)", src)
++  assert rt_m is not None
++  assert p.STEER_DELTA_UP * 25 < int(rt_m.group(1))
++
++
++def test_cn7_ramp_time():
++  CP, _ = _params(CN7)
++  p = CarControllerParams(CP)
++  last, frames = 0, 0
++  while last < p.STEER_MAX:
++    last = apply_driver_steer_torque_limits(p.STEER_MAX, last, 0.0, p)
++    frames += 1
++  assert frames == 96  # 0 -> 384 in 0.96 s (was 128 frames / 1.28 s at 3/frame)
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index da41b080..bf84610c 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -33,6 +33,10 @@ class HyundaiSafetyFlagsSP:
+   # period), a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera hand-back. C mirror:
+   # HYUNDAI_PARAM_SP_FCA11_LONG.
+   FCA11_LONG = 256
++  # Elantra N (HYUNDAI_ELANTRA_2022_NON_SCC) only: panda allows LKAS11 torque rate-up 4/frame (default 3); STEER_MAX stays
++  # 384. C mirror: HYUNDAI_PARAM_SP_CN7_STEER_RAMP. Must match CarControllerParams.STEER_DELTA_UP for that platform.
++  # Next free SP bit: 256 is FCA11_LONG (patch 0014), 512 is steer-test's unshipped LKAS_PARK_TEST; both must coexist.
++  CN7_STEER_RAMP = 1024
+ 
+ 
+ # Raw CR_VSM_DecCmd cap (0.01 g/LSB) for FCA11_BRAKE_TEST; must equal HYUNDAI_FCA11_TEST_MAX_DEC in safety/modes/hyundai.h
+-- 
+2.54.0 (Apple Git-157)
+

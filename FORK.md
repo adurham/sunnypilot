@@ -68,10 +68,59 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 31 | Hyundai **FCA11 LONGITUDINAL braking** — production (toggle-gated) FCA11 (0x38D) decel through the ESC **on top of the comma pedal**, openpilot ENGAGED. Param `HyundaiFca11Brake` **default OFF**; when ON (and the pedal armed) the card sets panda bit 256 `FCA11_LONG` and `CP_SP.fca11Brake`. The car layer mirrors the freshest bus-2 camera 0x38D byte-for-byte and overrides ONLY the brake fields, hard-zeroing gas while braking; panda independently polices: `controls_allowed` AND `heartbeat_engaged`, gear D, no pedal, every wheel > 9 km/h (no ceiling), inputs fresh ≤ 100 ms, `CR_VSM_DecCmd` ≤ 30 (0.30 g), growth ≤ 0.04 g/camera period, a 2.5 s actuation budget + 3 s cooldown, latched cut on driver brake/gas/gear≠D/pedal fault, and same-frame camera hand-back. No auto-resume after a cut. **Toggle OFF = byte-for-byte today's pedal-only behavior.** NOT FOR ROAD USE until reviewed + the drive-mode gate (open risk R1) — **offline-tested only (safety + car unit + firmware)** | feature (safety C + car + planner limits + selfdrived alert + UI) | fork-local; patch `0014`, opendbc branch `fca11-long` (08adce5c), firmware `67c1f99e`; NOT on main |
 | 32 | ESC 0x27 probe **phase 5 — READ-ONLY capability battery** (amends #27, same fingerprint window): `state.json` `{"phase": 5}` runs ONE parked, read-only ignition — a FIXED frame list (0xF100 canary, 0x0103 read, `10 03`, three `27 01` seed samples, ten 2-byte sub-probes `27 03/05/07/09/0B/0D/0F/11/41/61`, seven bare 1-byte service probes `23/29/31/34/35/36/37`, 0x0103 re-read, and two extra-address `10 03` peeks at 0x770/0x7A0) that records every response/NRC/timeout/latency and adds seed-stability + fp_canary + value_start/value_end summary fields. **NO `27 02`, NO `2E`, no multi-frame TX** — the guards admit only the exact frames above | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-4 byte-identical |
 | 33 | ESC 0x27 probe **phase 6 - security-policy matrix + DID sweep** (amends #27/#32, same fingerprint window): `state.json` `{"phase": 6}` (60 s budget) maps the attempt/session policy in ONE parked ignition - `22 0103` (value_start) -> `10 03` -> `27 01` x2 (S1/S2 seed stability) -> **`27 02` ZERO key (`00`x8)** -> R1; a `0x36`/`0x37` NRC sets `lockout_seen` and jumps to the reset; else adaptive `27 01`+`27 02` -> S3/R2 then S4/R3 (<=3 pre-cycle attempts); then **ALWAYS** `10 01` -> `10 03` -> `27 01`+`27 02` -> S5/**R4** (cycle-reset test; the only 4th attempt, ever); then the identification-DID sweep (`22 F186/F187/F190/F199/F18A/F18C/F191/F195`) -> `10 02` programming probe (+ `27 01` S6 only if positive, NO key) -> `19 02 A5` -> `10 01` leave -> `22 0103` (value_end). Records every frame; adds S1..S6 / R1..R4 / seed_stable_pre / seed_after_fail / lockout_seen / cycle_reset / dids{} / prog_session_1002 / dtc_19_02_a5. **NO `2E` ever; `27 02` admissible ONLY in phase 6, ONLY zero key, ONLY immediately after a `27 01`, and at most 4 times** | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-5 byte-identical |
+| 34 | Hyundai Elantra N (CN7 non-SCC) **LKAS11 torque ramp-up 3 -> 4/frame**, STEER_MAX unchanged at 384. Param-gated by platform fingerprint (`HYUNDAI_ELANTRA_2022_NON_SCC`) **only** — every other HKG car keeps 2/3. Car layer: `CarControllerParams.STEER_DELTA_UP = 4` + card sets panda SP bit 1024 `CN7_STEER_RAMP`. Panda: `HYUNDAI_STEERING_LIMITS_CN7_RAMP = HYUNDAI_LIMITS(384, 4, 7)`, honored only with `NON_SCC` and never over `ALT_LIMITS`/`ALT_LIMITS_2`; rate-down (7), max torque (384), rt delta (112) and the driver allowance are unchanged. Bit number is 1024 because 0014's `FCA11_LONG` took 256 and steer-test's unshipped `LKAS_PARK_TEST` reserves 512 (all three coexist). Logged EPS output saturates near a 270-300 command, so this only reaches the EPS maximum sooner (0->270 in 0.68 s vs 0.90 s) — it does **not** raise steady force. **A panda firmware rebuild + reflash is REQUIRED or the panda rejects every +4 step.** Not yet road-validated; the parked EPS ladder (Phase 0) comes first — **offline-tested only (safety + car unit + mutation + MISRA)** | feature (safety C + car) | fork-local; patch `0015`, opendbc branch `steer-torque` (47143643); NOT on main |
 
 ---
 
 ## Entries
+
+### steer-torque: Elantra N (CN7 non-SCC) LKAS11 steering torque ramp-up 3 -> 4/frame — 2026-10-06 (offline-tested; NOT road-run; REQUIRES a panda firmware rebuild + reflash)
+
+> **Driver notes (only on this car).** In sharp low-speed turns the steering-assist command can only climb 3 units per
+> 10 ms frame, so it takes ~0.9 s to reach the assist unit's useful maximum. Raising that to 4 gets there about a fifth
+> of a second sooner (0 -> 384 in 0.96 s instead of 1.28 s), which helps turn-in and roundabout entry. It does **not**
+> add steady turning force — the assist unit caps itself well below the commanded ceiling on this car, so this is a
+> responsiveness change, not a "more torque" change. It is this platform only: every other Hyundai/Kia/Genesis car is
+> untouched. **The panda must be reflashed with the matching firmware or the car will reject the faster ramp and
+> steering will feel limited** (that is the panda doing its job, not a bug).
+
+- **Why:** logged EPS output (MDPS12 `CR_Mdps_OutTq`) saturates near a ~270-300 LKAS11 command, so raising STEER_MAX
+  buys ~nothing (measured; see `steer-torque-report.md`). The bound the ramp rate actually costs in sharp low-speed
+  turns is `STEER_DELTA_UP = 3/frame`. 4 is the largest rate the panda's real-time check (112 per 250 ms; 4 x 25 = 100)
+  admits without loosening `max_rt_delta`. 5 would require raising that limit — a real safety loosening, not done.
+- **What (opendbc branch `steer-torque`, patched by `0015-hyundai-cn7-steer-ramp-up-4.patch`):**
+  - `car/hyundai/values.py`: `CarControllerParams.STEER_DELTA_UP = 4` **only** when
+    `CP.carFingerprint == CAR.HYUNDAI_ELANTRA_2022_NON_SCC`. `STEER_MAX` stays 384 everywhere.
+  - `car/hyundai/interface.py`: sets `HyundaiSafetyFlagsSP.CN7_STEER_RAMP` for that platform only (inside the NON_SCC
+    block, so NON_SCC is always also set).
+  - `sunnypilot/car/hyundai/values.py`: `HyundaiSafetyFlagsSP.CN7_STEER_RAMP = 1024` (mirror of the C constant).
+  - `safety/modes/hyundai_common.h`: `HYUNDAI_PARAM_SP_CN7_STEER_RAMP = 1024` + `hyundai_cn7_steer_ramp` state, reset on
+    every `hyundai_common_init`.
+  - `safety/modes/hyundai.h`: `HYUNDAI_STEERING_LIMITS_CN7_RAMP = HYUNDAI_LIMITS(384, 4, 7)`, selected only when the
+    bit is set **and** `hyundai_non_scc`, and only after `ALT_LIMITS_2` / `ALT_LIMITS` (those always win).
+- **Bit 1024, not 256:** the original preparation used SP bit 256, but patch `0014` shipped
+  `HYUNDAI_PARAM_SP_FCA11_LONG = 256` and the unshipped `steer-test` branch reserves bit 512 for `LKAS_PARK_TEST`.
+  1024 is the next free SP bit; FCA11_LONG (256), LKAS_PARK_TEST (512) and CN7_STEER_RAMP (1024) all coexist.
+- **The two places the +4 step is enforced (both must be raised; that is why a reflash is required):**
+  1. **car layer (Python):** `opendbc/car/lateral.py:83-88` `apply_driver_steer_torque_limits` clamps to
+     `apply_torque_last +/- LIMITS.STEER_DELTA_UP`; the default is `opendbc/car/hyundai/values.py:21`
+     `self.STEER_DELTA_UP = 3`. This patch raises `LIMITS.STEER_DELTA_UP` to 4 for CN7 only.
+  2. **panda (C):** `opendbc/safety/lateral.h:32-33` `driver_limit_check` (`MAX_RATE_UP`) and
+     `opendbc/safety/modes/hyundai.h:651` `HYUNDAI_LIMITS(384, 3, 7)` feed `steer_torque_cmd_checks`. This patch adds
+     the `CN7_RAMP` tuple with `max_rate_up = 4`. Without the reflashed firmware the panda still enforces 3 and blocks
+     every +4 frame (`steer_limited_by_safety`).
+- **Verification (this pickup, 2026-10-06 — rebased onto the current series tip `fca11-long` @ `08adce5c`, 0001-0014):**
+  safety suite `test_hyundai.py` **2752 passed / 0 failed / 351 skipped** (includes new
+  `TestHyundaiNonSCCCN7SteerRampSafety`, which re-runs the full inherited torque/driver/rt/steer-req suite at rate-up 4,
+  plus +4-accept/+5-reject boundaries, max-torque/rate-down/rt-delta unchanged, ALT_LIMITS precedence, bit/NON_SCC gating,
+  reset-on-reinit, and a C==Python==1024 bit match that asserts 1024 collides with no other flag). New
+  `sunnypilot/car/hyundai/tests/test_cn7_steer_ramp.py` **7 passed** (CN7 = 384/4/7 + bit; every other HKG keeps 2/3 and
+  no bit; controller/panda tuples agree; 0 -> 384 in 96 frames). Whole sunnypilot Hyundai set **260 passed**;
+  `test_lateral_limits.py` + `test_car_interfaces.py` **747 passed / 58 skipped**; `car/hyundai/tests` **13 passed**.
+  Mutation **20/20 killed**. MISRA cppcheck **rc 0, 0 findings**. Rehearsal: pristine `f95f996f` + patches 0001-0015
+  applies **15/15, 0 fuzz**, tree `9cabbf8b` == branch tree.
+- **Merge note:** fork-local; NOT for the car until the parked EPS ladder (Phase 0 in `steer-torque-report.md` §6) is
+  run. **The panda firmware must be rebuilt and reflashed for this to have any effect** (panda bit + limits tuple change).
 
 ### keep-cruise-prefs: never delete the owner's cruise settings when openpilot longitudinal is transiently unavailable — 2026-10-05 (offline-tested; no firmware change)
 
