@@ -3365,6 +3365,14 @@ class TestPhase9(Base):
   K_26400W = bytes.fromhex("7c707c707c707c70")   # cal_26400(seed[:2])[:2] x4 (7c70)
   K_26800W = bytes.fromhex("4d2d4d2d4d2d4d2d")   # cal_26800(seed[:2])[:2] x4 (4d2d)
   K_26600W = bytes.fromhex("d408d408d408d408")   # cal_26600(seed[:2])[:2] x4 (d408)
+  # the four offline-leftover tokens (phase-9 extended walk). All on the on-car seed 5AB05AB05AB05AB0.
+  K_26300W = bytes.fromhex("0086008600860086")   # cal_26300(seed[:4])[:2] x4 ([00,HI]x4; raw 0086002b)
+  K_26300_8 = bytes.fromhex("0086002b0086002b")  # cal_26300(seed[:4]) x2 (the 4-byte key doubled)
+  K_27400W = bytes.fromhex("c0b0c0b0c0b0c0b0")   # cal_27400(seed[:4])[:2] x4 ([c0,b0]x4)
+  K_27400_8 = bytes.fromhex("c0b0c0b0c0b0c0b0")  # cal_27400(seed[:4]) x2 (on-car seed repeats -> same bytes)
+  K_40000W = bytes.fromhex("0000000000000000")   # cal_40000(seed[:2]) [:2] x4 = 0000 x4 (5AB0 not in the lookup table)
+  # a generic NON-repeating seed, where the x4-repeat and x2-double shapes DIFFER
+  P9_SEED = bytes.fromhex("1122334455667788")
 
   CAND3 = ["algo8w_27100", "algo8_27100", "algo8w_26400"]
   CAND5 = ["algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600"]
@@ -3432,19 +3440,43 @@ class TestPhase9(Base):
     self.assertEqual(E.resolve_phase9("identity8", seed), PHASE4_SEED)
     self.assertEqual(E.resolve_phase9("algo8_26700", seed), SK.cal_26700(seed[:4]) * 2)
     self.assertEqual(E.resolve_phase9("algo8_26300", seed), SK.cal_26300(seed[:4]) * 2)
+    # ---- the four offline-leftover tokens (the extended walk) ----
+    self.assertEqual(E.resolve_phase9("algo8w_26300", seed), self.K_26300W)
+    self.assertEqual(E.resolve_phase9("algo8w_27400", seed), self.K_27400W)
+    self.assertEqual(E.resolve_phase9("algo8_27400", seed), self.K_27400_8)
+    self.assertEqual(E.resolve_phase9("algo8w_40000", seed), self.K_40000W)
+    self.assertEqual(E.resolve_phase9("algo8w_26300", seed), SK.cal_26300(seed[:4])[:2] * 4)
+    self.assertEqual(E.resolve_phase9("algo8w_27400", seed), SK.cal_27400(seed[:4])[:2] * 4)
+    self.assertEqual(E.resolve_phase9("algo8_27400", seed), SK.cal_27400(seed[:4]) * 2)
+    self.assertEqual(E.resolve_phase9("algo8w_40000", seed), SK.cal_40000(seed[:2])[:2] * 4)
+    # on a NON-repeating seed the [HI,LO]x4 and (4B)x2 shapes genuinely DIFFER (a mutant cannot alias them)
+    self.assertEqual(E.resolve_phase9("algo8w_27400", self.P9_SEED), bytes.fromhex("4a444a444a444a44"))
+    self.assertEqual(E.resolve_phase9("algo8_27400", self.P9_SEED), bytes.fromhex("4a44ce224a44ce22"))
+    self.assertEqual(E.resolve_phase9("algo8w_26300", self.P9_SEED), bytes.fromhex("0078007800780078"))
+    self.assertNotEqual(E.resolve_phase9("algo8w_27400", self.P9_SEED),
+                        E.resolve_phase9("algo8_27400", self.P9_SEED))
+    # 40000 is the fixed lookup: 0x0028 -> 0x0144; off-table -> 0000 (no zero-bail)
+    self.assertEqual(E.resolve_phase9("algo8w_40000", bytes.fromhex("0028") + bytes(6)),
+                     bytes.fromhex("0144014401440144"))
+    self.assertEqual(E.resolve_phase9("algo8w_40000", bytes(8)), bytes(8))
     # 26400 bails on a zero seed byte; 26600 bails only on a zero WORD
     z = bytes.fromhex("00b05ab05ab05ab0")
     self.assertIsNone(E.resolve_phase9("algo8w_26400", z))
     self.assertIsNotNone(E.resolve_phase9("algo8w_26600", z))
     self.assertIsNone(E.resolve_phase9("algo8w_26600", bytes(8)))
+    # 26300 bails on a zero seed byte (like 27100); 27400/40000 have NO zero-bail (always 8 bytes)
+    self.assertIsNone(E.resolve_phase9("algo8w_26300", z))
+    self.assertEqual(len(E.resolve_phase9("algo8w_27400", bytes(8))), 8)
+    self.assertEqual(len(E.resolve_phase9("algo8_27400", bytes(8))), 8)
     with self.assertRaises(D.Abort):
       E.resolve_phase9("banana", seed)
-    # the vocabulary is exactly the phase-8 tokens + the three new 2-byte-algo wrappers (== 10 total)
-    self.assertEqual(set(E.PHASE9_CANDIDATES), set(E.PHASE8_CANDIDATES) | {"algo8w_26400", "algo8w_26800", "algo8w_26600"})
-    self.assertEqual(len(E.PHASE9_CANDIDATES), 10)
+    # the vocabulary is exactly the phase-8 tokens + the three 2-byte-algo wrappers + the four offline leftovers (== 14)
+    self.assertEqual(set(E.PHASE9_CANDIDATES),
+                     set(E.PHASE8_CANDIDATES) | {"algo8w_26400", "algo8w_26800", "algo8w_26600",
+                                                 "algo8w_26300", "algo8w_27400", "algo8_27400", "algo8w_40000"})
+    self.assertEqual(len(E.PHASE9_CANDIDATES), 14)
     self.assertEqual(E.PHASE9_DEFAULT_CANDIDATES,
-                     ("algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
-                      "algo8_26700", "algo8_26300", "lit270100"))
+                     ("algo8_26300", "lit270100", "algo8w_26300", "algo8w_27400", "algo8_27400", "algo8w_40000"))
 
   def test_cal_26600_known_vectors(self):
     self.assertEqual(SK.cal_26600(bytes.fromhex("5ab0")), bytes.fromhex("d408"))
@@ -3454,11 +3486,22 @@ class TestPhase9(Base):
     self.assertIn("26600", SK.candidates(PHASE4_SEED))              # 2-byte seed -> 2-byte key, no crash
     self.assertEqual(SK.key_for(PHASE4_SEED, "26600"), SK.cal_26600(PHASE4_SEED[:2]))
 
+  def test_cal_40000_known_vectors(self):
+    # Securityindex 40000: a FIXED lookup; 0000 for any seed off the table (NO zero-bail)
+    self.assertEqual(SK.cal_40000(bytes.fromhex("0003")), bytes.fromhex("001a"))
+    self.assertEqual(SK.cal_40000(bytes.fromhex("0028")), bytes.fromhex("0144"))
+    self.assertEqual(SK.cal_40000(bytes.fromhex("007a")), bytes.fromhex("03d6"))
+    self.assertEqual(SK.cal_40000(bytes.fromhex("5ab0")), bytes(2))              # off-table -> 0000
+    self.assertEqual(SK.cal_40000(bytes(2)), bytes(2))
+    self.assertIn("40000", SK.ALGO_NAMES)
+    self.assertIn("40000", SK.candidates(PHASE4_SEED))
+    self.assertEqual(SK.key_for(PHASE4_SEED, "40000"), SK.cal_40000(PHASE4_SEED[:2])[:2])
+
   def test_phase9_constants(self):
     self.assertEqual(E.RUN_BUDGET_S_PHASE9, 420.0)
     self.assertEqual(E.PHASE9_MAX_CANDIDATES, 10)
-    self.assertEqual(E.PHASE9_MAX_KEY_ATTEMPTS, 12)
-    self.assertEqual(E.PHASE9_MAX_SEEDS, 14)
+    self.assertEqual(E.PHASE9_MAX_KEY_ATTEMPTS, 16)
+    self.assertEqual(E.PHASE9_MAX_SEEDS, 20)
     self.assertEqual(E.PHASE9_WAIT_S, 25.0)
     self.assertEqual((E.PHASE9_WAIT_MIN_S, E.PHASE9_WAIT_MAX_S), (10.0, 60.0))
 
@@ -3510,32 +3553,75 @@ class TestPhase9(Base):
     self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE9)
     self.assertEqual(s["p9_wait_s"], E.PHASE9_WAIT_S)
 
-  # ---- run 2: all 8 slots fail cleanly -------------------------------------------------------------------------------
-  def test_walk_all_8_slots_fail_cleanly(self):
+  # ---- run 2: all 6 default slots fail cleanly -----------------------------------------------------------------------
+  def test_walk_all_6_default_slots_fail_cleanly(self):
     self.fresh_state()
-    self.set_phase(9)                              # the 8-entry default list
+    self.set_phase(9)                              # the 6-entry default list (the offline leftovers)
     car = self.p9_car()
-    car.key12_actions = [{"nrc": 0x35}] * 8
+    car.key12_actions = [{"nrc": 0x35}] * 6
     s = self.run_car(car)
     self.assertTrue(s["ran"])
     self.assertIsNone(s["error"])
     doc = self.result_doc()
-    self.assertEqual([a["slot"] for a in doc["attempts9"]], list(range(8)))
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], list(range(6)))
     self.assertEqual([a["candidate"] for a in doc["attempts9"]], list(E.PHASE9_DEFAULT_CANDIDATES))
-    self.assertEqual([a["nrc"] for a in doc["attempts9"]], [0x35] * 8)
-    self.assertEqual([a["positive"] for a in doc["attempts9"]], [False] * 8)
+    self.assertEqual([a["nrc"] for a in doc["attempts9"]], [0x35] * 6)
+    self.assertEqual([a["positive"] for a in doc["attempts9"]], [False] * 6)
+    # every default token resolved to its EXACT 8 wire bytes (pinned in the frame, recorded in attempts9)
+    self.assertEqual([a["key_hex"] for a in doc["attempts9"]],
+                     [self.K_26300_8.hex(), self.K_LIT.hex(), self.K_26300W.hex(),
+                      self.K_27400W.hex(), self.K_27400_8.hex(), self.K_40000W.hex()])
     self.assertFalse(doc["unlocked9"])
     self.assertIsNone(doc["hard_lock"])
     self.assertFalse(doc["write_attempted"])
     self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])
-    self.assertEqual(len(self.key_frames(car)), 8)
-    self.assertEqual(len(self.seed_frames(car)), 8)
+    self.assertEqual(len(self.key_frames(car)), 6)
+    self.assertEqual(len(self.seed_frames(car)), 6)
     self.assertEqual(self.step_names(doc), ["read_esc", "session"] +
-                     [n for i in range(8) for n in (f"seed_{i}", f"key_{i}")] + ["leave_session", "read_esc_end"])
+                     [n for i in range(6) for n in (f"seed_{i}", f"key_{i}")] + ["leave_session", "read_esc_end"])
     kt = self.key_times(car)
-    for i in range(1, 8):
+    for i in range(1, 6):
       self.assertGreaterEqual(kt[i] - kt[i - 1], E.PHASE9_WAIT_S)
     self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE9)
+
+  # ---- the offline-leftover tokens' EXACT wire bytes (synthetic seeds) ------------------------------------------------
+  def test_leftover_tokens_exact_wire_bytes(self):
+    # on the on-car 8-byte seed 5AB05AB05AB05AB0
+    self.assertEqual(E.resolve_phase9("algo8w_26300", PHASE4_SEED), self.K_26300W)
+    self.assertEqual(E.resolve_phase9("algo8_26300", PHASE4_SEED), self.K_26300_8)
+    self.assertEqual(E.resolve_phase9("algo8w_27400", PHASE4_SEED), self.K_27400W)
+    self.assertEqual(E.resolve_phase9("algo8_27400", PHASE4_SEED), self.K_27400_8)
+    self.assertEqual(E.resolve_phase9("algo8w_40000", PHASE4_SEED), self.K_40000W)
+    self.assertEqual(self.K_40000W, bytes(8))
+    # on a synthetic NON-repeating seed every token differs from every other
+    a = {c: E.resolve_phase9(c, self.P9_SEED) for c in ("algo8w_26300", "algo8_26300", "algo8w_27400",
+                                                        "algo8_27400", "algo8w_40000")}
+    for c, k in a.items():
+      self.assertEqual(len(k), 8, c)
+    self.assertEqual(a["algo8w_26300"], bytes.fromhex("0078007800780078"))   # [00,0x78] x4
+    self.assertEqual(a["algo8_26300"], bytes.fromhex("0078004b0078004b"))   # cal_26300 raw 0078004b, doubled
+    self.assertEqual(a["algo8w_27400"], bytes.fromhex("4a444a444a444a44"))   # [4a,44] x4
+    self.assertEqual(a["algo8_27400"], bytes.fromhex("4a44ce224a44ce22"))   # 4a44ce22 x2
+    self.assertEqual(a["algo8w_40000"], bytes(8))                            # 1122 off-table -> 0000 x4
+    # the five distinct shapes are pairwise distinct (no aliasing between the x4-repeat and x2-double constructions)
+    self.assertEqual(len(set(a.values())), 5)
+
+  def test_default_walk_slot_frame_sequence(self):
+    # the 6-slot default walk emits exactly one slot (27 11 -> FC -> 27 12 FF -> 27 12 CF) per candidate, each preceded
+    # (k>0) by the wait+cycle recipe (10 01 -> 10 03); every 27 12 first frame carries the token's EXACT 4-byte head.
+    self.fresh_state()
+    self.set_phase(9)                              # the default list
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}] * 6
+    self.run_car(car)
+    keys = [self.K_26300_8, self.K_LIT, self.K_26300W, self.K_27400W, self.K_27400_8, self.K_40000W]
+    exp = [self.READ, self.SESSION]
+    for i, k in enumerate(keys):
+      if i:
+        exp += [self.SESSION01, self.SESSION]
+      exp += self.slot_frames(k)
+    exp += [self.SESSION01, self.READ]             # clean leave + value_end
+    self.assertEqual(self.tx_frames(car), exp)
 
   # ---- run 3: hard lock at slot 3 (0x36 twice -> stop) ----------------------------------------------------------------
   def test_hard_lock_at_slot_3(self):
@@ -3646,7 +3732,8 @@ class TestPhase9(Base):
   def test_candidates_capped_at_ten_and_unknown_dropped(self):
     self.fresh_state()
     self.set_phase(9, candidates=["algo8w_27100", "banana", "algo8_27100", "algo8w_26400", "algo8w_26800",
-                                  "algo8w_26600", "algo8_26700", "algo8_26300", "lit270100", "zero8", "identity8"])
+                                  "algo8w_26600", "algo8_26700", "algo8w_26300", "algo8w_27400", "algo8_27400",
+                                  "algo8w_40000", "lit270100", "zero8", "identity8"])
     car = self.p9_car()
     car.key12_actions = [{"nrc": 0x35}] * 10
     self.run_car(car)
@@ -3655,7 +3742,9 @@ class TestPhase9(Base):
     self.assertEqual(len(used), 10)
     self.assertNotIn("banana", used)
     self.assertEqual(used, ["algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
-                            "algo8_26700", "algo8_26300", "lit270100", "zero8", "identity8"])
+                            "algo8_26700", "algo8w_26300", "algo8w_27400", "algo8_27400", "algo8w_40000"])
+    # the dropped tail (lit270100/zero8/identity8) never got a 27 12
+    self.assertEqual(len(self.key_frames(car)), 10)
 
   def test_all_invalid_p9_candidates_skips(self):
     self.fresh_state()

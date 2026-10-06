@@ -276,8 +276,9 @@ Phase 9 -- the DOOR-B CANDIDATE WALK with the time-reset recipe (state ``{"probe
 The phase-8 run established the WORKABLE door-B recipe on the car: a wrong key, then a wait >= 25 s, then a session cycle
 (``10 01`` -> ``10 03``), then ``27 11`` (fresh seed) -> ``27 12`` (next candidate) IS evaluated again (``7F 27 35``) --
 the 25 s wait PLUS the cycle clears the per-session attempt counter, whereas a bare cycle alone does not. Phase 9 spends
-that recipe on a WALK: 8-10 candidates in ONE parked ignition (~30 s per slot, budget ``RUN_BUDGET_S_PHASE9`` = 420 s).
-``p9_candidates`` is optional (default the 8 door-B algorithm tokens incl. the three new 2-byte ones); only valid tokens
+that recipe on a WALK: up to ``PHASE9_MAX_CANDIDATES`` (10) candidates in ONE parked ignition (~55 s per slot incl. the
+wait, budget ``RUN_BUDGET_S_PHASE9`` = 420 s). ``p9_candidates`` is optional (default the 6 offline-leftover tokens:
+``algo8_26300``/``lit270100``/``algo8w_26300``/``algo8w_27400``/``algo8_27400``/``algo8w_40000``); only valid tokens
 are kept, capped at ``PHASE9_MAX_CANDIDATES`` (10); an all-invalid list is inert (skip). ``p9_wait_s`` is optional
 (default ``PHASE9_WAIT_S`` = 25.0), clamped to ``[PHASE9_WAIT_MIN_S, PHASE9_WAIT_MAX_S]`` = [10, 60]. All frames go to
 the ESC (0x7D1) ONLY:
@@ -303,8 +304,8 @@ Guards, mechanically enforced for phase 9 (``SafetyViolation`` raised BEFORE any
 
   * ``27 12``: phase 9 only, ONLY 8-byte keys pinned EXACTLY to the resolved candidate, ONLY immediately after a POSITIVE
     ``27 11`` in the SAME session (the ``p9_seed`` sentinel, cleared on any session change), total <= ``PHASE9_MAX_KEY_ATTEMPTS``
-    (12 = 8 slots + 1 retry + margin);
-  * ``27 11``: phase 9 only, bare, total <= ``PHASE9_MAX_SEEDS`` (14);
+    (16 = 6 slots + retries + margin);
+  * ``27 11``: phase 9 only, bare, total <= ``PHASE9_MAX_SEEDS`` (20);
   * ``27 01`` (and ``27 02``): NOT admissible in phase 9; no ``29``/``31``, no ``34``-``37``, NO extra request addresses;
   * ``2E``: only the ONE no-op write on the WIN PATH, payload == ``value_start`` exactly; no other ``2E`` ever;
   * ``22``: DID 0x0103 only; ``10``: subs {01, 03} only;
@@ -511,22 +512,23 @@ ALLOWED_PHASE8_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC
 # ---------------------------------------------------------------------------------------------------------------------
 # Phase 9 -- the DOOR-B CANDIDATE WALK with the time-reset recipe. Phase 8 found the ONE-free-key-per-session policy and
 # that a 25 s WAIT followed by a session cycle (10 01 -> 10 03) clears the counter; phase 9 spends that recipe on a WALK
-# of 8-10 candidates in ONE parked ignition (~30 s per slot). The candidate list lives in the optional ``p9_candidates``
-# state key; the wait in the optional ``p9_wait_s`` (clamped to [10, 60]). ``27 12`` is admissible ONLY right after a
-# POSITIVE ``27 11`` in the SAME session (the ``p9_seed`` sentinel, cleared on any session change), ONLY with its key
-# pinned EXACTLY to the resolved candidate, and at most PHASE9_MAX_KEY_ATTEMPTS (12) times per run; ``27 11`` is capped
-# at PHASE9_MAX_SEEDS (14). No 0x29, no 0x19/0x31/34-37, no extra request addresses.
+# of up to PHASE9_MAX_CANDIDATES (10) candidates in ONE parked ignition (~55 s per slot incl. the wait). The candidate
+# list lives in the optional ``p9_candidates`` state key; the wait in the optional ``p9_wait_s`` (clamped to [10, 60]).
+# ``27 12`` is admissible ONLY right after a POSITIVE ``27 11`` in the SAME session (the ``p9_seed`` sentinel, cleared on
+# any session change), ONLY with its key pinned EXACTLY to the resolved candidate, and at most PHASE9_MAX_KEY_ATTEMPTS
+# (16) times per run; ``27 11`` is capped at PHASE9_MAX_SEEDS (20). No 0x29, no 0x19/0x31/34-37, no extra request addrs.
 # ---------------------------------------------------------------------------------------------------------------------
 PHASE9_EXTRA_REQ_ADDRS = frozenset()            # phase 9 talks to the ESC (0x7D1) ONLY -- no extra peek addresses
 PHASE9_SESSION_SUBFUNCS = frozenset({SESSION_SUBFUNC_DEFAULT, ALLOWED_SESSION_SUBFUNC})   # 10 01 cycle / 10 03 enter
-# The phase-9 candidate vocabulary: the door-B algorithm tokens (incl. the three new 2-byte algos 26400/26800/26600) plus
-# the vendor-shape literal lit270100. 27 12's key is built by the shared resolve_phase9.
-PHASE9_CANDIDATES = (*PHASE8_CANDIDATES, "algo8w_26400", "algo8w_26800", "algo8w_26600")
+# The phase-9 candidate vocabulary: the door-B algorithm tokens (incl. the three 2-byte algos 26400/26800/26600 and the
+# four offline leftovers 26300w/27400w/27400/40000w) plus the vendor-shape literal lit270100. 27 12's key is built by
+# the shared resolve_phase9.
+PHASE9_CANDIDATES = (*PHASE8_CANDIDATES, "algo8w_26400", "algo8w_26800", "algo8w_26600",
+                     "algo8w_26300", "algo8w_27400", "algo8_27400", "algo8w_40000")
 PHASE9_MAX_CANDIDATES = 10          # hard cap on the candidate list (one 27 12 per slot)
-PHASE9_DEFAULT_CANDIDATES = ("algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
-                             "algo8_26700", "algo8_26300", "lit270100")
-PHASE9_MAX_KEY_ATTEMPTS = 12        # hard cap on 27 12 in the whole run (8 slots + 1 retry + margin)
-PHASE9_MAX_SEEDS = 14               # hard cap on 27 11 in the whole run (8 slots + 1 retry + margin)
+PHASE9_DEFAULT_CANDIDATES = ("algo8_26300", "lit270100", "algo8w_26300", "algo8w_27400", "algo8_27400", "algo8w_40000")
+PHASE9_MAX_KEY_ATTEMPTS = 16        # hard cap on 27 12 in the whole run (6 slots + retries + margin)
+PHASE9_MAX_SEEDS = 20               # hard cap on 27 11 in the whole run (6 slots + retries + margin)
 PHASE9_WAIT_S = 25.0                # the time-reset wait between slots (a REAL sleep, inside the budget)
 PHASE9_WAIT_MIN_S = 10.0            # p9_wait_s is clamped to this floor
 PHASE9_WAIT_MAX_S = 60.0            # p9_wait_s is clamped to this ceiling
@@ -1121,10 +1123,15 @@ def resolve_phase9(candidate: str, seed: bytes) -> bytes | None:
 
     * algo8w_26400 = ``cal_26400(seed[:4])[:2]`` repeated x4 (``[lo,hi]x4`` -- the wire shape of the on-car seed);
     * algo8w_26800 = ``cal_26800(seed[:4])[:2]`` repeated x4;
-    * algo8w_26600 = ``cal_26600(seed[:4])[:2]`` repeated x4.
+    * algo8w_26600 = ``cal_26600(seed[:4])[:2]`` repeated x4;
+    * algo8w_26300 = ``cal_26300(seed[:4])[:2]`` repeated x4 (``[00,HI]x4``);
+    * algo8w_27400 = ``cal_27400(seed[:4])[:2]`` repeated x4;
+    * algo8_27400  = ``cal_27400(seed[:4])`` repeated x2 (the 4-byte G-scan key doubled to 8);
+    * algo8w_40000 = ``cal_40000(seed[:4])[:2]`` repeated x4 (``[:2]`` is a no-op for the 2-byte output).
 
   ``cal_26400``/``cal_26800`` take 2 seed bytes; ``cal_26600`` (the recovered CRC-16/0xC0A3, Securityindex 26600) also
-  takes 2. Every mode returns EXACTLY 8 wire bytes; ``None`` means a vendor zero-byte bail (no frame); an unknown name
+  takes 2; ``cal_40000`` (the recovered fixed lookup, Securityindex 40000) also takes 2; ``cal_26300``/``cal_27400`` take
+  4. Every mode returns EXACTLY 8 wire bytes; ``None`` means a vendor zero-byte bail (no frame); an unknown name
   raises ``Abort`` (recorded) and never reaches the bus.
   """
   import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
@@ -1146,6 +1153,32 @@ def resolve_phase9(candidate: str, seed: bytes) -> bytes | None:
       raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
     if k is None:
       return None
+    return k[:2] * 4
+  if candidate == "algo8w_26300":
+    try:
+      k = sk.cal_26300(s[:4])
+    except Exception as e:  # missing/import failure -> recorded abort, no frame
+      raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
+    if k is None:
+      return None
+    return k[:2] * 4
+  if candidate == "algo8w_27400":
+    try:
+      k = sk.cal_27400(s[:4])                 # no vendor zero-bail: always a 4-byte key
+    except Exception as e:
+      raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
+    return k[:2] * 4
+  if candidate == "algo8_27400":
+    try:
+      k = sk.cal_27400(s[:4])
+    except Exception as e:
+      raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
+    return k * 2
+  if candidate == "algo8w_40000":
+    try:
+      k = sk.cal_40000(s[:2])                 # no vendor zero-bail: always a 2-byte key
+    except Exception as e:
+      raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
     return k[:2] * 4
   return resolve_phase8(candidate, s)                       # every other token is shared with phase 8
 
@@ -2760,9 +2793,10 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     p8_candidates = [c for c in p8_state if isinstance(c, str) and c in PHASE8_CANDIDATES][:PHASE8_MAX_CANDIDATES]
     if not p8_candidates:
       return {**summary, "skip": f"no valid p8_candidates in {p8_state!r}"}
-  # phase 9: the optional door-B walk candidate list + the optional reset wait. Defaults from PHASE9_DEFAULT_CANDIDATES;
-  # the first PHASE9_MAX_CANDIDATES (10) kept; an unknown name is dropped; a wrong-typed value falls back to the default;
-  # if NO entry is a known token the run is inert (skip), exactly like phases 7/8. p9_wait_s is clamped to [10, 60].
+  # phase 9: the optional door-B walk candidate list + the optional reset wait. Defaults from PHASE9_DEFAULT_CANDIDATES
+  # (the 6 offline-leftover tokens); the first PHASE9_MAX_CANDIDATES (10) kept; an unknown name is dropped; a wrong-typed
+  # value falls back to the default; if NO entry is a known token the run is inert (skip), exactly like phases 7/8.
+  # p9_wait_s is clamped to [10, 60].
   p9_candidates: list = []
   p9_wait_s = PHASE9_WAIT_S
   if phase == 9:

@@ -20,6 +20,7 @@ I/O SIZES ([confirmed] from each function's sprintf + the XML's SecuritySupporte
     cal_26700(seed[0:4]) : in 4 bytes -> out 4 bytes (06 27 02)
     cal_26800(seed[0:2]) : in 2 bytes -> out 2 bytes (04 27 02)
     cal_27400(seed[0:4]) : in 4 bytes -> out 4 bytes (06 27 02)
+    cal_40000(seed[0:2]) : in 2 bytes -> out 2 bytes (04 27 02)  [fixed lookup]
 
 THE 8-BYTE REPETITION IS A CLUE: no recovered algorithm consumes more than 4 seed bytes.  A [v0,v1]x4 seed makes every
 4-byte window identical (v0,v1,v0,v1), so the challenge is robust to which window the tester reads.  BUT an 8-byte
@@ -218,6 +219,28 @@ def cal_26600(seed2: bytes) -> bytes | None:
 
 
 # ----------------------------------------------------------------------------
+# Securityindex 40000 - fcn @ 0x73d20 [confirmed 0x73d20-0x73e2c]
+#   (used by MANDO/CN7C ESC and others, SecuritySupported=1 -> 2-byte key)
+#   Seed: Mid(8,4) = 2 bytes -> parsed as ONE hex number val = (b0<<8)|b1.
+#   FIXED LOOKUP on that value [0x73d7c-0x73dfc]:
+#     0x03->0x1A  0x17->0xB8  0x28->0x144  0x3B->0x1DF  0x4F->0x27B
+#     0x55->0x2AB  0x69->0x34D  0x7A->0x3D6  else 0
+#   Output sprintf("%04x") -> 2 bytes big-endian (04 27 02).  NO zero-bail.
+# ----------------------------------------------------------------------------
+_T40000 = {0x03: 0x1A, 0x17: 0xB8, 0x28: 0x144, 0x3B: 0x1DF,
+           0x4F: 0x27B, 0x55: 0x2AB, 0x69: 0x34D, 0x7A: 0x3D6}
+
+
+def cal_40000(seed2: bytes) -> bytes:
+  """2 seed bytes in -> 2 key bytes out (04 27 02).  Fixed lookup; 0000 for any seed off the table."""
+  if len(seed2) != 2:
+    raise ValueError("cal_40000 expects exactly 2 seed bytes (seed[0:2])")
+  val = (seed2[0] << 8) | seed2[1]
+  k16 = _T40000.get(val, 0)
+  return bytes([(k16 >> 8) & 0xFF, k16 & 0xFF])
+
+
+# ----------------------------------------------------------------------------
 # The phase-4 ``algo`` selector.  Names are the G-scan2 Securityindex values (the vendor CalKeyAlgorithm number).
 # ----------------------------------------------------------------------------
 _ALGOS = {
@@ -228,6 +251,7 @@ _ALGOS = {
   "26700": cal_26700,   # LFSR32 / 0x3BCC14C8, 4-byte seed -> 4-byte key
   "26800": cal_26800,   # table-XOR, 2-byte seed -> 2-byte key
   "27400": cal_27400,   # multiply/add, 4-byte seed -> 4-byte key
+  "40000": cal_40000,   # fixed lookup, 2-byte seed -> 2-byte key
 }
 ALGO_NAMES = tuple(_ALGOS.keys())
 DEFAULT_ALGO = "27100"
@@ -255,7 +279,7 @@ def key_for(seed: bytes, algo: str | None = None) -> bytes | None:
   if fn is None:
     raise ValueError(f"unknown algo {algo!r} (choose from {sorted(_ALGOS)})")
   s4 = _seed4(bytes(seed))
-  if name in ("26400", "26600", "26800"):
+  if name in ("26400", "26600", "26800", "40000"):
     return fn(s4[:2])
   return fn(s4)
 
@@ -276,6 +300,7 @@ def candidates(seed: bytes) -> dict[str, bytes | None]:
     "26700": cal_26700(s4),      # LFSR32          -> 06 27 02 [st BE 4B]
     "26800": cal_26800(s4[:2]),  # table-XOR       -> 04 27 02 [HI, LO]
     "27400": cal_27400(s4),      # mul/add         -> 06 27 02 [k0..k3]
+    "40000": cal_40000(s4[:2]),  # fixed lookup    -> 04 27 02 [HI, LO]
   }
 
 
