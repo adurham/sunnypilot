@@ -102,7 +102,13 @@ the key itself: ``27 02`` (sendKey). Phase 4 completes that unlock:
      the whole seed, ``algo`` = ``openpilot.sunnypilot.fork.esc_probe_seedkey.key_for(seed, state["algo"])`` (the
      recovered G-scan CalKeyAlgorithm_* family, selectable by Securityindex 27100..27400; a missing/failing module, an
      unknown ``algo``, or a zero-byte seed that the vendor path bails on aborts, recorded), ``hex`` =
-     ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible;
+     ``bytes.fromhex(state["key_hex"])``. ONLY lengths 2, 4, 8 are admissible. The 8-byte CONSTRUCTION modes wrap the
+     same resolvers into exactly 8 wire bytes, because the car proved ``27 02`` wants an 8-byte key (a 4-byte key drew
+     ``7F 27 13`` incorrect-length; the 8-byte seed-as-key drew ``7F 27 35`` invalidKey — so 8 bytes is the accepted
+     LENGTH and VALUE iteration begins): ``algo8`` = the algo key repeated to fill 8 (2-byte k -> k*4, 4-byte -> k*2);
+     ``algo8p`` = the algo key + zero padding (2-byte -> k+6 zeros, 4-byte -> k+4 zeros); ``repeat8`` = the seed's own
+     2-byte value repeated (``seed[:2]*4``); ``hex8`` = exactly 8 bytes from ``state["key_hex"]`` (any other length
+     aborts — stricter than ``hex``);
   6. send ``27 02`` ONCE: 2-byte key -> ``04 27 02 K1 K2``; 4-byte -> ``06 27 02 K1..K4``; 8-byte -> the ISO-TP
      multi-frame ``10 0A 27 02 K1..K4`` + one consecutive frame ``21 K5..K8`` (the phase-3 machinery);
   7. on ``67 02``: the no-op ``2E 0103 <readback>`` (the SAME readback guard as always) then a re-read — the payoff.
@@ -113,7 +119,7 @@ ONLY when ``phase == 4``, ONLY as the first key of the run (the same counter pha
 equal the RESOLVED candidate (``guard_frame`` takes the resolved bytes and re-checks them at the single TX site). Phase 3
 keeps its own identity-key path unchanged. A malformed ``key_mode`` is inert (``skip: unknown key_mode``).
 
-In ``algo`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
+In ``algo``/``algo8``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
 ``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
 The resolved candidate hex is recorded as ``key_bytes`` (and the selector as ``algo``) in the result JSON and the
 summary/cloudlog, BEFORE the ``27 02`` is sent, so a refused/silent key is still fully attributable. Every recovered
@@ -173,7 +179,12 @@ ALLOWED_SESSION_SUBFUNC = 0x03   # extended only (used to retry a refused 0x0103
 ALLOWED_SEC_SUBFUNC = 0x01       # requestSeed; sendKey (0x02) is admitted ONLY in the phase-3 battery (single attempt)
 ALLOWED_SEC_SUBFUNC_KEY = 0x02   # sendKey — phase 3 (identity key == the step-2 seed) and phase 4 (resolved candidate)
 ALLOWED_KEY_LENGTHS = (2, 4, 8)  # phase 4: the ONLY admissible candidate-key sizes (2/4 -> single frame, 8 -> ISO-TP)
-KEY_MODES = ("identity2", "identity4", "identity8", "algo", "hex")   # phase-4 candidate-key derivation modes
+# phase-4 candidate-key derivation modes. The 8-byte CONSTRUCTION modes ("algo8"/"algo8p"/"repeat8"/"hex8") were added
+# after the on-car run proved 27 02 wants an 8-byte key: a 4-byte key drew 7F 27 13 (incorrect length) and the
+# 8-byte seed-as-key (identity8) drew 7F 27 35 (invalidKey) — so 8 bytes is the accepted LENGTH and VALUE iteration
+# can begin. Each of the new modes resolves to exactly 8 wire bytes (see resolve_key).
+KEY_MODES = ("identity2", "identity4", "identity8", "algo", "hex",
+             "algo8", "algo8p", "repeat8", "hex8")   # phase-4 candidate-key derivation modes
 ALLOWED_AUTH_SUBFUNC = 0x01      # Authentication (0x29) start — phase 3 only
 ALLOWED_ROUTINE_SUBFUNC = 0x01   # RoutineControl (0x31) start — phase 3 only
 ROUTINE_CONTROL_ID = 0x0000      # the "is any routine even answered" probe
@@ -327,14 +338,38 @@ def parse_read_did(resp_hex: str | None, did: int) -> bytes | None:
   return None
 
 
+def _resolve_algo_key(seed: bytes, algo: str | None) -> bytes:
+  """Shared algo resolution for the ``algo``/``algo8``/``algo8p`` modes: ``key_for(seed, algo)``.
+
+  Aborts (recorded) on a missing/failing module, an unknown algo name, or the vendor zero-byte bail (``key_for`` ->
+  None) — identical semantics in all three modes, so a zero-byte seed can never reach the bus unpinned.
+  """
+  try:
+    import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
+    resolved = sk.key_for(bytes(seed), algo)          # None = the vendor zero-byte bail, not an error
+  except Exception as e:  # missing module, import error, unknown algo, or the algorithm raising -> recorded abort
+    raise Abort(f"algo module missing/failed: {e!r}") from e
+  if resolved is None:
+    raise Abort("algo returned no key for this seed (zero-byte bail)")
+  return bytes(resolved)
+
+
 def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: str | None = None) -> bytes:
-  """Phase 4 step 5: derive the candidate key bytes from the step-3 seed (2, 4 or 8 bytes only).
+  """Phase 4 step 5: derive the candidate key bytes from the step-3 seed.
 
   identity2 = the seed's first 2 bytes; identity4 = first 4; identity8 = the whole seed; algo = the separate
   ``esc_probe_seedkey`` module's ``key_for(seed, algo)`` (``algo`` names a recovered G-scan algorithm, None -> its
   vendor-exact 27100 default); hex = the operator-supplied ``key_hex``. A missing/failing algo module, an unknown algo
   name, a zero-byte seed the vendor path bails on (``key_for`` -> None), an unparseable hex string, or any length other
   than 2/4/8 aborts the run (recorded).
+
+  The 8-byte CONSTRUCTION modes wrap the same resolvers into exactly 8 wire bytes (the car proved 27 02 wants an 8-byte
+  key — 4 bytes drew NRC 0x13, the full seed drew 0x35):
+    * algo8  = the algo key repeated to fill 8 (2-byte k -> k*4; 4-byte k -> k*2);
+    * algo8p = the algo key + zero padding (2-byte -> k + 6 zeros; 4-byte -> k + 4 zeros);
+    * repeat8 = the seed's own 2-byte value repeated (seed[:2] * 4) — same bytes as identity2-as-8B, kept distinct for
+      construction clarity;
+    * hex8   = exactly 8 bytes from ``key_hex`` (any other length aborts — stricter than ``hex``).
   """
   if key_mode == "identity2":
     key = bytes(seed)[:2]
@@ -343,19 +378,31 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: st
   elif key_mode == "identity8":
     key = bytes(seed)
   elif key_mode == "algo":
-    try:
-      import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
-      resolved = sk.key_for(bytes(seed), algo)          # None = the vendor zero-byte bail, not an error
-    except Exception as e:  # missing module, import error, unknown algo, or the algorithm raising -> recorded abort
-      raise Abort(f"algo module missing/failed: {e!r}") from e
-    if resolved is None:
-      raise Abort("algo returned no key for this seed (zero-byte bail)")
-    key = bytes(resolved)
+    key = _resolve_algo_key(seed, algo)
+  elif key_mode == "algo8":
+    k = _resolve_algo_key(seed, algo)
+    if len(k) not in (2, 4):
+      raise Abort(f"algo8: algo key length {len(k)} is not 2 or 4")
+    key = (k * 4)[:8] if len(k) == 2 else k * 2
+  elif key_mode == "algo8p":
+    k = _resolve_algo_key(seed, algo)
+    if len(k) not in (2, 4):
+      raise Abort(f"algo8p: algo key length {len(k)} is not 2 or 4")
+    key = k.ljust(8, b"\x00")
+  elif key_mode == "repeat8":
+    key = bytes(seed)[:2] * 4
   elif key_mode == "hex":
     try:
       key = bytes.fromhex((key_hex or "").strip())
     except ValueError as e:
       raise Abort(f"hex key_mode: bad key_hex {key_hex!r}") from e
+  elif key_mode == "hex8":
+    try:
+      key = bytes.fromhex((key_hex or "").strip())
+    except ValueError as e:
+      raise Abort(f"hex8 key_mode: bad key_hex {key_hex!r}") from e
+    if len(key) != 8:
+      raise Abort(f"hex8 key_mode: key_hex must be exactly 8 bytes, got {len(key)}")
   else:
     raise Abort(f"unknown key_mode {key_mode!r}")
   if len(key) not in ALLOWED_KEY_LENGTHS:
@@ -860,7 +907,7 @@ def _run_phase4_sequence(client: "EscProbeClient", doc: dict, state: dict, curre
   # ---- 5. resolve the candidate key bytes from the seed -----------------------------------------------------------
   key_mode = state.get("key_mode") or "identity2"
   doc["key_mode"] = key_mode
-  algo = state.get("algo") if key_mode == "algo" else None            # optional selector (None -> key_for's default)
+  algo = state.get("algo") if key_mode in ("algo", "algo8", "algo8p") else None   # selector (None -> key_for default)
   key = resolve_key(pos_seed, key_mode, state.get("key_hex"), algo)   # Abort (recorded) on bad mode/hex/algo/length/None
   doc["algo"] = algo
   doc["key"] = key.hex()

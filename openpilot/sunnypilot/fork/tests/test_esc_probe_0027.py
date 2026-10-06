@@ -1079,8 +1079,9 @@ class TestPhase3(Base):
 class TestPhase4(Base):
   """Phase 4 (state ``{"probe_enabled": true, "phase": 4, "key_mode": ...}``): the sendKey attempt.
   read 22 0103 -> 10 03 (REQUIRED positive, seeds are session-gated) -> 27 01 seed (REQUIRED positive, >=2 bytes)
-  -> ~500 ms -> ONE 27 02 with the RESOLVED candidate key (identity2/identity4/identity8/algo/hex) -> only on 67 02
-  the no-op 2E + re-read. Mechanically single-attempt and pinned to the resolved bytes."""
+  -> ~500 ms -> ONE 27 02 with the RESOLVED candidate key (identity2/identity4/identity8/algo/hex, plus the 8-byte
+  construction modes algo8/algo8p/repeat8/hex8) -> only on 67 02 the no-op 2E + re-read. Mechanically single-attempt
+  and pinned to the resolved bytes."""
 
   READ = bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")
   SESSION = bytes([2, 0x10, 0x03]).ljust(8, b"\x00")
@@ -1468,6 +1469,159 @@ class TestPhase4(Base):
     self.assertFalse(s["key_attempted"])
     self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
     self.assertEqual(self.write_frames(car), [])
+
+  # ---- (l) 8-byte CONSTRUCTION modes (algo8/algo8p/repeat8/hex8) -----------------------------------------------
+  # On-car evidence: a 4-byte key drew 7F 27 13 (incorrect length) and the 8-byte seed-as-key drew 7F 27 35
+  # (invalidKey), so 8 bytes is the accepted LENGTH and VALUE iteration begins. Every new mode resolves to exactly 8
+  # wire bytes -> the ISO-TP multi-frame shape (10 0A 27 02 K1..K4 + 21 K5..K8).
+  ALGO_26400_KEY = bytes.fromhex("37e2")          # key_for(1122334455667788, "26400") (2-byte algo output)
+
+  def test_phase4_algo8_2byte_algo_repeats_to_8(self):
+    # (a) algo8 with a 2-byte algorithm (26400): k = cal_26400(seed[:2]) -> repeated to fill: k*4 = 8 bytes
+    self.assertEqual(SK.key_for(self.ALGO_SEED, "26400"), self.ALGO_26400_KEY)
+    self.set_state(key_mode="algo8", algo="26400")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    self.assertIsNone(s["error"])
+    key8 = self.ALGO_26400_KEY * 4
+    self.assertEqual(key8.hex(), "37e237e237e237e2")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]              # FF: 10 0A 27 02 37 E2 37 E2
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")           # CF: 21 37 E2 37 E2
+    self.assertEqual(ff, bytes([0x10, 0x0A, 0x27, 0x02, 0x37, 0xE2, 0x37, 0xE2]))
+    self.assertEqual(cf, bytes([0x21, 0x37, 0xE2, 0x37, 0xE2]).ljust(8, b"\x00"))
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, ff, cf, self.WRITE, self.READ])
+    self.assertEqual([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])], [ff])
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x21], [cf])
+    doc = self.result_doc()
+    self.assertEqual(doc["key_mode"], "algo8")
+    self.assertEqual(doc["algo"], "26400")
+    self.assertEqual(doc["key"], "37e237e237e237e2")
+    self.assertEqual(doc["key_bytes"], "37e237e237e237e2")
+    self.assertTrue(doc["unlocked"])
+
+  def test_phase4_algo8_4byte_algo_doubles_to_8(self):
+    # (b) algo8 with a 4-byte algorithm (26700): key = cal_26700(seed[:4]) * 2 -> 8 bytes
+    self.set_state(key_mode="algo8", algo="26700")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key8 = self.ALGO_26700_KEY * 2
+    self.assertEqual(key8.hex(), "2375f3602375f360")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, ff, cf, self.WRITE, self.READ])
+    doc = self.result_doc()
+    self.assertEqual(doc["algo"], "26700")
+    self.assertEqual(doc["key"], "2375f3602375f360")
+    self.assertEqual(doc["key_bytes"], "2375f3602375f360")
+
+  def test_phase4_algo8p_4byte_algo_pads_to_8(self):
+    # (c) algo8p with a 4-byte algorithm (26700): k4 + 0000 (zero padding to 8)
+    self.set_state(key_mode="algo8p", algo="26700")
+    car = self.p4_car()
+    car.esc_seed8 = self.ALGO_SEED
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key8 = bytes.fromhex("2375f36000000000")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")
+    self.assertEqual(ff, bytes([0x10, 0x0A, 0x27, 0x02, 0x23, 0x75, 0xF3, 0x60]))
+    self.assertEqual(cf, bytes([0x21, 0x00, 0x00, 0x00, 0x00]).ljust(8, b"\x00"))
+    self.assertEqual(self.tx_frames(car),
+                     [self.READ, self.SESSION, self.SEED01, self.FC, ff, cf, self.WRITE, self.READ])
+    doc = self.result_doc()
+    self.assertEqual(doc["key_mode"], "algo8p")
+    self.assertEqual(doc["key"], "2375f36000000000")
+    self.assertEqual(doc["key_bytes"], "2375f36000000000")
+
+  def test_phase4_repeat8_is_seed_first_two_repeated(self):
+    # (d) repeat8: key == seed[:2] * 4 (the seed's own 2-byte value repeated)
+    self.set_state(key_mode="repeat8")
+    car = self.p4_car()                      # seed 5AB05AB05AB05AB0 -> 5AB0 x4
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key8 = PHASE4_SEED[:2] * 4
+    self.assertEqual(key8.hex(), "5ab05ab05ab05ab0")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")
+    self.assertEqual([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])], [ff])
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x21], [cf])
+    doc = self.result_doc()
+    self.assertEqual(doc["key_mode"], "repeat8")
+    self.assertEqual(doc["key"], key8.hex())
+    self.assertEqual(doc["key_bytes"], key8.hex())
+
+  def test_phase4_hex8_requires_exactly_eight_bytes(self):
+    # (e) hex8 accepts EXACTLY 8 bytes: any other length -> abort, NO 27 02 frame (stricter than hex)
+    for bad in ("a1b2c3d4", "a1b2c3d4e5", "a1b2", ""):
+      with self.subTest(bad=bad):
+        self.fresh_state()
+        self.set_state(key_mode="hex8", key_hex=bad)
+        car = self.p4_car()
+        s = self.run_car(car, key=f"hex8-{bad}")
+        self.assertTrue(s["ran"])
+        self.assertIn("exactly 8 bytes", s["aborted"])
+        self.assertFalse(s["key_attempted"])
+        self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+        self.assertEqual(self.write_frames(car), [])
+
+  def test_phase4_hex8_uses_key_hex(self):
+    self.set_state(key_mode="hex8", key_hex="0123456789abcdef")
+    car = self.p4_car()
+    car.key_unlock = True
+    car.write_refused = False
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    key8 = bytes.fromhex("0123456789abcdef")
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")
+    self.assertEqual([d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x02])], [ff])
+    self.assertEqual([d for _, d, _ in car.sent if d[0] == 0x21], [cf])
+    self.assertEqual(self.result_doc()["key"], "0123456789abcdef")
+
+  def test_phase4_algo8p_none_key_aborts_no_frame(self):
+    # (f) algo8p with a zero-byte seed -> key_for None -> recorded abort, NO 27 02
+    self.assertIsNone(SK.key_for(bytes.fromhex("1100334455667788"), "27100"))
+    self.set_state(key_mode="algo8p", algo="27100")
+    car = self.p4_car()
+    car.esc_seed8 = bytes.fromhex("1100334455667788")
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("algo returned no key for this seed (zero-byte bail)", s["aborted"])
+    self.assertFalse(s["key_attempted"])
+    self.assertEqual([d for _, d, _ in car.sent if d[1] == 0x27 and d[2] == 0x02], [])
+    self.assertEqual(self.write_frames(car), [])
+
+  def test_phase4_guard_frame_pins_8byte_construction_modes(self):
+    # (g) an 8-byte key from a construction mode goes through the SAME single-attempt counter + candidate pinning:
+    # guard_frame(seed=key) admits the FF only with the resolved bytes and only as the first attempt; the CF only once.
+    key8 = PHASE4_SEED[:2] * 4
+    ff = bytes([0x10, 0x0A, 0x27, 0x02]) + key8[:4]
+    cf = (bytes([0x21]) + key8[4:8]).ljust(8, b"\x00")
+    E.guard_frame(0x7D1, ff, 1, phase=4, seed=key8, key_attempts=0)     # pinned to the resolved 8 bytes
+    E.guard_frame(0x7D1, cf, 1, phase=4, seed=key8, key_attempts=1)     # the one consecutive frame
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, ff, 1, phase=4, seed=key8, key_attempts=1)   # a second key attempt is refused
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([0x10, 0x0A, 0x27, 0x02, 0, 0, 0, 0]), 1, phase=4, seed=key8, key_attempts=0)
 
   def test_phase4_budget_is_thirty_seconds(self):
     # phase 4 shares the phase-3 budget (the added 500 ms delay + key step)
