@@ -271,6 +271,45 @@ any frame is built):
   * NO extra request addresses (phase 8 talks to 0x7D1 only);
   * phases 1-7 stay byte-identical; once-per-ignition (``done_ignition``) like every other phase.
 
+Phase 9 -- the DOOR-B CANDIDATE WALK with the time-reset recipe (state ``{"probe_enabled": true, "phase": 9, "p9_candidates": [...]}``)
+---------------------------------------------------------------------------------------------------------------------------------------
+The phase-8 run established the WORKABLE door-B recipe on the car: a wrong key, then a wait >= 25 s, then a session cycle
+(``10 01`` -> ``10 03``), then ``27 11`` (fresh seed) -> ``27 12`` (next candidate) IS evaluated again (``7F 27 35``) --
+the 25 s wait PLUS the cycle clears the per-session attempt counter, whereas a bare cycle alone does not. Phase 9 spends
+that recipe on a WALK: 8-10 candidates in ONE parked ignition (~30 s per slot, budget ``RUN_BUDGET_S_PHASE9`` = 420 s).
+``p9_candidates`` is optional (default the 8 door-B algorithm tokens incl. the three new 2-byte ones); only valid tokens
+are kept, capped at ``PHASE9_MAX_CANDIDATES`` (10); an all-invalid list is inert (skip). ``p9_wait_s`` is optional
+(default ``PHASE9_WAIT_S`` = 25.0), clamped to ``[PHASE9_WAIT_MIN_S, PHASE9_WAIT_MAX_S]`` = [10, 60]. All frames go to
+the ESC (0x7D1) ONLY:
+
+  1. ``22 0103`` -> ``value_start`` (the no-op write needs it; silent/refused -> abort, no key);
+  2. ``10 03`` (extended). NOT positive -> ``skip to 6`` (the walk is skipped);
+  3. slot loop, k = 0..N-1 (each slot: ONE ``27 11`` -> fresh seed -> ONE ``27 12`` of the candidate):
+     * k > 0: wait ``p9_wait_s`` (a REAL sleep, inside the budget), then ``10 01``; ``10 03`` (both clear the sentinel);
+     * ``27 11`` -> fresh seed (positive required; a negative/silent seed -> record + STOP the walk);
+     * ``27 12`` + the resolved candidate key (ONE ISO-TP multi-frame) -> record {slot, candidate, key_hex, resp, nrc,
+       positive};
+     * ``67 12`` -> WIN PATH: the ONE no-op ``2E 0103 <value_start>`` + re-read ``22 0103``; record write9 /
+       value_after_write9; STOP;
+     * ``0x36``/``0x37`` -> POSSIBLE DEEPER LOCK: wait ``p9_wait_s``; ``10 01``; ``10 03``; ``27 11``; retry the SAME
+       candidate ONCE (only once per slot); a still-``0x36``/``0x37`` sets ``hard_lock`` (recorded, STOP) -- this
+       distinguishes "the reset recipe broke down" from "the counter is fine";
+     * ``0x35`` -> continue to the next slot;
+  4. after the loop: ``10 01``; ``22 0103`` -> ``value_end``.
+
+Summary fields: ``value_start``, ``value_end``, ``attempts9`` (the slot list), ``seeds9``, ``unlocked9``, ``write9``
+(resp/nrc), ``value_after_write9``, ``hard_lock``, ``hard_lock_slot``, ``aborted`` (plus ``walk_stopped`` on a bad seed).
+Guards, mechanically enforced for phase 9 (``SafetyViolation`` raised BEFORE any frame is built):
+
+  * ``27 12``: phase 9 only, ONLY 8-byte keys pinned EXACTLY to the resolved candidate, ONLY immediately after a POSITIVE
+    ``27 11`` in the SAME session (the ``p9_seed`` sentinel, cleared on any session change), total <= ``PHASE9_MAX_KEY_ATTEMPTS``
+    (12 = 8 slots + 1 retry + margin);
+  * ``27 11``: phase 9 only, bare, total <= ``PHASE9_MAX_SEEDS`` (14);
+  * ``27 01`` (and ``27 02``): NOT admissible in phase 9; no ``29``/``31``, no ``34``-``37``, NO extra request addresses;
+  * ``2E``: only the ONE no-op write on the WIN PATH, payload == ``value_start`` exactly; no other ``2E`` ever;
+  * ``22``: DID 0x0103 only; ``10``: subs {01, 03} only;
+  * phases 1-8 stay byte-identical; once-per-ignition (``done_ignition``) like every other phase.
+
 In ``algo``/``algo8``/``algo8w``/``algo8p`` mode the ``algo`` state key (an optional string) selects the recovered algorithm: one of
 ``"27100"``/``"26300"``/``"26400"``/``"26700"``/``"26800"``/``"27400"`` (absent -> the vendor-exact ``27100`` default).
 The resolved candidate hex is recorded as ``key_bytes`` (and the selector as ``algo``) in the result JSON and the
@@ -469,6 +508,35 @@ PHASE8_DIDS = frozenset({DID_VARIANT_CODING})   # phase 8 reads 0x0103 ONLY (no 
 ALLOWED_PHASE8_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSION_CONTROL,
                                      SVC_SECURITY_ACCESS, SVC_WRITE_DATA_BY_IDENTIFIER, SVC_AUTHENTICATION})
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 9 -- the DOOR-B CANDIDATE WALK with the time-reset recipe. Phase 8 found the ONE-free-key-per-session policy and
+# that a 25 s WAIT followed by a session cycle (10 01 -> 10 03) clears the counter; phase 9 spends that recipe on a WALK
+# of 8-10 candidates in ONE parked ignition (~30 s per slot). The candidate list lives in the optional ``p9_candidates``
+# state key; the wait in the optional ``p9_wait_s`` (clamped to [10, 60]). ``27 12`` is admissible ONLY right after a
+# POSITIVE ``27 11`` in the SAME session (the ``p9_seed`` sentinel, cleared on any session change), ONLY with its key
+# pinned EXACTLY to the resolved candidate, and at most PHASE9_MAX_KEY_ATTEMPTS (12) times per run; ``27 11`` is capped
+# at PHASE9_MAX_SEEDS (14). No 0x29, no 0x19/0x31/34-37, no extra request addresses.
+# ---------------------------------------------------------------------------------------------------------------------
+PHASE9_EXTRA_REQ_ADDRS = frozenset()            # phase 9 talks to the ESC (0x7D1) ONLY -- no extra peek addresses
+PHASE9_SESSION_SUBFUNCS = frozenset({SESSION_SUBFUNC_DEFAULT, ALLOWED_SESSION_SUBFUNC})   # 10 01 cycle / 10 03 enter
+# The phase-9 candidate vocabulary: the door-B algorithm tokens (incl. the three new 2-byte algos 26400/26800/26600) plus
+# the vendor-shape literal lit270100. 27 12's key is built by the shared resolve_phase9.
+PHASE9_CANDIDATES = (*PHASE8_CANDIDATES, "algo8w_26400", "algo8w_26800", "algo8w_26600")
+PHASE9_MAX_CANDIDATES = 10          # hard cap on the candidate list (one 27 12 per slot)
+PHASE9_DEFAULT_CANDIDATES = ("algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
+                             "algo8_26700", "algo8_26300", "lit270100")
+PHASE9_MAX_KEY_ATTEMPTS = 12        # hard cap on 27 12 in the whole run (8 slots + 1 retry + margin)
+PHASE9_MAX_SEEDS = 14               # hard cap on 27 11 in the whole run (8 slots + 1 retry + margin)
+PHASE9_WAIT_S = 25.0                # the time-reset wait between slots (a REAL sleep, inside the budget)
+PHASE9_WAIT_MIN_S = 10.0            # p9_wait_s is clamped to this floor
+PHASE9_WAIT_MAX_S = 60.0            # p9_wait_s is clamped to this ceiling
+PHASE9_LOCKOUT_NRCS = PHASE8_LOCKOUT_NRCS   # exceededNumberOfAttempts / requiredTimeDelayNotExpired
+PHASE9_DIDS = frozenset({DID_VARIANT_CODING})   # phase 9 reads 0x0103 ONLY (no F100 canary)
+# The phase-9 service allowlist: NO 0x29 (no bare probe at all), NO 0x19/0x31/34-37/0x3E; 2E is admitted but ONLY as the
+# single no-op write; 0x27 only as 27 11/27 12.
+ALLOWED_PHASE9_SERVICES = frozenset({SVC_READ_DATA_BY_IDENTIFIER, SVC_DIAGNOSTIC_SESSION_CONTROL,
+                                     SVC_SECURITY_ACCESS, SVC_WRITE_DATA_BY_IDENTIFIER})
+
 RESP_TIMEOUT_S = 0.25            # first answer frame
 SEED_SWEEP_TIMEOUT_S = 0.3       # the 6-address 27 01 sweep waits up to 300 ms per module
 PENDING_TIMEOUT_S = 2.0          # after NRC 0x78 responsePending
@@ -479,6 +547,7 @@ RUN_BUDGET_S_PHASE5 = 40.0       # hard cap on the phase-5 READ-ONLY capability 
 RUN_BUDGET_S_PHASE6 = 60.0       # hard cap on the phase-6 policy matrix + DID sweep (~25 frames, incl. 4 zero keys)
 RUN_BUDGET_S_PHASE7 = 60.0       # hard cap on the phase-7 ASK-family probe (4 fresh seeds + 4 keys + no-op write)
 RUN_BUDGET_S_PHASE8 = 140.0      # hard cap on the phase-8 door-B battery (cycle + 25 s wait + 30 s wait + <=6 keys)
+RUN_BUDGET_S_PHASE9 = 420.0      # hard cap on the phase-9 door-B candidate walk (8-10 slots x ~30 s + 25 s waits)
 SILENT_ABORT_N = 3               # consecutive requests with no answer at all = module not reachable, stop
 STATE_KNOWN_WAIT_S = 0.5         # wait this long for the first fresh gear/wheel frames before the pre-check
 KEEP_FILES = 60
@@ -507,6 +576,18 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
   sendKey 0x12 (the vendor Type-3 pairing; 0x01/0x02 are NOT admissible), 0x29 bare sub 0x01, and 0x2E ONLY for DID
   0x0103 (the one no-op write). No 0x19/0x31/0x3E anywhere.
   """
+  if phase == 9:
+    if service not in ALLOWED_PHASE9_SERVICES:
+      raise SafetyViolation(f"phase9: service 0x{service:02X} is not in the door-B walk allowlist")
+    if service == SVC_DIAGNOSTIC_SESSION_CONTROL and subfunc not in PHASE9_SESSION_SUBFUNCS:
+      raise SafetyViolation(f"phase9: session control sub-function {subfunc!r} refused (only 0x01/0x03)")
+    if service == SVC_SECURITY_ACCESS and subfunc not in (P7_SEC_SUBFUNC_SEED, P7_SEC_SUBFUNC_KEY):
+      raise SafetyViolation(f"phase9: security-access sub {subfunc!r} refused (only 27 11 requestSeed / 27 12 sendKey)")
+    if service == SVC_READ_DATA_BY_IDENTIFIER and did not in PHASE9_DIDS:
+      raise SafetyViolation(f"phase9: read of DID {did!r} refused (only 0x0103)")
+    if service == SVC_WRITE_DATA_BY_IDENTIFIER and did != WRITE_DID:
+      raise SafetyViolation(f"phase9: write to DID {did!r} refused (only 0x0103)")
+    return
   if phase == 8:
     if service not in ALLOWED_PHASE8_SERVICES:
       raise SafetyViolation(f"phase8: service 0x{service:02X} is not in the door-B battery allowlist")
@@ -579,7 +660,7 @@ def guard_service(service: int, subfunc: int | None, did: int | None = None, pha
 def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, *, phase: int = 1,
                 seed: bytes | None = None, key_attempts: int = 0, key: bytes | None = None,
                 p6_seed: bool = False, p7_seed: bool = False, p8_seed: bool = False,
-                seed_attempts: int = 0) -> None:
+                p9_seed: bool = False, seed_attempts: int = 0) -> None:
   """Layer 2: the exact frame shapes this module may emit, checked immediately before can_send.
 
   ``readback`` is the 4 bytes read from 0x0103 in step 1: a 0x2E frame is admitted only when its data bytes are
@@ -625,6 +706,57 @@ def guard_frame(addr: int, dat: bytes, bus: int, readback: bytes | None = None, 
     if ln == 1 and svc in PHASE5_SVC_PROBES:
       return
     raise SafetyViolation(f"phase5: frame {dat.hex()} is not an allowlisted read-only battery request")
+  if phase == 9:
+    # ---- PHASE 9: the DOOR-B CANDIDATE WALK. All frames to the ESC (0x7D1); NO extra request addresses. ``27 12`` is
+    # the 8-byte ISO-TP multi-frame, pinned to the resolved candidate AND to a POSITIVE 27 11 in the SAME session
+    # (``p9_seed``); the attempt/seed counters are capped HERE. The ONE ``2E`` is the no-op write whose payload must equal
+    # ``readback``. No 27 01/27 02, no 0x29/0x19/0x31/34-37/0x3E anywhere.
+    if bus != ESC_BUS or len(dat) != 8:
+      raise SafetyViolation(f"phase9: frame 0x{addr:X} bus {bus} len {len(dat)} refused")
+    if addr != ESC_REQ_ADDR:
+      raise SafetyViolation(f"phase9: frame 0x{addr:X} refused (only 0x7D1; phase 9 has NO extra request addresses): {dat.hex()}")
+    if dat == FLOW_CONTROL_FRAME:
+      return
+    # --- the 27 12 sendKey ISO-TP first frame (its byte 1 is a length, not a service) ---
+    if dat[0] == 0x10 and dat[1] == 0x0A and dat[2] == SVC_SECURITY_ACCESS and dat[3] == P7_SEC_SUBFUNC_KEY:
+      if not p9_seed:
+        raise SafetyViolation("phase9: 27 12 sendKey without the required immediately-preceding positive 27 11 (same session)")
+      if key_attempts >= PHASE9_MAX_KEY_ATTEMPTS:
+        raise SafetyViolation(f"phase9: 27 12 refused: {key_attempts} key attempts already (max {PHASE9_MAX_KEY_ATTEMPTS})")
+      if key is None or len(bytes(key)) != 8:
+        raise SafetyViolation("phase9: 27 12 sendKey without an 8-byte resolved candidate key")
+      if dat[4:8] != bytes(key)[:4]:
+        raise SafetyViolation(f"phase9: 27 12 first frame key {dat[4:8].hex()} != resolved candidate {bytes(key)[:4].hex()}")
+      return
+    if dat[0] == 0x21:
+      if key is None or len(bytes(key)) != 8:
+        raise SafetyViolation("phase9: 27 12 consecutive frame without an 8-byte resolved candidate key")
+      if dat[1:5] != bytes(key)[4:8]:
+        raise SafetyViolation(f"phase9: 27 12 consecutive frame key {dat[1:5].hex()} != resolved candidate tail {bytes(key)[4:8].hex()}")
+      return
+    if dat[0] >> 4 != 0 or not 1 <= dat[0] <= 7:
+      raise SafetyViolation(f"phase9: only ISO-TP single frames may be sent: {dat.hex()}")
+    ln, svc = dat[0], dat[1]
+    if svc == SVC_SECURITY_ACCESS and ln == 2 and dat[2] == P7_SEC_SUBFUNC_SEED:
+      if seed_attempts >= PHASE9_MAX_SEEDS:
+        raise SafetyViolation(f"phase9: 27 11 refused: {seed_attempts} seed requests already (max {PHASE9_MAX_SEEDS})")
+      return                                            # 27 11 requestSeed (bare)
+    if svc == SVC_SECURITY_ACCESS and ln in (4, 6) and dat[2] == P7_SEC_SUBFUNC_KEY:
+      raise SafetyViolation(f"phase9: 27 12 must carry an 8-byte key (ISO-TP multi-frame), not a {ln - 2}-byte single frame")
+    if svc == SVC_READ_DATA_BY_IDENTIFIER and ln == 3:
+      did = (dat[2] << 8) | dat[3]
+      if did not in PHASE9_DIDS:
+        raise SafetyViolation(f"phase9: read of DID 0x{did:04X} refused (only 0x0103)")
+      return
+    if svc == SVC_DIAGNOSTIC_SESSION_CONTROL and ln == 2 and dat[2] in PHASE9_SESSION_SUBFUNCS:
+      return
+    if svc == SVC_WRITE_DATA_BY_IDENTIFIER and ln == 7 and dat[2:4] == WRITE_DID.to_bytes(2, "big"):
+      if readback is None:
+        raise SafetyViolation("phase9: 0x2E write without the step-1 read-back value")
+      if dat[4:8] != bytes(readback):
+        raise SafetyViolation(f"phase9: 0x2E payload {dat[4:8].hex()} != step-1 read-back {bytes(readback).hex()}")
+      return
+    raise SafetyViolation(f"phase9: frame {dat.hex()} is not an allowlisted door-B walk request")
   if phase == 8:
     # ---- PHASE 8: the DOOR-B COUNTER ECONOMICS battery. All frames to the ESC (0x7D1); NO extra request addresses.
     # ``27 12`` is the 8-byte ISO-TP multi-frame, pinned to the resolved candidate AND to a POSITIVE 27 11 in the SAME
@@ -982,6 +1114,42 @@ def resolve_phase8(candidate: str, seed: bytes) -> bytes | None:
   return resolve_phase7(candidate, seed)                    # every other token is shared with phase 7
 
 
+def resolve_phase9(candidate: str, seed: bytes) -> bytes | None:
+  """Phase 9: derive the door-B walk candidate key bytes from a fresh ``27 11`` seed.
+
+  The vocabulary is ALL phase-8 tokens PLUS three NEW 2-byte-algorithm wrappers:
+
+    * algo8w_26400 = ``cal_26400(seed[:4])[:2]`` repeated x4 (``[lo,hi]x4`` -- the wire shape of the on-car seed);
+    * algo8w_26800 = ``cal_26800(seed[:4])[:2]`` repeated x4;
+    * algo8w_26600 = ``cal_26600(seed[:4])[:2]`` repeated x4.
+
+  ``cal_26400``/``cal_26800`` take 2 seed bytes; ``cal_26600`` (the recovered CRC-16/0xC0A3, Securityindex 26600) also
+  takes 2. Every mode returns EXACTLY 8 wire bytes; ``None`` means a vendor zero-byte bail (no frame); an unknown name
+  raises ``Abort`` (recorded) and never reaches the bus.
+  """
+  import openpilot.sunnypilot.fork.esc_probe_seedkey as sk
+  s = bytes(seed)
+  if candidate == "algo8w_26400":
+    k = sk.cal_26400(s[:2])
+    if k is None:
+      return None
+    return k[:2] * 4
+  if candidate == "algo8w_26800":
+    k = sk.cal_26800(s[:2])
+    if k is None:
+      return None
+    return k[:2] * 4
+  if candidate == "algo8w_26600":
+    try:
+      k = sk.cal_26600(s[:2])
+    except Exception as e:  # missing/import failure -> recorded abort, no frame
+      raise Abort(f"phase9 algo module missing/failed: {e!r}") from e
+    if k is None:
+      return None
+    return k[:2] * 4
+  return resolve_phase8(candidate, s)                       # every other token is shared with phase 8
+
+
 class EscProbeClient:
   """Minimal UDS client for the probe. ``_tx`` is the ONLY place a frame is handed to can_send.
 
@@ -1003,7 +1171,8 @@ class EscProbeClient:
     self._p6_seed_precedes = False   # phase 6: True for exactly one frame after a 27 01; guards the 27 02 ordering
     self._p7_seed_precedes = False   # phase 7: True only after a POSITIVE 27 11; guards the 27 12 ordering
     self._p8_seed_precedes = False   # phase 8: True only after a POSITIVE 27 11 in the SAME session; guards 27 12
-    self.seed_attempts = 0           # phase 8: 27 11 counter (guard_frame caps it at PHASE8_MAX_SEEDS)
+    self._p9_seed_precedes = False   # phase 9: True only after a POSITIVE 27 11 in the SAME session; guards 27 12
+    self.seed_attempts = 0           # phase 8/9: 27 11 counter (guard_frame caps it at PHASE8/PHASE9_MAX_SEEDS)
     self.rx: dict[int, list[tuple[float, bytes]]] = {a: [] for a in ALL_RESP_ADDRS}
     if phase == 5:
       # phase 5 also listens on the two extra peek addresses (0x778/0x7A8) so a response OR silence is timestamped
@@ -1016,12 +1185,13 @@ class EscProbeClient:
 
   def _tx(self, dat: bytes, readback: bytes | None = None, *, seed: bytes | None = None,
           key: bytes | None = None, p6_seed: bool = False, p7_seed: bool = False,
-          p8_seed: bool = False) -> None:
+          p8_seed: bool = False, p9_seed: bool = False) -> None:
     self.gate.check()
     if self.now() > self.deadline:
       raise Abort("time budget exhausted")
     guard_frame(ESC_REQ_ADDR, dat, ESC_BUS, readback, phase=self.phase, seed=seed, key_attempts=self.key_attempts,
-                key=key, p6_seed=p6_seed, p7_seed=p7_seed, p8_seed=p8_seed, seed_attempts=self.seed_attempts)
+                key=key, p6_seed=p6_seed, p7_seed=p7_seed, p8_seed=p8_seed, p9_seed=p9_seed,
+                seed_attempts=self.seed_attempts)
     self._can_send([CanData(ESC_REQ_ADDR, bytes(dat), ESC_BUS)])
     self.tx_log.append(bytes(dat).hex())
 
@@ -1068,6 +1238,8 @@ class EscProbeClient:
     guard_service(service, subfunc, did, phase=self.phase)
     if self.phase == 8 and service == SVC_DIAGNOSTIC_SESSION_CONTROL:
       self._p8_seed_precedes = False     # phase 8: any session change clears the 27 11 -> 27 12 ordering sentinel
+    if self.phase == 9 and service == SVC_DIAGNOSTIC_SESSION_CONTROL:
+      self._p9_seed_precedes = False     # phase 9: any session change clears the 27 11 -> 27 12 ordering sentinel
     req = bytes([service]) + (bytes([subfunc]) if subfunc is not None else b"") + bytes(payload)
     frame = build_single_frame(req)
     self.drain()
@@ -1474,6 +1646,74 @@ class EscProbeClient:
     self.rx[ESC_RSP_ADDR] = []
     t_tx = self.now()
     self._tx(first, key=key, p8_seed=p8_seed)
+    self.key_attempts += 1                    # consume the attempt only once the key actually reached the bus
+    res: dict = {"req": first.hex(), "addr": ESC_REQ_ADDR, "rsp_addr": ESC_RSP_ADDR, "frames": [first.hex()],
+                 "frames_t_ms": [0.0]}
+    seen: set[str] = set(res["frames"])
+    cf_sent = False
+    data = b""
+    expect = None
+    t_end = t_tx + CF_TIMEOUT_S
+    while self.now() < t_end:
+      took = False
+      for f in self._rx_for(ESC_RSP_ADDR):
+        took = True
+        if f.hex() not in seen:
+          seen.add(f.hex())
+          res["frames"].append(f.hex())
+          res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+        kind = f[0] >> 4
+        if kind == 3:                                                  # ESC flow control -> the ONE consecutive frame
+          if not cf_sent:
+            self._tx(cf, key=key)
+            cf_sent = True
+            seen.add(cf.hex())
+            res["frames"].append(cf.hex())
+            res["frames_t_ms"].append(round((self.now() - t_tx) * 1000, 3))
+            t_end = self.now() + RESP_TIMEOUT_S
+          continue
+        if kind == 0:
+          return self._finish(res, SVC_SECURITY_ACCESS, f[1:1 + (f[0] & 0xF)])
+        if kind == 1:
+          expect = ((f[0] & 0xF) << 8) | f[1]
+          data = f[2:8]
+          self._tx(FLOW_CONTROL_FRAME)
+          t_end = self.now() + CF_TIMEOUT_S
+        elif expect is not None and kind == 2:
+          data += f[1:8]
+          if len(data) >= expect:
+            return self._finish(res, SVC_SECURITY_ACCESS, data[:expect])
+      if not took:
+        self._rx_frames()
+    res["no_response" if not cf_sent else "incomplete"] = True
+    return res
+
+  def request_seed_phase9(self) -> dict:
+    """Phase 9: ``27 11`` requestSeed (the door-B candidate-walk family). The sentinel is set ONLY on a POSITIVE answer."""
+    r = self.request(SVC_SECURITY_ACCESS, P7_SEC_SUBFUNC_SEED)
+    self.seed_attempts += 1
+    self._p9_seed_precedes = bool(r.get("positive") and (r.get("resp") or "").startswith("6711"))
+    return r
+
+  def send_key_phase9(self, key: bytes) -> dict:
+    """Phase 9: ``27 12`` sendKey with the RESOLVED 8-byte candidate, as ISO-TP multi-frame.
+
+    Mechanically pinned (`guard_frame` is the SOLE enforcer of "phase 9 / 8-byte key / immediately after a POSITIVE
+    27 11 in the SAME session / at most PHASE9_MAX_KEY_ATTEMPTS"): the ordering sentinel must be set and is consumed,
+    so a 27 12 without a fresh positive 27 11 in this session is refused.
+    """
+    key = bytes(key)
+    if len(key) != 8:
+      raise SafetyViolation(f"phase9: sendKey key must be 8 bytes, got {len(key)}")
+    p9_seed = self._p9_seed_precedes          # the ordering sentinel: True only if a POSITIVE 27 11 preceded in this session
+    self._p9_seed_precedes = False            # consume it; guard_frame is the SOLE enforcer (raises if False)
+    req = bytes([SVC_SECURITY_ACCESS, P7_SEC_SUBFUNC_KEY]) + key       # 10 bytes -> multi-frame
+    first = bytes([0x10, len(req)]) + req[:6]                          # FF: 10 0A 27 12 <k0..k3>
+    cf = (bytes([0x21]) + key[4:8]).ljust(8, b"\x00")                  # CF: 21 <k4..k7> + pad
+    self.drain()
+    self.rx[ESC_RSP_ADDR] = []
+    t_tx = self.now()
+    self._tx(first, key=key, p9_seed=p9_seed)
     self.key_attempts += 1                    # consume the attempt only once the key actually reached the bus
     res: dict = {"req": first.hex(), "addr": ESC_REQ_ADDR, "rsp_addr": ESC_RSP_ADDR, "frames": [first.hex()],
                  "frames_t_ms": [0.0]}
@@ -2288,6 +2528,159 @@ def _run_phase8_battery(client: "EscProbeClient", doc: dict, candidates: list) -
   doc["unlocked"] = bool(doc.get("unlocked8"))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase-9 battery -- ONE ignition, the DOOR-B CANDIDATE WALK with the time-reset recipe
+# (see the module docstring / report "Update 12").
+# ---------------------------------------------------------------------------------------------------------------------
+def _run_phase9_battery(client: "EscProbeClient", doc: dict, candidates: list, wait_s: float) -> None:
+  """The exact phase-9 sequence. ``candidates`` is the validated, capped (<=10) list; ``wait_s`` the clamped reset wait.
+
+  One ignition: walk up to ``PHASE9_MAX_CANDIDATES`` door-B candidates, ONE ``27 12`` per slot after a fresh ``27 11``,
+  separated by the workable time-reset recipe (a REAL ``wait_s`` sleep, then ``10 01`` -> ``10 03``). Only a positive
+  ``67 12`` unlocks the ONE no-op ``0x0103`` write + re-read. A ``0x36``/``0x37`` triggers a single same-candidate retry
+  after the recipe; a still-locked retry sets ``hard_lock`` and stops. Records every frame; aborts only at the step-1
+  read gate (the no-op write needs the read value).
+  """
+
+  def step(name: str, res: dict) -> None:
+    doc["steps"].append({"name": name, "addr": res.get("addr", ESC_REQ_ADDR),
+                         "resp_addr": res.get("rsp_addr", ESC_RSP_ADDR), "req": res.get("req"),
+                         "frames": list(res.get("frames", [])), "frames_t_ms": list(res.get("frames_t_ms", [])),
+                         "resp": res.get("resp"), "nrc": res.get("nrc"), "positive": bool(res.get("positive")),
+                         "no_response": bool(res.get("no_response")), "timeout": bool(res.get("no_response")),
+                         "incomplete": bool(res.get("incomplete"))})
+
+  def seed_hex_of(res: dict) -> str | None:
+    return _seed_hex(res.get("resp"), "6711")
+
+  def slot_record(slot: int, candidate: str, res: dict, key: bytes | None) -> dict:
+    rec = {"slot": slot, "candidate": candidate, "key_hex": key.hex() if key is not None else None,
+           "resp": res.get("resp"), "nrc": res.get("nrc"), "positive": bool(res.get("positive")),
+           "no_response": bool(res.get("no_response"))}
+    doc["attempts9"].append(rec)
+    return rec
+
+  def seed_record(slot: int, candidate: str, res: dict) -> dict:
+    rec = {"slot": slot, "candidate": candidate, "resp": res.get("resp"), "nrc": res.get("nrc"),
+           "positive": bool(res.get("positive")), "no_response": bool(res.get("no_response")),
+           "seed": seed_hex_of(res)}
+    doc["seeds9"].append(rec)
+    return rec
+
+  def do_seed(slot: int, candidate: str) -> tuple[dict, str | None]:
+    """``27 11`` -> fresh seed, recorded under ``seeds9``. Returns (res, seed_hex or None)."""
+    sr = client.request_seed_phase9()
+    seed_record(slot, candidate, sr)
+    step(f"seed_{slot}", sr)
+    return sr, seed_hex_of(sr)
+
+  def attempt(slot: int, candidate: str) -> tuple[dict | None, dict | None]:
+    """``27 11`` -> fresh seed, then ``27 12`` of ``candidate``. Returns (seed_res, key_res).
+
+    A non-positive/silent seed, or a resolver None (vendor zero-byte bail), sends NO ``27 12`` and returns key_res=None
+    so the caller can stop the walk on a bad seed.
+    """
+    sr, sh = do_seed(slot, candidate)
+    if not (sr.get("positive") and sh is not None):
+      slot_record(slot, candidate, {}, None)["note"] = "27 11 not positive with a seed; no 27 12"
+      step(f"key_{slot}", {})
+      return sr, None
+    key = resolve_phase9(candidate, bytes.fromhex(sh))
+    if key is None:
+      slot_record(slot, candidate, {}, None)["note"] = "resolver returned None (vendor zero-byte bail); no frame"
+      step(f"key_{slot}", {})
+      return sr, None
+    kr = client.send_key_phase9(key)
+    slot_record(slot, candidate, kr, key)
+    step(f"key_{slot}", kr)
+    return sr, kr
+
+  def reset_recipe() -> None:
+    """The workable time-reset recipe: wait ``wait_s`` (a REAL sleep), then the session cycle 10 01 -> 10 03."""
+    client.wait(wait_s)
+    client.session_control(SESSION_SUBFUNC_DEFAULT)
+    client.session_control(ALLOWED_SESSION_SUBFUNC)
+
+  def win_path(value_start: bytes) -> None:
+    """A positive 67 12: the ONE no-op 2E 0103 (payload == value_start) + re-read 22 0103."""
+    doc["unlocked9"] = True
+    wr = client.write_did(DID_VARIANT_CODING, value_start, value_start)
+    doc["write9"] = wr
+    step("write9", wr)
+    rr = client.read_did(DID_VARIANT_CODING)
+    doc["read_after_write9"] = rr
+    after = parse_read_did(rr.get("resp"), DID_VARIANT_CODING)
+    doc["value_after_write9"] = after.hex() if after is not None else None
+    step("read_after_write9", rr)
+
+  # ---- 1. read 0x0103 -> value_start (the no-op write needs it; silent/refused -> abort, no key) --------------------
+  r_read = client.read_did(DID_VARIANT_CODING)
+  doc["read"] = r_read
+  value_start = parse_read_did(r_read.get("resp"), DID_VARIANT_CODING)
+  doc["value_start"] = value_start.hex() if value_start is not None else None
+  doc["current_value"] = doc["value_start"]
+  step("read_esc", r_read)
+  if value_start is None:
+    raise Abort("phase9: step-1 read of 0x0103 refused/missing; no key, no write")
+
+  # ---- 2. 10 03 extended session. NOT positive -> skip the walk, continue at the clean leave -------------------------
+  r_sess = client.extended_session()
+  doc["session"] = r_sess
+  step("session", r_sess)
+  extended_ok = bool(r_sess.get("positive"))
+
+  # ---- 3. the slot walk (one 27 12 per slot; k>0 preceded by the wait+cycle recipe) ---------------------------------
+  if extended_ok:
+    for k, cand in enumerate(candidates):
+      if client.key_attempts >= PHASE9_MAX_KEY_ATTEMPTS or client.seed_attempts >= PHASE9_MAX_SEEDS:
+        break
+      if k > 0:
+        reset_recipe()
+      _sr, kr = attempt(k, cand)
+      if kr is None:
+        doc["walk_stopped"] = f"slot {k} ({cand}): no fresh seed/resolvable key; walk stopped"
+        break
+      if kr.get("positive"):
+        win_path(value_start)
+        break
+      if kr.get("nrc") in PHASE9_LOCKOUT_NRCS:
+        # ---- the POSSIBLE DEEPER LOCK: one retry of the SAME candidate after the reset recipe ------------------------
+        doc["lockout_slot"] = k
+        reset_recipe()
+        if client.key_attempts >= PHASE9_MAX_KEY_ATTEMPTS or client.seed_attempts >= PHASE9_MAX_SEEDS:
+          doc["hard_lock"] = True
+          doc["hard_lock_slot"] = k
+          break
+        _sr2, kr2 = attempt(k, cand)
+        if kr2 is None or kr2.get("nrc") in PHASE9_LOCKOUT_NRCS:
+          doc["hard_lock"] = True
+          doc["hard_lock_slot"] = k
+          break
+        if kr2.get("positive"):
+          win_path(value_start)
+          break
+        # else: the reset recipe worked (a different NRC) -> continue to the next slot
+      # 0x35 (or any other non-lockout NRC): continue to the next slot
+
+  # ---- 4. clean leave: 10 01, then 22 0103 -> value_end -------------------------------------------------------------
+  r_leave = client.session_control(SESSION_SUBFUNC_DEFAULT)
+  doc["leave_session"] = r_leave
+  step("leave_session", r_leave)
+  r_end = client.read_did(DID_VARIANT_CODING)
+  doc["read_end"] = r_end
+  value_end = parse_read_did(r_end.get("resp"), DID_VARIANT_CODING)
+  doc["value_end"] = value_end.hex() if value_end is not None else None
+  doc["reread"] = r_end
+  doc["reread_value"] = doc["value_end"]
+  doc["value_changed"] = (value_start is not None and value_end is not None and value_end != value_start)
+  step("read_esc_end", r_end)
+
+  # ---- summary fields -----------------------------------------------------------------------------------------------
+  doc["key_attempted"] = client.key_attempts > 0
+  doc["write_attempted"] = doc.get("write9") is not None
+  doc["unlocked"] = bool(doc.get("unlocked9"))
+
+
 def _run_phase4_read(client: "EscProbeClient", doc: dict) -> bytes:
   """Phase-4 step 1: read 0x0103 (extended-retry rules unchanged). No usable read -> Abort; no key, no write."""
   r1 = client.read_did(DID_VARIANT_CODING)
@@ -2344,7 +2737,7 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     key_mode = "identity2"
   if phase == 4 and key_mode not in KEY_MODES:
     return {**summary, "skip": f"unknown key_mode {key_mode!r}"}
-  if phase not in (1, 2, 3, 4, 5, 6, 7, 8):
+  if phase not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
     return {**summary, "skip": "unknown phase"}
   # phase 7: the optional ASK-family candidate list. Default ["zero8"]; the first PHASE7_MAX_CANDIDATES (4) kept;
   # an unknown name is inert; a wrong-typed value falls back to the default.
@@ -2367,10 +2760,27 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     p8_candidates = [c for c in p8_state if isinstance(c, str) and c in PHASE8_CANDIDATES][:PHASE8_MAX_CANDIDATES]
     if not p8_candidates:
       return {**summary, "skip": f"no valid p8_candidates in {p8_state!r}"}
+  # phase 9: the optional door-B walk candidate list + the optional reset wait. Defaults from PHASE9_DEFAULT_CANDIDATES;
+  # the first PHASE9_MAX_CANDIDATES (10) kept; an unknown name is dropped; a wrong-typed value falls back to the default;
+  # if NO entry is a known token the run is inert (skip), exactly like phases 7/8. p9_wait_s is clamped to [10, 60].
+  p9_candidates: list = []
+  p9_wait_s = PHASE9_WAIT_S
+  if phase == 9:
+    p9_state = state.get("p9_candidates", list(PHASE9_DEFAULT_CANDIDATES))
+    if not isinstance(p9_state, (list, tuple)) or not p9_state:
+      p9_state = list(PHASE9_DEFAULT_CANDIDATES)
+    p9_candidates = [c for c in p9_state if isinstance(c, str) and c in PHASE9_CANDIDATES][:PHASE9_MAX_CANDIDATES]
+    if not p9_candidates:
+      return {**summary, "skip": f"no valid p9_candidates in {p9_state!r}"}
+    try:
+      p9_wait_s = min(PHASE9_WAIT_MAX_S, max(PHASE9_WAIT_MIN_S, float(state.get("p9_wait_s", PHASE9_WAIT_S))))
+    except (TypeError, ValueError):
+      p9_wait_s = PHASE9_WAIT_S
 
   gate = VehicleGate(now)
   t0 = now()
-  budget = (RUN_BUDGET_S_PHASE8 if phase == 8 else
+  budget = (RUN_BUDGET_S_PHASE9 if phase == 9 else
+            RUN_BUDGET_S_PHASE8 if phase == 8 else
             RUN_BUDGET_S_PHASE7 if phase == 7 else
             RUN_BUDGET_S_PHASE6 if phase == 6 else
             RUN_BUDGET_S_PHASE5 if phase == 5 else
@@ -2410,7 +2820,12 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
               "seeds8": [], "cands8": [], "S0": None, "S1b": None,
               "unlocked8": None, "write8": None, "read_after_write8": None, "value_after_write8": None,
               "lockout_at_start": None, "cycle_clears": None, "time_reset": None,
-              "time_reset_after_lockout": None, "a29_05": None}
+              "time_reset_after_lockout": None, "a29_05": None,
+              # phase-9 only (kept None/empty for phases 1-8, so those results are unchanged). NB S1/S2 already exist
+              # (phase-6 init) and are reused; phase 9 reuses "session"/"leave_session"/"read_end" too.
+              "attempts9": [], "seeds9": [], "unlocked9": None, "write9": None, "read_after_write9": None,
+              "value_after_write9": None, "hard_lock": None, "hard_lock_slot": None, "lockout_slot": None,
+              "walk_stopped": None}
   for fw in car_fw or []:
     if str(getattr(fw, "ecu", "")) == "abs":
       doc["car_fw_abs"] = bytes(fw.fwVersion).hex()
@@ -2475,6 +2890,9 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
     elif phase == 8:
       # ---- PHASE 8: the door-B counter economics (27 11/27 12 cycle/time-reset) + the lit270100 candidate ----------
       _run_phase8_battery(client, doc, p8_candidates)
+    elif phase == 9:
+      # ---- PHASE 9: the door-B candidate walk (27 11/27 12 x 8-10 slots with the 25 s wait+cycle reset recipe) -----
+      _run_phase9_battery(client, doc, p9_candidates, p9_wait_s)
     else:
       # ---- step 1: read the CURRENT 0x0103 value (default session; extended retry only if refused) -------------
       r1 = client.read_did(DID_VARIANT_CODING)
@@ -2640,7 +3058,22 @@ def run(can_send, can_recv, set_obd_multiplexing, *, fingerprint: str, car_fw=No
                  write8_nrc=(doc.get("write8") or {}).get("nrc"),
                  write8_positive=bool((doc.get("write8") or {}).get("positive")),
                  value_after_write8=doc.get("value_after_write8"), a29_05=(doc.get("a29_05") or {}).get("resp"),
-                 a29_05_nrc=(doc.get("a29_05") or {}).get("nrc"))
+                 a29_05_nrc=(doc.get("a29_05") or {}).get("nrc"),
+                 # phase-9 (door-B candidate walk with the time-reset recipe)
+                 attempts9=[{"slot": a["slot"], "candidate": a.get("candidate"), "key": a.get("key_hex"),
+                             "resp": a.get("resp"), "nrc": a.get("nrc"), "positive": bool(a.get("positive")),
+                             "no_response": bool(a.get("no_response"))} for a in (doc.get("attempts9") or [])],
+                 seeds9=[{"slot": s["slot"], "candidate": s.get("candidate"), "resp": s.get("resp"),
+                          "nrc": s.get("nrc"), "positive": bool(s.get("positive")),
+                          "no_response": bool(s.get("no_response")), "seed": s.get("seed")}
+                         for s in (doc.get("seeds9") or [])],
+                 unlocked9=doc.get("unlocked9"),
+                 write9_nrc=(doc.get("write9") or {}).get("nrc"),
+                 write9_positive=bool((doc.get("write9") or {}).get("positive")),
+                 value_after_write9=doc.get("value_after_write9"),
+                 hard_lock=doc.get("hard_lock"), hard_lock_slot=doc.get("hard_lock_slot"),
+                 lockout_slot=doc.get("lockout_slot"), walk_stopped=doc.get("walk_stopped"),
+                 p9_wait_s=(p9_wait_s if phase == 9 else None))
   if log_event is not None:
     log_event("esc_probe_0027", **summary)
   return summary

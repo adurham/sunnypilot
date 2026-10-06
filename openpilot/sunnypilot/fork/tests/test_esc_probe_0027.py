@@ -628,8 +628,8 @@ class TestPhase2(Base):
 
   def test_unknown_phase_sends_nothing(self):
     # NB: `int(state.get("phase", 1) or 1)` maps a FALSY value (missing, None, 0) to the default 1; only a value that
-    # is neither 1..8 (e.g. -1, 9) or non-numeric ("banana") is unknown.
-    for phase in (-1, 9, "banana"):
+    # is neither 1..9 (e.g. -1, 10) or non-numeric ("banana") is unknown.
+    for phase in (-1, 10, "banana"):
       with self.subTest(phase=phase):
         self.fresh_state()
         self.set_phase(phase)
@@ -3341,5 +3341,471 @@ class TestPhase8(Base):
     # the phase-8 write path reuses write_did: value must equal the step-1 readback
     car = self.p8_car()
     c = E.EscProbeClient(car.can_send, car.can_recv, D.VehicleGate(car.now), car.now, car.now() + 99, phase=8)
+    with self.assertRaises(D.SafetyViolation):
+      c.write_did(E.DID_VARIANT_CODING, b"\x01\x02\x03\x04", CURRENT)     # value != readback
+
+
+class TestPhase9(Base):
+  """Phase 9 (state ``{"probe_enabled": true, "phase": 9, "p9_candidates": [...], "p9_wait_s": ...}``): the DOOR-B
+  CANDIDATE WALK -- up to 10 candidates, ONE ``27 12`` per slot, separated by the workable time-reset recipe (a REAL
+  ``p9_wait_s`` sleep, then ``10 01`` -> ``10 03``). Only a positive ``67 12`` unlocks the ONE no-op ``2E 0103``; a
+  ``0x36``/``0x37`` gets ONE same-candidate retry after the recipe, and a still-locked retry sets ``hard_lock``. No
+  ``27 01``/``27 02``, no ``29``/``31``/``34``-``37``. Every guard is mechanically enforced."""
+
+  READ = bytes([3, 0x22, 0x01, 0x03]).ljust(8, b"\x00")
+  SESSION = bytes([2, 0x10, 0x03]).ljust(8, b"\x00")
+  SESSION01 = bytes([2, 0x10, 0x01]).ljust(8, b"\x00")
+  SEED11 = bytes([2, 0x27, 0x11]).ljust(8, b"\x00")
+  WRITE = bytes([7, 0x2E, 0x01, 0x03]) + CURRENT
+  FC = D.FLOW_CONTROL_FRAME
+
+  K_LIT = bytes.fromhex("0032373031303000")     # lit270100 = 00 '2' '7' '0' '1' '0' '0' 00
+  K_ALGO8W = bytes.fromhex("f1c6f1c6f1c6f1c6")   # cal_27100(seed[:4])[:2] x4
+  K_ALGO8 = bytes.fromhex("f1c60000f1c60000")    # cal_27100(seed[:4]) x2
+  K_26400W = bytes.fromhex("7c707c707c707c70")   # cal_26400(seed[:2])[:2] x4 (7c70)
+  K_26800W = bytes.fromhex("4d2d4d2d4d2d4d2d")   # cal_26800(seed[:2])[:2] x4 (4d2d)
+  K_26600W = bytes.fromhex("d408d408d408d408")   # cal_26600(seed[:2])[:2] x4 (d408)
+
+  CAND3 = ["algo8w_27100", "algo8_27100", "algo8w_26400"]
+  CAND5 = ["algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600"]
+
+  def setUp(self):
+    super().setUp()
+    self.set_phase(9, candidates=self.CAND3)
+
+  def set_phase(self, phase, candidates=None, wait_s=None):
+    state = {"probe_enabled": True, "phase": phase}
+    if candidates is not None:
+      state["p9_candidates"] = candidates
+    if wait_s is not None:
+      state["p9_wait_s"] = wait_s
+    with open(os.path.join(self.out, "state.json"), "w") as f:
+      json.dump(state, f)
+
+  def p9_car(self, **kw):
+    car = FakeCar(**kw)
+    car.ask_family = True             # 27 11 -> 67 11 + 8-byte seed; 27 12 per the action script
+    car.esc_seed8_11 = PHASE4_SEED
+    return car
+
+  @staticmethod
+  def ff(key):
+    return bytes([0x10, 0x0A, 0x27, 0x12]) + bytes(key)[:4]
+
+  @staticmethod
+  def cf(key):
+    return (bytes([0x21]) + bytes(key)[4:8]).ljust(8, b"\x00")
+
+  def slot_frames(self, key):
+    return [self.SEED11, self.FC, self.ff(key), self.cf(key)]
+
+  def step_names(self, doc):
+    return [st["name"] for st in doc["steps"]]
+
+  def key_times(self, car):
+    """The send-time of every 27 12 first frame -- for the wait-path timing asserts."""
+    return [car.sent_t[i] for i, (_, d, _) in enumerate(car.sent) if d[:4] == bytes([0x10, 0x0A, 0x27, 0x12])]
+
+  def seed_frames(self, car):
+    return [d for _, d, _ in car.sent if d[:3] == bytes([2, 0x27, 0x11])]
+
+  def key_frames(self, car):
+    return [d for _, d, _ in car.sent if d[:4] == bytes([0x10, 0x0A, 0x27, 0x12])]
+
+  # ---- resolver: the three new 2-byte-algo tokens + every shared phase-8 token ---------------------------------------
+  def test_resolve_phase9_new_tokens(self):
+    seed = PHASE4_SEED
+    self.assertEqual(E.resolve_phase9("algo8w_26400", seed), self.K_26400W)
+    self.assertEqual(E.resolve_phase9("algo8w_26800", seed), self.K_26800W)
+    self.assertEqual(E.resolve_phase9("algo8w_26600", seed), self.K_26600W)
+    self.assertEqual(E.resolve_phase9("algo8w_26400", seed), SK.cal_26400(seed[:2])[:2] * 4)
+    self.assertEqual(E.resolve_phase9("algo8w_26800", seed), SK.cal_26800(seed[:2])[:2] * 4)
+    self.assertEqual(E.resolve_phase9("algo8w_26600", seed), SK.cal_26600(seed[:2])[:2] * 4)
+    # every token resolves to EXACTLY 8 wire bytes
+    for c in E.PHASE9_CANDIDATES:
+      self.assertEqual(len(E.resolve_phase9(c, seed)), 8, c)
+    # the shared phase-8/7 tokens keep their values
+    self.assertEqual(E.resolve_phase9("lit270100", seed), self.K_LIT)
+    self.assertEqual(E.resolve_phase9("algo8w_27100", seed), self.K_ALGO8W)
+    self.assertEqual(E.resolve_phase9("algo8_27100", seed), self.K_ALGO8)
+    self.assertEqual(E.resolve_phase9("zero8", seed), bytes(8))
+    self.assertEqual(E.resolve_phase9("identity8", seed), PHASE4_SEED)
+    self.assertEqual(E.resolve_phase9("algo8_26700", seed), SK.cal_26700(seed[:4]) * 2)
+    self.assertEqual(E.resolve_phase9("algo8_26300", seed), SK.cal_26300(seed[:4]) * 2)
+    # 26400 bails on a zero seed byte; 26600 bails only on a zero WORD
+    z = bytes.fromhex("00b05ab05ab05ab0")
+    self.assertIsNone(E.resolve_phase9("algo8w_26400", z))
+    self.assertIsNotNone(E.resolve_phase9("algo8w_26600", z))
+    self.assertIsNone(E.resolve_phase9("algo8w_26600", bytes(8)))
+    with self.assertRaises(D.Abort):
+      E.resolve_phase9("banana", seed)
+    # the vocabulary is exactly the phase-8 tokens + the three new 2-byte-algo wrappers (== 10 total)
+    self.assertEqual(set(E.PHASE9_CANDIDATES), set(E.PHASE8_CANDIDATES) | {"algo8w_26400", "algo8w_26800", "algo8w_26600"})
+    self.assertEqual(len(E.PHASE9_CANDIDATES), 10)
+    self.assertEqual(E.PHASE9_DEFAULT_CANDIDATES,
+                     ("algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
+                      "algo8_26700", "algo8_26300", "lit270100"))
+
+  def test_cal_26600_known_vectors(self):
+    self.assertEqual(SK.cal_26600(bytes.fromhex("5ab0")), bytes.fromhex("d408"))
+    self.assertEqual(SK.cal_26600(bytes.fromhex("1122")), bytes.fromhex("9a65"))
+    self.assertIsNone(SK.cal_26600(bytes(2)))                       # zero word -> vendor bail
+    self.assertIn("26600", SK.ALGO_NAMES)
+    self.assertIn("26600", SK.candidates(PHASE4_SEED))              # 2-byte seed -> 2-byte key, no crash
+    self.assertEqual(SK.key_for(PHASE4_SEED, "26600"), SK.cal_26600(PHASE4_SEED[:2]))
+
+  def test_phase9_constants(self):
+    self.assertEqual(E.RUN_BUDGET_S_PHASE9, 420.0)
+    self.assertEqual(E.PHASE9_MAX_CANDIDATES, 10)
+    self.assertEqual(E.PHASE9_MAX_KEY_ATTEMPTS, 12)
+    self.assertEqual(E.PHASE9_MAX_SEEDS, 14)
+    self.assertEqual(E.PHASE9_WAIT_S, 25.0)
+    self.assertEqual((E.PHASE9_WAIT_MIN_S, E.PHASE9_WAIT_MAX_S), (10.0, 60.0))
+
+  # ---- run 1: win at slot 5 (slots 1-4 -> 0x35 each with waits; slot 5 -> 67 12 -> no-op write + reread) -------------
+  def test_walk_win_at_slot_5(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND5)
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}, {"nrc": 0x35}, {"nrc": 0x35}, {"nrc": 0x35}, {"unlock": True}]
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["error"])
+    self.assertIsNone(s["aborted"])
+    keys = [self.K_ALGO8W, self.K_ALGO8, self.K_26400W, self.K_26800W, self.K_26600W]
+    exp = [self.READ, self.SESSION]
+    for i, k in enumerate(keys):
+      if i:
+        exp += [self.SESSION01, self.SESSION]
+      exp += self.slot_frames(k)
+    exp += [self.WRITE, self.READ, self.SESSION01, self.READ]        # win path + clean leave + value_end
+    self.assertEqual(self.tx_frames(car), exp)
+    doc = self.result_doc()
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], [0, 1, 2, 3, 4])
+    self.assertEqual([a["candidate"] for a in doc["attempts9"]], self.CAND5)
+    self.assertEqual([a["positive"] for a in doc["attempts9"]], [False, False, False, False, True])
+    self.assertEqual([a["key_hex"] for a in doc["attempts9"]],
+                     [self.K_ALGO8W.hex(), self.K_ALGO8.hex(), self.K_26400W.hex(), self.K_26800W.hex(),
+                      self.K_26600W.hex()])
+    self.assertTrue(doc["unlocked9"])
+    self.assertIsNone(doc["hard_lock"])
+    self.assertTrue(doc["write9"]["positive"])
+    self.assertEqual(doc["value_after_write9"], "90060350")
+    self.assertEqual(doc["value_start"], "90060350")
+    # exactly ONE no-op write, payload == value_start
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [self.WRITE])
+    # no 27 01/27 02, no 29/31/34-37 anywhere (single frames only)
+    single = [d for d in self.tx_frames(car) if d[0] >> 4 == 0]
+    for svc in (0x29, 0x31, 0x34, 0x35, 0x36, 0x37):
+      self.assertEqual([d for d in single if d[1] == svc], [])
+    self.assertEqual([d for d in single if d[1] == 0x27 and d[2] in (0x01, 0x02)], [])
+    self.assertEqual(len(self.key_frames(car)), 5)
+    self.assertEqual(len(self.seed_frames(car)), 5)
+    self.assertEqual(self.step_names(doc)[-4:], ["write9", "read_after_write9", "leave_session", "read_esc_end"])
+    self.assertEqual(self.events[-1][0], "esc_probe_0027")
+    # the wait happened between EVERY adjacent pair of slots (>= 25 s of the run's own clock)
+    kt = self.key_times(car)
+    for i in range(1, 5):
+      self.assertGreaterEqual(kt[i] - kt[i - 1], E.PHASE9_WAIT_S)
+    self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE9)
+    self.assertEqual(s["p9_wait_s"], E.PHASE9_WAIT_S)
+
+  # ---- run 2: all 8 slots fail cleanly -------------------------------------------------------------------------------
+  def test_walk_all_8_slots_fail_cleanly(self):
+    self.fresh_state()
+    self.set_phase(9)                              # the 8-entry default list
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}] * 8
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["error"])
+    doc = self.result_doc()
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], list(range(8)))
+    self.assertEqual([a["candidate"] for a in doc["attempts9"]], list(E.PHASE9_DEFAULT_CANDIDATES))
+    self.assertEqual([a["nrc"] for a in doc["attempts9"]], [0x35] * 8)
+    self.assertEqual([a["positive"] for a in doc["attempts9"]], [False] * 8)
+    self.assertFalse(doc["unlocked9"])
+    self.assertIsNone(doc["hard_lock"])
+    self.assertFalse(doc["write_attempted"])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])
+    self.assertEqual(len(self.key_frames(car)), 8)
+    self.assertEqual(len(self.seed_frames(car)), 8)
+    self.assertEqual(self.step_names(doc), ["read_esc", "session"] +
+                     [n for i in range(8) for n in (f"seed_{i}", f"key_{i}")] + ["leave_session", "read_esc_end"])
+    kt = self.key_times(car)
+    for i in range(1, 8):
+      self.assertGreaterEqual(kt[i] - kt[i - 1], E.PHASE9_WAIT_S)
+    self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE9)
+
+  # ---- run 3: hard lock at slot 3 (0x36 twice -> stop) ----------------------------------------------------------------
+  def test_hard_lock_at_slot_3(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND5)
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}, {"nrc": 0x35}, {"nrc": 0x35}, {"nrc": 0x36}, {"nrc": 0x36}]
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["error"])
+    doc = self.result_doc()
+    self.assertTrue(doc["hard_lock"])
+    self.assertEqual(doc["hard_lock_slot"], 3)
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], [0, 1, 2, 3, 3])    # slot 3 recorded twice (the retry)
+    self.assertEqual([a["nrc"] for a in doc["attempts9"]], [0x35, 0x35, 0x35, 0x36, 0x36])
+    self.assertFalse(doc["unlocked9"])
+    self.assertFalse(doc["write_attempted"])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])
+    # 3 clean slots + slot-3 first + slot-3 retry = 5 keys, 5 seeds
+    self.assertEqual(len(self.key_frames(car)), 5)
+    self.assertEqual(len(self.seed_frames(car)), 5)
+    # slot 4 was never tried
+    self.assertNotIn("seed_4", self.step_names(doc))
+    # the retry happened after the wait (~25 s) between the two slot-3 keys
+    kt = self.key_times(car)
+    self.assertGreaterEqual(kt[4] - kt[3], E.PHASE9_WAIT_S)
+    self.assertLessEqual(s["duration_s"], E.RUN_BUDGET_S_PHASE9)
+
+  # ---- run 4: first-slot 67 12 win -----------------------------------------------------------------------------------
+  def test_first_slot_win(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND3)
+    car = self.p9_car()
+    car.key12_actions = [{"unlock": True}]
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    exp = [self.READ, self.SESSION] + self.slot_frames(self.K_ALGO8W) + [self.WRITE, self.READ,
+                                                                         self.SESSION01, self.READ]
+    self.assertEqual(self.tx_frames(car), exp)
+    doc = self.result_doc()
+    self.assertTrue(doc["unlocked9"])
+    self.assertIsNone(doc["hard_lock"])
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], [0])
+    self.assertEqual(len(self.key_frames(car)), 1)
+    self.assertEqual(len(self.seed_frames(car)), 1)
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [self.WRITE])
+    self.assertEqual(doc["value_after_write9"], "90060350")
+    # no wait at all -> the two 27 12 slots never happened, and the run is short
+    self.assertLess(s["duration_s"], E.PHASE9_WAIT_S)
+
+  # ---- lockout that RECOVERS via the recipe (0x36 then 0x35 -> continue) -----------------------------------------------
+  def test_lockout_retry_recovers_then_walks_on(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND3)
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}, {"nrc": 0x36}, {"nrc": 0x35}, {"unlock": True}]
+    self.run_car(car)
+    doc = self.result_doc()
+    self.assertIsNone(doc["hard_lock"])
+    self.assertTrue(doc["unlocked9"])
+    self.assertEqual([a["slot"] for a in doc["attempts9"]], [0, 1, 1, 2])
+    self.assertEqual([a["nrc"] for a in doc["attempts9"]], [0x35, 0x36, 0x35, None])
+    self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [self.WRITE])
+
+  # ---- session / read gates -------------------------------------------------------------------------------------------
+  def test_session_not_positive_skips_walk(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND3)
+    car = self.p9_car()
+    car.session_positive = {0x01: True, 0x03: False}
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIsNone(s["aborted"])
+    doc = self.result_doc()
+    self.assertEqual(doc["seeds9"], [])
+    self.assertEqual(doc["attempts9"], [])
+    self.assertFalse(doc["unlocked9"])
+    self.assertEqual(self.key_frames(car), [])
+    self.assertEqual(self.seed_frames(car), [])
+    # the clean leave + value_end still run
+    self.assertIn(self.SESSION01, self.tx_frames(car))
+    self.assertIn(self.READ, self.tx_frames(car))
+
+  def test_read_gate_aborts(self):
+    car = self.p9_car()
+    car.read_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    self.assertIn("0x0103", s["aborted"])
+    self.assertEqual([d[1] for d in self.tx_frames(car)], [0x22])   # only the failed read
+    self.assertEqual(car.mux_calls, [True, False])
+
+  def test_bad_seed_stops_walk(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=self.CAND3)
+    car = self.p9_car()
+    car.seed11_refused = True
+    s = self.run_car(car)
+    self.assertTrue(s["ran"])
+    doc = self.result_doc()
+    self.assertEqual(self.key_frames(car), [])
+    self.assertEqual(len(doc["attempts9"]), 1)
+    self.assertIn("no 27 12", doc["attempts9"][0]["note"])
+    self.assertIsNotNone(doc["walk_stopped"])
+    self.assertFalse(doc["write_attempted"])
+
+  # ---- candidates list handling ---------------------------------------------------------------------------------------
+  def test_candidates_capped_at_ten_and_unknown_dropped(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=["algo8w_27100", "banana", "algo8_27100", "algo8w_26400", "algo8w_26800",
+                                  "algo8w_26600", "algo8_26700", "algo8_26300", "lit270100", "zero8", "identity8"])
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}] * 10
+    self.run_car(car)
+    doc = self.result_doc()
+    used = [a["candidate"] for a in doc["attempts9"]]
+    self.assertEqual(len(used), 10)
+    self.assertNotIn("banana", used)
+    self.assertEqual(used, ["algo8w_27100", "algo8_27100", "algo8w_26400", "algo8w_26800", "algo8w_26600",
+                            "algo8_26700", "algo8_26300", "lit270100", "zero8", "identity8"])
+
+  def test_all_invalid_p9_candidates_skips(self):
+    self.fresh_state()
+    self.set_phase(9, candidates=["banana", "nope"])
+    car = self.p9_car()
+    s = self.run_car(car)
+    self.assertFalse(s["ran"])
+    self.assertIn("p9_candidates", s["skip"])
+    self.assertEqual(car.sent, [])
+
+  def test_p9_wait_clamped(self):
+    # below the floor -> 10 s
+    self.fresh_state()
+    self.set_phase(9, candidates=["algo8w_27100", "algo8_27100"], wait_s=5.0)
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}, {"nrc": 0x35}]
+    s = self.run_car(car)
+    self.assertEqual(s["p9_wait_s"], E.PHASE9_WAIT_MIN_S)
+    kt = self.key_times(car)
+    self.assertGreaterEqual(kt[1] - kt[0], E.PHASE9_WAIT_MIN_S)
+    # above the ceiling -> 60 s
+    self.fresh_state()
+    self.set_phase(9, candidates=["algo8w_27100", "algo8_27100"], wait_s=999.0)
+    car = self.p9_car()
+    car.key12_actions = [{"nrc": 0x35}, {"nrc": 0x35}]
+    s = self.run_car(car)
+    self.assertEqual(s["p9_wait_s"], E.PHASE9_WAIT_MAX_S)
+    kt = self.key_times(car)
+    self.assertGreaterEqual(kt[1] - kt[0], E.PHASE9_WAIT_MAX_S)
+
+  # ---- scheduling / stationarity --------------------------------------------------------------------------------------
+  def test_once_per_ignition(self):
+    car = self.p9_car()
+    car.key12_actions = [{"unlock": True}]
+    self.run_car(car, key="boot:1")
+    n = len(car.sent)
+    s = self.run_car(car, key="boot:1")
+    self.assertFalse(s["ran"])
+    self.assertEqual(s["skip"], "already done (ignition)")
+    self.assertEqual(len(car.sent), n)
+
+  def test_not_in_park_sends_nothing(self):
+    car = self.p9_car(gear=5)
+    s = self.run_car(car)
+    self.assertFalse(s["ran"])
+    self.assertEqual(car.sent, [])
+    self.assertEqual(car.mux_calls, [])
+
+  # ---- guards: the closed phase-9 allowlist ---------------------------------------------------------------------------
+  def test_guard_service_phase9_closed_set(self):
+    E.guard_service(0x22, None, 0x0103, phase=9)
+    E.guard_service(0x10, 0x01, None, phase=9)
+    E.guard_service(0x10, 0x03, None, phase=9)
+    E.guard_service(0x27, 0x11, None, phase=9)
+    E.guard_service(0x27, 0x12, None, phase=9)
+    E.guard_service(0x2E, None, 0x0103, phase=9)
+    # 27 01/27 02 are NOT phase-9 sub-functions (the walk never sends them)
+    for sub in (0x01, 0x02, 0x10, 0x13, 0x00):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x27, sub, None, phase=9)
+    # 10 only 01/03; 22 only 0103
+    for sub in (0x02, 0x04, 0x81, 0x83):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x10, sub, None, phase=9)
+    for did in (0xF100, 0x0104, 0x0000):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x22, None, did, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_service(0x2E, None, 0x0104, phase=9)
+    # 0x29 has NO admissible sub in phase 9 (the walk has no auth probe)
+    for sub in (0x01, 0x05, None):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(0x29, sub, None, phase=9)
+    # everything else is out
+    for svc in (0x19, 0x31, 0x3E, 0x23, 0x34, 0x35, 0x36, 0x37):
+      with self.assertRaises(D.SafetyViolation):
+        E.guard_service(svc, None, None, phase=9)
+
+  def test_guard_frame_phase9_closed_shapes(self):
+    for f in (self.READ, self.SESSION, self.SESSION01, self.SEED11):
+      E.guard_frame(0x7D1, f, 1, phase=9)
+    E.guard_frame(0x7D1, self.FC, 1, phase=9)                              # RX flow control
+    E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8W, p9_seed=True, key_attempts=0)
+    E.guard_frame(0x7D1, self.cf(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8W)
+    E.guard_frame(0x7D1, self.WRITE, 1, phase=9, readback=CURRENT)
+    # extra request addresses are NOT admissible
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x770, self.READ, 1, phase=9)
+    # 27 12 without the sentinel, and with a wrong-length / wrong / missing key
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8W, p9_seed=False, key_attempts=0)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=None, p9_seed=True, key_attempts=0)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8, p9_seed=True, key_attempts=0)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8W[:4], p9_seed=True, key_attempts=0)
+    # a 13th attempt (counter at the cap) is refused
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=9, key=self.K_ALGO8W, p9_seed=True,
+                    key_attempts=E.PHASE9_MAX_KEY_ATTEMPTS)
+    # the consecutive frame must carry the key tail
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.cf(self.K_ALGO8), 1, phase=9, key=self.K_ALGO8W)
+    # a 27 12 single frame is NEVER admissible in phase 9
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([6, 0x27, 0x12, 1, 2, 3, 4]).ljust(8, b"\x00"), 1, phase=9, p9_seed=True)
+    # 27 01/27 02, wrong 10 sub, F100, wrong 2E payload / missing readback
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([2, 0x27, 0x01]).ljust(8, b"\x00"), 1, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([2, 0x27, 0x02]).ljust(8, b"\x00"), 1, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([2, 0x10, 0x02]).ljust(8, b"\x00"), 1, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([3, 0x22, 0xF1, 0x00]).ljust(8, b"\x00"), 1, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([7, 0x2E, 0x01, 0x03]) + bytes(4), 1, phase=9, readback=CURRENT)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.WRITE, 1, phase=9)                          # no readback -> refused
+    # 27 11 seed cap
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.SEED11, 1, phase=9, seed_attempts=E.PHASE9_MAX_SEEDS)
+    # wrong bus / length
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.READ, 0, phase=9)
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.SEED11[:3], 1, phase=9)
+
+  def test_phase9_shapes_refused_outside_phase9(self):
+    # a `29 05` frame (admissible in phase 8) is NOT admissible in phase 9
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, bytes([2, 0x29, 0x05]).ljust(8, b"\x00"), 1, phase=9)
+    # the phase-9-only walk shapes must NOT leak into phase 8: a 27 12 with p9_seed (and no p8_seed) is refused there
+    with self.assertRaises(D.SafetyViolation):
+      E.guard_frame(0x7D1, self.ff(self.K_ALGO8W), 1, phase=8, key=self.K_ALGO8W, p9_seed=True, p8_seed=False,
+                    key_attempts=0)
+    # and the phase-9 caps differ from phase 8's
+    self.assertNotEqual(E.PHASE9_MAX_KEY_ATTEMPTS, E.PHASE8_MAX_KEY_ATTEMPTS)
+    self.assertNotEqual(E.PHASE9_MAX_SEEDS, E.PHASE8_MAX_SEEDS)
+
+  def test_single_tx_site_unchanged(self):
+    tree = ast.parse(inspect.getsource(E))
+    calls = [getattr(n.func, "attr", getattr(n.func, "id", "")) for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) == "_can_send"]
+    self.assertEqual(sorted(calls), ["_can_send", "_can_send"])
+
+  def test_write_did_is_the_only_write_and_is_a_noop(self):
+    # the phase-9 write path reuses write_did: value must equal the step-1 readback
+    car = self.p9_car()
+    c = E.EscProbeClient(car.can_send, car.can_recv, D.VehicleGate(car.now), car.now, car.now() + 99, phase=9)
     with self.assertRaises(D.SafetyViolation):
       c.write_did(E.DID_VARIANT_CODING, b"\x01\x02\x03\x04", CURRENT)     # value != readback

@@ -16,6 +16,7 @@ I/O SIZES ([confirmed] from each function's sprintf + the XML's SecuritySupporte
                            form.  OUTPUT: 4 BYTES (27100 vendor-exact) -> frame 06 27 02 k0 k1 k2 k3.
     cal_26300(seed[0:4]) : in 4 bytes -> out 4 bytes "00 HI 00 LO" (06 27 02)
     cal_26400(seed[0:2]) : in 2 bytes -> out 2 bytes (04 27 02)
+    cal_26600(seed[0:2]) : in 2 bytes -> out 2 bytes (04 27 02)  [CRC-16/0xC0A3]
     cal_26700(seed[0:4]) : in 4 bytes -> out 4 bytes (06 27 02)
     cal_26800(seed[0:2]) : in 2 bytes -> out 2 bytes (04 27 02)
     cal_27400(seed[0:4]) : in 4 bytes -> out 4 bytes (06 27 02)
@@ -191,12 +192,39 @@ def cal_26800(seed2: bytes) -> bytes:
 
 
 # ----------------------------------------------------------------------------
+# CalKeyAlgorithm "Key = %d" — fcn @ 0x72418, Securityindex 26600 [confirmed 0x72418-0x724f8]
+#   Seed: Mid(8,4) = 2 bytes -> one hex number val = (b0<<8)|b1 [0x7247c-0x72490]; bail (None) if val == 0.
+#   CRC-16, reflected, poly 0xC0A3 (= bit-reverse of 0xC503 — the same Hyundai constant family as the 27100 LFSR and
+#   the 26300 modulus), init 0xFFFF, no xor-out, over the 2 seed bytes in order [lo, hi] (i.e. [b1, b0] LSB byte first;
+#   CRC core fcn 0x69948 [confirmed 0x69948-0x699a4]). Output 2 bytes big-endian (04 27 02): [crc>>8, crc&0xFF].
+# ----------------------------------------------------------------------------
+def cal_26600(seed2: bytes) -> bytes | None:
+  """2 seed bytes in -> 2 key bytes out (04 27 02).  CRC-16/0xC503.  None if the seed word is zero."""
+  if len(seed2) != 2:
+    raise ValueError("cal_26600 expects exactly 2 seed bytes (seed[0:2])")
+  b0, b1 = seed2
+  val = (b0 << 8) | b1
+  if val == 0:
+    return None
+  crc = 0xFFFF
+  for byte in (b1, b0):                # buffer order: lo byte first [confirmed]
+    for _ in range(8):
+      bit = (crc ^ byte) & 1
+      crc >>= 1
+      byte >>= 1
+      if bit:
+        crc ^= 0xC0A3
+  return bytes([(crc >> 8) & 0xFF, crc & 0xFF])
+
+
+# ----------------------------------------------------------------------------
 # The phase-4 ``algo`` selector.  Names are the G-scan2 Securityindex values (the vendor CalKeyAlgorithm number).
 # ----------------------------------------------------------------------------
 _ALGOS = {
   "27100": cal_27100,   # LFSR16 / 0xC503, 4-byte seed -> [bitsum(lo), bitsum(hi), 00, 00]
   "26300": cal_26300,   # mod 0xC503, 4-byte seed -> [00, HI, 00, LO]
   "26400": cal_26400,   # XOR 0x26C0, 2-byte seed -> 2-byte key
+  "26600": cal_26600,   # CRC-16/0xC0A3, 2-byte seed -> 2-byte key
   "26700": cal_26700,   # LFSR32 / 0x3BCC14C8, 4-byte seed -> 4-byte key
   "26800": cal_26800,   # table-XOR, 2-byte seed -> 2-byte key
   "27400": cal_27400,   # multiply/add, 4-byte seed -> 4-byte key
@@ -227,7 +255,7 @@ def key_for(seed: bytes, algo: str | None = None) -> bytes | None:
   if fn is None:
     raise ValueError(f"unknown algo {algo!r} (choose from {sorted(_ALGOS)})")
   s4 = _seed4(bytes(seed))
-  if name in ("26400", "26800"):
+  if name in ("26400", "26600", "26800"):
     return fn(s4[:2])
   return fn(s4)
 
@@ -244,6 +272,7 @@ def candidates(seed: bytes) -> dict[str, bytes | None]:
     "27100": cal_27100(s4),      # LFSR16 / 0xC503  -> 06 27 02 [lo, hi, 00, 00]
     "26300": cal_26300(s4),      # mod 0xC503      -> 06 27 02 [00, HI, 00, LO]
     "26400": cal_26400(s4[:2]),  # XOR 0x26C0      -> 04 27 02 [HI, LO]
+    "26600": cal_26600(s4[:2]),  # CRC-16/0xC0A3   -> 04 27 02 [HI, LO]
     "26700": cal_26700(s4),      # LFSR32          -> 06 27 02 [st BE 4B]
     "26800": cal_26800(s4[:2]),  # table-XOR       -> 04 27 02 [HI, LO]
     "27400": cal_27400(s4),      # mul/add         -> 06 27 02 [k0..k3]
@@ -290,6 +319,17 @@ if __name__ == "__main__":
   print(f"[{'ok ' if ok else 'FAIL'}] 0xC503 family: bitrev(0xC0A3) == 0xC503 ({rev16(0xC0A3):#06x})")
   if not ok:
     failures.append("0xC503 family")
+
+  # 26600 CRC-16/0xC0A3: 2-byte seed -> 2-byte key; the zero word bails (None)
+  k266 = cal_26600(bytes([0x5A, 0xB0]))
+  ok = k266 is not None and len(k266) == 2
+  print(f"[{'ok ' if ok else 'FAIL'}] 26600 CRC-16/0xC0A3(5AB0) -> 2 bytes {k266.hex() if k266 else None}")
+  if not ok:
+    failures.append("26600 CRC")
+  ok = cal_26600(bytes(2)) is None
+  print(f"[{'ok ' if ok else 'FAIL'}] 26600 zero word -> None (vendor bail)")
+  if not ok:
+    failures.append("26600 zero-bail")
 
   # Repetition property: 8-byte repeated seed behaves as its first 4 bytes
   v = bytes([0x5A, 0xB0])
