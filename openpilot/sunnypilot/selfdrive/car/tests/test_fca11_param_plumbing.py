@@ -19,17 +19,17 @@ import os
 import tempfile
 import unittest
 
-# Isolated params store. PARAMS_ROOT is honoured by libparams at Params() construction, so this must
+# Isolated params store. PARAMS_ROOT is honored by libparams at Params() construction, so this must
 # be set before any Params() is built in this process (openpilot's common/params fallback does not).
 os.environ["PARAMS_ROOT"] = tempfile.mkdtemp(prefix="fca11-plumbing-test-")
 
-from openpilot.common.params import Params  # noqa: E402
-from openpilot.common.test import OpenpilotTestCase  # noqa: E402
-from openpilot.sunnypilot.selfdrive.car import interfaces as sp_interfaces  # noqa: E402
-from opendbc.car.car_helpers import interfaces  # noqa: E402
-from opendbc.car.hyundai.values import CAR  # noqa: E402
-from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP  # noqa: E402
-from opendbc.sunnypilot.car.interfaces import setup_interfaces  # noqa: E402
+from openpilot.common.params import Params
+from openpilot.common.test import OpenpilotTestCase
+from openpilot.sunnypilot.selfdrive.car import interfaces as sp_interfaces
+from opendbc.car.car_helpers import interfaces
+from opendbc.car.hyundai.values import CAR
+from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+from opendbc.sunnypilot.car.interfaces import setup_interfaces
 
 CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
 # standard pedal sensor 0x201 present so the gas-interceptor capability flag is set (FCA11 rides on it)

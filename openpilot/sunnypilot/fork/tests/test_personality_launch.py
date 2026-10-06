@@ -13,7 +13,6 @@ import numpy as np
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
-from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib import longitudinal_planner as upstream_lp
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
