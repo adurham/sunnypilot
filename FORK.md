@@ -80,6 +80,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 43 | **SCC-Vision entry gate + merge-gate exclusion** (drive 149 "SCC vision still too touchy"): `ForkSCCVision` ENTERING now needs current-lateral corroboration (`current_lat_acc >= VISION_ENTER_CUR_LAT_ACC` = 0.9 m/s^2) or a SUSTAINED high prediction (`max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC` = 1.8 for `VISION_ENTER_PRED_HOLD_S` = 0.4 s), so a predicted-only curvature (pull-away / on-ramp merge) no longer caps accel. AND while a setspeed-ease merge window is open, a predicted-only SCC-V (cur < 0.9) is released to `V_CRUISE_UNSET` so it cannot bind the arbitrated target; a cur-corroborated curve inside the window still binds. `SetSpeedEase.merge_state` evaluates the gate once per tick and `LongitudinalPlannerSP` hands the result to `ForkSmartCruiseControl.update(..., merging=)`; a `scc_vision_supersede` cloudlog event (no capnp change) logs the exclusion edges. Drive-149 offline rlog replay: the 1247.7 on-ramp merge hold (SCC-V bound 3.2 s) and the touchy 676.8 / 685.9 caps are gone; the legit 1222 / 1938-46 / 1997 curves and the SCC-M map gate are unchanged - **offline-replay + unit tested only, NOT road-run; no firmware change** | fix (planner) | fork-local (`fork/scc.py`, `fork/setspeed_ease.py`, `sunnypilot/.../longitudinal_planner.py`) |
 | 44 | **Personality-indexed launch feel** (drive 149 §1): the driver's `LongitudinalPersonality` (cereal `log.LongitudinalPersonality`, 0 = aggressive / 1 = standard / 2 = relaxed) becomes the master lever for driver-felt launch / merge response. New `CarControlSP.personality` (UInt8) capnp field + the opendbc `structs.py` mirror (default STANDARD, so a no-arg `CarControlSP` is never aggressive); `controlsd_ext.state_control_ext` writes it every tick from `selfdriveState.personality` (a not-yet-seen `selfdriveState` falls back to STANDARD, never the capnp `0` = aggressive default) and `LongitudinalPlanner` scales the cruise-candidate ceiling `A_CRUISE_MAX` by it (`PERSONALITY_CRUISE_SCALE`: aggressive 1.15 / standard 1.00 = upstream / relaxed 0.80). opendbc patch `0019`: the Hyundai comma-pedal law scales the launch ceiling (`LOW_SPEED_MAX_GAS_V_OFFSET`: relaxed -0.02/-0.03, standard shipped, aggressive +0.04/+0.06), the cruise-pull gain (`PEDAL_SCALE`) and the hold feedforward (`HOLD_CMD`) by one feel factor per tier (relaxed 0.85 / standard 1.00 / aggressive 1.20, clamped so no raw command exceeds the 0.35 interceptor cap / panda A 1218 / B 612); the upward slew limit is deliberately NOT personality-scaled. STANDARD reproduces the shipped law bit-for-bit, so a drive that never touches the personality button is byte-identical. **COUPLING: the capnp field and the opendbc `structs.py` mirror are a matched pair — `convert_carControlSP` raises a TypeError if only one side ships, so patch `0019` + the superproject change MUST land together.** Python-only, no firmware change (no `opendbc/safety`, no `panda`) | feature (planner + car, Python only) | fork-local; patch `0019`; NOT on main |
 | 45 | **FCA11-long personality-indexed braking strength** (drive 149): the same `LongitudinalPersonality` (via `CarControlSP.personality`, patch `0019`'s channel) now owns the FCA11-long **commanded decel cap**. `fca11_long.py` gains `PERSONALITY_MAX_DEC` (relaxed 12 = 0.12 g / standard 20 = 0.20 g / aggressive 30 = 0.30 g, raw 0.01 g/LSB), `personality_max_dec()` and `clamp_dec_cmd(dec_cmd, personality)`; `Fca11LongBrake.update(..., personality)` indexes the cap and `gas_interceptor.create_gas_command` threads its personality arg into it. Unknown / out-of-range -> STANDARD (the middle, never the strongest); standard's 20 is the new default so a bare / legacy caller gets the middle. **Every tier <= the panda gate `HYUNDAI_FCA11_LONG_MAX_DEC` (30, personality-agnostic) — python-only, no `opendbc/safety` change, deployed firmware `00e086b9` stays valid.** No resume/stop change; toggle-OFF byte-for-byte inert | tune (car, Python only) | fork-local; patch `0020` (follows `0019`); NOT on main |
+| 46 | **Drive mode follows personality** (new param `DriveModePersonality`, BOOL, default OFF = byte-for-byte today's behaviour): the CN7 drive mode is now decoded and broadcast — new DBC signal CLU13 `CF_Clu_DriveMode` (44\|4; bits 44-47 were undefined) with values 1 Normal / 2 Eco / 3 Sport / 6 N-Custom / 7 N, documented + surfaced as `CarStateSP.driveMode` (capnp + opendbc `structs.py` coupled pair, debounced one source frame). ON: NORMAL -> standard, ECO -> relaxed, SPORT -> aggressive, applied on EVERY mode CHANGE to selfdrived's live `self.personality` **and** the `LongitudinalPersonality` param (the gap-button rail: planner / MPC / setspeed-ease / adaptive-follow / `CC_SP.personality` all follow live; manual gap cycling between changes stays allowed, the mode re-asserts on the next change). N and N-Custom (both slots) BLOCK openpilot LONGITUDINAL via `EventName.driveModePersonalityBlock` (NO_ENTRY + USER_DISABLE): no new engage, and an engaged long is dropped immediately; MADS strips that event (same rail as the factory-cruise lockout) so OP LATERAL / lateral-only is untouched, with SP `driveModePersonalityLockout` as the driver alert. Unknown / absent (`driveMode` 0) -> do nothing (never force, never block). Pure mapping + debounce unit-tested; block gate tested on the real selfdrived StateMachine | feature (car + selfdrived + planner + UI, Python only) | fork-local; patch `0021`; NOT on main |
 
 ---
 
@@ -140,6 +141,46 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   report).
 - **Merge note:** fork-local feel feature; patch `0020` consumes `0019`'s `CC_SP.personality` channel. NOT pushed, device
   untouched.
+
+### drive-mode-personality: drive mode sets the personality + blocks long in N — 2026-10-06 (offline-tested; Python-only, no firmware change; DBC + capnp additions)
+
+> **Driver notes:** the car's own drive mode now talks to sunnypilot. Switch the car to ECO and the feel dial goes
+> relaxed; NORMAL is standard; SPORT is aggressive — and it follows you live, every time you change mode (you can still
+> nudge the gap button in between; the next mode change re-asserts). In **N / N-Custom** openpilot longitudinal is
+> switched off and cannot engage (lateral assist keeps working); go back to a ring mode and long is available again.
+> Off by default — nothing changes until you turn on "Drive Mode Personality".
+
+- **Why:** the CN7 drive mode was decoded and verified (route 00000147 + a 52-route census; `car-features/0x4a0-decode.md`)
+  but lived as a raw byte. Making it first-class lets the driver's own mode choice drive the feel dial, and N mode (a
+  track-ish mode) is the natural place to keep openpilot longitudinal out.
+- **What:**
+  - **DBC** (`opendbc/dbc/generator/hyundai/hyundai_can.dbc`, classic-CAN Hyundai): new `CF_Clu_DriveMode : 44|4@1+`
+    on CLU13 (0x50C) — bits 44-47 were undefined, no collision with `CF_Clu_EcoDriveInf` (40|3) or `CF_Clu_IsaMainSW`
+    (43|1) — plus `CM_` notes documenting the mode values, that on CN7 the `EcoDriveInf` low nibble carries the N-Custom
+    slot, and that MDPS11 `CF_Mdps_CurrMode` is a steering-mode level (0 normal / 1 sport / 3 N, not an alive counter),
+    with a matching `VAL_`. Additive only.
+  - `opendbc` patch `0021`: `drive_mode.py` — pure `map_drive_mode` (`DriveModeResult`: 1 -> standard, 2 -> relaxed,
+    3 -> aggressive, 6/7 -> BLOCK, else UNKNOWN) + `DriveModeDebouncer` (one source frame); `carstate_ext.py` reads CLU13
+    `CF_Clu_DriveMode` off the C-CAN parser (`vl_all`, debounced) into the new `CarStateSP.driveMode`
+    (`custom.capnp` `driveMode @1 :UInt8` + the `structs.py` mirror — a coupled pair, like `speedLimit`).
+  - `fork/drive_mode_personality.py`: param `DriveModePersonality` (default OFF) gates the whole feature; on a mode
+    CHANGE it applies the personality live (`self.personality` + `LongitudinalPersonality`, the gap-button rail) and
+    raises `personalityChanged`; N / N-Custom add `EventName.driveModePersonalityBlock`.
+  - `selfdrived.py`: subscribes `carStateSP`; calls `dmp.step(...)` in the `CS.canValid` block; reads the param in
+    `params_thread`. `custom.capnp` adds `OnroadEventSP.EventName.driveModePersonalityLockout @29`; `log.capnp` adds
+    `OnroadEvent.EventName.driveModePersonalityBlock @104`; `events.py` (both) define the alerts (block = NO_ENTRY +
+    USER_DISABLE; lockout = permanent driver alert). `mads.py` strips the block event so lateral survives. Param +
+    Hyundai UI toggle added.
+- **Lateral safety:** the block is a LOG-level event with NO_ENTRY — so the main selfdrived state machine refuses a new
+  long engage and drops an engaged one — and MADS removes it (exactly like `wrongCruiseMode`), so OP lateral / a
+  lateral-only engagement is never gated. On a non-MADS car the same event carries the no-entry alert text.
+- **Verification:** `test_drive_mode.py` (DBC layout/no-collision/VAL_ + real-CANParser decode + mapping incl. unknown +
+  debounce + CarStateExt wiring) and `test_drive_mode_personality.py` (mapping, live personality switch through the real
+  rail, manual gap cycling preserved, block gate on the real selfdrived `StateMachine` — no-engage in N and
+  disengage-on-switch-in, MADS strip → lateral preserved, OFF / unknown inert). Series rehearsal `0001-0021` clean.
+  Python-only: no `opendbc/safety/*`, no `panda/*`.
+- **Merge note:** fork-local feature; patch `0021` + the superproject change are a coupled pair (the `driveMode` capnp
+  field and its opendbc `structs.py` mirror). NOT pushed, device untouched.
 
 ### fca11-plumbing: FCA11-long param never armed (initialize_params + bool gate) — 2026-10-06 (offline-tested; Python-only, no firmware change)
 
