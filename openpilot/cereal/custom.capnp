@@ -387,6 +387,11 @@ struct CarControlSP @0xa5cd762cd951a455 {
   leadOne @2 :LeadData;
   leadTwo @3 :LeadData;
   intelligentCruiseButtonManagement @4 :IntelligentCruiseButtonManagement;
+  # fork: raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed; cereal
+  # log.LongitudinalPersonality) so car-brand controllers can scale driver-felt actuation by the feel dial (Hyundai
+  # pedal law: launch ceiling / pull gain / interceptor cap). 0 in capnp is aggressive, so the opendbc mirror defaults
+  # to standard and the producer always writes it; consumers clamp anything unknown to standard.
+  personality @5 :UInt8;
 
   struct Param {
     key @0 :Text;

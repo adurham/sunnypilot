@@ -429,7 +429,7 @@ class TestUpstreamHooks(OpenpilotTestCase):
 
   def test_pinned_signatures(self):
     self.assertEqual(list(inspect.signature(upstream_lp.get_cruise_accel).parameters),
-                     ['e2e', 'v_cruise', 'v_ego', 'a_cruise_prev', 'angle_steers', 'CP', 'dt', 'accel_coast', 'allow_throttle'])
+                     ['e2e', 'v_cruise', 'v_ego', 'a_cruise_prev', 'angle_steers', 'CP', 'dt', 'accel_coast', 'allow_throttle', 'personality'])
     self.assertEqual(list(inspect.signature(LongitudinalPlannerSP.update_targets).parameters),
                      ['self', 'sm', 'v_ego', 'a_ego', 'v_cruise'])
     src = inspect.getsource(upstream_lp.LongitudinalPlanner.update)
@@ -497,7 +497,7 @@ class TestUpstreamHooks(OpenpilotTestCase):
     planner.setspeed_ease.update = lambda sm, v_target, *a: v_target
     self._run(planner, 5, v, 45 * 1.609344, personality=P.relaxed)
     self._run(planner, 40, v, 55 * 1.609344, personality=P.relaxed)
-    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v)), places=3)
+    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, P.relaxed)), places=3)
 
   def test_end_to_end_down_immediate(self):
     v = 45 * MPH
@@ -550,7 +550,7 @@ class TestUpstreamHooks(OpenpilotTestCase):
         self._run(planner, 5, v, 30 * 1.609344, personality=p, **road)
         self._run(planner, 40, v, 75 * 1.609344, personality=p, **road)
         self.assertTrue(planner.setspeed_ease.merging, (road, p))
-        self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v)), places=3, msg=str((road, p)))
+        self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, p)), places=3, msg=str((road, p)))
 
   def test_end_to_end_bump_on_normal_road_still_eased(self):
     # +10 mph at 45 mph on an urban 45 mph road, and +10 mph at 65 mph on a 70 mph highway: eased (discretionary)
