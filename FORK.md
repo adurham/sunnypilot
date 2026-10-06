@@ -77,6 +77,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 40 | ESC 0x27 probe **phase 9 -- door-B candidate walk with the time-reset recipe** (amends #27/#32/#33/#36/#37, same fingerprint window): the phase-8 run found the WORKABLE recipe (a wrong key -> wait >= 25 s -> `10 01` -> `10 03` -> `27 11` -> `27 12` IS re-evaluated; a bare cycle alone does NOT clear the counter), so `state.json` `{"phase": 9, "p9_candidates": [...], "p9_wait_s": 25.0}` (420 s budget; default the 8 door-B algorithm tokens incl. the three NEW `algo8w_26400`/`algo8w_26800`/`algo8w_26600`; first 10 kept; unknown names dropped; all-invalid -> inert) walks 8-10 candidates in ONE parked ignition (~30 s/slot) - `22 0103` (value_start) -> `10 03` -> for each slot: (k>0) sleep `p9_wait_s` then `10 01`; `10 03`, then `27 11` -> fresh seed -> `27 12` + the resolved 8-byte candidate: a positive `67 12` -> WIN PATH (the ONE no-op `2E 0103` == value_start + re-read, STOP); a `0x36`/`0x37` -> wait+cycle then ONE same-candidate retry, a still-locked retry sets `hard_lock` + STOP; a `0x35` -> next slot; then `10 01` -> `22 0103` (value_end). New tokens: `algo8w_26400`/`algo8w_26800`/`algo8w_26600` = `cal_26400/26800/26600(seed[:2])[:2]` repeated x4; `cal_26600` (CRC-16/0xC0A3, Securityindex 26600) added to `fork/esc_probe_seedkey.py`. Adds `attempts9`/`seeds9`/`unlocked9`/`write9`/`value_after_write9`/`hard_lock`/`hard_lock_slot`/`p9_wait_s`. Guards: `27 12` ONLY 8-byte keys, ONLY right after a POSITIVE `27 11` in the SAME session (`p9_seed` sentinel, cleared on any `10`), <=12 keys; `27 11` <=14; `27 01`/`27 02`/`29`/`31`/`34`-`37` NOT admissible; the ONE `2E` pinned to value_start; `22` only 0103; `10` only {01,03}; NO extra addrs; phases 1-8 byte-identical. Tests **201** (+21 phase-9); mutation **84/84** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py`); phases 1-8 byte-identical |
 | 41 | ESC 0x27 probe **phase 9 extension -- the 4 remaining offline candidate tokens + raised caps** (amends #40, same fingerprint window): the phase-9 run evaluated 6 candidates (all `7F 27 35`) and stopped at the 12-attempt cap with `algo8_26300`/`lit270100` still on the list (they stay queued via state, no code change). FOUR offline constructions were still NEVER built as tokens, so this closes the whole offline space in ONE parked ignition -- `PHASE9_CANDIDATES` += `algo8w_26300` (`cal_26300(seed[:4])[:2]` x4 = `[00,HI]x4`), `algo8w_27400` (`cal_27400(seed[:4])[:2]` x4), `algo8_27400` (`cal_27400(seed[:4])` x2, the 4-byte key doubled), `algo8w_40000` (`cal_40000(seed[:4])[:2]` x4); the optional `cal_40000` (Securityindex 40000, fixed lookup, 2-byte key) is now ported into `fork/esc_probe_seedkey.py` and registered in `_ALGOS`/`candidates()`. `PHASE9_DEFAULT_CANDIDATES` -> `("algo8_26300","lit270100","algo8w_26300","algo8w_27400","algo8_27400","algo8w_40000")` (the 6 leftovers); caps `PHASE9_MAX_KEY_ATTEMPTS` 12 -> **16**, `PHASE9_MAX_SEEDS` 14 -> **20** (budget stays `RUN_BUDGET_S_PHASE9` 420 s -- 6 slots x ~55 s fits). Guards otherwise unchanged: `27 12` ONLY 8-byte keys pinned EXACTLY to the pinned candidate, ONLY after a POSITIVE same-session `27 11`, only in phase 9; phases 1-8 byte-identical. Tests **204** (+3 net; the default-walk test retargeted 8 -> 6 slots + the new exact-wire-byte tests); mutation **89/89** killed (5 new) | diagnostics | fork-local (`fork/esc_probe_0027.py` + `fork/esc_probe_seedkey.py`); phases 1-8 byte-identical |
 | 42 | **FCA11-long param plumbing fix** (amends #31, route 149 finding): the `HyundaiFca11Brake` toggle read ON in the UI but the feature came up **NOT armed** on the road (`carParamsSP.fca11Brake=False` every seg, panda `safetyParam` bit 256 clear, zero 0x38D TX). Two defects: (a) `openpilot/sunnypilot/selfdrive/car/interfaces.py::initialize_params()` never read the key, so it never reached opendbc's `params_dict`; (b) opendbc's arm gate compared `str(raw) == "1"` but `Params.get()` returns a python **bool** for a BOOL key, and `str(True) == "True"`. Fix: read the key with the same `UnknownKeyName` guard as the pedal keys (missing -> OFF), and accept the python bool as well as the raw string `"1"`. Toggle OFF/absent/junk/stale-libparams stays byte-for-byte today's. Patch `0018` (opendbc gate), superproject `initialize_params` + new real-path E2E test `test_fca11_param_plumbing.py`. **No firmware impact** (deployed `00e086b9` stays valid, no reflash) | fix (car plumbing, Python only) | fork-local; amends #31; patch `0018`; NOT on main |
+| 43 | **SCC-Vision entry gate + merge-gate exclusion** (drive 149 "SCC vision still too touchy"): `ForkSCCVision` ENTERING now needs current-lateral corroboration (`current_lat_acc >= VISION_ENTER_CUR_LAT_ACC` = 0.9 m/s^2) or a SUSTAINED high prediction (`max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC` = 1.8 for `VISION_ENTER_PRED_HOLD_S` = 0.4 s), so a predicted-only curvature (pull-away / on-ramp merge) no longer caps accel. AND while a setspeed-ease merge window is open, a predicted-only SCC-V (cur < 0.9) is released to `V_CRUISE_UNSET` so it cannot bind the arbitrated target; a cur-corroborated curve inside the window still binds. `SetSpeedEase.merge_state` evaluates the gate once per tick and `LongitudinalPlannerSP` hands the result to `ForkSmartCruiseControl.update(..., merging=)`; a `scc_vision_supersede` cloudlog event (no capnp change) logs the exclusion edges. Drive-149 offline rlog replay: the 1247.7 on-ramp merge hold (SCC-V bound 3.2 s) and the touchy 676.8 / 685.9 caps are gone; the legit 1222 / 1938-46 / 1997 curves and the SCC-M map gate are unchanged - **offline-replay + unit tested only, NOT road-run; no firmware change** | fix (planner) | fork-local (`fork/scc.py`, `fork/setspeed_ease.py`, `sunnypilot/.../longitudinal_planner.py`) |
 
 ---
 
@@ -120,6 +121,55 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - **Merge note:** fork-local bug fix; amends #31. Patch `0018` + the superproject change. NOT pushed, device
   untouched. Re-run the route-149 brake question only after confirming seg 0 shows `carParamsSP.fca11Brake=True`
   and `safetyParam & 256`.
+### sccv-touchy: SCC-Vision entry gate + merge-gate exclusion (drive 149) - 2026-10-06 (offline-replay + unit tested; NOT road-run; no firmware change)
+
+> **Driver notes:** the vision curve feature no longer slows you down for a curve it only *predicts* but does not
+> yet feel. On a pull-away or an on-ramp merge it used to trim/cap acceleration for a couple of seconds and could
+> hold you near a fixed speed while you were trying to merge - that is gone. Real curves are untouched: once the
+> car is actually turning (or the curve has been predicted solidly for a moment) the slowdown still comes.
+
+- **Why:** upstream `SmartCruiseControlVision` enters ENTERING on the model's PREDICTED lateral accel alone
+  (>= 1.3 m/s^2). Drive 149 ("SCC vision still too touchy", `drive-149-report.md` §4) shows the touchy episodes are
+  acceleration CAPS from predicted-only curvature with almost no current lateral: 676.8 and 685.9-689 (on-ramp pull),
+  and worst, 1247-1251 during an on-ramp MERGE - pred 1.53-1.79 with cur 0.03-0.82, held the car near 16 m/s for
+  ~4 s while merging (aT 1.03 -> 0.33). The setspeed-ease merge gate passes the ARBITRATED target, which still
+  included SCC-V, so SCC-V bound during the merge window.
+- **What (fork only; upstream SCC files untouched):**
+  - `fork/scc.py` `ForkSCCVision`: ENTERING (enabled -> entering) now requires current-lateral evidence
+    (`current_lat_acc >= VISION_ENTER_CUR_LAT_ACC` = 0.9) OR a sustained prediction
+    (`max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC` = 1.8 for `VISION_ENTER_PRED_HOLD_S` = 0.4 s). The sustained run
+    must be CONTINUOUS (a dip resets it). The 9 m/s floor and the already-turning (>= 1.0) -> TURNING promotion are
+    untouched; TURNING/LEAVING are untouched.
+  - `fork/scc.py` `ForkSmartCruiseControl.update(..., merging=False)`: while `merging` (a setspeed-ease merge window)
+    and `long_enabled` and `current_lat_acc < VISION_ENTER_CUR_LAT_ACC`, SCC-V's `output_v_target` is released to
+    `V_CRUISE_UNSET`, so the arbitrated `min()` cannot select it. A cur-corroborated curve inside the window
+    (149 @1222: cur 4.9) binds exactly as before. A `scc_vision_supersede` cloudlog event (rlog, no capnp change)
+    logs each change of the exclusion state.
+  - `fork/setspeed_ease.py`: new `SetSpeedEase.merge_state(sm, v_set, v_ego)` so the planner evaluates the merge gate
+    ONCE per tick; `update(..., merging=)` accepts the result (None = evaluate here, standalone use unchanged).
+  - `sunnypilot/selfdrive/controls/lib/longitudinal_planner.py`: `update_targets` calls `merge_state` before
+    `self.scc.update(...)` (passing `CS.vEgo`) and hands the same `merging` to `setspeed_ease.update`. One extra hook
+    line vs upstream, mirroring the existing ease hook.
+- **Thresholds (why):** 0.9 m/s^2 current lateral sits between the touchy band (cur <= 0.82 at 1247-1251) and the
+  already-turning promotion (1.0), so a light real curve still enters; 1.8 m/s^2 is the TOP of the drive-149 touchy
+  prediction band (<= 1.79), and the 0.4 s hold means a 1.3-1.6 noise burst (which never reaches 1.8) can never enter,
+  while a genuine curve holds >= 1.8 for its whole approach (149's legit 1938 case held >= 1.9 for ~1.2 s before
+  current lateral arrived).
+- **Verification (offline, this pickup):**
+  - Replay harness `car-features/sccv-touchy/{replay_lib,arb,rules,sweep,compare,report_replay}.py`: reconstructs the
+    SCC-V arbitration inputs from the 149 rlog extract (an149) and drives the REAL vision controller at 20 Hz. The
+    fork controller reproduces the recorded `vision.vTarget` on **99.98 %** of engaged frames and the recorded
+    `vision.state` on **99.96 %** (the 15 frame mismatches are the v ~ 9 m/s boundary; the replay's own `v` is
+    carState.vEgo, the planner's is the filtered v_desired_filter.x - see the report).
+  - Before/after bound-episode table (`report_replay.py`): SCC-V bound total 22.6 -> 13.0 s; bound during merge windows
+    15.0 -> 7.1 s; the touchy 676.8 (0.7 s), 685.9 (3.2 s), 1247.7 (3.2 s) and 1251.1 (0.3 s) episodes no longer bind;
+    the legit 1222 (1.2 s), 1938-46 (4.3 s) and 1997 (1.6 s) curves still bind; SCC-M bound unchanged.
+  - Tests: `fork/tests/test_scc.py` + `test_setspeed_ease.py` **98 passed**; whole fork set (adaptive follow, SCC,
+    setspeed-ease, cruise-prefs, vehicle-specs, esc-diag) **189 passed, 1 pre-existing failure**
+    (`test_real_hyundai_elantra_interceptor_is_throttle_only`, fails on master too - the main checkout's `opendbc_repo`
+    lacks the patches). Ruff clean.
+- **Merge note:** fork-local feel fix; the ENTERING gate is an upstream-PR candidate, the merge-gate exclusion is
+  fork-local (it references `fork/setspeed_ease.py`). NOT pushed, device untouched.
 
 ### power-budget: raise the offroad power budget 30 -> 55 Wh so uploads survive a 30 h park — 2026-10-06 (offline-tested; Python-only, no firmware change)
 

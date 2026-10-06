@@ -11,14 +11,18 @@ import numpy as np
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib import longitudinal_planner as upstream_lp
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.fork import setspeed_ease as se
+from openpilot.sunnypilot.fork import scc as fscc
+from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 
 P = log.LongitudinalPersonality
+VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.VisionState
 PERSONALITIES = (P.relaxed, P.standard, P.aggressive)
 MPH = 0.44704
 
@@ -374,13 +378,39 @@ class TestMergeStep(OpenpilotTestCase):
     self.assertEqual(e.step(18., 20., P.relaxed, True, 0.5), 18.)
 
 
+class TestMergeStateShared(OpenpilotTestCase):
+  """merge_state: one evaluation per tick, shared with the SCC-V exclusion (fork/scc.py)."""
+
+  def test_merge_state_returns_and_resets(self):
+    e = se.SetSpeedEase()
+    sm = planner_sm(13., 120., car_limit=70 * MPH)
+    self.assertTrue(e.merge_state(sm, 33., 13.))
+    self.assertTrue(e.merge_gate.merging)
+    # not in control (off) resets the gate
+    sm_off = planner_sm(13., 120., car_limit=70 * MPH, lcs=LongCtrlState.off)
+    self.assertFalse(e.merge_state(sm_off, 33., 13.))
+    self.assertFalse(e.merge_gate.merging)
+
+  def test_update_with_merging_skips_a_second_evaluation(self):
+    # the result is handed in: update must NOT advance the ref-boundary debounce again this tick
+    e = se.SetSpeedEase()
+    sm = planner_sm(10., 120., car_limit=70 * MPH)
+    with mock.patch.object(e.merge_gate, 'update_sm', wraps=e.merge_gate.update_sm) as up:
+      e.update(sm, 33., True, False, 0., 33., merging=True)
+      self.assertEqual(up.call_count, 0)
+      e.update(sm, 33., True, False, 0., 33., merging=False)
+      self.assertEqual(up.call_count, 0)
+      e.update(sm, 33., True, False, 0., 33.)            # merging=None -> evaluate here
+      self.assertEqual(up.call_count, 1)
+
+
 def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, lcs=LongCtrlState.pid, override=False,
-               lead=None, road_type=None, map_limit=0., car_limit=0.):
+               lead=None, road_type=None, map_limit=0., car_limit=0., cur_lat=0., pred_lat=0.):
   N = len(ModelConstants.T_IDXS)
   md = messaging.new_message('modelV2').modelV2
   md.position.x = [v_ego * t for t in ModelConstants.T_IDXS]
   md.velocity.x = [v_ego] * N
-  md.orientationRate.z = [0.] * N
+  md.orientationRate.z = [pred_lat] * N            # SCC-V max predicted lat accel = |orientationRate.z| * velocity.x
   md.action.desiredAcceleration = 2.0
   md.meta.disengagePredictions.gasPressProbs = [1.] * 6
   cs = messaging.new_message('carState').carState
@@ -393,6 +423,7 @@ def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, 
   cc.orientationNED = [0., 0., 0.]
   ctl = messaging.new_message('controlsState').controlsState
   ctl.longControlState = lcs
+  ctl.curvature = float(cur_lat / max(v_ego, 0.1) ** 2)  # SCC-V current lat accel = v^2 * |curvature|
   sd = messaging.new_message('selfdriveState').selfdriveState
   sd.enabled = True
   sd.experimentalMode = experimental
@@ -608,3 +639,23 @@ class TestUpstreamHooks(OpenpilotTestCase):
     with mock.patch.object(planner.setspeed_ease, 'update', wraps=planner.setspeed_ease.update) as up:
       planner.update(planner_sm(20., 100.))
       self.assertAlmostEqual(up.call_args.args[5], 100. / 3.6, places=3)
+
+  def test_end_to_end_sccv_excluded_during_a_merge_window(self):
+    # through the REAL planner: on an on-ramp merge window a (sustained-prediction) SCC-V must not bind the plan
+    Params().put_bool("SmartCruiseControlVision", True, block=True)
+    v = 30 * MPH
+    n = int(round(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL)) + 6
+    planner = make_planner()
+    for _ in range(n):
+      planner.update(planner_sm(v, 75 * 1.609344, car_limit=70 * MPH, cur_lat=0.3, pred_lat=2.0))
+    self.assertTrue(planner.setspeed_ease.merging)
+    self.assertEqual(planner.scc.vision.state, VisionState.entering)   # it WOULD bind on prediction alone
+    self.assertTrue(planner.scc.vision.merge_excluded)
+    self.assertNotEqual(str(planner.source), 'sccVision')
+    # the same inputs with the merge gate NOT open: SCC-V binds (control), so the exclusion is what changed it
+    p2 = make_planner()
+    for _ in range(n):
+      p2.update(planner_sm(v, 30 * 1.609344, cur_lat=0.3, pred_lat=2.0))
+    self.assertFalse(p2.setspeed_ease.merging)
+    self.assertEqual(p2.scc.vision.state, VisionState.entering)
+    self.assertFalse(p2.scc.vision.merge_excluded)

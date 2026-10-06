@@ -61,8 +61,9 @@ class LongitudinalPlannerSP:
     long_enabled = sm['carControl'].enabled
     long_override = sm['carControl'].cruiseControl.override
 
-    # Smart Cruise Control
-    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+    # Smart Cruise Control (evaluate the merge gate first so SCC-V can be excluded during a merge window)
+    merging = self.setspeed_ease.merge_state(sm, v_cruise, CS.vEgo)
+    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise, merging)
 
     # Speed Limit Resolver
     self.resolver.update(v_ego, sm)
@@ -81,8 +82,9 @@ class LongitudinalPlannerSP:
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
-    # fork: personality-dependent ramp toward a higher target (fork/setspeed_ease.py); vTarget stays raw
-    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego, v_cruise)
+    # fork: personality-dependent ramp toward a higher target (fork/setspeed_ease.py); vTarget stays raw.
+    # `merging` was evaluated once this tick, above, and shared with the SCC-V exclusion.
+    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego, v_cruise, merging)
     return v_cruise_eased, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:

@@ -71,6 +71,9 @@ The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``
   longer, the benign direction). While merging ``v_ease`` = target; on leaving, the leash hands over at
   ``v_ego + rate * LEASH_S``, so the request steps down to ~1.5 x rate (close to the upstream ceiling at highway
   speed), not to zero, and then tapers in at the personality rate.
+  ``SetSpeedEase.merge_state`` exposes the gate so the planner can hand the SAME tick's result to the SCC-V exclusion
+  (``fork/scc.py``): while merging, a predicted-only SCC-V (no current-lateral evidence) is released so it cannot bind
+  the arbitrated target during the merge. Evaluating the gate once per tick keeps the debounce honest.
 * Personality is the ONLY input that changes the feel: relaxed gentlest, standard middle, aggressive ~= upstream.
   When the drive-mode CAN signal is decoded, Eco/Normal/Sport -> relaxed/standard/aggressive feed this same input.
 
@@ -249,14 +252,26 @@ class SetSpeedEase:
     self.v_ease = min(v_ease, v_target)                         # down is immediate; never above the target
     return self.v_ease
 
+  def merge_state(self, sm, v_set: float, v_ego: float) -> bool:
+    """Evaluate the merge gate ONCE for this tick. Shared by the SCC-V exclusion (fork/scc.py) and the ease, so the
+    ref-boundary debounce is not advanced twice per tick. Also resets the gate while not in control."""
+    active = sm['carControl'].enabled and not sm['carControl'].cruiseControl.override and \
+             sm['controlsState'].longControlState != LongCtrlState.off
+    merging = active and self.merge_gate.update_sm(sm, v_set, v_ego, self.dt)
+    if not active:
+      self.merge_gate.reset()
+    return merging
+
   def update(self, sm, v_target: float, long_enabled: bool, long_override: bool, a_plan: float,
-             v_set: float | None = None) -> float:
-    """v_target = arbitrated target (cruise / SCC / SLA min); v_set = the cruise set speed (merge-gate cap)."""
+             v_set: float | None = None, merging: bool | None = None) -> float:
+    """v_target = arbitrated target (cruise / SCC / SLA min); v_set = the cruise set speed (merge-gate cap);
+    merging = the merge-gate result already evaluated this tick by the planner (None = evaluate here, standalone use)."""
     cs = sm['carState']
     v_set = v_target if v_set is None else max(v_set, v_target)
     active = long_enabled and not long_override and sm['controlsState'].longControlState != LongCtrlState.off
     personality = sm['selfdriveState'].personality
-    merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo, self.dt)
+    if merging is None:
+      merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo, self.dt)
     if not active:
       self.merge_gate.reset()
     v = self.step(v_target, cs.vEgo, personality, active, a_plan, merging)

@@ -23,8 +23,18 @@ What this module does (all inert for a non-throttle-only car except the two bug 
   - ENTERING is not entered below ``VISION_MIN_ENTER_V`` = 9 m/s (20 mph). Intersection turns from a stop are taken at
     4-7 m/s; every non-launch ENTERING on 12e/12f was at >= 10 m/s (12e 337, 12f 141, 689, 696);
   - if the car is already turning when ENTERING first fires (current lat accel >= ``VISION_ALREADY_TURNING_LAT_ACC``
-    = 1.0 m/s^2), go straight to TURNING (gentle +0.5..0 m/s^2) instead of ENTERING (decel).
-  Feature stays ON.
+    = 1.0 m/s^2), go straight to TURNING (gentle +0.5..0 m/s^2) instead of ENTERING (decel);
+  - ENTERING gate (drive 149): upstream enters on the model's PREDICTED lateral accel alone (>= 1.3). A predicted-only
+    curvature with almost no CURRENT lateral (a pull-away, an on-ramp merge) got a decel/accel cap it did not need (149:
+    676.8, 685.9-689, 1247-1251 held at ~16 m/s for ~4 s while merging). ENTERING now requires current-lateral
+    evidence (``current_lat_acc >= VISION_ENTER_CUR_LAT_ACC`` = 0.9) OR a SUSTAINED high prediction
+    (``max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC`` = 1.8 for ``VISION_ENTER_PRED_HOLD_S`` = 0.4 s; a genuine curve
+    holds pred >= 1.8 well before current lateral arrives -- 149's legit 1938 case held >= 1.9 for ~1.2 s first -- while
+    noise spikes at 1.3-1.6 never reach it). Feature stays ON.
+  - merge-gate exclusion: while a setspeed-ease merge window is open and the current lateral is below
+    ``VISION_ENTER_CUR_LAT_ACC``, SCC-V's output is released (``V_CRUISE_UNSET``) so it cannot bind the arbitrated
+    target (``ForkSmartCruiseControl`` passes the merge state in). A real curve inside the window (current lateral
+    corroborated) is untouched, so the map gate and legit curve slowdowns stay exactly as upstream.
 * ``ForkSCCMap`` (subclass of upstream ``SmartCruiseControlMap``):
   - ignore the map path when the nearest MapTargetVelocities point is > ``MAP_MAX_NEAREST_DIST`` (25 m) from the car,
     or mapd has no current way match (``roadType == unknown and not speedLimitValid and roadName == ''``). Rejection
@@ -69,6 +79,17 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.vision_con
 # --- vision ---
 VISION_MIN_ENTER_V = 9.0               # m/s; no ENTERING below 20 mph (intersection turns from a stop: 4-7 m/s)
 VISION_ALREADY_TURNING_LAT_ACC = 1.0   # m/s^2; already in the turn when ENTERING first fires -> TURNING
+# ENTERING gate: a curve must be corroborated. Upstream enters on the model's PREDICTED lateral accel alone
+# (>= 1.3 m/s^2), so a pull-away or an on-ramp merge with predicted curvature and almost no current lateral
+# gets a decel/accel-cap it does not need (drive 149: 676.8, 685.9-689, 1247-1251 the on-ramp merge held at
+# ~16 m/s for ~4 s). Enter only with CURRENT-lateral evidence, or a SUSTAINED high prediction.
+VISION_ENTER_CUR_LAT_ACC = 0.9         # m/s^2; current lateral accel at/above this corroborates a curve now
+VISION_ENTER_PRED_LAT_ACC = 1.8        # m/s^2; ... or the prediction has been at/above this for HOLD_S (a genuine
+                                       # curve not yet felt; noise spikes at 1.3-1.6 never reach it, and 1.3-1.6
+                                       # bursts die before HOLD_S). 1.8 = the top of the drive-149 touchy band.
+VISION_ENTER_PRED_HOLD_S = 0.4         # s; sustained-prediction hold. A real curve holds pred >= 1.8 for its whole
+                                       # approach (the legit 1938 case: pred >= 1.9 from 1937.4, ~1.2 s before current
+                                       # lateral arrives), so a short hold cannot lose a genuine slowdown.
 
 # --- map ---
 MAP_MAX_NEAREST_DIST = 25.             # m; nearest MapTargetVelocities point farther than this -> not on that path
@@ -88,6 +109,17 @@ GUARD_PRED_LAT_ACC_TH = 1.3            # m/s^2; predicted lat accel at/above = c
 
 
 class ForkSCCVision(SmartCruiseControlVision):
+  def __init__(self):
+    super().__init__()
+    self._enter_pred_t = 0.       # s; how long max_pred_lat_acc has been >= VISION_ENTER_PRED_LAT_ACC while enabled
+    self.merge_excluded = False   # set each cycle by ForkSmartCruiseControl: the merge gate asked SCC-V out
+
+  def _entering_corroborated(self) -> bool:
+    """ENTERING needs current-lateral evidence, or a sustained high prediction (see the constants)."""
+    if self.current_lat_acc >= VISION_ENTER_CUR_LAT_ACC:
+      return True
+    return self._enter_pred_t >= VISION_ENTER_PRED_HOLD_S
+
   def get_v_target_from_control(self) -> float:
     v_target = super().get_v_target_from_control()
     if self.is_active:
@@ -97,12 +129,20 @@ class ForkSCCVision(SmartCruiseControlVision):
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     prev_state = self.state
+    # accumulate the sustained-prediction timer off the state BEFORE the transition (a genuine curve holds pred high
+    # through the enabled phase, so the timer is full when the pred threshold is reached)
+    if prev_state == VisionState.enabled and self.max_pred_lat_acc >= VISION_ENTER_PRED_LAT_ACC:
+      self._enter_pred_t += DT_MDL
+    else:
+      self._enter_pred_t = 0.
     super()._update_state_machine()
     if prev_state == VisionState.enabled and self.state == VisionState.entering:
       if self.v_ego < VISION_MIN_ENTER_V:
         self.state = VisionState.enabled
       elif self.current_lat_acc >= VISION_ALREADY_TURNING_LAT_ACC:
         self.state = VisionState.turning
+      elif not self._entering_corroborated():
+        self.state = VisionState.enabled
     return self.state in VISION_ENABLED_STATES, self.state in VISION_ACTIVE_STATES
 
 
@@ -263,14 +303,33 @@ class ForkSmartCruiseControl(SmartCruiseControl):
     self.throttle_only = throttle_only
     self.guard = ThrottleOnlySCCGuard()
     self.guard_active = False
+    self._last_supersede_key = None
+
+  def _log_supersede(self, merging: bool, excluded: bool, v_ego: float) -> None:
+    """Route data: a state change of the merge-gate exclusion (no capnp change)."""
+    key = (merging, excluded)
+    if key == self._last_supersede_key:
+      return
+    self._last_supersede_key = key
+    cloudlog.event("scc_vision_supersede", merging=merging, excluded=excluded, v_ego=round(float(v_ego), 2),
+                   vision_state=str(self.vision.state), vision_v=round(float(self.vision.output_v_target), 2))
 
   def update(self, sm: messaging.SubMaster, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float,
-             v_cruise: float) -> None:
+             v_cruise: float, merging: bool = False) -> None:
     try:
       self.map.live_map = sm['liveMapDataSP']
     except (KeyError, IndexError):
       self.map.live_map = None
     super().update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+
+    # merge-gate exclusion: while a setspeed-ease merge window is open, SCC-V must not bind the arbitrated target
+    # unless it carries CURRENT-lateral evidence of a real curve (drive 149: the 1247-1251 on-ramp merge was a
+    # predicted-only cap; the legit 1222 curve inside the 1213.9-1229.5 window must still bind). No capnp change.
+    excluded = bool(merging and long_enabled and self.vision.current_lat_acc < VISION_ENTER_CUR_LAT_ACC)
+    self.vision.merge_excluded = excluded
+    if excluded:
+      self.vision.output_v_target = V_CRUISE_UNSET
+    self._log_supersede(bool(merging), excluded, v_ego)
 
     was_active = self.guard_active
     self.guard_active = False

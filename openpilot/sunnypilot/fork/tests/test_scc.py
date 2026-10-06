@@ -121,8 +121,10 @@ class TestVision(OpenpilotTestCase):
 
   def test_output_floored_at_min_v(self):
     c = fscc.ForkSCCVision()
-    c.update(model_sm(12., 0.2, 3.0), True, False, 12., 0., 30.)  # disabled -> enabled
-    c.update(model_sm(12., 0.2, 3.0), True, False, 12., 0., 30.)  # enabled -> entering
+    # a genuine curve: the prediction is sustained (>= VISION_ENTER_PRED_LAT_ACC for the hold) before entry
+    n_hold = int(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL) + 2
+    for _ in range(n_hold):
+      c.update(model_sm(12., 0.2, 3.0), True, False, 12., 0., 30.)
     self.assertEqual(c.state, VisionState.entering)
     c.update(model_sm(5.7, 0.2, 3.0), True, False, 5.7, 0., 30.)  # still entering, slow, max decel
     self.assertEqual(c.state, VisionState.entering)
@@ -132,18 +134,20 @@ class TestVision(OpenpilotTestCase):
     self.assertLess(upstream_value, MIN_V)  # i.e. the floor is what held it
 
   def test_no_entering_below_9_mps_but_above(self):
+    # a sustained prediction is enough to enter ABOVE 9 m/s; the 9 m/s floor still holds BELOW it, however long
+    n = int(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL) + 4
     for v, expect in ((6., VisionState.enabled), (8.9, VisionState.enabled), (9.1, VisionState.entering), (20., VisionState.entering)):
       c = fscc.ForkSCCVision()
-      for _ in range(3):
+      for _ in range(n):
         c.update(model_sm(v, 0.2, 2.0), True, False, v, 0., 30.)
       self.assertEqual(c.state, expect, v)
 
   def test_already_turning_goes_to_turning(self):
     # 12e @337-343 kind: at >= 9 m/s, ENTERING first fires while the car is already at 1.0-1.6 m/s^2 lateral
-    for cur, expect in ((1.2, VisionState.turning), (1.0, VisionState.turning), (0.6, VisionState.entering)):
+    for cur, expect in ((1.2, VisionState.turning), (1.0, VisionState.turning), (0.6, VisionState.enabled)):
       c = fscc.ForkSCCVision()
-      c.update(model_sm(12., cur, 2.2), True, False, 12., 0., 30.)
-      c.update(model_sm(12., cur, 2.2), True, False, 12., 0., 30.)
+      c.update(model_sm(12., 0.3, 2.2), True, False, 12., 0., 30.)   # disabled -> enabled
+      c.update(model_sm(12., cur, 2.2), True, False, 12., 0., 30.)   # enabled -> (turning | entering | gated)
       self.assertEqual(c.state, expect, cur)
       if expect == VisionState.turning:
         self.assertGreaterEqual(c.a_target, 0.)  # gentle accel, not a decel
@@ -154,6 +158,141 @@ class TestVision(OpenpilotTestCase):
     for cur in (0.2, 0.2, 1.7):
       c.update(model_sm(15., cur, 2.4), True, False, 15., 0., 30.)
     self.assertEqual(c.state, VisionState.turning)
+
+
+class TestVisionEnterGate(OpenpilotTestCase):
+  """Drive-149 'entering' gate: a curve must be corroborated (current lateral, or a sustained high prediction)."""
+
+  def setup_method(self):
+    Params().put_bool("SmartCruiseControlVision", True, block=True)
+
+  def _run(self, seq):
+    c = fscc.ForkSCCVision()
+    states = []
+    for v, cur, pred in seq:
+      c.update(model_sm(v, cur, pred), True, False, v, 0., 30.)
+      states.append(c.state)
+    return c, states
+
+  def test_predicted_only_does_not_enter(self):
+    # 149 @1247.7-1251: pred 1.3-1.8, current lateral <= 0.82 -> no ENTERING (the on-ramp merge cap)
+    seq = [(14.2, 0.82, 1.37), (14.5, 0.69, 1.66), (15.0, 0.31, 1.63), (15.4, 0.17, 1.62), (15.8, 0.11, 1.52),
+           (16.0, 0.02, 1.34), (16.4, 0.19, 1.31)]
+    _, st = self._run(seq)
+    self.assertTrue(all(s == VisionState.enabled for s in st), [str(s) for s in st])
+
+  def test_current_lateral_corroborates_entry(self):
+    # a real curve (149 @1222 kind: cur climbs through 4.9): current lateral past the gate -> enter (v >= 9)
+    c = fscc.ForkSCCVision()
+    c.update(model_sm(10., 0.3, 3.7), True, False, 10., 0., 30.)   # disabled -> enabled
+    st = []
+    for v, cur, pred in [(10.0, 0.5, 3.7), (10.0, 0.95, 3.6), (10.0, 0.92, 3.6), (10.0, 2.2, 3.5)]:
+      c.update(model_sm(v, cur, pred), True, False, v, 0., 30.)
+      st.append(c.state)
+    self.assertIn(VisionState.entering, st)
+    self.assertTrue(any(s in (VisionState.entering, VisionState.turning, VisionState.leaving) for s in st))
+    # the gate threshold sits below the already-turning promotion so a light curve still enters
+    self.assertLess(fscc.VISION_ENTER_CUR_LAT_ACC, fscc.VISION_ALREADY_TURNING_LAT_ACC)
+
+  def test_sustained_prediction_corroborates_entry(self):
+    # a genuine curve that has NOT produced current lateral yet: pred >= 1.8 held long enough -> enter
+    # (the counter needs the hold, plus one first frame that only goes disabled -> enabled)
+    n = int(round(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL)) + 2
+    _, st = self._run([(28.0, 0.1, 1.9)] * (n - 2))
+    self.assertTrue(all(s == VisionState.enabled for s in st))
+    _, st = self._run([(28.0, 0.1, 1.9)] * n)
+    self.assertEqual(st[-1], VisionState.entering)
+
+  def test_touchy_pred_burst_never_enters(self):
+    # pred briefly 1.5-1.7 (below VISION_ENTER_PRED_LAT_ACC) must never enter, and a sustained run must START FRESH
+    seq = [(16.0, 0.2, 1.4), (16.1, 0.2, 1.7), (16.2, 0.2, 1.6), (16.0, 0.2, 1.4), (15.9, 0.2, 1.7), (15.8, 0.2, 1.6)]
+    _, st = self._run(seq)
+    self.assertTrue(all(s == VisionState.enabled for s in st))
+    # the hold timer needs a CONTINUOUS run: a pred dip below the threshold resets it
+    c = fscc.ForkSCCVision()
+    for _ in range(int(0.3 / DT_MDL)):
+      c.update(model_sm(28., 0.1, 1.9), True, False, 28., 0., 30.)
+    c.update(model_sm(28., 0.1, 1.5), True, False, 28., 0., 30.)   # dip
+    for _ in range(int(0.3 / DT_MDL)):
+      c.update(model_sm(28., 0.1, 1.9), True, False, 28., 0., 30.)
+    self.assertEqual(c.state, VisionState.enabled)                 # still under the hold since the dip
+
+  def test_curve_still_reaches_turning_and_leaving(self):
+    # entering -> turning (cur >= 1.6) and the 9 m/s floor are untouched
+    seq = [(15.0, 0.1, 2.0)] * 12 + [(15.0, 1.7, 2.2)] * 5 + [(15.0, 1.0, 1.1)] * 5
+    _, st = self._run(seq)
+    self.assertIn(VisionState.entering, st)
+    self.assertIn(VisionState.turning, st)
+    self.assertEqual(st[-1], VisionState.enabled)   # the 5 low-cur frames run OUT leaving -> finished
+
+
+class TestVisionMergeExclusion(OpenpilotTestCase):
+  """SCC-V is released from the arbitrated target during a setspeed-ease merge window (unless cur-corroborated)."""
+
+  def setup_method(self):
+    Params().put_bool("SmartCruiseControlVision", True, block=True)
+
+  def _active_scc(self, v=28.):
+    """A ForkSmartCruiseControl whose vision is ACTIVE via a sustained prediction (cur stays low)."""
+    s = fscc.ForkSmartCruiseControl()
+    for _ in range(int(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL) + 2):
+      s.update(model_sm(v, 0.1, 2.0), True, False, v, 0., 33., merging=False)
+    self.assertEqual(s.vision.state, VisionState.entering)
+    self.assertNotEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+    return s
+
+  def test_merging_low_cur_releases_an_active_vision(self):
+    # active on a sustained prediction, but no current lateral -> the merge window releases it
+    s = self._active_scc()
+    s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=True)
+    self.assertTrue(s.vision.merge_excluded)
+    self.assertEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+
+  def test_merging_with_cur_keeps_vision(self):
+    # a real curve inside the merge window (149 @1222: cur >= 0.9) must still bind
+    s = fscc.ForkSmartCruiseControl()
+    s.update(model_sm(10., 0.3, 1.5), True, False, 10., 0., 33., merging=True)   # disabled -> enabled
+    s.update(model_sm(10., 0.95, 3.5), True, False, 10., 0., 33., merging=True)  # enabled -> entering (cur-corroborated)
+    self.assertEqual(s.vision.state, VisionState.entering)
+    self.assertFalse(s.vision.merge_excluded)
+    self.assertNotEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+    # control: same predicted-only inputs with cur below the threshold ARE excluded while merging
+    s2 = fscc.ForkSmartCruiseControl()
+    s2.update(model_sm(10., 0.3, 1.5), True, False, 10., 0., 33., merging=True)
+    s2.update(model_sm(10., 0.5, 1.5), True, False, 10., 0., 33., merging=True)
+    self.assertTrue(s2.vision.merge_excluded)
+
+  def test_not_merging_keeps_an_active_vision(self):
+    s = self._active_scc()
+    s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=False)
+    self.assertFalse(s.vision.merge_excluded)
+    self.assertNotEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+
+  def test_not_engaged_never_excludes(self):
+    s = self._active_scc()
+    s.update(model_sm(28., 0.1, 2.0), False, False, 28., 0., 33., merging=True)
+    self.assertFalse(s.vision.merge_excluded)
+
+  def test_exclusion_is_reversible_tick_to_tick(self):
+    s = self._active_scc()
+    s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=True)
+    self.assertEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+    s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=False)
+    self.assertFalse(s.vision.merge_excluded)
+    self.assertNotEqual(s.vision.output_v_target, V_CRUISE_UNSET)
+
+  def test_supersede_event_logged_on_edges(self):
+    s = self._active_scc()
+    with mock.patch.object(fscc.cloudlog, "event") as ev:
+      s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=True)
+      s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=True)
+      self.assertEqual(sum(1 for c in ev.call_args_list if c.args and c.args[0] == "scc_vision_supersede"), 1)
+      s.update(model_sm(28., 0.1, 2.0), True, False, 28., 0., 33., merging=False)
+      self.assertEqual(sum(1 for c in ev.call_args_list if c.args and c.args[0] == "scc_vision_supersede"), 2)
+
+  def test_update_accepts_merging_kwarg(self):
+    import inspect
+    self.assertIn('merging', inspect.signature(fscc.ForkSmartCruiseControl.update).parameters)
 
 
 class TestMap(OpenpilotTestCase):
