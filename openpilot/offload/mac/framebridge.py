@@ -359,6 +359,14 @@ class FrameBridge:
       fs.timestampSof = sof
       fs.timestampEof = eof
       fs.processingTime = (eof - sof) / 1e6 if eof > sof else 0.0
+      # `sensor` MUST be set: modeld_v2 indexes
+      # DEVICE_CAMERAS[(deviceState.deviceType, narrowRoadCameraState.sensor)] to get the
+      # intrinsics, and the capnp default is `unknown`. On this car (deviceType 'tizi') that
+      # pair is absent from the table -> KeyError on the first frame, killing modeld before
+      # it ever publishes. The value is not in the device's cameraState either (the field is
+      # synthesized here, never consumed), so it is pinned to what the device's own rlogs
+      # report for this unit's road cameras (ox03c10). Override with OFFLOAD_CAMERA_SENSOR.
+      fs.sensor = self._sensor_value()
       # header logMonoTime is set by new_message to time.monotonic()*1e9 (Mac clock)
       cs.logMonoTime = recv_mac
       self.pm.send(CAMERAS[cam]["cam_state"], cs)
@@ -430,6 +438,31 @@ class FrameBridge:
       "decode_ms": dec_ns / 1e6, "payload_bytes": meta["bytes"],
     })
 
+  # --- device cameraState: learn the static sensor field -------------------
+  def _on_device_cam_state(self, service: str, raw: bytes):
+    """Record the device's `sensor` enum so the synthesized cameraState can carry it.
+
+    modeld_v2 looks up DEVICE_CAMERAS[(deviceState.deviceType, cameraState.sensor)] for
+    intrinsics; the capnp default is `unknown`, and ('tizi','unknown') is NOT in the table
+    (KeyError -> modeld dies on its first frame). The device reports the truth, so read it.
+    """
+    try:
+      with capnp_log.Event.from_bytes(raw) as reader:
+        cs = getattr(reader, service, None)
+        if cs is None:
+          return
+        sensor = str(cs.sensor)
+        if sensor and sensor != "unknown":
+          self._cam_sensor = sensor
+    except Exception as e:
+      elog(f"device cameraState parse failed ({service}): {e}")
+      return
+
+  def _sensor_value(self) -> str:
+    """Sensor enum for the synthesized cameraState: device-reported, else env, else the
+    value this car's own rlogs carry (ox03c10) — never the capnp default 'unknown'."""
+    return getattr(self, "_cam_sensor", None) or os.environ.get("OFFLOAD_CAMERA_SENSOR", "ox03c10")
+
   # --- small-service republish --------------------------------------------
   def _on_small(self, service: str, raw: bytes):
     # (d) re-stamp header logMonoTime to Mac clock, payload untouched (§1.2).
@@ -472,7 +505,13 @@ class FrameBridge:
                                 lambda s, r, _cam=cam: self._on_encode(_cam, r)))
     for svc in small_services:
       if svc in ("narrowRoadCameraState", "wideRoadCameraState"):
-        continue  # synthesized locally, not consumed from device
+        # Not consumed for republishing (the Mac synthesizes its own so frameId/encodeId/sof
+        # stay consistent with the Mac frame path), but the device's copy is the authority for
+        # the STATIC `sensor` field — modeld_v2 needs the (deviceType, sensor) pair to exist in
+        # DEVICE_CAMERAS. Learn it here instead of hardcoding hardware assumptions.
+        subs.append(ZmqSubscriber(ctx, svc, self.args.host,
+                                  lambda s, r, _svc=svc: self._on_device_cam_state(_svc, r)))
+        continue
       subs.append(ZmqSubscriber(ctx, svc, self.args.host,
                                 lambda s, r, _svc=svc: self._on_small(_svc, r)))
     for s in subs:
