@@ -297,15 +297,15 @@ def main():
   estimator = LocationEstimator(DEBUG)
 
   filter_initialized = False
-  critcal_services = ["accelerometer", "gyroscope", "cameraOdometry"]
+  critical_services = ["accelerometer", "gyroscope", "cameraOdometry"]
   observation_input_invalid = defaultdict(int)
   # start at the limit so a never-yet-seen (e.g. extrinsicsCalibration at startup) still reads bad from the
   # first poll, leaving startup identical to before; any valid poll drops it to zero
   all_valid_invalid_cnt = ALL_VALID_INVALID_LIMIT
 
-  input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critcal_services}
-  input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critcal_services}
-  input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critcal_services}
+  input_invalid_limit = {s: round(INPUT_INVALID_LIMIT * (SERVICE_LIST[s].frequency / 20.)) for s in critical_services}
+  input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critical_services}
+  input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critical_services}
 
   initial_pose_data = params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
@@ -335,7 +335,7 @@ def main():
         if valid:
           t = log_mono_time * 1e-9
           res = estimator.handle_log(t, which, msg)
-          if which not in critcal_services:
+          if which not in critical_services:
             continue
 
           if res == HandleLogResult.TIMING_INVALID:
@@ -350,7 +350,7 @@ def main():
       filter_initialized = sm.all_checks() and sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
 
     if sm.updated["cameraOdometry"]:
-      critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critcal_services)
+      critical_service_inputs_valid = all(observation_input_invalid[s] < input_invalid_threshold[s] for s in critical_services)
       all_valid_invalid_cnt, all_valid = debounce_all_valid(all_valid_invalid_cnt, sm.all_valid())
       inputs_valid = all_valid and critical_service_inputs_valid
       sensors_valid = sensor_all_checks(acc_msgs, gyro_msgs, sensor_valid, sensor_recv_time, sensor_alive, SIMULATION)
