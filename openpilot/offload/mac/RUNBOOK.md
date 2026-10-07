@@ -115,3 +115,57 @@ that case on the offload host only.
 Unit-test the guard: `pytest openpilot/sunnypilot/modeld_v2/tests/test_offload_guard.py`
 (asserts no exception escapes, `prev_feat` unchanged, a subsequent good frame advances
 normally, and that OFFLOAD-unset still raises).
+
+## Return path (Mac -> device) — `returnsend.py`
+
+**What it is.** The Mac-side half of the return loop (INTERFACES §1, §7). The Mac-local
+`modeld_v2` publishes its outputs into the **Mac-local** msgq under the real service names. A
+stalled consumer must never be handed a backlog, so `returnsend.py` subscribes that msgq with a
+**raw** socket, drops anything already older than `OFFLOAD_SEND_MAX_AGE_MS` (default **150 ms**,
+env-overridable; `--max-age-ms`), and republishes the **raw Event bytes unchanged** over ZMQ to
+the device, one PUB per service on `ports.get_port(name)` — the exact ports `offloadd` SUBs to.
+It never re-stamps on the wire: `offloadd` re-stamps the header to device-now at receipt (§1.3).
+
+**Run it (drive mode).** Mac binds, device connects:
+
+```bash
+cd /Users/adam.durham/repos/sunnypilot-offload
+PYTHONPATH=$PWD:$PWD/opendbc_repo:$PWD/msgq_repo:$PWD/tinygrad_repo \
+  .venv/bin/python -m openpilot.offload.mac.returnsend --bind 0.0.0.0 --stats
+# on the device (read-only tree, from its root), once OffloadMode is set:
+#   OFFLOAD_MODE=shadow python3 -m openpilot.offload.device.offloadd --connect-host <mac-ip>
+```
+
+`--bind` defaults to `0.0.0.0` so the device can reach the Mac over the tether
+(`OFFLOAD_RETURN_BIND` overrides); use `127.0.0.1` for a same-machine test. `--services` restricts
+the subset; `--quiet` silences stdout; `--stats`/`--stats-period` emit periodic counters.
+
+**One-machine end-to-end test (no device).** Runs `returnsend` + `offloadd` as real subprocesses on
+`127.0.0.1`, publishes fake modeld outputs with a recent SOF into the Mac msgq, then raw-subscribes
+the shadow topics and asserts the full chain:
+
+```bash
+openpilot/offload/mac/return_path_test.sh          # exit 0 = chain proven
+# equivalent pytest form:
+PYTHONPATH=$PWD:$PWD/opendbc_repo:$PWD/msgq_repo:$PWD/tinygrad_repo \
+  .venv/bin/python -m pytest openpilot/offload/mac/tests/test_returnsend.py -v
+```
+
+One machine is the correct model: here `offloadd`'s "device" clock **is** this machine's monotonic
+clock, exactly as on a drive — both ends share one monotonic domain through the receipt re-stamp.
+
+**Expected readings.**
+- `returnsend` stdout (JSON lines): `forwarded` climbing with the message rate, `dropped_age == 0`
+  (nothing is stale on a healthy Mac), `dropped_noreader == 0` once `offloadd` is connected
+  (a brief nonzero at startup is the reader-monitor latch), `readers` per service `>= 1`.
+- `offloadd` stdout: `forwarded` climbing; `dropped_stale == 0`, `dropped_error == 0`. When an
+  offloadd SUB is down, `returnsend` keeps running (never blocks) and counts `dropped_noreader`.
+
+**Known gap — `modelDataV2SP` is NOT forwarded by `offloadd`.** Its payload
+(`custom.capnp ModelDataV2SP`) carries **no `frameId` and no `timestampSof`**, so `offloadd`'s
+freshness gate (`sof_for_service`) cannot age it and drops it as `dropped_no_sof` — the "never
+republish blind" rule. `returnsend` still ships it (it is a `RETURN_SERVICES` member and a pipe),
+and `modelV2`/`cameraOdometry`/`drivingModelData` (all carry `frameId`) forward normally. Closing
+this needs a cross-workstream decision (e.g. a `frameId` on the SP payload, or offloadd aging SP
+from the same-frame camera state under a paired policy); the integration test asserts the current
+behavior so a fix flips a visible assertion.

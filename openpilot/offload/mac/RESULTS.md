@@ -13,6 +13,7 @@ Owner: WS-B. Deliverables under `openpilot/offload/mac/`. Conforms to
 | `fixtures.py` (replay reader) | ✅ | 9/9 unit tests |
 | `framebridge.py` replay mode | ✅ | 1200/1200 frames, exact device frame_id/sof |
 | `framebridge.py` ZMQ mode | ✅ | loopback test: 40/40 decoded + small services republished |
+| `returnsend.py` (Mac→device return sender) | ✅ | 5/5 tests; full return chain proven: 3 shadow topics, frameId preserved, receipt re-stamp |
 | Mac-local cameraState synth + header restamp | ✅ | §1.2 |
 | small-service republish into local msgq | ✅ | `carState`/`deviceState`/`carControl` seen by SubMaster |
 | VisionIPC publish (`camerad`, device ids) | ✅ | `VisionIpcClient` receives exact frame_id/sof/eof; buffers use DEVICE NV12 geometry (stride 2048 / uv_offset 2490368 / size 4804608) |
@@ -120,6 +121,14 @@ tuple. (3) `modeld_runner` drops the zero-pad and now **asserts** `len(buf) >= f
 
 ## Blockers / OPEN items
 
+0. **`modelDataV2SP` cannot be forwarded by offloadd (ageable-gate gap).** Its payload
+   (`custom.capnp ModelDataV2SP`) carries **no `frameId`/`timestampSof`**, so offloadd's freshness
+   gate drops it as `dropped_no_sof` ("never republish blind"). `returnsend` ships all four
+   `RETURN_SERVICES` as a pipe; the other three (all carry `frameId`) forward. Fix is a
+   cross-workstream call (add a frame id to the SP payload, or offloadd ages SP from the same-frame
+   camera state). The return-chain test asserts current behavior so a fix flips a visible assertion.
+   See `RUNBOOK.md` "Return path (Mac -> device)".
+
 1. **BLOCKER — this repo's msgq has NO ZMQ transport.** `MSGQSubSocket::connect`
    hard-asserts `address == "127.0.0.1"` (`msgq_repo/msgq/impl_msgq.cc:40`), so
    `messaging.sub_sock(..., addr=<device>)` aborts the process. framebridge therefore
@@ -151,6 +160,9 @@ tuple. (3) `modeld_runner` drops the zero-pad and now **asserts** `len(buf) >= f
 - `openpilot/offload/mac/logs/*.jsonl` + `*.log` (raw runs)
 - fixtures (WS-B-generated, WS-C-owned dir): `openpilot/offload/replay/fixtures/00000149--4a4df1cf8a--36/{narrow,wide}.enc`
 - `openpilot/offload/mac/run_framebridge.sh` (caffeinate / App-Nap-safe launcher)
+- `openpilot/offload/mac/returnsend.py` (Mac→device return sender: raw msgq → ZMQ PUB, age gate)
+- `openpilot/offload/mac/return_path_test.sh` (one-command full return-chain test)
+- `openpilot/offload/mac/tests/test_returnsend.py` (5 tests; §7 return loop)
 - `openpilot/offload/mac/bench_resources_mac.py` (macOS soak/resource sampler)
 - `openpilot/offload/mac/RUNBOOK.md` (sleep assertions & App Nap; soak evidence; OFFLOAD §4g guard)
 
