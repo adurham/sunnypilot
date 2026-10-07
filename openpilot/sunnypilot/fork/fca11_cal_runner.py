@@ -50,7 +50,9 @@ PROGRESS_PATH = os.path.join(CAL_DIR, "progress.json")
 LOG_PATH = os.path.join(CAL_DIR, "reps.jsonl")
 
 # ---- protocol constants (must match cal_mode defaults / the contract) ----
-DEFAULT_TTL_S = 900.0
+DEFAULT_TTL_S = None    # None -> derive from expires_days: under the autonomous model the plan
+                        # stays valid until it EXPIRES (a short ttl would silently stale the plan
+                        # minutes after writing it and no rep would ever run)
 DEFAULT_EXPIRES_DAYS = 30.0
 DEFAULT_PER_DRIVE_CAP = 15
 DEFAULT_HOLD_S = 2.2
@@ -130,7 +132,7 @@ def build_plan(phases, rev=1, issued_at=None, ttl_s=DEFAULT_TTL_S, expires_days=
   doc = {
     "rev": int(rev),
     "issued_at": float(issued_at if issued_at is not None else time.time()),
-    "ttl_s": float(ttl_s),
+    "ttl_s": float(ttl_s) if ttl_s is not None else float(expires_days * 86400.0),
     "expires_at": float(time.time() + expires_days * 86400.0),
     "per_drive_cap": int(per_drive_cap),
     "conditions": {
