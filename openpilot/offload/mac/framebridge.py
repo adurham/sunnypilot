@@ -31,6 +31,7 @@ Responsibilities (INTERFACES.md §1-3):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -237,6 +238,8 @@ class FrameBridge:
     self._decoders = {}
     self._out_fp = None
     self._out_lock = threading.Lock()
+    self._digest_fp = None                  # opt-in --digest-out (WS-C integrity harness)
+    self._digest_lock = threading.Lock()
     self._published = dict.fromkeys(CAMERAS, 0)
     self._received = dict.fromkeys(CAMERAS, 0)
     self._decoded = dict.fromkeys(CAMERAS, 0)
@@ -291,12 +294,24 @@ class FrameBridge:
   def _open_out(self):
     if self.args.out:
       self._out_fp = open(self.args.out, "a", buffering=1)
+    if getattr(self.args, "digest_out", None):
+      self._digest_fp = open(self.args.digest_out, "a", buffering=1)
 
   def _emit_jsonl(self, obj: dict):
     if self._out_fp is None:
       return
     with self._out_lock:
       self._out_fp.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
+  def _emit_digest(self, obj: dict):
+    """Opt-in (--digest-out): one jsonl row per received EncodeData, carrying the
+    sha256 of the EXACT received payload so WS-C's integrity checker can compare it
+    against the fixture digest for that (frame_id, encode_id). Default path is
+    unchanged when the flag is absent (self._digest_fp stays None)."""
+    if self._digest_fp is None:
+      return
+    with self._digest_lock:
+      self._digest_fp.write(json.dumps(obj, separators=(",", ":")) + "\n")
 
   # --- EncodeData handling ------------------------------------------------
   def _on_encode(self, cam: str, raw: bytes):
@@ -317,6 +332,17 @@ class FrameBridge:
     recv_mac = time.monotonic_ns()
 
     self._received[cam] += 1
+
+    # (WS-C integrity, opt-in via --digest-out): digest the EXACT received payload so
+    # the checker can prove bytes on the wire == fixture bytes for this (frame_id,
+    # encode_id). Emitted on receipt, before any decode/publish, so it cannot be
+    # affected by downstream drops. Guarded so the flag-absent path computes nothing.
+    if self._digest_fp is not None:
+      self._emit_digest({
+        "kind": "encode", "cam": cam, "frame_id": frame_id, "encode_id": encode_id,
+        "sha256": hashlib.sha256(bytes(data)).hexdigest(), "len": len(data),
+        "recv_mac_ns": recv_mac,
+      })
 
     # (c) init VisionIPC on first EncodeData dimensions.
     if cam not in self._dims and width > 0 and height > 0:
@@ -514,6 +540,11 @@ class FrameBridge:
         self._out_fp.close()
       except Exception:
         pass
+    if self._digest_fp:
+      try:
+        self._digest_fp.close()
+      except Exception:
+        pass
 
 
 def _encode_data_bytes(service: str, rec: fix.FixtureRecord) -> bytes:
@@ -546,6 +577,8 @@ def build_argparser():
   p.add_argument("--host", default="127.0.0.1", help="device bridge host (ZMQ SUB connect)")
   p.add_argument("--vtdec", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vtdec"))
   p.add_argument("--out", default=None, help="jsonl latency log path")
+  p.add_argument("--digest-out", default=None,
+                 help="opt-in per-recv-EncodeData digest jsonl {frame_id,encode_id,sha256(data),len,recv_mac_ns} for WS-C integrity")
   p.add_argument("--retention", type=int, default=1200, help="FrameTable retention (>=600)")
   p.add_argument("--num-buffers", type=int, default=4, help="VisionIPC buffers")
   p.add_argument("--params-dir", default=None, help="dir with <cam>.params Annex-B files (ZMQ mode)")

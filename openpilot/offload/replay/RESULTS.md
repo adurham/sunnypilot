@@ -6,8 +6,14 @@ loadavg during the runs `2.0–2.5` (bracketed by `uptime` at each p1_gate invoc
 
 Everything under `openpilot/offload/replay/` (WS-C owns it exclusively):
 `fixture.py` (frozen format lib), `extractor.py`, `replayd.py`, `metrics.py`,
-`modeld_runner.py`, `p1_gate.py`, `tests/test_replay.py`, `reports/<ts>/`.
+`modeld_runner.py`, `p1_gate.py`, `integrity.py` + `integrity_run.sh` (uplink
+byte-integrity harness), `tests/test_replay.py`, `tests/test_integrity.py`, `reports/<ts>/`.
 Fixtures live OUTSIDE the repo: `~/.hermes/cache/scratch/car-features/offload/replay-fixtures/<name>/`.
+
+> **Uplink byte-integrity (separate evidence): see [`INTEGRITY.md`](INTEGRITY.md)** — fixture digests vs
+> `framebridge --digest-out` payloads. Clean run **40800/40800 frames lossless**; reconnect-stress run
+> **40800 expected / 39580 received across 5 consumer restarts**, with **0 mismatch / 0 dup / 0 replay /
+> 0 regression and digest match rate 1.0** in both. Independent of the p1_gate latency/numeric gates below.
 
 ## Verdict
 
