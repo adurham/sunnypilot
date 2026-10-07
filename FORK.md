@@ -86,6 +86,9 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 49 | **FCA11-long passive release frame + panda actuation-budget mirror** (overnight loop G7; drive-149 N1): the panda ends an FCA11 episode only on an accepted PASSIVE 0x38D frame or budget expiry, and the car layer never sent one — so its 2.5 s budget kept running across separate brakes and ~half of intended brake time was refused. The car layer now emits exactly ONE passive mirror frame (all brake fields 0, Warn 0, fresh alive + CRC, camera idle shape) on every braking true→false edge, and mirrors the panda's 2.5 s / 3 s budget in Python. Python + panda test only | fix (car, Python only) | fork-local; opendbc patch `0024`; NOT on main |
 | 50 | **FCA11-long frame contract (R7-A/C/D)** (overnight loop G8): three frame-contract defects found by running the real car layer against the real compiled panda — (a) the rate reference advanced every 100 Hz frame while sends happen at 50 Hz, so the sent ramp jumped +8 where the panda allows +4 (every frame after the first refused); (b) the cooldown started one frame before the panda's (from the release frame instead of the accepted passive frame — `FCA11_COOLDOWN_MARGIN_FRAMES` = 2, stamped at emission); (c) the longActive-off exit owed no passive frame, leaving the panda's episode open. Frame-exact co-sim: refusals 1481 → 0 across 9 scenarios; whole-drive delivery restored to 0.820 / 0.785 / 0.854 of the budget ceiling. Python + panda test only | fix (car, Python only) | fork-local; opendbc patch `0025`; NOT on main |
 | 51 | **FCA11-long driver-input cut re-arms on the openpilot resume edge** (overnight loop G9; drive-149 R7-B) — **the FIRST safety `.h` change of the FCA11-long set.** The panda's cut latch (`hyundai_fca11_long_cut`) is set by `hyundai_fca11_long_rx()` on brake/gas/gear≠D for EVERY RX frame — engaged or not, arm-or-not-gated — and cleared only by `hyundai_init()` (ignition). On route 149 it latched on the first CAN frame after the arm (gear P, +0.01 s, ~66 s before first engagement) and never cleared for the whole 2 570 s drive: FCA11 actuated **zero** frames. New `hyundai_fca11_long_driver_cut` re-arms on the `controls_allowed` **rising edge** — the pause/resume grant the panda itself only issues with the brake released and the pause button armed — mirroring the car layer's `blocked_until_resume`; pedal-fault and camera-owns stay hard-latched (fail closed); clear runs before set so a driver input on the grant frame still wins; every actuating frame is still re-checked against the live window. Bit-256-unset behaviour byte-identical. First accepted actuating frame on the route-149 replay: never → +369.03 s. `hyundai.h` is compiled into the panda → the series sha changes → CI sets `FW_NEEDED=true`, rebuilds and re-signs the H7 to a **functionally different binary**; flashing is an explicit owner decision (patch `0026` reverts to a byte-identical `00e086b9` build) | fix (FIRMWARE, safety) | fork-local; opendbc patch `0026`; NOT on main |
+| 52 | **FCA11-long driver cut re-arms on the FIRST CLEAN FRAME of the engagement** (drive-14 G9b): the panda's G9 driver-input latch re-armed on the `controls_allowed` rising edge but cleared-then-re-set in the SAME rx call whenever a driver input was still held at that instant — and the pedal-mode grant needs the brake released but NOT the gas. Engaging with the foot still on the gas therefore latched the cut for the whole engagement: on routes 0000014a/0000014b 7 of 16 engagements were granted with `gas_raw > 420` (574/748/731/739…), the latch stayed up to 24.7 s and refused 753 of 755 actuating FCA11 frames (7 dead episodes; only 37.5 % of braking frames reached the ESC, while the car layer — which never latches gas outside `longActive` — believed the window open). Now the edge only ARMS a pending re-arm; the first CLEAN engaged frame clears it; SET runs before CLEAR (a driver input on the grant frame still wins); the clear is gated on `controls_allowed`; an unconsumed pending re-arm is dropped on disengage; pedal-fault and camera-owns stay hard-latched. The car-layer mirror splits `blocked_until_resume` into `_driver_cut` / `_hard_cut` with the same semantics. 3 panda + 4 Python mirror tests FAIL on the shipped rule and PASS here; the four "must stay refused" conditions pass on both | fix (FIRMWARE, safety) | fork-local; opendbc patch `0027`; NOT on main |
+| 53 | **CLU13 subscribed on the powertrain parser so `CF_Clu_DriveMode` reaches `CarStateSP.driveMode`** (drive-14): patch `0021` decoded the drive mode but CLU13 was never SUBSCRIBED on the `Bus.pt` parser — `CANParser` builds `message_states` only from its subscribed list, so `update_drive_mode` read an always-empty `vl_all` and `driveMode` stayed 0 on every drive (0 in all 162 322 samples of 14a/14b, while the bus said Normal on both). Two consequences: `DriveModePersonality` was completely inert, and the N / N-Custom longitudinal block rail was dead (12.9 s of real N-mode on 14b did not drop openpilot long). Fix: `CANParser(..., [(DRIVE_MODE_MSG, 10)], 0)` — the signal's own 10 Hz broadcast rate; nothing polls it at 100 Hz and the one-source-frame debounce reads frames-per-tick. DBC untouched (the runtime DBC already contains the signal). The new wiring test exercises the REAL `get_can_parsers` path and FAILS on the shipped subscription | fix (car, Python only) | fork-local; opendbc patch `0028`; NOT on main |
+| 54 | **SLA auto-applies speed-limit changes at ANY speed + driver override memory** (drive-14 §6): the old rule required a press whenever the set speed was below 50 mph / 80 km/h or the target fell below that floor — so every sub-50 limit change asked (and this fork's whole driving is sub-50). The confirm decision is now a pure function of (current set speed, target set speed) that ignores vehicle speed entirely: a change auto-applies UNLESS it would decrease the set speed by more than `MAX_AUTO_DECREASE` (15 mph / 24 km/h; strict `>`, so 15 mph still applies); increases always apply. Override memory: a driver's manual set-speed edit wins until the next limit change AND `OVERRIDE_MEMORY_S` = 600 s (a real confirm press clears it), so a stretch of changing limits cannot make SLA fight the driver. Own-write disambiguation: on this car (`pcmCruise=False`) SLA writes the cluster set speed itself, and `_is_manual_override_edge` now tells a driver edit apart from SLA's own write. `CONFIRM_SPEED_THRESHOLD` survives only as the pcm max-set-speed ceiling. 51 tests pass on the new code; 24 of 26 new tests FAIL pristine (2 deliberate parity pins); real-log replay of 14a/14b: **18/18 confirm prompts removed, 0 new friction** (largest decrease −10 mph, cap never approached) | feature (SLA, Python only) | fork-local (`sunnypilot/.../speed_limit/`); NOT on main |
 
 ---
 
@@ -228,6 +231,48 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   `cc -fsyntax-only` clean.
 - **Merge note:** fork-local; series `0022`-`0026` + the G4 superproject change (turn-limit the e2e launch
   candidate at turn entry; `longitudinal_planner.py`) + these FORK.md rows. NOT pushed, device untouched.
+
+### drive-14: the two drives' complaints chased to code — G9b engage-latch + CLU13 subscription + SLA auto-apply (2026-10-07) (unit + real-log replay; patch `0027` REQUIRES a firmware rebuild + re-sign + explicit owner flash; `0028` + SLA are Python-only)
+
+> **Driver notes:** these are the fixes for what you actually wrote down after the two drives. **"Braked once
+> but randomly"** — the panda's driver-took-over latch was re-arming on the resume edge but re-latching in the
+> same frame whenever you still had your foot on the gas at the moment openpilot engaged (the pedal-mode grant
+> releases the brake check, not the gas check). 7 of your 16 engagements started that way, and every one of
+> them refused ALL braking — 753 of 755 frames over the two drives. Now the resume edge only *arms* the re-arm;
+> the latch clears on the first clean frame, and a live gas/brake/gear input still cuts instantly. **"Personality
+> menu said aggressive while the car starts Normal"** — the drive mode was decoded but the CAN message carrying
+> it was never subscribed, so openpilot never saw the mode at all; it's subscribed now, so Normal really maps to
+> standard, and N really blocks long. **"Auto max-speed apply"** — every limit change under 50 mph used to ask
+> for a press; now they all auto-apply except a drop of more than 15 mph, and a set-speed change you make
+> yourself sticks for 10 minutes / until the next limit change. **The one you'll feel that isn't fixed yet:**
+> a mid-drive gas tap still parks braking until you press resume — that is the security model working as
+> designed, and it stays.
+
+- **Why:** the owner's post-drive notes (six complaints) + the sim campaign that ran the changes against
+  routes 14a/14b/149 (`car-features/simcamp/`, rounds A/B/C + fidelity 1/2, `roundC/OPUS-SIM-ANALYSIS.md`).
+- **What (series 0022-0028 + two superproject changes):**
+  - `0027` (G9b, **firmware**): the G9 driver-cut re-arm cleared directly on the `controls_allowed` rising edge
+    and could re-set in the same call; now the edge arms a *pending* re-arm consumed by the first clean engaged
+    frame, SET before CLEAR, clear gated on `controls_allowed`, pending dropped on disengage. Car-layer mirror
+    splits `blocked_until_resume` into `_driver_cut` (re-armable) / `_hard_cut` (camera / pedal-fault, sticky).
+    3 panda + 4 Python tests fail on the shipped rule and pass here. Firmware: `hyundai.h` changes compiled C →
+    CI rebuilds + re-signs the H7 to a new binary (flash = explicit owner decision; the device stays on `b524628e`).
+  - `0028`: subscribe CLU13 at 10 Hz on the `Bus.pt` parser so `CF_Clu_DriveMode` reaches `CarStateSP.driveMode`.
+    `CANParser` builds `message_states` only from the subscribed list, so `driveMode` was structurally 0 on
+    every drive — `DriveModePersonality` inert and the N-mode long block dead. DBC untouched (the runtime DBC
+    already has the signal). New test exercises the REAL `get_can_parsers` path (the old tests subscribed CLU13
+    by hand, which is exactly why the blackout survived them).
+  - SLA (superproject): auto-apply at any speed + the 15 mph / 24 km/h decrease cap + 600 s override memory +
+    own-write disambiguation — 18/18 confirm prompts removed on the 14a/14b replays, 0 new friction.
+- **Verification:** series `0001-0028` applies clean on a fresh `f95f996f` opendbc checkout (CI order); the
+  composed opendbc files match the fix1 tree; SLA tests 51 passed; SLA contrast 24/26 new tests fail pristine.
+  `roundC` per-complaint verdicts: 2 (mode) and 6 (SLA) ADDRESSED; 1 (random braking) PARTIAL — the grant-frame
+  latch fixed on test evidence, the mid-drive gas-tap latch deliberately unchanged; 3/4 improved in direction
+  by 0029 (held); 5 is the display artifact (fixed on-device via `TrueVEgoUI=1`, not a code change).
+- **Not in the set (held for after the calibration drive):** `0029` brake shaping, the planner middle-ground
+  (`ForkBrakeAdmission`), the coast-table retune `0030`. Round C: they ride together, with pinned BITE/K.
+- **Merge note:** fork-local; opendbc series `0027` + `0028`, the SLA superproject change, and these FORK.md
+  rows. `0027` sets `FW_NEEDED=true` → CI rebuilds + re-signs; no flash performed.
 
 ### fca11-plumbing: FCA11-long param never armed (initialize_params + bool gate) — 2026-10-06 (offline-tested; Python-only, no firmware change)
 
