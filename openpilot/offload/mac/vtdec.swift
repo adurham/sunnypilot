@@ -145,10 +145,19 @@ func buildFormat() -> CMFormatDescription? {
 }
 
 let decodeCallback: VTDecompressionOutputCallback = { (_, srcRefcon, status, _, imageBuffer, _, _) in
+    // LEAK FIX (2026-10-07, part 2): this callback runs on VideoToolbox's own dispatch
+    // queue, which has NO autorelease pool of its own. Every per-frame autoreleased
+    // CF/CoreMedia object created below therefore accumulated forever (measured:
+    // Malloc Small 41.6 -> 159.9 MB per 60 s; ~7 GB/h RSS growth). Draining a pool per
+    // callback bounds it to one frame's temporaries. Measured after fix: flat RSS.
+    autoreleasepool {
     let cbT = monotonicNs()
     let pts = UInt64(bitPattern: Int64(Int(bitPattern: srcRefcon)))
+    // LEAK FIX (2026-10-07): consume the submitNs entry here. It is written once per
+    // submitted frame in submit(); deleting on callback is what keeps the map bounded
+    // (previously it grew forever — ~2.7 GB RSS per 30 min at 20-40 fps, r2>0.99).
     g.lock()
-    let sub = submitNs[pts] ?? 0
+    let sub = submitNs.removeValue(forKey: pts) ?? 0
     g.unlock()
     if status != 0 {
         g.lock(); decodeErr += 1; lastErr = status; g.unlock()
@@ -211,6 +220,7 @@ let decodeCallback: VTDecompressionOutputCallback = { (_, srcRefcon, status, _, 
     wr64(&rec, pts)
     wr64(&rec, decNs)
     outLock.lock(); FileHandle.standardOutput.write(rec); outLock.unlock()
+    }  // autoreleasepool — drain this frame's temporaries (LEAK FIX part 2)
 }
 
 // ---------- main ----------
@@ -329,7 +339,13 @@ final class Reader {
         if n == 0 { return [] }
         var buf = [UInt8](); buf.reserveCapacity(n)
         while buf.count < n {
-            let d = fh.readData(ofLength: n - buf.count)
+            // LEAK FIX (2026-10-07, part 3 — the real one): FileHandle.readData returns an
+            // AUTORELEASED Data. A bare swiftc command-line binary's main loop has no autorelease
+            // pool, so every ~62 KB read result was retained forever: measured ~72 KB leaked per
+            // frame submitted (RSS 6 MB -> 2 GB in 5 s standalone, even with zero successful
+            // decodes; ~7 GB/h live). Draining a pool around the read bounds it — buf is a Swift
+            // array (copied), so it survives the pool.
+            let d: Data = autoreleasepool { fh.readData(ofLength: n - buf.count) }
             if d.isEmpty { return nil }
             buf.append(contentsOf: d)
         }
