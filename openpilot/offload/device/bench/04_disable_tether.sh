@@ -33,7 +33,8 @@ else
 fi
 
 echo ">> [3/4] clear AdbEnabled (USER-GATED param write)"
-"${SSH[@]}" "$DEV_PY - <<'PY'
+# NOTE: PYTHONPATH=/data/openpilot is required for `openpilot.*` imports on this fork.
+"${SSH[@]}" "PYTHONPATH=/data/openpilot $DEV_PY - <<'PY'
 from openpilot.common.params import Params
 p = Params()
 p.put_bool('AdbEnabled', False, block=True)

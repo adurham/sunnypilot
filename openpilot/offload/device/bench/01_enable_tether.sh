@@ -41,7 +41,9 @@ echo ">> [1/4] reachability: $HOST"
 "${SSH[@]}" 'echo reachable: $(uname -sr)' || { echo "ssh failed — load your key / check mDNS"; exit 1; }
 
 echo ">> [2/4] set AdbEnabled=1 (USER-GATED param write)"
-"${SSH[@]}" "$DEV_PY - <<'PY'
+# NOTE: the device's fork requires PYTHONPATH=/data/openpilot for `openpilot.*` imports
+# (see comma-car-bridge skill: import path is openpilot.cereal.messaging, not cereal.messaging).
+"${SSH[@]}" "PYTHONPATH=/data/openpilot $DEV_PY - <<'PY'
 from openpilot.common.params import Params
 p = Params()
 p.put_bool('AdbEnabled', True, block=True)
