@@ -211,3 +211,16 @@ shadow path (bridge + any join-side comparison) with `bench/bench_resources.py` 
 soak, and do not assume it is free. This is a stronger reason to gate return-path/arbitration work
 behind `OffloadMode` and to keep the local model authoritative.
 
+## 7. Arbitration hook (§7) — device modeld_v2 consumes the shadow topics
+
+The consumer of this daemon's SHADOW output is implemented in WS-A:
+`openpilot/sunnypilot/modeld_v2/offload_arbiter.py` (state machine + raw-msgq reader) wired at
+three call sites in `openpilot/sunnypilot/modeld_v2/modeld.py` (`:498` construct, `:569` poll,
+`:677` select). Full spec, gating, cohesion/settling and open items: `openpilot/offload/ARBITRATION.md`.
+Default off: enabled only by `OFFLOAD_ARBITRATION` (bench) or (device: `COMMA_HARDWARE` and
+`OffloadMode == 'drive'`); otherwise modeld_v2's publish path is byte-identical. It reads the four
+shadow topics with **raw msgq sockets** (no `log.Event` union member exists), publishes the remote
+set under the real names only when ENGAGED and an eligible+settled complete set exists, re-stamping
+only the header `logMonoTime` to device-now, and otherwise publishes its own local outputs.
+
+

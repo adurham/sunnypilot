@@ -61,6 +61,10 @@ from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.modeld_v2.helpers import load_oob
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
+# OFFLOAD §7: output-arbitration hook (default off). Importing this module has no side effects and
+# opens no sockets; make_arbiter() only builds the arbiter when explicitly enabled. Device path
+# (arbiter is None) is byte-identical. See openpilot/offload/ARBITRATION.md.
+from openpilot.sunnypilot.modeld_v2.offload_arbiter import make_arbiter
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld_tinygrad"
 BIG_MODEL_TIMEOUT = 60
@@ -488,6 +492,11 @@ def main(demo=False):
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
+  # OFFLOAD §7: remote-output arbitration (a dead-man-switch on the Mac's big model). Enabled only
+  # by OFFLOAD_ARBITRATION (bench) or (device: COMMA_HARDWARE and Params OffloadMode == 'drive');
+  # otherwise None, no sockets are opened, and the publish path below is byte-identical.
+  arbiter = make_arbiter(params)
+
   publish_state = PublishState()
   chestnut_state = _get_chestnut_state_class()(pm, model.chestnut) if CHESTNUT else None
 
@@ -557,6 +566,9 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    # OFFLOAD §7: drain the remote (Mac) shadow outputs once per model loop, non-blocking.
+    if arbiter is not None:
+      arbiter.poll(time.monotonic_ns())
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
@@ -658,6 +670,14 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      # OFFLOAD §7: when remote mode is engaged and an eligible shadow set exists for this frame,
+      # publish the REMOTE model's outputs under the real names (re-stamped logMonoTime) instead of
+      # the local ones. Cohesion: all four come from ONE source (never mixed). `remote` is None on
+      # the device / when unengaged / when ineligible => the four local sends below are unchanged.
+      remote = arbiter.select(meta_main.frame_id, time.monotonic_ns()) if arbiter is not None else None
+      if remote is not None:
+        modelv2_send, drivingdata_send = remote['modelV2'], remote['drivingModelData']
+        posenet_send, mdv2sp_send = remote['cameraOdometry'], remote['modelDataV2SP']
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
