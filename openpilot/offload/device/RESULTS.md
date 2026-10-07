@@ -66,6 +66,8 @@ MISSING: []          # every FORWARD + RETURN service is present on the device s
 
 ## 2. offloadd unit tests (offline, no device) — 13/13 PASS
 
+> Reframe 2026-10-07: the suite is now **27** tests (these 13 + `test_holdpolicy.py`); see §5.
+
 ```
 $ PYTHONPATH=... .venv/bin/python -m pytest openpilot/offload/device/tests/test_offloadd.py -v
 collected 13 items
@@ -121,3 +123,91 @@ absent param → False; `UnknownKeyName` → False; `b"shadow"`/`"drive"`/`" Dri
 - **`submodules` are empty in this worktree**, but `msgq` resolves via the `openpilot`
   editable `.pth` to the sibling `sunnypilot/msgq_repo` build; `openpilot.cereal.messaging`
   and `log` import and operate in-process.
+
+## 5. Jetlink borrows — HOLD/BEHIND/LOST eligibility machine + device bench tooling
+
+Ported from `jetlink/openpilot/model_state.py` (`_note_hold`, `HOLD_FRAME=0.046`) and
+`docs/link-protocol.md` "Late replies", **reframed to our single-publisher architecture**
+(INTERFACES §7, 2026-10-07): the device's LOCAL model keeps computing AND publishing every frame;
+`offloadd` only receives the remote (Mac) outputs, freshness-validates them, and forwards each
+eligible one into device msgq under SHADOW service names. Feature flag `OFFLOAD_HOLDPOLICY=1`
+(or `OffloadMode='holds'`, or `--hold-policy`); **default off preserves the pre-port behavior
+exactly** (`published` kept as a compat alias of the new `forwarded`).
+
+### State-machine mapping (theirs → ours)
+
+| Jetlink (comma side) | OURS (device side) |
+|---|---|
+| `HOLD_FRAME=0.046` from the frame's warp start | `OFFLOAD_HOLD_MS=46` from the frame's first arrival at offloadd |
+| held → republish previous frame's output | a HOLD means "no eligible remote output for this frame"; **nothing is published** |
+| `HOLDS_IN_A_ROW=5` | `OFFLOAD_HOLDS_IN_A_ROW=5` |
+| `HOLDS_ALLOWED=20` within `HOLD_WINDOW=10 s` | `OFFLOAD_HOLDS_ALLOWED=20` within `OFFLOAD_HOLD_WINDOW=10 s` |
+| `behind` → hand the drive to the small model | `behind` **event** + `remote_eligible=False`; arbitration (modeld_v2) decides |
+| `PROVING_FRAMES=20` / `SETTLING_FRAMES=3` | `OFFLOAD_PROVING_FRAMES` / `OFFLOAD_SETTLING_FRAMES` |
+| lost: no answer for 0.2 s | `OFFLOAD_LOST_MS=200`: no Mac message at all → `lost` event, reset; recover on next msg |
+
+**Reframe note:** absence of a remote message NEVER removes model output — the local model always
+publishes the real `modelV2`/`cameraOdometry`/`drivingModelData`/`modelDataV2SP`. The state
+machine's output is an ELIGIBILITY signal (`remote_eligible`) + stdout events (`hold`, `behind`,
+`lost`, `recovered`), not a stop-publishing action; a `behind` frame still forwards later eligible
+messages. The correctness rule carried over — "never replace state with a non-finite/failed
+output" — becomes **never forward a stale or non-finite message**: a message older than
+`OFFLOAD_STALE_MS` at receipt is dropped, and a message with any NaN/Inf float is dropped.
+
+### Unit tests — 27/27 PASS (2× stable)
+
+```
+$ PYTHONPATH=... .venv/bin/python -m pytest openpilot/offload/device/tests/ -q
+27 passed in 9.42s      # test_offloadd.py 14 + test_holdpolicy.py 13
+```
+
+`test_holdpolicy.py`: HOLD fires at 46 ms (not at 45); HOLD makes the remote ineligible and
+forwards nothing; a remote output is forwarded under the shadow name with the header re-stamped
+and the payload intact; stale- and non-finite-message drop; 5-consecutive → `behind` + ineligible
+(and a later message still forwards); >20-in-window → `behind`; LOST at 200 ms + recovery;
+default-off leaves the policy inert. `test_offloadd.py` gained
+`test_nonfinite_message_is_dropped_not_forwarded` and now asserts forwarding under
+`offloadModelV2` (raw msgq), not a real modelV2.
+
+### Cereal service-name validation — REQUIRED before this can run on the device
+
+Reported for the join task (the §7 shadow names must be registered the same way on both sides):
+1. **`openpilot/cereal/services.py`** — the four shadow names were NOT in `SERVICE_LIST`, so
+   `pub_sock`/`sub_sock` sized them `segment_size=0`. **Fixed here**: added `offloadModelV2`
+   (BIG), `offloadCameraOdometry` (SMALL), `offloadDrivingModelData` (SMALL), `offloadModelDataV2SP`
+   (BIG), matching `contract.SHADOW_OUTPUT_SERVICES`. Registration is mandatory: an unregistered
+   topic with a >0 message **ABORTS the process** (`msgq_msg_send` assertion `3 * total_msg_size
+   <= q->size`), proven on this Mac. `offloadd` reads the names from `contract.SHADOW_OUTPUT_SERVICES`
+   and asserts its map matches, so a contract change breaks the daemon loudly, not silently.
+2. **`openpilot/cereal/log.capnp`** — the names are NOT members of `log.Event`'s union. That is a
+   **hard blocker for cereal *consumption***: `SubMaster([...])` calls `new_message(name)` →
+   `dat.init(name)` → `KjException: struct has no such member; name = offloadModelV2`. `offloadd`'s
+   **WRITE path is unaffected** — it forwards raw Event bytes with `msgq.pub_sock(name, size)` /
+   `send`, never `Event.init(service)` — and the tests read them back on the **raw msgq topic**
+   (`msgq.sub_sock`) and then decode with `log.Event.from_bytes` + `which()` (which works, since
+   the payload union member is the real `modelV2`/etc.). But the **modeld_v2 join side needs a
+   typed read of the shadow topic**, so a capnp member must be added per shadow name (e.g.
+   `offloadModelV2 @<id> :ModelDataV2;` — same payload type), regenerated, and `services.py` kept
+   in sync. `openpilot/cereal/log.capnp` is **frozen and PM-owned**; this is a CHANGES REQUESTED
+   item for PM (the §7 text "python-cereal only (no capnp change)" is accurate for `offloadd`
+   but not yet for a typed consumer).
+
+### Cost measurement (guards the join-task budget)
+
+A recursive finite-scan of a synthetic modelV2 (6208 B, `position`/`velocity`/`acceleration`/
+`laneLines` floats as `to_dict` emits them) measured **0.024 ms/msg** on the bench Mac — the
+non-finite guard is affordable at 20 Hz (two orders of magnitude under one frame).
+
+## 6. P3/P4 measurement: on-device shadow cost (Jetlink W2 warning)
+
+Jetlink **tried per-frame shadow and removed it** (2026-10-05): shadow frames cost the comma
+**~9 ms of every frame** while a window stayed shut, starving the driver-monitoring model under
+selfdrived's frequency floor (`joining.py:28-34`, COMPARISON-COMMS.md W2). Our design is additive
+(no device fork, encoderd/cereal tap), so the mechanism differs — but the lesson is direct: **any
+on-device shadow validation must budget its per-frame cost deliberately**, and the
+"local always publishes + remote eligible when fresh" reframe is exactly the always-on variant
+they found unsafe. Flag as a **measurement for P3/P4**: instrument the added per-frame cost of the
+shadow path (bridge + any join-side comparison) with `bench/bench_resources.py` alongside the P3
+soak, and do not assume it is free. This is a stronger reason to gate return-path/arbitration work
+behind `OffloadMode` and to keep the local model authoritative.
+

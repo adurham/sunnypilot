@@ -7,10 +7,11 @@ non-device file touched is a minimal, param-gated pair of entries in
 
 ```
 device/
-  offloadd.py            device-side return-path republisher (P2 code-complete, P4-prep)
+  offloadd.py            device-side return-path forwarder (P2 code-complete, P4-prep) + HOLD/BEHIND/LOST
   check_device.sh        read-only ssh audit (run from the Mac)
-  bench/                 user-executed tether bring-up / smoke / teardown + P3 checklist
-  tests/test_offloadd.py offline unit tests (Mac; no device needed)
+  bench/                 user-executed bring-up / smoke / tuning / latency / resources + P3 checklist
+  tests/test_offloadd.py     offline unit tests (Mac; no device needed)
+  tests/test_holdpolicy.py   offline tests for the HOLD/BEHIND/LOST eligibility machine
   README.md  RESULTS.md
 ```
 
@@ -23,39 +24,61 @@ device/
  │ offload_bridge (./bridge) ├────────────────────────►│  vtdec → VisionIPC         │
  │   = msgq→zmq, ALL services│   (FORWARD_* on connect- │  Mac msgq republish        │
  │                          │    list selects the set) │ WS-A modeld_v2 (METAL)     │
- │ msgq ◄── offloadd ◄───────┼──────────────────────────┤  modelV2/cameraOdometry/   │
- │   republish RETURN_SERVICES│  ZMQ PUB (Mac binds)     │  drivingModelData/         │
- │   header→device now (§1.3) │  RETURN_SERVICES         │  modelDataV2SP (Mac PUB)   │
+ │ LOCAL modeld → msgq      │                          │  modelV2/cameraOdometry/   │
+ │   (the real modelV2/…)   │  ZMQ PUB (Mac binds)     │  drivingModelData/         │
+ │ msgq ◄── offloadd ◄───────┼──────────────────────────┤  modelDataV2SP (Mac PUB)   │
+ │   offload* SHADOW names  │  RETURN_SERVICES         │                            │
+ │   header→device now (§1.3)│                          │                            │
  └──────────────────────────┘                         └───────────────────────────┘
 ```
 
 - **Forward (device→Mac):** `./bridge` re-publishes every msgq service on
   `tcp://*:8023 + fnv1a(name) % (65535-8023)` (ports per `../ports.py`). The Mac SUB's
   connect-list effectively selects the service set.
-- **Return (Mac→device, drive mode):** `offloadd` SUBs to the Mac's PUBs, freshness-gates on
-  the **device** clock, re-stamps the cereal header `logMonoTime` to device-now, and injects
-  into the **local** msgq. No clock sync anywhere (§1.4).
+- **Return (Mac→device):** `offloadd` SUBs to the Mac's PUBs, freshness-gates on the **device**
+  clock, re-stamps the cereal header `logMonoTime` to device-now, and forwards into the **local**
+  msgq — under the **SHADOW** service names `offloadModelV2` / `offloadCameraOdometry` /
+  `offloadDrivingModelData` / `offloadModelDataV2SP`, **never** the real names. No clock sync
+  anywhere (§1.4).
+- **Single publisher (reframe 2026-10-07, INTERFACES §7):** the device's **local** model keeps
+  computing AND publishing the real `modelV2`/`cameraOdometry`/`drivingModelData`/`modelDataV2SP`
+  every frame; the remote output is a *shadow*. `offloadd` never publishes a real service name
+  and never removes one. The local-vs-remote choice (arbitration, hysteresis, settling) lives in
+  the device `modeld_v2`, not in `offloadd`.
 - **Echo prevention:** the Mac must **not** subscribe to `modelV2` (etc.) on the device ZMQ
   while it is republishing the same services back — that is an infinite echo. Keep the return
   PUB on the Mac and the forward SUB list disjoint from `RETURN_SERVICES`.
 
 ## offloadd operational rules (read before enabling)
 
-1. **Echo prevention (above).** The Mac's forward SUB list must exclude the services it
-   republishes.
+1. **Single publisher.** `offloadd` forwards only under the shadow names; the real services are
+   the local model's. Never add a second publisher of a real service name.
 2. **Do NOT live-stream during offload.** `livestream*` encode data shares the encode path and
    the USB link budget; it perturbs the frame timing gates. Kill/disable livestream for the
    whole offload session.
 3. **Freshness is `now_device - timestamp_sof`** (SOF, not EOF), threshold `OFFLOAD_STALE_MS`
-   (default 300 ms). Stale ⇒ drop, never republish.
-4. **Absence is the signal.** On a `OFFLOAD_GAP_MS` (default 400 ms) gap with no valid
-   republish, `offloadd` publishes *nothing* — `controlsd`'s existing SubMaster alive/valid
-   checks then soft-disable. Do not add a synthetic "stale" message.
-5. **OffloadMode gates everything.** `offloadd` is inert unless the device param `OffloadMode`
-   ∈ {`shadow`,`drive`}. The manager entries are gated the same way; with the param absent
-   (default) nothing offload-related starts. Set it only when you mean it.
-6. **Stats go to stdout only** (JSONL). Bench mode may append `/tmp/offloadd_bench.jsonl`.
-   **No `/data` writes** — `/data` is ~90% full on the target device.
+   (default 300 ms). Stale ⇒ drop, **never forward**. A message with any non-finite payload float
+   is likewise dropped.
+4. **Absence of a remote NEVER removes model output.** When no eligible remote output exists for
+   a frame, the shadow topics simply go quiet; the local model still publishes. The shadow
+   going quiet is the remote's staleness signal **for the modeld_v2 arbitration**, not for
+   `controlsd`.
+5. **HOLD/BEHIND/LOST eligibility (default OFF).** `OFFLOAD_HOLDPOLICY=1` (or `OffloadMode='holds'`
+   or `--hold-policy`) runs the ported Jetlink timing machine: per-frame 46 ms HOLD →
+   `remote_eligible=False`; 5-in-a-row or >20-in-10 s → a `behind` event; 200 ms of no Mac
+   message → a `lost` event; recover on the next message. Its output is an eligibility signal +
+   stdout events, not a stop-publishing action. Default off preserves the pre-port behavior.
+6. **OffloadMode gates everything.** `offloadd` is inert unless the device param `OffloadMode` ∈
+   {`shadow`,`drive`,`holds`}. With the param absent (default) nothing offload-related starts.
+7. **Stats go to stdout only** (JSONL: `forwarded`, `dropped_stale`, `dropped_nonfinite`, …).
+   Bench mode may append `/tmp/offloadd_bench.jsonl`. **No `/data` writes** — `/data` is ~90% full.
+
+### Shadow service names — a capnp prerequisite (INTERFACES §7)
+
+The four shadow names are registered in `openpilot/cereal/services.py` (queue sizing) **and must
+be added as members of the `log.Event` union in `openpilot/cereal/log.capnp`** before a cereal
+`SubMaster` can read them (writing on the raw msgq topic already works). `log.capnp` is frozen /
+PM-owned; see `RESULTS.md` §5 for the exact failure and the CHANGES REQUESTED item.
 
 ## Tether bring-up (USER-GATED)
 
@@ -64,7 +87,10 @@ Use the **AUX** USB-C port (USB 3.1 Gen2, UDC `a600000.dwc3`), never OBD-C/panda
 ```bash
 bash openpilot/offload/device/bench/01_enable_tether.sh comma@comma-b203ed6e.local   # AdbEnabled=1 + start adbd
 bash openpilot/offload/device/bench/02_mac_side.sh    comma@comma-b203ed6e.local       # find link, ping, iperf3
+bash openpilot/offload/device/bench/05_device_tuning.sh comma@comma-b203ed6e.local --apply  # sysctls + FFS log off
+bash openpilot/offload/device/bench/06_latency_roundtrip.sh comma@comma-b203ed6e.local 2000   # return-path p99/p99.9
 bash openpilot/offload/device/bench/03_live_smoke.sh  169.254.x.y 30                    # framebridge smoke (needs WS-B)
+bash openpilot/offload/device/bench/05_device_tuning.sh comma@comma-b203ed6e.local --revert   # restore sysctls
 bash openpilot/offload/device/bench/04_disable_tether.sh comma@comma-b203ed6e.local    # AdbEnabled=0 + stop adbd
 ```
 

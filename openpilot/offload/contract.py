@@ -31,6 +31,16 @@ FORWARD_SERVICES = FORWARD_SMALL_SERVICES + FORWARD_SHADOW_SERVICES  # + video (
 # Mac -> device over ZMQ (future drive mode; code-complete in P2, unused in P1-P4).
 RETURN_SERVICES = ["modelV2", "cameraOdometry", "drivingModelData", "modelDataV2SP"]
 
+# Shadow names the device offloadd forwards remote outputs to (INTERFACES §7 join). Device modeld_v2
+# consumes these; python-cereal only (no capnp change); the C++ bridge/loggerd never see them.
+SHADOW_OUTPUT_SERVICES = ["offloadModelV2", "offloadCameraOdometry", "offloadDrivingModelData", "offloadModelDataV2SP"]
+
+# Arbitration defaults (INTERFACES §7; env-tunable as OFFLOAD_*).
+ELIGIBLE_MS = 46
+ENTER_N = 10
+EXIT_N = 3
+SETTLE_N = 2
+
 # Services the Mac republishes into its LOCAL msgq for modeld_v2's SubMaster.
 # (modeld_v2 subscribes: deviceState, carState, narrowRoadCameraState, extrinsicsCalibration,
 #  driverMonitoringState, carControl, lateralDelay. wideRoad* kept for the frame bridge.)

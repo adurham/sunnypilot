@@ -19,32 +19,81 @@ Steps:
   (b) Freshness gate per §1.3 using the device clock: track ``timestampSof`` per camera from the
       last local ``narrowRoadCameraState``. For each incoming return msg, ``sof_of_its_frame``
       is the device-clock SOF of the camera frame the model output refers to. If
-      ``now_device_ns - sof > OFFLOAD_STALE_MS`` (default 300 ms) -> DROP + count.
-      Else -> keep the payload byte-identical, set header ``logMonoTime = time.monotonic_ns()``,
-      publish into local msgq via ``PubMaster``.
-  (c) Gap watchdog: if there is no *valid republish* for ``OFFLOAD_GAP_MS`` (default 400 ms) while
-      engaged, publish nothing. The resulting absence of ``modelV2``/``cameraOdometry`` messages is
-      itself the staleness signal -> ``controlsd``'s existing soft-disable path (``SubMaster``
-      alive/valid checks) fires. One event line is logged when a gap opens and when it closes.
+      ``now_device_ns - sof > OFFLOAD_STALE_MS`` (default 300 ms) -> DROP + count (never forward).
+      A msg whose payload carries any non-finite float -> DROP + count (never forward). Else ->
+      keep the payload byte-identical, set header ``logMonoTime = time.monotonic_ns()``, and
+      forward into local msgq under the SHADOW service name (``shadow_map``), never the real one.
+  (c) Output / staleness: the real modelV2/cameraOdometry/drivingModelData/modelDataV2SP are the
+      device's OWN model's — this daemon neither publishes nor removes them. When no eligible
+      remote output exists for a frame, the shadow name simply goes quiet; that absence is the
+      remote's staleness signal for the modeld_v2 arbitration (INTERFACES §7), not for controlsd.
+      A gap watchdog logs open/close edges for the return link only.
   (d) Stats: one JSON object per line to **stdout only**. Bench mode (``--bench``) may also append
       a local JSONL for convenience. Never writes to /data.
   (e) Mode gate: only runs when ``params.get("OffloadMode")`` in {"shadow", "drive"}; tolerates
       ``UnknownKeyName`` (key absent) by staying disabled.
   (f) SIGTERM/SIGINT -> publish nothing further, close sockets, exit 0.
+  (g) HOLD/BEHIND/LOST timing policy (Jetlink borrow; OFFLOAD_HOLDPOLICY=1, default off):
+      per-frame deadline HOLD (OFFLOAD_HOLD_MS, 46 ms) measured from a camera frame's first
+      arrival at offloadd; 5 consecutive HOLDs or >20 HOLDs in a rolling 10 s -> BEHIND
+      (hand back = stop republishing, pluggable callback); no Mac message at all for
+      OFFLOAD_LOST_MS (200 ms) -> LOST. Default off preserves the pre-port behavior exactly.
+      See the ported-state-machine section below.
 
 Failure-mode table (design reference / operational rules)
 ---------------------------------------------------------
   | Mode                        | Detected by                          | Daemon action                    | System effect                                  |
   |-----------------------------|--------------------------------------|----------------------------------|------------------------------------------------|
-  | link death (tether drops)   | ZMQ recv timeout budget exhausted    | stop republishing; open gap      | modelV2 staleness -> soft-disable              |
-  | bridge death (device)       | local narrowRoadCameraState stalls   | SOF map ages out -> all drops    | gap -> soft-disable                            |
-  | Mac pipeline stall/lag      | age of return frame SOF > stale_ms   | drop + count stale               | controlsd sees no fresh modelV2 -> soft-disable|
-  | segment boundary / route end| cameraOdometry frameId resets/gap    | drop unmatched; keep republishing| brief stale window; loggerd unaffected        |
-  | encoder GOP gap            | no return msg for a frame id         | nothing to publish for that frame| handled upstream (WS-B); not this daemon's job |
+  | link death (tether drops)   | ZMQ recv timeout budget exhausted    | forward nothing; open gap        | shadow stays quiet; LOCAL model still drives   |
+  | bridge death (device)       | local narrowRoadCameraState stalls   | SOF map ages out -> all drops    | shadow quiet; LOCAL model still drives         |
+  | Mac pipeline stall/lag      | age of return frame SOF > stale_ms   | drop + count stale (never forward)| shadow missing; arbitration sees remote stale  |
+  | segment boundary / route end| cameraOdometry frameId resets/gap    | drop unmatched; keep forwarding  | brief shadow gap; loggerd unaffected           |
+  | encoder GOP gap            | no return msg for a frame id         | nothing to forward for that frame| handled upstream (WS-B); not this daemon's job |
   | ZMQ HWM drops              | SUB side: messages silently dropped  | (see note) count via recv gaps   | gap watchdog covers the symptom                |
+  | non-finite remote output   | any NaN/Inf float in the payload     | drop + count nonfinite           | shadow missing; never a bad plan into msgq     |
   | echo loop (Mac sub'd to dev)| Mac SubMaster on modelV2 sees its own| MUST NOT HAPPEN                  | OPERATIONAL RULE: the Mac runner must NOT      |
   |                             | republished output                    |                                  | subscribe to modelV2 on the device ZMQ while it |
   |                             |                                       |                                  | is republishing; keep the return PUB separate   |
+
+Ported HOLD/BEHIND/LOST state machine (Jetlink borrow; OFFLOAD_HOLDPOLICY=1, off by default)
+------------------------------------------------------------------------------------------
+JOB (INTERFACES §7, reframed 2026-10-07): the device's LOCAL model keeps computing AND publishing
+every frame. This daemon never publishes, and never removes, the real modelV2/cameraOdometry/
+drivingModelData/modelDataV2SP. Its job is to receive the remote (Mac) outputs over ZMQ,
+freshness-validate them, and forward each eligible one into device msgq under the SHADOW service
+names ``offloadModelV2`` / ``offloadCameraOdometry`` / ``offloadDrivingModelData`` /
+``offloadModelDataV2SP`` (``Config.shadow_map``), re-stamping ONLY the header ``logMonoTime`` to
+device monotonic at receipt (payload untouched). The local-vs-remote choice (arbitration,
+hysteresis, settling) lives in the device modeld_v2 and is NOT this daemon's job.
+
+Mapping from jetlink/openpilot/model_state.py (their COMMA-side gate) to ours (DEVICE side, where
+the Mac publishes remotely). Their per-frame gate is ``_note_hold`` (model_state.py:321); the wire
+rule is docs/link-protocol.md "Late replies":
+
+  | Jetlink (comma)                          | OURS (device)                                            |
+  |------------------------------------------|----------------------------------------------------------|
+  | HOLD_FRAME=0.046 from frame warp start   | OFFLOAD_HOLD_MS=46 from frame first arrival at offloadd  |
+  | held -> republish previous frame output  | (reframe) a HOLD means "no eligible remote output for this frame" |
+  | HOLDS_IN_A_ROW=5                         | OFFLOAD_HOLDS_IN_A_ROW=5 (consecutive HOLDs)             |
+  | HOLDS_ALLOWED=20 within HOLD_WINDOW=10 s | OFFLOAD_HOLDS_ALLOWED=20 within OFFLOAD_HOLD_WINDOW=10 s |
+  | `behind` -> hand the drive to the small model | `behind` event: remote ineligible this frame; arbitration (modeld_v2) decides |
+  | lost: no answer for 0.2 s (link.INFERENCE_TIMEOUT) | OFFLOAD_LOST_MS=200: no Mac message at all -> LOST     |
+  | PROVING_FRAMES=20 / SETTLING_FRAMES=3    | OFFLOAD_PROVING_FRAMES=20 / OFFLOAD_SETTLING_FRAMES=3    |
+
+Correctness rule carried over (their "never replace hidden state with a non-finite/failed
+output", model_state.py:41): we forward whole messages, so the equivalent is **never forward a
+stale or non-finite message**. A frame's expected remote output is matched by ``frameId`` from the
+local ``narrowRoadCameraState``; eligibility uses the same 46 ms deadline. A message older than
+OFFLOAD_STALE_MS at receipt is dropped (never forwarded); a message with any non-finite float in
+its payload is dropped (never forwarded).
+
+Reframe divergences from Jetlink (single-publisher, always-on-local — see COMPARISON-COMMS.md W2):
+  * The state machine's output is an ELIGIBILITY signal + logged events, not an action that stops
+    a publication. Absence of a remote message NEVER removes model output: the local model always
+    publishes the real services.
+  * On BEHIND we emit a ``behind`` event and mark the remote ineligible; the device modeld_v2's
+    arbitration picks the fallback. On LOST we emit a ``lost`` event, mark the remote ineligible,
+    and reset HOLD accounting; the next received Mac message re-enters normal operation.
 
 Notes:
   * SOF (not EOF) is used for the freshness age, matching §1.4 ("now_device - timestamp_sof").
@@ -59,6 +108,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -69,7 +119,7 @@ from dataclasses import dataclass, field
 import zmq
 
 from openpilot.offload import ports
-from openpilot.offload.contract import RETURN_SERVICES
+from openpilot.offload.contract import RETURN_SERVICES, SHADOW_OUTPUT_SERVICES
 
 # --- tunables (env-overridable; see INTERFACES/README) -----------------------------
 DEFAULT_STALE_MS = 300          # OFFLOAD_STALE_MS — max device-clock age of a return frame
@@ -78,7 +128,50 @@ DEFAULT_SOF_TTL_MS = 1000       # drop camera SOF entries older than this
 DEFAULT_RECV_TIMEOUT_MS = 100   # ZMQ SUB RCVTIMEO (prompt watchdog + SIGTERM)
 RING_SIZE = 4096                # recent republish timestamps for the watchdog
 CAMERA_SERVICES = ("narrowRoadCameraState", "wideRoadCameraState")
-ENABLED_MODES = ("shadow", "drive")
+ENABLED_MODES = ("shadow", "drive", "holds")  # 'holds' = drive + the HOLD/BEHIND/LOST policy
+HOLD_POLICY_MODE = "holds"                    # OffloadMode sub-value that turns the policy on
+
+# Remote (Mac) return service -> the DEVICE msgq SHADOW service name it is forwarded under.
+# Never the real modelV2/cameraOdometry/... : those are the device's own model's, and the local
+# model publishes them every frame. Names come from contract.SHADOW_OUTPUT_SERVICES (INTERFACES §7).
+DEFAULT_SHADOW_MAP = {
+  "modelV2": "offloadModelV2",
+  "cameraOdometry": "offloadCameraOdometry",
+  "drivingModelData": "offloadDrivingModelData",
+  "modelDataV2SP": "offloadModelDataV2SP",
+}
+SHADOW_SERVICES = tuple(SHADOW_OUTPUT_SERVICES)
+# The map's values must be exactly the frozen §7 shadow set (order-insensitive).
+assert set(DEFAULT_SHADOW_MAP.values()) == set(SHADOW_OUTPUT_SERVICES), "shadow names drifted from contract.SHADOW_OUTPUT_SERVICES"
+
+# --- HOLD/BEHIND/LOST timing policy (Jetlink borrow; default OFF) -----------------
+# All of these are inert unless hold_policy is on (OFFLOAD_HOLDPOLICY=1 / OffloadMode
+# 'holds' / --hold-policy). With the policy off, offloadd behaves exactly as before.
+DEFAULT_HOLD_MS = 46            # OFFLOAD_HOLD_MS   — per-frame reply deadline (Jetlink HOLD_FRAME)
+DEFAULT_HOLDS_IN_A_ROW = 5      # OFFLOAD_HOLDS_IN_A_ROW — consecutive HOLDs -> behind
+DEFAULT_HOLDS_ALLOWED = 20      # OFFLOAD_HOLDS_ALLOWED  — HOLDs within the window -> behind
+DEFAULT_HOLD_WINDOW_S = 10.0    # OFFLOAD_HOLD_WINDOW   — rolling HOLD window (s)
+DEFAULT_PROVING_FRAMES = 20     # OFFLOAD_PROVING_FRAMES — settle window; any HOLD here is behind
+DEFAULT_SETTLING_FRAMES = 3     # OFFLOAD_SETTLING_FRAMES — first frames never hand back
+DEFAULT_LOST_MS = 200           # OFFLOAD_LOST_MS   — no Mac message at all -> lost
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+  """Truthy env var: unset/empty -> ``default``; 0/false/no/off -> False; else True."""
+  raw = os.getenv(name)
+  if raw is None or raw == "":
+    return default
+  return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+  raw = os.getenv(name)
+  if raw is None or raw == "":
+    return default
+  try:
+    return float(raw)
+  except ValueError:
+    return default
 
 
 def _env_ms(name: str, default: int) -> int:
@@ -159,10 +252,27 @@ class Config:
   recv_timeout_ms: int = DEFAULT_RECV_TIMEOUT_MS
   bench: bool = False
   bench_path: str = "/tmp/offloadd_bench.jsonl"
-  offload_mode: str = "auto"               # auto | shadow | drive  (explicit value = bench bypass)
+  offload_mode: str = "auto"               # auto | shadow | drive | holds (explicit = bench bypass)
   camera_addr: str = "127.0.0.1"           # local msgq address for camera states
   services: tuple = field(default_factory=lambda: tuple(RETURN_SERVICES))
   endpoint_for: object = None             # callable(service)->endpoint; tests inject a free port
+  shadow_map: dict = field(default_factory=lambda: dict(DEFAULT_SHADOW_MAP))
+  # shadow service names to open a device msgq PubMaster on (defaults to shadow_map's values).
+  shadow_services: tuple = field(default_factory=lambda: SHADOW_SERVICES)
+
+  # --- HOLD/BEHIND/LOST eligibility policy (Jetlink borrow; default OFF) --------
+  # When hold_policy is False every field below is inert and the daemon behaves exactly
+  # as it did before this port. Turn it on with OFFLOAD_HOLDPOLICY=1, OffloadMode='holds',
+  # or --hold-policy.
+  hold_policy: bool = field(default_factory=lambda: _env_flag("OFFLOAD_HOLDPOLICY", False))
+  hold_ms: int = field(default_factory=lambda: _env_ms("OFFLOAD_HOLD_MS", DEFAULT_HOLD_MS))
+  holds_in_a_row: int = field(default_factory=lambda: _env_ms("OFFLOAD_HOLDS_IN_A_ROW", DEFAULT_HOLDS_IN_A_ROW))
+  holds_allowed: int = field(default_factory=lambda: _env_ms("OFFLOAD_HOLDS_ALLOWED", DEFAULT_HOLDS_ALLOWED))
+  hold_window_s: float = field(default_factory=lambda: _env_float("OFFLOAD_HOLD_WINDOW", DEFAULT_HOLD_WINDOW_S))
+  proving_frames: int = field(default_factory=lambda: _env_ms("OFFLOAD_PROVING_FRAMES", DEFAULT_PROVING_FRAMES))
+  settling_frames: int = field(default_factory=lambda: _env_ms("OFFLOAD_SETTLING_FRAMES", DEFAULT_SETTLING_FRAMES))
+  lost_ms: int = field(default_factory=lambda: _env_ms("OFFLOAD_LOST_MS", DEFAULT_LOST_MS))
+  on_event: object = None                 # optional callable(kind:str, info:dict)->None observer
 
 
 class _CerealIO:
@@ -196,7 +306,8 @@ class _CerealIO:
 
   def open(self) -> None:
     self.sub = self._SubMaster(list(CAMERA_SERVICES), addr=self.cfg.camera_addr)
-    self.pub = self._PubMaster(list(self.cfg.services))
+    # forward remote outputs under the SHADOW names (INTERFACES §7), never the real ones.
+    self.pub = self._PubMaster(list(self.cfg.shadow_services))
 
   def update(self, timeout_ms: int) -> None:
     self.sub.update(timeout_ms)
@@ -213,6 +324,32 @@ class _CerealIO:
 
   def publish(self, service: str, payload: bytes) -> None:
     self.pub.send(service, payload)
+
+
+def _finite(o) -> bool:
+  """Recursively True when every float in ``o`` (dict/list/scalar from ``to_dict``) is finite."""
+  if isinstance(o, float):
+    return math.isfinite(o)
+  if isinstance(o, dict):
+    return all(_finite(v) for v in o.values())
+  if isinstance(o, (list, tuple)):
+    return all(_finite(v) for v in o)
+  return True
+
+
+def _all_finite(reader) -> bool:
+  """True when every float in the message payload is finite (never forward a non-finite output).
+
+  Jetlink only replaces hidden state after an all-finite frame (link-protocol.md "Hidden state
+  on the server"); carried over, we never forward a message carrying a NaN/Inf. The scan walks
+  the nested payload dict; on a synthetic modelV2 with 6208 B of position/velocity/acceleration/
+  laneLines floats it measured 0.024 ms on the bench Mac (RESULTS.md), so it is affordable at
+  20 Hz. Any decode error is treated as not-finite (fail safe: never forward).
+  """
+  try:
+    return _finite(reader.to_dict())
+  except Exception:
+    return False
 
 
 def _restamp(raw: bytes, now_ns: int) -> bytes:
@@ -239,16 +376,38 @@ class Offloadd:
     self.sof_by_frame: dict[int, int] = {}
     self.recent_republish: deque[float] = deque(maxlen=RING_SIZE)
     self.zmq_msgs = 0
-    self.published = 0
+    self.forwarded = 0                       # eligible remote msgs written to a shadow topic
+    self.published = 0                      # DEPRECATED alias of ``forwarded`` (compat)
     self.dropped_stale = 0
+    self.dropped_nonfinite = 0
     self.dropped_no_sof = 0
     self.dropped_error = 0
     self.gap_open = False
-    self.last_republish_mono: float | None = None
+    self.last_forward_mono: float | None = None
+    self.last_republish_mono: float | None = None   # DEPRECATED alias of last_forward_mono
     self._stop = False
     self._sub_socks: dict[str, zmq.Socket] = {}
     self._zmq_ctx = None
     self._start_mono = time.monotonic()
+
+    # -- HOLD/BEHIND/LOST eligibility state (inert unless cfg.hold_policy) ------
+    self.frame_expected: dict[int, float] = {}   # frameId -> device monotonic s first seen
+    self.handled_frames: set[int] = set()          # frameIds whose expected output was seen
+    self.frame_seen: set[int] = set()                # every camera frameId seen (for index-based ids)
+    self.last_received_mono: float | None = None   # last message from the Mac of ANY kind
+    self.hold_times: deque[float] = deque()        # monotonic s of recent HOLDs (rolling window)
+    self.holds_in_a_row = 0
+    self.behind = False                             # remote ineligible (behind); eligibility signal
+    self._proving_behind: str | None = None          # first-HOLD-in-proving-window reason, if any
+    self.remote_eligible = True                     # aggregate eligibility for modeld_v2 arbitration
+    self.hold_count = 0
+    self.behind_count = 0
+    self.lost_count = 0
+    self.lost = False
+    # last observed values (eligibility signal inputs). Empty dicts -> the corresponding
+    # sub-condition is not evaluated yet (matches Jetlink's "not seen -> pass" default).
+    self.max_tx_age_ns: dict[str, int] = {}
+    self.max_rx_age_ns: dict[str, int] = {}
 
   # -- lifecycle ---------------------------------------------------------------
   def request_stop(self, *_: object) -> None:
@@ -290,7 +449,7 @@ class Offloadd:
 
   # -- core step ---------------------------------------------------------------
   def step(self, now_ns: int | None = None) -> None:
-    """One iteration: refresh camera SOF, drain ZMQ, gate+republish, run gap watchdog.
+    """One iteration: refresh camera SOF, drain ZMQ, validate+forward, run watchdogs.
 
     ``now_ns`` injects the device clock for deterministic tests; production callers omit it.
     """
@@ -298,8 +457,12 @@ class Offloadd:
       now_ns = time.monotonic_ns()
     now_mono = now_ns / 1e9
     self._refresh_camera_sof(now_mono)
+    if self.cfg.hold_policy:
+      self._note_frame_arrivals(now_mono)
     self._drain_zmq(now_ns, now_mono)
     self._watchdog(now_mono)
+    if self.cfg.hold_policy:
+      self._hold_policy_tick(now_mono)
 
   def _refresh_camera_sof(self, now_mono: float) -> None:
     self.cereal.update(self.cfg.recv_timeout_ms)
@@ -309,6 +472,7 @@ class Offloadd:
         fid, sof = got
         if sof > 0:
           self.sof_by_frame[fid] = sof
+          self.frame_seen.add(fid)
     # evict stale entries (route/segment rollover safety)
     if self.sof_by_frame:
       cutoff = (now_mono - self.cfg.sof_ttl_ms / 1000.0) * 1e9
@@ -330,48 +494,181 @@ class Offloadd:
         self._handle_return(svc, raw, now_ns, now_mono)
 
   def _handle_return(self, svc: str, raw: bytes, now_ns: int, now_mono: float) -> None:
+    """Freshness-validate one remote message and, if eligible, forward it under its shadow name.
+
+    Never forwards a stale message; never forwards a message with a non-finite payload float;
+    never publishes a real service name (the local model owns those). Any message at all is
+    proof the link is alive, so it clears LOST (the 'comma re-hellos' equivalent).
+    """
+    if self.cfg.hold_policy:
+      self.last_received_mono = now_mono
+      if self.lost:
+        self.lost = False
+        self._reset_hold_accounting()
+        self._event("recovered", now_mono)
     try:
       from openpilot.cereal import log
       limit = 2 ** 64 - 1
       with log.Event.from_bytes(raw, traversal_limit_in_words=limit) as reader:
         if reader.which() != svc:
-          # wrong service on this port: never republish
+          # wrong service on this port: never forward
           self.dropped_error += 1
           return
         msg = getattr(reader, svc)
+        # -- "never forward stale" (drop, do not forward) --
         sof = sof_for_service(msg, self.sof_by_frame)
         if sof is None:
+          # un-ageable: never forward blind (kept from the pre-reframe design)
           self.dropped_no_sof += 1
           return
         age_ns = now_ns - sof
         if age_ns > self.cfg.stale_ms * 1_000_000:
           self.dropped_stale += 1
           return
-        # fresh: single-pass re-stamp; only the root header scalar is written, payload untouched
+        if self.cfg.hold_policy:
+          self.max_tx_age_ns[svc] = int(age_ns)
+        # -- "never forward non-finite output" (drop, do not forward) --
+        if not _all_finite(reader):
+          self.dropped_nonfinite += 1
+          return
+        # fresh + finite: single-pass re-stamp; only the root header scalar is written.
         b = reader.as_builder()
         b.logMonoTime = int(now_ns)
         out = b.to_bytes()
+        fid = int(msg.frameId) if hasattr(msg, "frameId") else None
     except Exception:
       self.dropped_error += 1
       return
 
+    if self.cfg.hold_policy and fid is not None:
+      # this frame's remote output has now been seen; mark it handled so no HOLD fires for it.
+      self.handled_frames.add(fid)
+      self.holds_in_a_row = 0
+
+    shadow = self.cfg.shadow_map.get(svc)
+    if shadow is None:
+      self.dropped_error += 1          # no shadow name mapped: never forward under the real one
+      return
     try:
-      self.cereal.publish(svc, out)
+      self.cereal.publish(shadow, out)
     except Exception:
       self.dropped_error += 1
       return
-
-    self.published += 1
+    self.forwarded += 1
+    self.published = self.forwarded    # compat alias
     self.recent_republish.append(now_mono)
+    self.last_forward_mono = now_mono
     self.last_republish_mono = now_mono
 
+  # -- HOLD/BEHIND/LOST eligibility (Jetlink borrow; only when cfg.hold_policy) -----
+  def _note_frame_arrivals(self, now_mono: float) -> None:
+    """Record the device-monotonic time each camera frame was first seen at offloadd.
+
+    This anchors the HOLD deadline: Jetlink measures HOLD_FRAME from the frame's warp start; we
+    measure OFFLOAD_HOLD_MS from the frame's first arrival here, because the device has no warp
+    of its own for a remotely computed frame. A frameId already known keeps its first-seen time.
+    """
+    for fid in list(self.sof_by_frame):
+      self.frame_expected.setdefault(fid, now_mono)
+    if not self.frame_expected:
+      return
+    # prune: keep an entry only as long as its output could still arrive fresh, plus the window.
+    keep_s = self.cfg.stale_ms / 1000.0 + self.cfg.hold_window_s
+    for fid in [fid for fid, t in self.frame_expected.items() if now_mono - t > keep_s]:
+      del self.frame_expected[fid]
+    self.handled_frames.intersection_update(self.frame_expected)
+    self.frame_seen.intersection_update(self.frame_expected)
+
+  def _hold_policy_tick(self, now_mono: float) -> None:
+    """Advance LOST, evaluate HOLD deadlines, and recompute the remote eligibility signal."""
+    # LOST: nothing from the Mac (any message) for lost_ms.
+    if self.last_received_mono is not None and (now_mono - self.last_received_mono) * 1000.0 >= self.cfg.lost_ms:
+      if not self.lost:
+        self.lost = True
+        self.lost_count += 1
+        self._event("lost", now_mono, extra={"silent_ms": round((now_mono - self.last_received_mono) * 1000.0, 1)})
+      self._reset_hold_accounting()
+    else:
+      if self.lost:
+        self.lost = False
+        self._reset_hold_accounting()
+      # HOLD: the oldest expected frame whose remote output has not been seen and is overdue.
+      deadline_s = self.cfg.hold_ms / 1000.0
+      for fid in sorted(self.frame_expected, key=lambda k: self.frame_expected[k]):
+        if fid in self.handled_frames:
+          continue
+        if now_mono - self.frame_expected[fid] < deadline_s:
+          continue
+        self._do_hold(fid, now_mono)
+        break
+
+    # behind is a per-frame signal (Jetlink recomputes it each frame) derived from the persistent
+    # HOLD state; the "behind" EVENT fires once per onset, so a sustained overshoot logs one line.
+    reason = None if self.lost else self._behind_now_reason()
+    if reason is not None and not self.behind:
+      self.behind_count += 1
+      self._event("behind", now_mono, extra={"reason": reason})
+    self.behind = reason is not None
+
+    # Eligibility signal for the modeld_v2 arbitration (INTERFACES §7). Local TX age is always
+    # satisfied here (the local model publishes steadily); RX age is the remote's freshness.
+    self.remote_eligible = self._compute_eligibility()
+
+  def _do_hold(self, fid: int, now_mono: float) -> None:
+    """A frame's remote output is overdue: count a HOLD and note a proving-window violation."""
+    self.handled_frames.add(fid)
+    self.holds_in_a_row += 1
+    self.hold_count += 1
+    self.hold_times.append(now_mono)
+    while self.hold_times and now_mono - self.hold_times[0] > self.cfg.hold_window_s:
+      self.hold_times.popleft()
+    self._event("hold", now_mono, extra={"frame_id": fid, "in_a_row": self.holds_in_a_row})
+    if self.cfg.settling_frames < fid <= self.cfg.proving_frames and self._proving_behind is None:
+      self._proving_behind = f"held frame {fid} of the first {self.cfg.proving_frames}"
+
+  def _behind_now_reason(self) -> str | None:
+    """Why the remote is behind right now, or None. Jetlink's _note_hold, recomputed per frame:
+    the first SETTLING_FRAMES never go behind; any HOLD among the first PROVING_FRAMES does;
+    then holds_in_a_row, then holds_allowed within the window."""
+    if self._proving_behind is not None:
+      return self._proving_behind
+    if self.holds_in_a_row >= self.cfg.holds_in_a_row:
+      return f"held {self.holds_in_a_row} frames in a row"
+    if len(self.hold_times) > self.cfg.holds_allowed:
+      return f"held {len(self.hold_times)} frames in {self.cfg.hold_window_s:.0f} s"
+    return None
+
+  def _compute_eligibility(self) -> bool:
+    """True when the remote may be selected. Any unsatisfied sub-condition makes it ineligible."""
+    if self.lost or self.behind:
+      return False
+    if self.hold_times:                       # a frame is currently held -> not eligible this frame
+      return False
+    limit_ns = self.cfg.stale_ms * 1_000_000
+    if self.max_tx_age_ns and max(self.max_tx_age_ns.values()) > limit_ns:
+      return False
+    if self.max_rx_age_ns and max(self.max_rx_age_ns.values()) > limit_ns:
+      return False
+    return True
+
+  def _reset_hold_accounting(self) -> None:
+    """Clear HOLD bookkeeping (on LOST, and before resuming fresh after a LOST)."""
+    self.holds_in_a_row = 0
+    self.hold_times.clear()
+    self._proving_behind = None
+
   def _watchdog(self, now_mono: float) -> None:
-    """Publish nothing if no valid republish happened within gap_ms; log the gap edges."""
-    if self.last_republish_mono is None:
+    """Log the return-link gap edges: no eligible remote forward within gap_ms.
+
+    This is about the RETURN link only. The real modelV2/... are the local model's and are never
+    gap-gated here; the shadow topics going quiet is the remote's staleness signal for the
+    modeld_v2 arbitration (INTERFACES §7), not for controlsd.
+    """
+    if self.last_forward_mono is None:
       if not self.gap_open and (now_mono - self._start_mono) * 1000.0 >= self.cfg.gap_ms:
         self._open_gap(now_mono)
       return
-    if (now_mono - self.last_republish_mono) * 1000.0 >= self.cfg.gap_ms:
+    if (now_mono - self.last_forward_mono) * 1000.0 >= self.cfg.gap_ms:
       self._open_gap(now_mono)
     elif self.gap_open:
       self.gap_open = False
@@ -383,26 +680,43 @@ class Offloadd:
       self._event("gap_open", now_mono)
 
   # -- output ------------------------------------------------------------------
-  def _event(self, kind: str, now_mono: float) -> None:
-    print(json.dumps({
+  def _event(self, kind: str, now_mono: float, extra: dict | None = None) -> None:
+    line = {
       "ts_mono": round(now_mono, 6),
       "event": kind,
       "gap_ms": self.cfg.gap_ms,
-    }), flush=True)
+    }
+    if extra:
+      line.update(extra)
+    print(json.dumps(line), flush=True)
 
   def stats(self, now_mono: float | None = None) -> dict:
     now_mono = time.monotonic() if now_mono is None else now_mono
-    return {
+    st = {
       "ts_mono": round(now_mono, 6),
       "uptime_s": round(now_mono - self._start_mono, 3),
       "zmq_msgs": self.zmq_msgs,
-      "published": self.published,
+      "forwarded": self.forwarded,
+      "published": self.published,          # compat alias of forwarded
       "dropped_stale": self.dropped_stale,
+      "dropped_nonfinite": self.dropped_nonfinite,
       "dropped_no_sof": self.dropped_no_sof,
       "dropped_error": self.dropped_error,
       "sof_frames_tracked": len(self.sof_by_frame),
       "gap_open": self.gap_open,
     }
+    if self.cfg.hold_policy:
+      st.update({
+        "hold_policy": True,
+        "holds": self.hold_count,
+        "held_in_a_row": self.holds_in_a_row,
+        "behind": self.behind,
+        "behind_events": self.behind_count,
+        "lost": self.lost,
+        "lost_events": self.lost_count,
+        "remote_eligible": self.remote_eligible,
+      })
+    return st
 
   def _emit_stats(self, now_mono: float) -> dict:
     st = self.stats(now_mono)
@@ -439,10 +753,12 @@ class Offloadd:
 def main() -> int:
   ap = argparse.ArgumentParser(description="device-side offload return-path republisher")
   ap.add_argument("--offload-mode", default=os.getenv("OFFLOAD_MODE", "auto"),
-                  choices=("auto", "shadow", "drive"),
-                  help="auto = read OffloadMode param (production); shadow/drive = explicit enable (bench)")
+                  choices=("auto", "shadow", "drive", "holds"),
+                  help="auto = read OffloadMode param (production); shadow/drive/holds = explicit enable (bench)")
   ap.add_argument("--connect-host", default=os.getenv("OFFLOAD_RETURN_HOST", "127.0.0.1"),
                   help="host where the Mac publishes RETURN_SERVICES")
+  ap.add_argument("--hold-policy", action="store_true",
+                  help="enable the HOLD/BEHIND/LOST timing policy (also OFFLOAD_HOLDPOLICY=1, or --offload-mode holds)")
   ap.add_argument("--bench", action="store_true", help="also append stats to a local /tmp jsonl")
   ap.add_argument("--bench-path", default="/tmp/offloadd_bench.jsonl")
   ap.add_argument("--stats-period", type=float, default=5.0)
@@ -460,12 +776,16 @@ def main() -> int:
       params = None
     mode = read_offload_mode(params)
     if not enabled_mode(mode):
-      print(json.dumps({"event": "disabled", "reason": "OffloadMode not in {shadow,drive}",
+      print(json.dumps({"event": "disabled", "reason": "OffloadMode not in {shadow,drive,holds}",
                         "offload_mode": mode}), flush=True)
       return 0
     cfg.offload_mode = mode or args.offload_mode
   else:
     cfg.offload_mode = args.offload_mode
+
+  # HOLD/BEHIND/LOST policy: on for --hold-policy, OFFLOAD_HOLDPOLICY=1, or OffloadMode 'holds'.
+  if args.hold_policy or cfg.offload_mode == HOLD_POLICY_MODE:
+    cfg.hold_policy = True
 
   if not _CerealIO(cfg).ready():
     print(json.dumps({"event": "disabled", "reason": "cereal bindings unavailable",

@@ -10,8 +10,43 @@ under `openpilot/offload/device/bench/`.
 | `02_mac_side.sh` | Mac ↔ device | find the tether link, show both link-local IPs, ping, iperf3 | **YES** (starts a one-shot iperf3 server) |
 | `03_live_smoke.sh` | Mac | run `openpilot/offload/mac/framebridge.py` against the device; print frame counts + decode p50/p99 | no (read-only on device) |
 | `04_disable_tether.sh` | Mac → device | reverse of 01: stop `adbd`, `AdbEnabled=0` | **YES** |
+| `05_device_tuning.sh` | Mac → device | read / apply / revert the device sysctls + FunctionFS-debug-off (`--apply`/`--revert`) | **YES** |
+| `06_latency_roundtrip.sh` | Mac ↔ device | NCM+TCP round-trip latency p50/p95/p99/p99.9/max, both directions, at 256/8192/8324 B | **YES** |
+| `echo_server.py` | either | tiny TCP echo server + matching latency client that 06 scp's to the device | helper |
+| `bench_resources.py` | **device** | PSS/smaps + VM-state sampler (jsonl to stdout or a path) for bench runs | **YES** |
 
-Order: `01 → 02 → 03 → … → 04`. Use the AUX USB-C port (USB 3.1 Gen2), never OBD-C.
+Order: `01 → 02 → 03 → … → 04`. Use the AUX USB-C port (USB 3.1 Gen2), never OBD-C. `05`/`06`/`bench_resources.py`
+are independent bench add-ons; run `05 --apply` before a latency/soak run and `05 --revert` after.
+
+### `05_device_tuning.sh` — what each knob buys (Jetlink `jetlink-root.sh:93,127-128`)
+
+- `vm.extra_free_kbytes=32768` + `dirty_bytes`/`dirty_background_bytes` caps — kswapd keeps ~32 MB
+  free ahead of the allocators so loggerd's reclaim does not stall a transfer. **Not `min_free_kbytes`**:
+  that false-trips openpilot's LOW-MEMORY gauge (see the script header; Jetlink shipped and reverted it).
+- `net.core.wmem_max`/`rmem_max=4194304` — a socket that asks for 4 MB keeps it (a big write goes in one shot).
+- FunctionFS debug logging **off** (`ipc_logging/f_fs/log_disable=1`) — `io_submit` 1.20 → 0.88 ms, frames 21.14 → 20.86 ms p50.
+- **RE-APPLY AFTER EVERY AGNOS UPDATE** (runtime values; `extra_free_kbytes` was dropped from later kernels —
+  the script reports a per-key failure rather than aborting). Revert: `bash 05_device_tuning.sh <host> --revert`.
+
+### `06_latency_roundtrip.sh` — the return-path decision number
+
+Measures the NCM+TCP round-trip distribution at 256 B (floor), **8192 B** (our return-path payload class) and
+**8324 B** (Jetlink's `INFER_RESP`), N ≥ 2000 per size, both directions, p50/p95/p99/**p99.9**/max ms.
+This closes the "NCM round-trip p99/p99.9 never measured" gap. **Expected reading:** local loopback sanity is
+p50 ~0.03 / p99.9 < 0.15 ms (harness is not the tail). Across the cable, absolute RTT should be far below
+Jetlink's raw-bulk number, but read the **tail**: Jetlink's raw-bulk USB3 **p99 was 45.7 ms** (`mac-performance.md:57-61`)
+right at their 46 ms boundary; ours is NCM+TCP with fatter tails, so **if our p99.9 is near or over 46 ms the
+return path is not viable as-is** — record the numbers in `../RESULTS.md`.
+
+### On-device shadow cost — measure it, do not assume it is free (P3/P4)
+
+Jetlink **removed** its per-frame shadow: shadow frames cost the comma ~9 ms of every frame while a window
+stayed shut, starving the driver-monitoring model under selfdrived's frequency floor (`joining.py:28-34`;
+COMPARISON-COMMS.md W2). Our design is additive (no device fork) so the mechanism differs, but the lesson is
+direct: **budget the on-device shadow cost deliberately**. Flag for **P3/P4**: sample the shadow path's added
+per-frame cost with `bench_resources.py` during the soak. It also argues for gating all return-path/arbitration
+work behind `OffloadMode` with the local model authoritative.
+
 
 Device facts this bench assumes (re-verify with `check_device.sh`):
 AGNOS Ubuntu 24.04 / kernel 4.9.103; configfs + F_FS + NCM built-in, **F_UVC not built**,

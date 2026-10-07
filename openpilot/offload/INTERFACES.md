@@ -90,5 +90,36 @@ Numeric parity with rlog `modelV2` is NEVER a gate (different model + lossy code
 | Any submodule pointer change in diff | Hard fail; revert. |
 | Other sessions' GPU load perturbs bench | Record loadavg; rerun; if still noisy, mark bench "provisional". |
 
+## 7. Active fallback / output arbitration (JOIN) — owner directive 2026-10-07; Jetlink-proven shape
+
+**Invariant: exactly ONE process on the device publishes {modelV2, drivingModelData, cameraOdometry,
+modelDataV2SP}. That process is the device modeld (modeld_v2).** The local model always runs and computes
+every frame (unchanged); the Mac's outputs are consumed only when eligible. Absence/death of the offload
+link NEVER removes model output — it only means the local output is published. ("Dead-man-switch the big
+model": the big model must continuously prove liveness to be selected; the local model is the default
+that never stops.)
+
+- **Remote delivery (offloadd, WS-D):** Mac→device over ZMQ; offloadd forwards each remote message into
+  device msgq under SHADOW names (contract.SHADOW_OUTPUT_SERVICES), header `logMonoTime` = device monotonic
+  at receipt, payload untouched. Stale (>OFFLOAD_STALE_MS) or non-finite messages are dropped, never forwarded.
+  Eligibility counters + behind/lost events logged; eligibility is signalled by presence/age of the shadow
+  messages, not by an API.
+- **Arbitration (device modeld_v2, OFFLOAD-gated):** at each publish point, if remote mode is engaged and an
+  eligible shadow output exists for the frame being published → publish the shadow's outputs under the real
+  names (re-stamped to device-now). Else publish the locally computed outputs (today's path).
+- **Eligibility:** shadow output for the target frame arrived within `OFFLOAD_ELIGIBLE_MS` (default 46) of the
+  frame's reference time, and its outputs are finite.
+- **Hysteresis (no per-frame flipping):** engage remote mode after `OFFLOAD_ENTER_N` (default 10 = 0.5 s)
+  consecutive eligible frames; disengage after `OFFLOAD_EXIT_N` (default 3) consecutive ineligible.
+- **Settling:** on engage, do not republish plans older than `OFFLOAD_SETTLE_N` (default 2) frames behind the
+  latest locally computed frame; mirror Jetlink's "large model owns its settling frames" behavior in structure.
+- **Cohesion:** all four messages published for a given frame come from ONE source (remote or local) — never
+  mixed within a frame's output set. cameraOdometry travels with its frame's source.
+- **Observability:** source switches + eligible/ineligible per-second counters via cloudlog (no schema change).
+  OPEN (lagd P4): re-identify the delay model per active source; log the source for that analysis.
+- **Failure semantics:** link dead / offloadd dead / Mac dead → eligibility 0 → local keeps publishing.
+  No disengage may be caused by the offload system.
+
 ## CHANGES REQUESTED
-(none)
+(none — §7 (join/arbitration) was added 2026-10-07 by PM under owner directive "active fallback /
+dead-man-switch the big model": local always publishes; remote selected only on continuous eligibility.)

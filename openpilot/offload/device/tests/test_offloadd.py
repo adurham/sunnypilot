@@ -29,15 +29,21 @@ from openpilot.offload.contract import RETURN_SERVICES
 from openpilot.offload.device import offloadd as od
 
 try:
-  import msgq  # noqa: F401
+  import msgq
   from openpilot.cereal import log as cereal_log
-  from openpilot.cereal.messaging import PubMaster, SubMaster, new_message
+  from openpilot.cereal.messaging import PubMaster, new_message
+  from openpilot.cereal.services import SERVICE_LIST
+  # namespace this process's msgq topics at import, before any socket/context exists, so other
+  # sessions on the shared Mac cannot feed our camera subscription a stray frameId (RESULTS.md).
+  msgq.set_fake_prefix(f"offloadtest-{os.getpid()}")
   _HAVE_CEREAL = True
 except Exception:  # pragma: no cover - host without native bindings
   _HAVE_CEREAL = False
+  SERVICE_LIST = {}
 
 needs_cereal = pytest.mark.skipif(not _HAVE_CEREAL, reason="cereal/msgq native bindings not importable")
 _TRAV = 2 ** 64 - 1
+
 
 
 def _wait_updated(sub, service: str, timeout: float = 2.0) -> bool:
@@ -183,12 +189,15 @@ def test_restamp_all_return_services_roundtrip():
 # ---------------------------------------------------------------------------
 
 class Fixture:
-  def __init__(self, gap_ms=400, stale_ms=300):
+  def __init__(self, gap_ms=400, stale_ms=300, cfg_extra=None):
     self.ports_map = {svc: _free_port() for svc in RETURN_SERVICES}
+    extra = dict(cfg_extra or {})
+    extra.setdefault("hold_policy", False)   # default-off unless a test opts in
     self.cfg = od.Config(
       stale_ms=stale_ms, gap_ms=gap_ms, recv_timeout_ms=20,
       endpoint_for=lambda svc: f"tcp://127.0.0.1:{self.ports_map[svc]}",
       services=tuple(RETURN_SERVICES),
+      **extra,
     )
     self.ctx = zmq.Context()
     self.pub = self.ctx.socket(zmq.PUB)
@@ -201,7 +210,14 @@ class Fixture:
     self.daemon.open()
 
     self.cam_pub = PubMaster(["narrowRoadCameraState"]) if _HAVE_CEREAL else None
-    self.recv_sub = SubMaster(["modelV2"]) if _HAVE_CEREAL else None
+    # Forward verification uses the RAW msgq transport, because a cereal SubMaster cannot yet
+    # construct on the shadow name: offloadModelV2 is registered in services.py but has no member
+    # in log.capnp's Event.union, so `new_message("offloadModelV2")` raises KjException (RESULTS.md
+    # "Jetlink borrows"). msgq itself carries the topic fine with a matching segment size.
+    self.shadow_name = self.cfg.shadow_map["modelV2"]
+    self.shadow_sub = (msgq.sub_sock(self.shadow_name, addr="127.0.0.1", timeout=200,
+                                    segment_size=SERVICE_LIST[self.shadow_name].queue_size)
+                       if _HAVE_CEREAL else None)
 
     self._wait_zmq_accepted()
     # SUBSCRIBE propagates just after ACCEPTED; give the link a moment so the first
@@ -254,6 +270,19 @@ class Fixture:
   def send_modelv2(self, fid: int, eof_ns: int, frame_age: int = 3) -> None:
     self.pub.send(_modelv2(fid, eof_ns, frame_age))
 
+  def recv_shadow(self, timeout_s: float = 3.0):
+    """Raw msgq receive on the shadow topic: (logMonoTime, frameId, frameAge), or None."""
+    if self.shadow_sub is None:
+      return None
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+      d = self.shadow_sub.receive()
+      if d:
+        with _load(bytes(d)) as r:
+          assert r.which() == "modelV2"          # payload unchanged: it is still a modelV2
+          return r.logMonoTime, r.modelV2.frameId, r.modelV2.frameAge
+    return None
+
   def close(self):
     self.daemon.close()
     try:
@@ -265,34 +294,53 @@ class Fixture:
 
 
 @needs_cereal
-def test_fresh_message_is_restamped_and_published():
+def test_fresh_message_is_restamped_and_forwarded():
   fx = Fixture()
   try:
     n, _sof = fx.learn_camera(1)
     fx.send_modelv2(1, n + 10_000_000)
     publish_now = n + 20_000_000          # 20 ms later -> well within 300 ms
-    assert fx.step_until(lambda: fx.daemon.published == 1, publish_now)
-    assert fx.daemon.published == 1
+    assert fx.step_until(lambda: fx.daemon.forwarded == 1, publish_now)
+    assert fx.daemon.forwarded == 1
     assert fx.daemon.dropped_stale == 0
-    assert _wait_updated(fx.recv_sub, "modelV2", 2.0)
-    assert fx.recv_sub.logMonoTime["modelV2"] == publish_now   # header = device now
-    assert fx.recv_sub["modelV2"].frameId == 1                  # payload intact
-    assert fx.recv_sub["modelV2"].frameAge == 3
+    # forwarded under the SHADOW name, not the real modelV2
+    got = fx.recv_shadow()
+    assert got is not None
+    mt, fid, age = got
+    assert mt == publish_now                # header re-stamped to device now
+    assert fid == 1 and age == 3            # payload intact
   finally:
     fx.close()
 
 
 @needs_cereal
-def test_stale_message_is_dropped_not_republished():
+def test_stale_message_is_dropped_not_forwarded():
   fx = Fixture(stale_ms=300)
   try:
     # camera frame advertised as 900 ms old: > stale (300) but < SOF TTL (1000) so it survives
     n, _sof = fx.learn_camera(1, sof_fn=lambda now: now - 900_000_000)
     fx.send_modelv2(1, n)
     assert fx.step_until(lambda: fx.daemon.dropped_stale == 1, n)
-    assert fx.daemon.published == 0
-    fx.recv_sub.update(200)
-    assert not fx.recv_sub.seen["modelV2"]
+    assert fx.daemon.forwarded == 0
+    assert fx.recv_shadow(timeout_s=0.5) is None     # nothing reached the shadow topic
+  finally:
+    fx.close()
+
+
+@needs_cereal
+def test_nonfinite_message_is_dropped_not_forwarded():
+  """A remote message carrying a NaN/Inf is never forwarded (Jetlink's all-finite rule)."""
+  fx = Fixture()
+  try:
+    n, _sof = fx.learn_camera(1)
+    raw = _modelv2(1, n + 2_000_000)
+    with _load(raw) as r:
+      b = r.as_builder()
+      b.modelV2.modelExecutionTime = float("nan")   # a non-finite float in the payload
+      bad = b.to_bytes()
+    fx.pub.send(bad)
+    assert fx.step_until(lambda: fx.daemon.dropped_nonfinite == 1, n)
+    assert fx.daemon.forwarded == 0
   finally:
     fx.close()
 
@@ -304,7 +352,7 @@ def test_no_sof_is_dropped():
     n = time.monotonic_ns()
     fx.send_modelv2(999, n)                   # frameId 999 was never announced
     assert fx.step_until(lambda: fx.daemon.dropped_no_sof == 1, n)
-    assert fx.daemon.published == 0
+    assert fx.daemon.forwarded == 0
   finally:
     fx.close()
 
@@ -314,18 +362,18 @@ def test_gap_watchdog_fires_then_clears():
   fx = Fixture(gap_ms=100, stale_ms=300)
   try:
     n, _sof = fx.learn_camera(1)
-    # establish a valid republish first (this is the gap baseline)
+    # establish a valid forward first (this is the gap baseline)
     fx.send_modelv2(1, n + 1_000_000)
-    assert fx.step_until(lambda: fx.daemon.published == 1, n + 20_000_000)
+    assert fx.step_until(lambda: fx.daemon.forwarded == 1, n + 20_000_000)
     assert not fx.daemon.gap_open
 
-    # nothing valid for > gap_ms (100 ms), age still < stale (300 ms) -> gap opens, no publish
+    # nothing valid for > gap_ms (100 ms), age still < stale (300 ms) -> gap opens, no forward
     fx.daemon.step(now_ns=n + 200_000_000)
     assert fx.daemon.gap_open
 
-    # a fresh frame for the same camera frame resumes republish and clears the gap
+    # a fresh frame for the same camera frame resumes forward and clears the gap
     fx.send_modelv2(1, n + 200_000_001)
-    assert fx.step_until(lambda: fx.daemon.published == 2, n + 200_000_000)
+    assert fx.step_until(lambda: fx.daemon.forwarded == 2, n + 200_000_000)
     assert not fx.daemon.gap_open
   finally:
     fx.close()
