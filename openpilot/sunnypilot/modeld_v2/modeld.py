@@ -132,6 +132,27 @@ def _load_offload_car_params():
   return get_demo_car_params()
 
 
+# OFFLOAD §4g: a non-finite frame must not tear down the offload host. jetlink's
+# server-side queues adopt the same rule (keep the last good hidden state, report
+# NOT_FINITE, keep serving) — JetlinkKit/.../Queues.swift:122-125. We preserve the
+# last good recurrent state (prev_feat feeds features_buffer) and publish nothing
+# for that frame; the absence is the staleness signal downstream. Device behavior
+# (OFFLOAD unset) is unchanged: the stock chestnut raise below still fires.
+_NONFINITE_OFFLOAD_STATE = {'count': 0, 'warned': False, 'last_warn_t': 0.0}
+_NONFINITE_WARN_INTERVAL_S = 5.0
+
+
+def _note_nonfinite_offload() -> None:
+  """Log a preserved non-finite frame once, then rate-limit while counting."""
+  st = _NONFINITE_OFFLOAD_STATE
+  st['count'] += 1
+  now = time.monotonic()
+  if not st['warned'] or (now - st['last_warn_t'] >= _NONFINITE_WARN_INTERVAL_S):
+    cloudlog.warning("OFFLOAD: non-finite model output (%d so far); keeping last-good state, publishing nothing", st['count'])
+    st['warned'] = True
+    st['last_warn_t'] = now
+
+
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -312,7 +333,15 @@ class ModelState(ModelStateBase):
 
     if self._combined_model_type == 'supercombo':
       model_output = raw_outputs.numpy().flatten()
-      if self.chestnut and not np.all(np.isfinite(model_output)):
+      # OFFLOAD §4g: on the offload host a non-finite frame preserves the last-good
+      # recurrent state and publishes nothing, instead of crashing (stock chestnut
+      # raise) or silently poisoning prev_feat. OFFLOAD unset => the original
+      # `self.chestnut and not finite: raise`, byte-identical device behavior.
+      if os.environ.get('OFFLOAD') == '1':
+        if not np.all(np.isfinite(model_output)):
+          _note_nonfinite_offload()
+          return None
+      elif self.chestnut and not np.all(np.isfinite(model_output)):
         raise RuntimeError("model output not finite")
       sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
       outputs = self.parser.parse_outputs(sliced)
@@ -320,6 +349,10 @@ class ModelState(ModelStateBase):
         self.numpy_inputs['prev_feat'][:] = model_output[self.vision_output_slices['hidden_state']]
     else:
       vision_output = raw_outputs[0].numpy().flatten()
+      if os.environ.get('OFFLOAD') == '1' and not np.all(np.isfinite(vision_output)):
+        # OFFLOAD §4g: same last-good policy for the split/multi-policy host path.
+        _note_nonfinite_offload()
+        return None
       vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
       outputs = self.parser.parse_vision_outputs(vision_sliced)
 
@@ -328,6 +361,10 @@ class ModelState(ModelStateBase):
 
       for i, policy_slices in enumerate(self._policy_slices_list):
         policy_output = raw_outputs[i + 1].numpy().flatten()
+        if os.environ.get('OFFLOAD') == '1' and not np.all(np.isfinite(policy_output)):
+          # OFFLOAD §4g: same last-good policy as the supercombo branch (jetlink Queues.swift:122-125).
+          _note_nonfinite_offload()
+          return None
         policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
         parsed = self.parser.parse_policy_outputs(policy_sliced)
         if ('off' in self._policy_keys[i]

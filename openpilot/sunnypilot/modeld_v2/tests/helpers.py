@@ -8,6 +8,8 @@ See the LICENSE.md file in the root directory for more details.
 import pathlib
 import tempfile
 
+import numpy as np
+
 import openpilot.sunnypilot.models.helpers as helpers
 import openpilot.sunnypilot.modeld_v2.modeld as modeld_module
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants
@@ -60,6 +62,46 @@ class Archetype:
 
 def _noop_jit(**kwargs):
   pass
+
+
+class FakeRunModel:
+  """Callable stand-in for a compiled `run_model` JIT.
+
+  Returns a Tensor whose flat float32 output is drawn from `flats` (one entry per
+  call, the last repeats). NOT pickled into a pkl — assign it onto a ModelState
+  after construction (the init path never calls run_model).
+  """
+
+  def __init__(self, flats):
+    self.flats = [np.asarray(f, dtype=np.float32) for f in flats]
+    self.calls = 0
+
+  def __call__(self, **inputs):
+    from tinygrad.tensor import Tensor
+    flat = self.flats[min(self.calls, len(self.flats) - 1)]
+    self.calls += 1
+    return (Tensor(flat, device='NPY').realize(),)
+
+
+SUPERCOMBO_RUN_INPUT_SHAPES = {
+  'img': (1, 12, 128, 256), 'big_img': (1, 12, 128, 256),
+  'features_buffer': (1, 24, 512), 'desire_pulse': (1, 25, 8),
+  'traffic_convention': (1, 2), 'action_t': (1, 2),
+}
+
+
+def write_supercombo_run_pkl(tmp_path, output_slices=None):
+  """Write a run_model supercombo pkl (metadata 'model' + run_model JIT). Returns path."""
+  from openpilot.selfdrive.modeld.helpers import dump_oob
+  if output_slices is None:
+    output_slices = SUPERCOMBO_SLICES  # plan/hidden_state/meta; defined below
+  pkl_data = {'metadata': {'model': {'input_shapes': SUPERCOMBO_RUN_INPUT_SHAPES,
+                                     'output_slices': output_slices}},
+              'run_model': {(CAM_W, CAM_H): _noop_jit}}
+  pkl_path = tmp_path / 'driving_test_tinygrad.pkl'
+  with open(pkl_path, 'wb') as f:
+    dump_oob(pkl_data, f)
+  return pkl_path
 
 
 def _make_vision_policy_metadata(vision_input_shapes, policy_input_shapes,

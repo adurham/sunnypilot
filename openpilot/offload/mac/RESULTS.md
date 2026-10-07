@@ -150,3 +150,28 @@ tuple. (3) `modeld_runner` drops the zero-pad and now **asserts** `len(buf) >= f
   `test_integration_replay.py`, `test_zmq_loopback.py`
 - `openpilot/offload/mac/logs/*.jsonl` + `*.log` (raw runs)
 - fixtures (WS-B-generated, WS-C-owned dir): `openpilot/offload/replay/fixtures/00000149--4a4df1cf8a--36/{narrow,wide}.enc`
+- `openpilot/offload/mac/run_framebridge.sh` (caffeinate / App-Nap-safe launcher)
+- `openpilot/offload/mac/bench_resources_mac.py` (macOS soak/resource sampler)
+- `openpilot/offload/mac/RUNBOOK.md` (sleep assertions & App Nap; soak evidence; OFFLOAD §4g guard)
+
+## RUNBOOK — sleep/App Nap, soak evidence, guard
+
+Operational details moved to `openpilot/offload/mac/RUNBOOK.md`:
+
+- **Sleep assertions & App Nap.** jetlink measured an in-process server throttled by App
+  Nap at p50 75 ms vs 36 ms for the same work as a CLI process
+  (`~/repos/jetlink/JetlinkKit/Sources/JetlinkServer/Server.swift:530-545`). Our
+  `framebridge.py` is a plain CLI process and should already be exempt, but the wrapper is
+  cheap insurance: **use `run_framebridge.sh` for all soak/bench runs.** It prints whether
+  it wraps in `caffeinate`, the pre-run `pmset -g assertions`, and an `NSAppSleepDisabled`
+  note.
+- **Soak evidence.** `bench_resources_mac.py` (stdlib + subprocess) samples per-PID RSS/CPU,
+  `memory_pressure` / `vm_stat`, swap + swap I/O deltas, compressor, and a one-shot
+  `pmset -g therm`; it writes jsonl + a summary with least-squares MB/h trends and leak
+  flags (slope > 5 MB/h, R² ≥ 0.5, window ≥ 300 s). This is the Mac counterpart to the
+  device-side PSS sampler and gives the soak "flat memory" claim actual evidence.
+- **OFFLOAD §4g non-finite guard.** On the offload Mac a non-finite model output now
+  preserves the last-good recurrent state and publishes nothing instead of crashing or
+  silently poisoning `prev_feat` — all inside `if OFFLOAD` guards; device behavior (OFFLOAD
+  unset) is byte-identical. See `modeld.py:336-345,352-355,364-367`; unit test
+  `tests/test_offload_guard.py`.
