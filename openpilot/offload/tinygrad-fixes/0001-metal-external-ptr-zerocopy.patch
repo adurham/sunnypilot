@@ -1,5 +1,5 @@
 diff --git a/tinygrad/runtime/ops_metal.py b/tinygrad/runtime/ops_metal.py
-index 770162c0c..56d7b2079 100644
+index 770162c0c..03e2316bd 100644
 --- a/tinygrad/runtime/ops_metal.py
 +++ b/tinygrad/runtime/ops_metal.py
 @@ -156,8 +156,21 @@ class MetalBuffer:
@@ -11,10 +11,10 @@ index 770162c0c..56d7b2079 100644
 +    # OFFLOAD fork fix (2026-10-07): external_ptr from Tensor.from_blob is a RAW HOST ADDRESS,
 +    # not an existing MTLBuffer object. metal.MTLBuffer(options.external_ptr) fabricated a Spec
 +    # whose .contents()/.release() message-sent to a bogus pointer -> SIGSEGV (objc.py:33).
-+    # Upstream tinygrad master 18345d059 has the same defect (reported upstream).
-+    # Wrap the caller's memory ZERO-COPY via newBufferWithBytesNoCopy — aliasing must be preserved
-+    # (from_blob contract: writes to the source must be visible to the tensor; the frame pipeline
-+    # caches tensors per buffer address, so a copy would freeze frames).
++    # Upstream keeps this signature on purpose (its METAL path expects a device-owned MTLBuffer),
++    # so the fix is fork-local. Wrap the caller's memory ZERO-COPY via newBufferWithBytesNoCopy —
++    # aliasing must be preserved (from_blob contract: writes to the source must be visible to the
++    # tensor; the frame pipeline caches tensors per buffer address, so a copy would freeze frames).
 +    if options.external_ptr is not None:
 +      ret = objc.msg("newBufferWithBytesNoCopy:length:options:deallocator:", metal.MTLBuffer,
 +                     [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, objc.id_], retain=True)(
