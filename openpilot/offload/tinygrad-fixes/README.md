@@ -1,38 +1,66 @@
 # tinygrad fork fixes (offload track)
 
-Patches applied to the `tinygrad_repo` submodule that are **fork-local and not upstream**.
-The offload CI cannot carry submodule changes, so the Mac worktree applies these locally via
-`apply.sh` (idempotent; safe to re-run after `git submodule update`). Re-run it whenever the
-submodule pin moves — the patch is anchored on the pinned commit's source.
+The METAL `external_ptr` fix lives on **our tinygrad fork**, not upstream:
 
-| Patch | Why | Status |
-|---|---|---|
-| `0001-metal-external-ptr-zerocopy.patch` | `Tensor.from_blob(host_addr, device='METAL')` segfaults on macOS. `MetalAllocator._alloc` does `metal.MTLBuffer(options.external_ptr)`, which constructs a bogus Spec from an int rather than doing an ObjC message send, so the later `.contents()` / `.release()` / `mark_resident()` calls message-send to garbage. The offload pipeline needs exactly this call for zero-copy frame ingest (`model_adapters.copy_frames` → `Tensor.from_blob(ptr, device=WARP_DEV)`). | **Fork-local, not upstream.** Wraps the caller's memory with `newBufferWithBytesNoCopy:length:options:deallocator:` (aliasing preserved — required, since the frame tensor is cached per buffer address and the source is rewritten every frame). Do NOT swap in `newBufferWithBytes:length:options:`: it copies, which silently freezes frames. |
+    https://github.com/adurham/tinygrad
+    branch: offload-metal-external-ptr   (commit 16d93f68c)
+    base:   fe5d3169b  == the exact commit the superproject pins
 
-## Scope and blast radius
+Upstream (`tinygrad/tinygrad`) keeps the current signature on purpose — a maintainer closed the
+report with "from_blob for METAL expects an MTLBuffer" — so this is fork-local by design, and
+**never open an upstream PR for it**.
 
-- **The device is unaffected**: AGNOS compiles tinygrad with `DEV=QCOM`, so the METAL allocator
-  is never exercised there. This matters only on the tethered Mac.
-- **Upstream intends the current signature.** A tinygrad maintainer closed the report with
-  "from_blob for METAL expects an MTLBuffer" — that path is only supported for buffers the caller
-  obtained from the same METAL device. Our use (a host pointer produced by the VisionIPC frame
-  buffer) is outside that contract, so the fix lives in this fork and is re-applied locally.
-  If upstream ever changes the external-pointer contract, re-check this patch rather than
-  assuming it still applies.
+## Why the fix is not in the superproject's gitlink
+
+The prebuilt tree ships tinygrad flattened (real files, zero gitlinks/.gitmodules), and the sync
+workflow hard-fails on any gitlink in that tree. A superproject pointer change would therefore be
+either flattened (fine) or rejected (loudly) — but it would also churn CI for a Mac-only fix the
+device never executes (`DEV=QCOM`). So the fork carries the commit and the Mac applies it locally.
+
+## Applying it on the Mac
+
+```bash
+# 1. fetch the fork's branch and check it out in the submodule
+cd tinygrad_repo
+git fetch https://github.com/adurham/tinygrad.git offload-metal-external-ptr
+git checkout FETCH_HEAD
+
+# 2. or apply the patch form (idempotent; no fork fetch needed)
+bash openpilot/offload/tinygrad-fixes/apply.sh
+```
+
+Both reach the same tree. `apply.sh` is the offline form (patch file in this dir, anchored on the
+pinned commit's source) — re-run it after any `git submodule update`. If the submodule pin moves,
+rebase the patch rather than forcing it (`apply.sh` fails closed rather than fuzz-applying).
+
+## What it fixes
+
+`Tensor.from_blob(host_addr, device='METAL')` segfaults: `MetalAllocator._alloc` passes the raw
+address to `metal.MTLBuffer(...)`, which builds a Spec whose `.value` is that integer instead of
+doing an ObjC message send, so the next `contents()` / `release()` / `mark_resident()` call
+message-sends to a bogus pointer. The offload frame path needs exactly this call
+(`model_adapters.copy_frames` → `Tensor.from_blob(ptr, device=WARP_DEV)`).
+
+The fix wraps the caller's memory with `newBufferWithBytesNoCopy:length:options:deallocator:`
+(zero-copy, `deallocator=None` so ownership stays with the caller). Zero-copy is **required**, not
+stylistic: `from_blob` promises the tensor aliases the source and `test_tensor_from_blob` asserts
+it, and the frame tensor is cached per buffer address while the source is rewritten every frame —
+a copying constructor would silently freeze frame contents.
+
+## Scope
+
+- **Device unaffected**: AGNOS compiles tinygrad with `DEV=QCOM`; the METAL allocator never runs.
+- The fix matters only on the tethered Mac (and any other macOS METAL user of host-pointer blobs).
 
 ## Reproduce
 
 ```bash
-cd tinygrad_repo && git status --short   # expect: M tinygrad/runtime/ops_metal.py after apply.sh
+cd tinygrad_repo && git status --short    # M tinygrad/runtime/ops_metal.py once applied
 PYTHONPATH="$PWD/tinygrad_repo" ../.venv/bin/python -u ../openpilot/offload/tinygrad-fixes/repro_from_blob.py
-# without the patch: Fatal Python error: Segmentation fault (ops_metal.py _alloc -> objc.py msg send)
-# with the patch:    RESULT: PASS
+# unfixed: Fatal Python error: Segmentation fault (ops_metal.py _alloc -> objc.py msg send)
+# fixed:   RESULT: PASS   (also asserts the aliasing property)
 ```
 
-The repro also asserts the aliasing property (`src[i] = x` must be visible through the tensor),
-which is the reason the zero-copy constructor is required.
-
-History: METAL host-pointer `from_blob` has never worked here — on the Aug/Sept pins it crashed
-later (kernel-bind, `setBuffer_offset_atIndex`), on the Oct pin it crashes in allocation. The
-Oct 7 sync (`buffer: rework storage` #18060 onwards) moved the crash site; it did not introduce
-the defect relative to our usage.
+History: METAL host-pointer `from_blob` never worked here. On the Aug/Sept pins it crashed later
+(kernel-bind, `setBuffer_offset_atIndex`); on the Oct pin it crashes in allocation. The Oct 7 sync
+(`buffer: rework storage` #18060) moved the crash site; it did not introduce the defect.

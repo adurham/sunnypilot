@@ -21,11 +21,39 @@ Env vars consumed on the Mac path:
   OFFLOAD_VIPC_SERVER        VisionIPC server name (consumed in modeld.py)
 """
 import os
+import re
 import sys
 import types
 from enum import IntEnum, IntFlag
 
 OFFLOAD = os.environ.get('OFFLOAD') == '1'
+
+
+def _keys_from_header() -> dict:
+  """Parse openpilot/common/params_keys.h for {key: default-string}.
+
+  The shim used to carry a hand-maintained default dict, which silently returned None
+  for any key it had not enumerated (first failure: LaneTurnValue -> float(None) during
+  DesireHelper() init, killing modeld on the Mac). The header is the single source of
+  truth, so read it and stop guessing. Missing/unparsable header -> empty map (falls
+  back to the small built-in set below).
+  """
+  out: dict[str, str] = {}
+  try:
+    header = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          '..', '..', 'common', 'params_keys.h')
+    with open(header) as f:
+      for line in f:
+        m = re.match(r'\s*\{"([A-Za-z0-9_]+)",\s*\{([^}]*)\}', line)
+        if not m:
+          continue
+        key, body = m.group(1), m.group(2)
+        parts = [p.strip() for p in body.split(',')]
+        if len(parts) >= 3 and parts[2].startswith('"'):
+          out[key] = parts[2].strip('"')
+  except OSError:
+    pass
+  return out
 
 
 def _install_params_shim() -> None:
@@ -54,11 +82,10 @@ def _install_params_shim() -> None:
     JSON = 5
     BYTES = 6
 
-  _DEFAULTS = {
-    'LagdValueCache': 0.1,
-    'PlanplusControl': 1.0,
-    'CameraOffset': 0.0,
-  }
+  # Real defaults from params_keys.h, plus the float keys modeld_v2 reads that carry
+  # no default in the header (the on-device C++ layer supplies these from lagd/params).
+  _HEADER_DEFAULTS = _keys_from_header()
+  _EXTRA_FLOAT_DEFAULTS = {'LagdValueCache': 0.1}
 
   class Params:
     def __init__(self, d=""):
@@ -74,7 +101,27 @@ def _install_params_shim() -> None:
       return ParamKeyType.STRING
 
     def _default(self, key):
-      return _DEFAULTS.get(key)
+      """Typed default for `key`, or None when the key genuinely has no default.
+
+      Order: fork-specific float overrides, then the parsed params_keys.h table
+      (values are stored as the header's literal strings, coerced by the header's
+      declared type where we can tell), then None.
+      """
+      if key in _EXTRA_FLOAT_DEFAULTS:
+        return _EXTRA_FLOAT_DEFAULTS[key]
+      raw = _HEADER_DEFAULTS.get(key)
+      if raw is None:
+        return None
+      # The header declares types positionally; coerce the obvious ones so callers
+      # doing arithmetic (float(get(...)) is fine either way) or truthiness get sane values.
+      if raw == "0":
+        return False
+      if raw == "1":
+        return True
+      try:
+        return float(raw)
+      except ValueError:
+        return raw
 
     def get(self, key, block=False, return_default=False):
       override = os.environ.get(f'OFFLOAD_{key.upper()}')

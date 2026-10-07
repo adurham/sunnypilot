@@ -13,7 +13,7 @@ sleep 7   # VisionIPC + first IDR
 
 echo "[2/3] modeld_v2 runner (live VisionIPC, OFFLOAD=1)"
 # The runner needs the model pkl + CarParams. Use the fork-flavor METAL pkl built in-tree.
-export COMBINED_MODEL_PKL="$PWD/openpilot/offload/models/driving_supercombo_fork_metal.pkl"
+export COMBINED_MODEL_PKL="$PWD/openpilot/offload/models/driving_supercombo_fork_metal2.pkl"
 [ -f "$HOME/.hermes/cache/scratch/car-features/offload/models/carparams.bin" ] && \
   export OFFLOAD_CARPARAMS_PKL="$HOME/.hermes/cache/scratch/car-features/offload/models/carparams.bin"
 OFFLOAD=1 .venv/bin/python -m openpilot.offload.replay.modeld_runner --frames 300 --timeout 40 \
