@@ -148,9 +148,10 @@ if [[ "$IFACE" == *"usb0"* ]]; then add PASS tether_iface "usb0 present: $IFACE"
 DPCT="$(rsh_retry "df -P /data | awk 'NR==2{print \$5}'")"
 if [[ -n "$DPCT" ]]; then
   USE="${DPCT%\%}"
-  if (( USE >= 90 )); then add FAIL data_space "/data ${DPCT} used — offload deliverables must not write here"
-  elif (( USE >= 80 )); then add WARN data_space "/data ${DPCT} used"
-  else add PASS data_space "/data ${DPCT} used"; fi
+  # 90% is this device's DESIGNED steady state: logs stay local by choice while comma prime
+  # uploads cloud copies; the deleter floor parks it here. Informational only — never a FAIL.
+  if (( USE >= 95 )); then add WARN data_space "/data ${DPCT} used (steady state ~90% is normal; ≥95% worth a look)"
+  else add PASS data_space "/data ${DPCT} used (steady state ~90% is normal — local logs + prime upload)"; fi
 else
   add WARN data_space "could not read df /data"
 fi
