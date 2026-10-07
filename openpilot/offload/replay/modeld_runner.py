@@ -161,7 +161,7 @@ def main(argv=None) -> int:
       # size 4804608 for 1928x1208), so the run path's np.frombuffer(count=frame_copy_size)
       # reads a correctly laid-out NV12 frame (Y plane first, stride-aligned). Fail loudly
       # if the geometry ever regresses to the old tight layout instead of zero-padding.
-      fcs = int(getattr(model, "frame_copy_size", 0))
+      fcs = int(getattr(getattr(model, "adapter", None), "frame_copy_size", 0))
       if fcs:
         for name, b in bufs.items():
           if b is None:

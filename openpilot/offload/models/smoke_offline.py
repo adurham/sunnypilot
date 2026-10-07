@@ -46,7 +46,7 @@ def run_pass(pkl, n_iters, seed):
   model = M.ModelState(cam_w=CAM_W, cam_h=CAM_H, chestnut=False)
   model.warmup()
 
-  frame = np.arange(model.frame_copy_size, dtype=np.uint8) % 251
+  frame = np.arange(model.adapter.frame_copy_size, dtype=np.uint8) % 251
   bufs = {name: frame.tobytes() for name in model.vision_input_names}
   transforms = {name: np.eye(3, dtype=np.float32) for name in model.vision_input_names}
 

@@ -63,7 +63,7 @@ class TestOffloadNonFiniteGuard(OpenpilotTestCase):
     return modeld_module.ModelState(cam_w=CAM_W, cam_h=CAM_H)
 
   def _bufs_and_inputs(self, state):
-    frame = (np.arange(state.frame_copy_size, dtype=np.uint8) % 251)
+    frame = (np.arange(state.adapter.frame_copy_size, dtype=np.uint8) % 251)
     bufs = {name: frame.tobytes() for name in state.vision_input_names}
     transforms = {name: np.eye(3, dtype=np.float32) for name in state.vision_input_names}
     vec_desire = np.zeros(state.constants.DESIRE_LEN, dtype=np.float32)
@@ -76,10 +76,12 @@ class TestOffloadNonFiniteGuard(OpenpilotTestCase):
 
   def test_nonfinite_preserves_last_good_state_and_continues(self, tmp_path, monkeypatch, patch_modeld):
     state = self._make_state(tmp_path, monkeypatch, patch_modeld)
-    assert state.is_run_model and state._combined_model_type == 'supercombo'
+    # POST-MERGE (2026-10-07): ModelState delegates to the adapter; the supercombo
+    # run path is adapter.run() -> run_policy(...). ModelState.is_run_model is gone.
+    assert state._combined_model_type == 'supercombo'
 
     # one good frame first, so prev_feat holds a known good value
-    state.run_model = FakeRunModel([_good_flat()])
+    state.adapter.run_policy = FakeRunModel([_good_flat()])
     bufs, transforms, inputs = self._bufs_and_inputs(state)
     out = state.run(bufs, transforms, inputs)
     assert out is not None
@@ -89,14 +91,14 @@ class TestOffloadNonFiniteGuard(OpenpilotTestCase):
 
     # a non-finite frame: no exception, nothing published, last-good state kept
     before_count = modeld_module._NONFINITE_OFFLOAD_STATE['count']
-    state.run_model = FakeRunModel([_bad_flat()])
+    state.adapter.run_policy = FakeRunModel([_bad_flat()])
     out = state.run(bufs, transforms, inputs)  # must NOT raise
     assert out is None
     assert modeld_module._NONFINITE_OFFLOAD_STATE['count'] == before_count + 1
     np.testing.assert_array_equal(state.numpy_inputs['prev_feat'], good_state)
 
     # a subsequent good frame runs normally and advances the hidden state
-    state.run_model = FakeRunModel([_good_flat() * 2.0])
+    state.adapter.run_policy = FakeRunModel([_good_flat() * 2.0])
     out = state.run(bufs, transforms, inputs)
     assert out is not None
     np.testing.assert_allclose(np.asarray(state.numpy_inputs['prev_feat']).ravel(),
@@ -105,7 +107,7 @@ class TestOffloadNonFiniteGuard(OpenpilotTestCase):
   def test_nonfinite_is_rate_limited(self, tmp_path, monkeypatch, patch_modeld):
     state = self._make_state(tmp_path, monkeypatch, patch_modeld)
     bufs, transforms, inputs = self._bufs_and_inputs(state)
-    state.run_model = FakeRunModel([_bad_flat()])
+    state.adapter.run_policy = FakeRunModel([_bad_flat()])
     start = modeld_module._NONFINITE_OFFLOAD_STATE['count']
     for _ in range(3):
       assert state.run(bufs, transforms, inputs) is None
@@ -117,7 +119,7 @@ class TestOffloadNonFiniteGuard(OpenpilotTestCase):
     state = self._make_state(tmp_path, monkeypatch, patch_modeld, offload=False)
     # chestnut models are the only ones that carry the finite check; force it
     monkeypatch.setattr(state, 'chestnut', True)
-    state.run_model = FakeRunModel([_bad_flat()])
+    state.adapter.run_policy = FakeRunModel([_bad_flat()])
     bufs, transforms, inputs = self._bufs_and_inputs(state)
     with self.assertRaisesRegex(RuntimeError, "not finite"):
       state.run(bufs, transforms, inputs)

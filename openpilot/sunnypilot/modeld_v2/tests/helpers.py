@@ -67,11 +67,13 @@ def _noop_jit(**kwargs):
 
 
 class FakeRunModel:
-  """Callable stand-in for a compiled `run_model` JIT.
+  """Callable stand-in for a compiled `run_policy` JIT (the supercombo path).
 
   Returns a Tensor whose flat float32 output is drawn from `flats` (one entry per
-  call, the last repeats). NOT pickled into a pkl — assign it onto a ModelState
-  after construction (the init path never calls run_model).
+  call, the last repeats). NOT pickled into a pkl — assign it onto
+  `state.adapter.run_policy` after construction (the init path never calls it).
+  POST-MERGE (2026-10-07): ModelState no longer owns run_model/run_policy; the run
+  path goes through the adapter, which returns the policy Tensor directly.
   """
 
   def __init__(self, flats):
@@ -82,7 +84,7 @@ class FakeRunModel:
     from tinygrad.tensor import Tensor
     flat = self.flats[min(self.calls, len(self.flats) - 1)]
     self.calls += 1
-    return (Tensor(flat, device='NPY').realize(),)
+    return Tensor(flat, device='NPY').realize()
 
 
 SUPERCOMBO_RUN_INPUT_SHAPES = {
@@ -93,15 +95,22 @@ SUPERCOMBO_RUN_INPUT_SHAPES = {
 
 
 def write_supercombo_run_pkl(tmp_path, output_slices=None):
-  """Write a run_model supercombo pkl (metadata 'model' + run_model JIT). Returns path."""
-  # POST-MERGE (2026-10-07): upstream's ONNX-compiler sync (#38922) removed dump_oob from
-  # openpilot.selfdrive.modeld.helpers; it lives in the sunnypilot helpers only.
+  """Write a supercombo pkl in the POST-MERGE layout. Returns path.
+
+  POST-MERGE (2026-10-07): upstream's ONNX-compiler sync changed the combined-pkl
+  layout. LegacyModelAdapter now reads a top-level `run_policy` JIT plus a
+  `(cam_w, cam_h)` warp JIT; the old `'run_model': {(w, h): jit}` nesting is no
+  longer accepted (KeyError: (1928, 1208)). Mirrors helpers.make_pkl_data().
+  Also note: dump_oob moved from openpilot.selfdrive.modeld.helpers to
+  openpilot.sunnypilot.modeld_v2.helpers.
+  """
   from openpilot.sunnypilot.modeld_v2.helpers import dump_oob
   if output_slices is None:
     output_slices = SUPERCOMBO_SLICES  # plan/hidden_state/meta; defined below
   pkl_data = {'metadata': {'model': {'input_shapes': SUPERCOMBO_RUN_INPUT_SHAPES,
                                      'output_slices': output_slices}},
-              'run_model': {(CAM_W, CAM_H): _noop_jit}}
+              'run_policy': _noop_jit,
+              (CAM_W, CAM_H): _noop_jit}
   pkl_path = tmp_path / 'driving_test_tinygrad.pkl'
   with open(pkl_path, 'wb') as f:
     dump_oob(pkl_data, f)

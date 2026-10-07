@@ -35,7 +35,7 @@ ROUTE = os.path.expanduser("~/comma-routes/00000149--4a4df1cf8a--36")
 HEVC = os.path.join(ROUTE, "fcamera.hevc")
 FIXTURE = os.path.join(REPO, "openpilot/offload/replay/fixtures/00000149--4a4df1cf8a--36/narrow.enc")
 VTDEC = os.path.join(REPO, "openpilot/offload/mac/vtdec")
-PKL = os.path.join(REPO, "openpilot/offload/models/driving_supercombo_fork_metal.pkl")
+PKL = os.path.join(REPO, "openpilot/offload/models/driving_supercombo_fork_metal2.pkl")
 PKL_MANIFEST = PKL + ".chunkmanifest"
 
 DEVICE_STRIDE = 2048
@@ -145,10 +145,10 @@ def test_modeld_runner_and_real_forward_pass_over_device_geometry(tmp_path, monk
   def run_pass():
     model = M.ModelState(cam_w=w, cam_h=h, chestnut=False)
     model.warmup()
-    assert model.frame_copy_size == 3735552
+    assert model.adapter.frame_copy_size == 3735552
     outs = []
     for fb in frames:
-      assert len(fb) >= model.frame_copy_size  # the OPEN-C1 assert in modeld_runner
+      assert len(fb) >= model.adapter.frame_copy_size  # the OPEN-C1 assert in modeld_runner
       bufs = dict.fromkeys(model.vision_input_names, fb)
       transforms = {k: np.eye(3, dtype=np.float32) for k in model.vision_input_names}
       out = model.run(bufs, transforms, make_inputs(model))
