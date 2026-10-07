@@ -148,8 +148,7 @@ def test_replay_exact_frame_ids_and_sof(tmp_path):
   # decode_ms must be logged for the frames we published.
   assert dec, f"no decode_ms rows logged; framebridge output:\n{out}"
   p50, p99 = _pctl(dec, 0.50), _pctl(dec, 0.99)
-  print(f"\n[integration] received={len(received)}/{len(expect)} "
-        f"decode_ms p50={p50:.3f} p99={p99:.3f} (n={len(dec)})")
+  print(f"\n[integration] received={len(received)}/{len(expect)} decode_ms p50={p50:.3f} p99={p99:.3f} (n={len(dec)})")
 
 
 def _pctl(xs, p):

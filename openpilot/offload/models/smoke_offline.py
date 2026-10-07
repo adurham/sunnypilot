@@ -22,8 +22,8 @@ import numpy as np
 if os.environ.get('OFFLOAD') != '1':
   raise SystemExit("run with OFFLOAD=1 (this script proves the OFFLOAD-patched path)")
 
-from openpilot.sunnypilot.modeld_v2 import modeld as M  # noqa: E402
-from openpilot.sunnypilot.modeld_v2.constants import ModelConstants  # noqa: E402
+from openpilot.sunnypilot.modeld_v2 import modeld as M
+from openpilot.sunnypilot.modeld_v2.constants import ModelConstants
 
 CAM_W, CAM_H = 1928, 1208
 
@@ -75,7 +75,7 @@ def main():
   frac_nonzero = float(np.mean([np.count_nonzero(o) / o.size for o in outs0]))
 
   rel = []
-  for a, b in zip(outs0, outs1):
+  for a, b in zip(outs0, outs1, strict=False):
     denom = max(float(np.max(np.abs(a))), 1e-12)
     rel.append(float(np.max(np.abs(a - b)) / denom))
   max_rel = max(rel)

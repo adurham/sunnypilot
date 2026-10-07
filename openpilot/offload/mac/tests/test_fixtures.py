@@ -6,7 +6,6 @@ The reader's spec is frozen by openpilot/offload/mac/fixtures_README.md:
 A self-generated 10-record sample is written here so these tests do not depend
 on the (large) real fixture being present.
 """
-import os
 import struct
 
 import pytest
@@ -37,7 +36,7 @@ def test_roundtrip(tmp_path):
   recs = _write_sample(p, n=10, payload_len=64)
   got = fix.read_fixture(p)
   assert len(got) == 10
-  for (au, fid, eid, sof, eof, flags), r in zip(recs, got):
+  for (au, fid, eid, sof, eof, flags), r in zip(recs, got, strict=False):
     assert r.data == au
     assert (r.frame_id, r.encode_id, r.timestamp_sof, r.timestamp_eof, r.flags) == (fid, eid, sof, eof, flags)
     assert r.nbytes == len(au)

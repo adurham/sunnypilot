@@ -38,7 +38,7 @@ def test_fixture_roundtrip(tmp_path):
 
   back = list(fx.read_records(p))
   assert len(back) == len(recs) == fx.count_records(p)
-  for r, (fid, eid, sof, eof, flags, au) in zip(back, recs):
+  for r, (fid, eid, sof, eof, flags, au) in zip(back, recs, strict=False):
     assert (r.frame_id, r.encode_id, r.sof, r.eof, r.flags, r.au) == (fid, eid, sof, eof, flags, au)
   assert back[0].is_keyframe and not back[1].is_keyframe
 
@@ -72,7 +72,7 @@ def test_au_grouping_real_route_149():
   lens = []
   for msg in LogReader(os.path.join(ROUTE_149, "qlog.zst")):
     if msg.which() == "narrowRoadEncodeIdx":
-      d = getattr(msg, "narrowRoadEncodeIdx")
+      d = msg.narrowRoadEncodeIdx
       f = d.to_dict()
       lens.append(int(f["len"]))
 
@@ -105,7 +105,7 @@ def test_port_usage_anchors():
 
 
 def test_port_usage_matches_contract_services():
-  for cam, svc in fx.ENCODE_DATA_SVC.items():
+  for _cam, svc in fx.ENCODE_DATA_SVC.items():
     assert ports.get_port(svc) == ports.get_port(svc)   # deterministic
     assert 8023 <= ports.get_port(svc) < 65535
   assert len(fx.ENCODE_DATA_SVC) == 2
@@ -238,7 +238,7 @@ def test_p1_gate_ws_a_missing(monkeypatch, tmp_path):
 def test_p1_gate_main_ws_a_missing_exit2(monkeypatch, tmp_path):
   from openpilot.offload.replay import p1_gate as G
   # WS-B present, WS-A absent
-  monkeypatch.setattr(G, "MAC_DIR", str((tmp_path / "mac")))
+  monkeypatch.setattr(G, "MAC_DIR", str(tmp_path / "mac"))
   (tmp_path / "mac").mkdir()
   (tmp_path / "mac" / "framebridge.py").write_text("")
   (tmp_path / "mac" / "vtdec").write_text("")

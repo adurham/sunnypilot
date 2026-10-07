@@ -100,15 +100,15 @@ def _extract_camera(route_dirs: list[str], cam: str, out_dir: str) -> dict:
 
       if len(aus) != len(idx):
         raise FixtureError(
-          f"{_route_name(route_dir)}/{cam}: AU count {len(aus)} != EncodeIdx records {len(idx)} "
-          "(stream/record desync — bad fixture)")
+          f"{_route_name(route_dir)}/{cam}: AU count {len(aus)} != EncodeIdx records {len(idx)} (stream/record desync — bad fixture)")
 
-      for i, (fid, eid, sof, eof_q, flags, ln) in enumerate(idx):
+      for i, (fid, eid, sof, _eof_q, flags, ln) in enumerate(idx):
         au = aus[i]
         if len(au) != ln:
-          raise FixtureError(
-            f"{_route_name(route_dir)}/{cam}: record {i} (frameId {fid} encodeId {eid}) "
-            f"AU len {len(au)} != EncodeIdx len {ln} — AU grouping/record misalignment (bad fixture)")
+          raise FixtureError("".join([
+            f"{_route_name(route_dir)}/{cam}: record {i} (frameId {fid} encodeId {eid}) ",
+            f"AU len {len(au)} != EncodeIdx len {ln} — AU grouping/record misalignment (bad fixture)",
+          ]))
         eof = eof_map.get(fid, 0)
         if eof > 0:
           n_real += 1
@@ -153,7 +153,7 @@ def extract_route(route_dirs: list[str], out_dir: str, name: str | None = None) 
     raise FixtureError(f"{dest}: fixture exists (use --force to rebuild)")
 
   os.makedirs(dest, exist_ok=True)
-  t0 = time.time()
+  t0 = time.monotonic()
   cams = {cam: _extract_camera(route_dirs, cam, dest) for cam in fx.CAMERAS}
   all_cont = all(cams[cam]["encode_id_contiguous"] for cam in fx.CAMERAS)
 
@@ -163,7 +163,7 @@ def extract_route(route_dirs: list[str], out_dir: str, name: str | None = None) 
     "route_dirs": route_dirs,
     "segments": [_route_name(d) for d in route_dirs],
     "extracted_utc": fx.utc_now(),
-    "extract_seconds": round(time.time() - t0, 3),
+    "extract_seconds": round(time.monotonic() - t0, 3),
     "n_frames": {cam: cams[cam]["n_frames"] for cam in fx.CAMERAS},
     "first_frame_id": {cam: cams[cam]["first_frame_id"] for cam in fx.CAMERAS},
     "last_frame_id": {cam: cams[cam]["last_frame_id"] for cam in fx.CAMERAS},
@@ -195,18 +195,20 @@ def main(argv=None) -> int:
   except FixtureError as e:
     print(f"[extractor] BAD FIXTURE: {e}", file=sys.stderr)
     return 1
-  except Exception as e:  # noqa: BLE001 — surface any IO/parse failure clearly
+  except Exception as e:
     print(f"[extractor] ERROR: {e!r}", file=sys.stderr)
     return 2
 
   ns = meta["n_frames"]
-  print(f"[extractor] OK {meta['route']}  segs={len(meta['segments'])} "
-        f"narrow={ns['narrow']} wide={ns['wide']}  "
-        f"eof real/synth narrow={meta['eof_source']['narrow']['real']}/"
-        f"{meta['eof_source']['narrow']['synthetic']} "
-        f"wide={meta['eof_source']['wide']['real']}/{meta['eof_source']['wide']['synthetic']}  "
-        f"encodeId_contiguous={meta['_all_encode_id_contiguous']}  "
-        f"-> {os.path.join(args.out_dir, meta['route'])}")
+  print("".join([
+    f"[extractor] OK {meta['route']}  segs={len(meta['segments'])} ",
+    f"narrow={ns['narrow']} wide={ns['wide']}  ",
+    f"eof real/synth narrow={meta['eof_source']['narrow']['real']}/",
+    f"{meta['eof_source']['narrow']['synthetic']} ",
+    f"wide={meta['eof_source']['wide']['real']}/{meta['eof_source']['wide']['synthetic']}  ",
+    f"encodeId_contiguous={meta['_all_encode_id_contiguous']}  ",
+    f"-> {os.path.join(args.out_dir, meta['route'])}",
+  ]))
   return 0
 
 

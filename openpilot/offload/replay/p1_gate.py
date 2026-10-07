@@ -15,7 +15,7 @@ Pipeline per route (INTERFACES.md §1/§3/§5):
                            modelV2 into local msgq, writes modelV2 publish rows
   (e) metrics              G1 timeline, G2 counts, G6 SOF->modelV2, G7 decode + rlog
                            baselines -> PASS/FAIL per gate
-  exit 0 iff every implemented gate PASSes.
+  exit 0 if and only if every implemented gate PASSes.
 
 Graceful degradation (do NOT stub a missing workstream):
   * WS-B absent (openpilot/offload/mac/framebridge.py or vtdec missing)
@@ -106,7 +106,7 @@ def check_ws_b() -> tuple[bool, str]:
     return False, f"missing {os.path.relpath(fb, REPO)}"
   if not os.path.exists(vt):
     return False, f"missing {os.path.relpath(vt, REPO)} (binary not built)"
-  return True, f"framebridge.py + vtdec present"
+  return True, "framebridge.py + vtdec present"
 
 
 # --- fixture helpers ---------------------------------------------------------
@@ -330,7 +330,7 @@ def _port_free(host: str, port: int) -> bool:
 
 
 # Services replayd binds (video + small) — used for the preflight port check.
-from openpilot.offload.ports import get_port  # noqa: E402
+from openpilot.offload.ports import get_port
 BOUND_SERVICES = ["narrowRoadEncodeData", "wideRoadEncodeData", "narrowRoadCameraState",
                   "wideRoadCameraState", "carState", "deviceState", "carControl",
                   "extrinsicsCalibration", "driverMonitoringState", "lateralDelay"]
@@ -404,22 +404,25 @@ def wire_g1(replay_log: str, fixture_dir: str) -> dict:
 def fmt_gate(g: dict) -> str:
   d = g.get("detail", {})
   if g["gate"] == "G6" and "p50_ms" in d:
-    return (f"{g['gate']} {g['status']:4s}  SOF->modelV2  n={d['n']}  p50={d['p50_ms']}  "
-            f"p99={d['p99_ms']}  p99.9={d['p99.9_ms']} ms   (<= {d['limits'][0]}/{d['limits'][1]}/{d['limits'][2]})")
+    head = f"{g['gate']} {g['status']:4s}  SOF->modelV2  n={d['n']}  p50={d['p50_ms']}  "
+    return head + f"p99={d['p99_ms']}  p99.9={d['p99.9_ms']} ms   (<= {d['limits'][0]}/{d['limits'][1]}/{d['limits'][2]})"
   if g["gate"] == "G7" and "p50_ms" in d:
-    return (f"{g['gate']} {g['status']:4s}  decode  n={d['n']}  p50={d['p50_ms']}  "
-            f"p99.9={d['p99.9_ms']} ms   (<= {d['limits'][0]}/{d['limits'][1]})")
+    return f"{g['gate']} {g['status']:4s}  decode  n={d['n']}  p50={d['p50_ms']}  p99.9={d['p99.9_ms']} ms   (<= {d['limits'][0]}/{d['limits'][1]})"
   if g["gate"] == "G1":
     return f"{g['gate']} {g['status']:4s}  " + " | ".join(
-      f"{c}: frames={v['frames']}/{v['source_frames']} drops={v['drops_in_span']} "
-      f"not_replayed={v['not_replayed']} dup={v['dup_frame_ids']} "
-      f"subseq={v['out_is_subsequence_of_source']} eid_mono={v['encode_id_monotone_strict']} "
-      f"contig={v['encode_id_contiguous']} 1to1={v['encode_id_frame_id_1to1']}" for c, v in d.items())
+      "".join([
+        f"{c}: frames={v['frames']}/{v['source_frames']} drops={v['drops_in_span']} ",
+        f"not_replayed={v['not_replayed']} dup={v['dup_frame_ids']} ",
+        f"subseq={v['out_is_subsequence_of_source']} eid_mono={v['encode_id_monotone_strict']} ",
+        f"contig={v['encode_id_contiguous']} 1to1={v['encode_id_frame_id_1to1']}",
+      ]) for c, v in d.items())
   if g["gate"] == "G2":
     return f"{g['gate']} {g['status']:4s}  " + " | ".join(
-      f"{c}: dec={v['decoded']} src_win={v['decoded_window'].get('source_in_window','-')} "
-      f"(no_drops={v['decoded_eq_encoded_in_window']}) mv2={v['joined_window'].get('modelv2',0)}"
-      f"/{v['joined_window'].get('decoded_in_window','-')}" for c, v in d.items())
+      "".join([
+        f"{c}: dec={v['decoded']} src_win={v['decoded_window'].get('source_in_window','-')} ",
+        f"(no_drops={v['decoded_eq_encoded_in_window']}) mv2={v['joined_window'].get('modelv2',0)}",
+        f"/{v['joined_window'].get('decoded_in_window','-')}",
+      ]) for c, v in d.items())
   return f"{g['gate']} {g['status']}"
 
 
@@ -449,14 +452,20 @@ def write_report(reports_dir: str, ts: str, reports: list[dict], dep: dict, args
               "```"]
     for g in rep["gates"]:
       lines.append(fmt_gate(g))
-    lines.append(f"G1w  {rep['wire_check']['status']:4s}  wire: emitted={rep['wire_check'].get('n_emitted')} "
-                 f"fixture={rep['wire_check'].get('n_fixture')} dup={rep['wire_check'].get('dup')} "
-                 f"prefix_match={rep['wire_check'].get('emitted_matches_fixture_prefix')}")
+    parts = [
+      f"G1w  {rep['wire_check']['status']:4s}  wire: emitted={rep['wire_check'].get('n_emitted')} ",
+      f"fixture={rep['wire_check'].get('n_fixture')} dup={rep['wire_check'].get('dup')} ",
+      f"prefix_match={rep['wire_check'].get('emitted_matches_fixture_prefix')}",
+    ]
+    lines.append("".join(parts))
     wf = rep.get("wire_full", {})
     if wf:
-      lines.append(f"G1wF {wf.get('status','SKIP'):4s}  full wire: emitted={wf.get('n_emitted')} "
-                   f"fixture={wf.get('n_fixture')} dup={wf.get('dup')} "
-                   f"prefix_match={wf.get('emitted_matches_fixture_prefix')}")
+      parts = [
+        f"G1wF {wf.get('status','SKIP'):4s}  full wire: emitted={wf.get('n_emitted')} ",
+        f"fixture={wf.get('n_fixture')} dup={wf.get('dup')} ",
+        f"prefix_match={wf.get('emitted_matches_fixture_prefix')}",
+      ]
+      lines.append("".join(parts))
     lines += ["```", "", "### rlog baselines (report only)", "", "```"]
     b = rep.get("baselines", {})
     for k, v in b.items():

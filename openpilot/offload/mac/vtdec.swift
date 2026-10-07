@@ -48,9 +48,9 @@ func wr64(_ out: inout Data, _ v: UInt64) {
 }
 func elog(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
-func nowNs() -> UInt64 {
+func monotonicNs() -> UInt64 {
     var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
-    return mach_absolute_time() * UInt64(tb.numer) / UInt64(tb.denom)
+    return mach_absolute_time() * UInt64(tb.numer) / UInt64(tb.denom)  // codespell:ignore numer
 }
 
 // ---------- Annex-B NAL parsing ----------
@@ -110,7 +110,7 @@ func buildFormat() -> CMFormatDescription? {
 }
 
 let decodeCallback: VTDecompressionOutputCallback = { (_, srcRefcon, status, _, imageBuffer, _, _) in
-    let cbT = nowNs()
+    let cbT = monotonicNs()
     let pts = UInt64(bitPattern: Int64(Int(bitPattern: srcRefcon)))
     g.lock()
     let sub = submitNs[pts] ?? 0
@@ -255,7 +255,7 @@ func submit(_ nals: [NAL], _ data: [UInt8], _ pts: UInt64) -> Bool {
     guard !nals.isEmpty else { return false }
     guard let s = ensureSession() else { elog("vtdec: no session/params yet — dropping pts \(pts)"); return false }
     guard let fmt = gFmt, let sbuf = makeSampleBuffer(nals, data, fmt, pts) else { return false }
-    g.lock(); submitNs[pts] = nowNs(); submitted += 1; g.unlock()
+    g.lock(); submitNs[pts] = monotonicNs(); submitted += 1; g.unlock()
     let refcon = UnsafeMutableRawPointer(bitPattern: Int(pts)) ?? UnsafeMutableRawPointer(bitPattern: 1)
     var info = VTDecodeInfoFlags()
     let r = VTDecompressionSessionDecodeFrame(s, sampleBuffer: sbuf, flags: [], frameRefcon: refcon, infoFlagsOut: &info)

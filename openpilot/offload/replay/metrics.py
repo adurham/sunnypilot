@@ -315,7 +315,8 @@ def baselines_from_rlog(route_dir: str) -> dict:
       d = msg.narrowRoadCameraState
       sof[int(d.frameId)] = int(d.timestampSof)
     elif w == "modelV2":
-      mvt.append(int(msg.logMonoTime)); mvf.append(int(msg.modelV2.frameId))
+      mvt.append(int(msg.logMonoTime))
+      mvf.append(int(msg.modelV2.frameId))
     elif w == "carControl":
       cct.append(int(msg.logMonoTime))
     elif w == "sendcan":
@@ -394,15 +395,17 @@ def analyze(latency_jsonl: str, route_or_fixture: str, window=None, replay_log=N
 def _fmt(g):
   d = g["detail"]
   if g["gate"] == "G6" and "p50_ms" in d:
-    return (f"{g['gate']} {g['status']:4s} n={d['n']} SOF->modelV2 p50={d['p50_ms']} "
-            f"p99={d['p99_ms']} p99.9={d['p99.9_ms']} ms (<= {G6_P50}/{G6_P99}/{G6_P999})")
+    head = f"{g['gate']} {g['status']:4s} n={d['n']} SOF->modelV2 p50={d['p50_ms']} "
+    return head + f"p99={d['p99_ms']} p99.9={d['p99.9_ms']} ms (<= {G6_P50}/{G6_P99}/{G6_P999})"
   if g["gate"] == "G7" and "p50_ms" in d:
-    return (f"{g['gate']} {g['status']:4s} n={d['n']} decode p50={d['p50_ms']} "
-            f"p99.9={d['p99.9_ms']} ms (<= {G7_P50}/{G7_P999})")
+    head = f"{g['gate']} {g['status']:4s} n={d['n']} decode p50={d['p50_ms']} "
+    return head + f"p99.9={d['p99.9_ms']} ms (<= {G7_P50}/{G7_P999})"
   if g["gate"] == "G1":
-    parts = [f"{c}:frames={v['frames']} dup={v['dup_frame_ids']} "
-             f"gaps_mirror={v['gaps_mirror_source']} eid_mono={v['encode_id_monotone_by_1']} "
-             f"1to1={v['encode_id_frame_id_1to1']}" for c, v in d.items()]
+    parts = ["".join([
+      f"{c}:frames={v['frames']} dup={v['dup_frame_ids']} ",
+      f"gaps_mirror={v['gaps_mirror_source']} eid_mono={v['encode_id_monotone_by_1']} ",
+      f"1to1={v['encode_id_frame_id_1to1']}",
+    ]) for c, v in d.items()]
     return f"{g['gate']} {g['status']:4s} " + " | ".join(parts)
   if g["gate"] == "G2":
     parts = [f"{c}:enc={v['encoded']} dec={v['decoded']} mv2={v['modelv2_published']}"
@@ -430,7 +433,7 @@ def main(argv=None) -> int:
     return 2
   try:
     rep = analyze(args.latency, args.route, window, args.replay_log)
-  except Exception as e:  # noqa: BLE001
+  except Exception as e:
     print(f"[metrics] ERROR: {e!r}", file=sys.stderr)
     return 2
 

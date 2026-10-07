@@ -45,7 +45,7 @@ import os
 import struct
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from collections.abc import Iterator
 
 SYNTHETIC_EOF_OFFSET_NS = 50_000_000  # 50 ms marker when no real eof exists
 FORMAT_ID = "offload-replay-fixture/1"

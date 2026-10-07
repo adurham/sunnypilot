@@ -38,10 +38,10 @@ if os.environ.get("OFFLOAD") != "1":
   print("[modeld_runner] must run with OFFLOAD=1", file=sys.stderr)
   raise SystemExit(2)
 
-from msgq.visionipc import VisionIpcClient  # noqa: E402
-from openpilot.cereal.visionipc import VisionStreamType  # noqa: E402
-import openpilot.cereal.messaging as messaging  # noqa: E402
-from openpilot.sunnypilot.modeld_v2.constants import ModelConstants  # noqa: E402
+from msgq.visionipc import VisionIpcClient
+from openpilot.cereal.visionipc import VisionStreamType
+import openpilot.cereal.messaging as messaging
+from openpilot.sunnypilot.modeld_v2.constants import ModelConstants
 
 _STOP = False
 
@@ -80,7 +80,7 @@ def main(argv=None) -> int:
   # --- import the patched model stack (needs OFFLOAD=1 already set) ----------
   try:
     from openpilot.sunnypilot.modeld_v2 import modeld as M
-  except Exception as e:  # noqa: BLE001
+  except Exception as e:
     print(f"[modeld_runner] import modeld failed: {e!r}", file=sys.stderr)
     return 2
 
@@ -124,7 +124,7 @@ def main(argv=None) -> int:
   try:
     model = M.ModelState(cam_w=W, cam_h=H, chestnut=False)
     model.warmup()
-  except Exception as e:  # noqa: BLE001
+  except Exception as e:
     print(f"[modeld_runner] model load failed: {e!r}", file=sys.stderr)
     return 2
 
@@ -156,7 +156,7 @@ def main(argv=None) -> int:
           last_extra_sof = int(cli_extra.timestamp_sof)
       bufs = {name: (last_extra_buf if "big" in name else buf) for name in model.vision_input_names}
       if last_extra_buf is None:
-        bufs = {name: buf for name in model.vision_input_names}
+        bufs = dict.fromkeys(model.vision_input_names, buf)
       # WS-B's VisionIPC buffers are tight (1928*1208*3/2) but modeld copies
       # frame_copy_size (stride-aligned, larger). Pad to frame_copy_size so the
       # run path's np.frombuffer(count=...) succeeds. NOTE: the NV12 stride/layout
@@ -177,7 +177,7 @@ def main(argv=None) -> int:
       t_in = time.perf_counter()
       try:
         model.run(bufs, transforms, inp)
-      except Exception as e:  # noqa: BLE001
+      except Exception as e:
         print(f"[modeld_runner] run failed at frame {fid}: {e!r}", file=sys.stderr)
         return 2
       exec_ms = (time.perf_counter() - t_in) * 1e3

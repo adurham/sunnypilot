@@ -38,8 +38,6 @@ def main():
       print(f"MISSING {p}")
       continue
     src, found = guards(p)
-    # also flag module-level OFFLOAD reads used directly as guards
-    lines = src.splitlines()
     for lineno, node in sorted(found):
       body_lines = [n.lineno for n in ast.walk(node) if hasattr(n, 'lineno') and n.lineno > node.lineno]
       span = f"L{node.lineno}-L{max(body_lines) if body_lines else node.lineno}"

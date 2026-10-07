@@ -49,7 +49,6 @@ class FixtureFormatError(Exception):
 
 def iter_fixture(path: str, max_frames: int | None = None):
   """Yield FixtureRecord objects from a .enc file, in file order."""
-  size = os.path.getsize(path)
   n = 0
   with open(path, "rb") as f:
     while True:
@@ -59,13 +58,11 @@ def iter_fixture(path: str, max_frames: int | None = None):
       if not head:
         return
       if len(head) < HDR_SIZE:
-        raise FixtureFormatError(f"{path}: truncated header at record {n} "
-                                 f"(got {len(head)} of {HDR_SIZE} bytes)")
+        raise FixtureFormatError(f"{path}: truncated header at record {n} (got {len(head)} of {HDR_SIZE} bytes)")
       nbytes, frame_id, encode_id, sof, eof, flags = HDR.unpack(head)
       data = f.read(nbytes)
       if len(data) != nbytes:
-        raise FixtureFormatError(f"{path}: truncated payload at record {n} "
-                                 f"(got {len(data)} of {nbytes} bytes)")
+        raise FixtureFormatError(f"{path}: truncated payload at record {n} (got {len(data)} of {nbytes} bytes)")
       yield FixtureRecord(data, frame_id, encode_id, sof, eof, flags)
       n += 1
 
@@ -77,8 +74,7 @@ def read_fixture(path: str, max_frames: int | None = None) -> list[FixtureRecord
     framed = sum(HDR_SIZE + r.nbytes for r in records)
     on_disk = os.path.getsize(path)
     if framed != on_disk:
-      raise FixtureFormatError(f"{path}: framed size {framed} != on-disk {on_disk} "
-                               f"(trailing/garbage bytes)")
+      raise FixtureFormatError(f"{path}: framed size {framed} != on-disk {on_disk} (trailing/garbage bytes)")
   return records
 
 

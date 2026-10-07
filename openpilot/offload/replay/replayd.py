@@ -171,8 +171,7 @@ def run(args) -> int:
 
   meta_path = os.path.join(fixture_dir, "meta.json")
   if not os.path.exists(meta_path):
-    print(f"[replayd] ERROR: no fixture at {fixture_dir} "
-          f"(run extractor first, or pass --fixture-dir)", file=sys.stderr)
+    print(f"[replayd] ERROR: no fixture at {fixture_dir} (run extractor first, or pass --fixture-dir)", file=sys.stderr)
     return 2
 
   try:
@@ -182,7 +181,7 @@ def run(args) -> int:
       route_dirs = [route_arg if os.path.isdir(route_arg) else os.path.expanduser(
         f"~/comma-routes/{meta['route']}")]
     events = build_timeline(route_dirs, fixture_dir)
-  except Exception as e:  # noqa: BLE001
+  except Exception as e:
     print(f"[replayd] ERROR building timeline: {e!r}", file=sys.stderr)
     return 2
   if not events:
@@ -254,10 +253,9 @@ def run(args) -> int:
   dev_span = (events[-1]["dev_ns"] - events[0]["dev_ns"]) / 1e9
   if args.stats:
     n_vid = sum(1 for e in events if e["kind"] == "video")
-    print(f"[replayd] route={route} events={len(events)} (video={n_vid} small={len(events)-n_vid}) "
-          f"loops={loops} sent={sent} speed={speed} jitter_ms={args.jitter_ms}")
-    print(f"[replayd] device span {dev_span:.2f}s  wall {wall:.2f}s  "
-          f"ports {{{', '.join(f'{s}:{get_port(s)}' for s in services)}}}")
+    head = f"[replayd] route={route} events={len(events)} (video={n_vid} small={len(events)-n_vid}) "
+    print(head + f"loops={loops} sent={sent} speed={speed} jitter_ms={args.jitter_ms}")
+    print(f"[replayd] device span {dev_span:.2f}s  wall {wall:.2f}s  ports {{{', '.join(f'{s}:{get_port(s)}' for s in services)}}}")
   return 0
 
 

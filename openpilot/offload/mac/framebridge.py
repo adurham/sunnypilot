@@ -37,8 +37,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
-from collections import deque
 
 # --- ZMQ semantics must be decided before importing messaging ----------------
 # We deliberately do NOT set os.environ["ZMQ"]="1": this msgq build has no ZMQ
@@ -53,7 +51,7 @@ from openpilot.offload.mac import fixtures as fix
 try:
   from msgq.visionipc import VisionIpcServer
 except Exception as e:  # pragma: no cover
-  raise SystemExit(f"msgq.visionipc unavailable: {e}")
+  raise SystemExit(f"msgq.visionipc unavailable: {e}") from e
 
 CAMERAS = {
   "narrow": {
@@ -220,7 +218,7 @@ class FrameBridge:
 
     # pending EncodeData per camera, keyed by pts we hand to vtdec (monotone)
     self._pending = {c: {} for c in CAMERAS}          # cam -> pts -> dict
-    self._next_pts = {c: 1 for c in CAMERAS}
+    self._next_pts = dict.fromkeys(CAMERAS, 1)
     self._pts_lock = threading.Lock()
 
     # per-frame latency rows (contract.LatencyRecord), keyed (cam, frame_id)
@@ -236,9 +234,9 @@ class FrameBridge:
     self._decoders = {}
     self._out_fp = None
     self._out_lock = threading.Lock()
-    self._published = {c: 0 for c in CAMERAS}
-    self._received = {c: 0 for c in CAMERAS}
-    self._decoded = {c: 0 for c in CAMERAS}
+    self._published = dict.fromkeys(CAMERAS, 0)
+    self._received = dict.fromkeys(CAMERAS, 0)
+    self._decoded = dict.fromkeys(CAMERAS, 0)
 
     self.pm = None
     self._pm_services = None
@@ -275,8 +273,7 @@ class FrameBridge:
         self._vipc_streams[c] = meta["stream"]
       srv.start_listener()
       self._vipc = srv
-      log(f"VisionIPC server '{self.vipc_name}' listening: {dims[0]}x{dims[1]}, "
-          f"{self.args.num_buffers} buffers")
+      log(f"VisionIPC server '{self.vipc_name}' listening: {dims[0]}x{dims[1]}, {self.args.num_buffers} buffers")
       self._vipc_ready.set()
 
   # --- latency jsonl ------------------------------------------------------
@@ -423,7 +420,7 @@ class FrameBridge:
     self._ensure_publishers(small_services + [m["cam_state"] for m in CAMERAS.values()])
     self._open_out()
 
-    for cam, meta in CAMERAS.items():
+    for cam, _meta in CAMERAS.items():
       params = None
       if self.args.params_dir:
         p = os.path.join(self.args.params_dir, f"{cam}.params")
@@ -443,8 +440,7 @@ class FrameBridge:
                                 lambda s, r, _svc=svc: self._on_small(_svc, r)))
     for s in subs:
       s.start()
-    log(f"ZMQ SUB to {self.args.host}: {len(subs)} services "
-        f"({', '.join(encode_services)} + small)")
+    log(f"ZMQ SUB to {self.args.host}: {len(subs)} services ({', '.join(encode_services)} + small)")
     self._loop()
     for s in subs:
       s.stop()
@@ -509,7 +505,7 @@ class FrameBridge:
         pass
 
 
-def _encode_data_bytes(service: str, rec: "fix.FixtureRecord") -> bytes:
+def _encode_data_bytes(service: str, rec: fix.FixtureRecord) -> bytes:
   """Build raw cereal Event bytes for a camera EncodeData from a fixture record.
 
   Mirrors VideoEncoder::publisher_publish (encoder.cc): idx.frameId/encodeId/

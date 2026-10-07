@@ -104,10 +104,10 @@ def test_thread_safe_concurrent_appends():
   def worker(base):
     for i in range(500):
       t.append(_evt(base + i))
-  ths = [threading.Thread(target=worker, args=(b,)) for b in (0, 500, 1000, 1500)]
-  for th in ths:
+  threads = [threading.Thread(target=worker, args=(b,)) for b in (0, 500, 1000, 1500)]
+  for th in threads:
     th.start()
-  for th in ths:
+  for th in threads:
     th.join()
   assert t.count == 2000
   assert t.size == 2000
