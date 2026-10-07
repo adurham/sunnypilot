@@ -157,22 +157,18 @@ def main(argv=None) -> int:
       bufs = {name: (last_extra_buf if "big" in name else buf) for name in model.vision_input_names}
       if last_extra_buf is None:
         bufs = dict.fromkeys(model.vision_input_names, buf)
-      # WS-B's VisionIPC buffers are tight (1928*1208*3/2) but modeld copies
-      # frame_copy_size (stride-aligned, larger). Pad to frame_copy_size so the
-      # run path's np.frombuffer(count=...) succeeds. NOTE: the NV12 stride/layout
-      # still differs (see OPEN-C1 in RESULTS.md) — structural gates only.
+      # OPEN-C1 closed: WS-B allocates DEVICE-geometry VisionIPC buffers (stride 2048,
+      # size 4804608 for 1928x1208), so the run path's np.frombuffer(count=frame_copy_size)
+      # reads a correctly laid-out NV12 frame (Y plane first, stride-aligned). Fail loudly
+      # if the geometry ever regresses to the old tight layout instead of zero-padding.
       fcs = int(getattr(model, "frame_copy_size", 0))
       if fcs:
-        padded = {}
         for name, b in bufs.items():
           if b is None:
             continue
-          data = bytes(b.data) if hasattr(b, "data") else bytes(b)
-          if len(data) < fcs:
-            data = data + b"\x00" * (fcs - len(data))
-          padded[name] = data
-        if padded:
-          bufs = padded
+          blen = len(b.data) if hasattr(b, "data") else len(b)
+          assert blen >= fcs, \
+            f"VisionIPC buffer [{name}] is {blen} B < frame_copy_size {fcs} B — wrong NV12 geometry (OPEN-C1)"
       inp = _inputs(model, args.v_ego, lat_delay)
       t_in = time.perf_counter()
       try:

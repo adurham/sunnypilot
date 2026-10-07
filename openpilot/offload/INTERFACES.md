@@ -45,8 +45,9 @@ narrowRoadCameraState=20911, wideRoadCameraState=53095. Computed: `8023 + fnv1a(
 - `vtdec` CLIs: frame in `[u32 len][bytes][u64 pts][u32 flags]` → out `[u32 len][bytes][u64 pts][u64 decode_ns]`
   on stdout; exit non-zero + stderr on fatal. Keyframes flagged so the consumer can (re)init the session.
 - Decoded pixel buffer handed to VisionIPC server `camerad` via `VisionIpcServer.send(...)` with
-  **device frame_id, device timestamp_sof/eof** — never a local counter. NV12/I420 layout per
-  upstream `tools/camerastream/compressed_vipc.py` fill logic (do not reinvent strides).
+  **device frame_id, device timestamp_sof/eof** — never a local counter. Buffers use DEVICE NV12
+  geometry via `create_buffers_with_sizes` (stride/y_height/uv_height/size from
+  `system.camerad.cameras.nv12_info.get_nv12_info`), not msgq's tight `create_buffers` (OPEN-C1).
 - `framebridge.py` publishes Mac-local `narrowRoadCameraState` (+`wideRoadCameraState`) synthesized from
   EncodeData idx (frameId/sof/eof/flags), header re-stamped per §1.2.
 - FrameTable (WS-B) is the single source of truth for FrameEvent rows; exposes `append(evt)`,

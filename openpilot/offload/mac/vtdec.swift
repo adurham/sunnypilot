@@ -4,7 +4,11 @@
 //   flags bit0 = keyframe, bit1 = codec-config block (VPS/SPS/PPS, no frame out)
 // stdout (little-endian, one record per decoded picture):
 //   [u32 nbytes][bytes][u64 pts][u64 decode_ns]
-//   bytes = packed NV 12 (420v biplanar, video range), exactly width*height*3/2.
+//   bytes = DEVICE-GEOMETRY NV12 (420v biplanar, video range): stride=align(w,128),
+//   Y plane y_height=align(h,32) rows at row*stride, UV plane uv_height=align(h/2,16)
+//   rows at uv_offset + row*stride, buffer size = get_nv12_info(w,h) (OPEN-C1 fix).
+//   nbytes is the FULL device VisionIPC buffer size (e.g. 4804608 for 1928x1208),
+//   exactly what msgq create_buffers_with_sizes allocates on the device.
 //
 // CRITICAL: openpilot HEVC packs 3 slices per picture. VCL NALs are grouped into
 // complete access units by first_slice_segment_in_pic_flag and submitted as ONE
@@ -14,10 +18,15 @@
 // did the same).
 //
 // Modes:
-//   vtdec [--file F] [--format info] [--params FILE] [--threads N] [--sw]
+//   vtdec [--file F] [--format info|geom] [--params FILE] [--threads N] [--sw]
 //   --format info : decode until the first picture, print
 //                   {"width":W,"height":H,"pixelformat":"420v","pixelformat_code":N}
 //                   to stdout, exit 0.
+//   --format geom : decode until the first picture, print
+//                   {"width":W,"height":H,"stride":S,"uv_offset":U,
+//                    "y_height":YH,"uv_height":UVH,"size":SZ}
+//                   to stdout, exit 0. Self-check: must equal
+//                   openpilot/system/camerad/cameras/nv12_info.get_nv12_info(W,H).
 //   --file F      : read the framed stream from F instead of stdin.
 //   --params FILE : Annex-B file whose VPS/SPS/PPS seed the session.
 //   --sw          : prefer software decode (default requires hardware).
@@ -53,6 +62,31 @@ func monotonicNs() -> UInt64 {
     return mach_absolute_time() * UInt64(tb.numer) / UInt64(tb.denom)  // codespell:ignore numer
 }
 
+// ---------- device NV12 geometry ----------
+// OPEN-C1: VisionIPC buffers are allocated by camerad with VENUS NV12 geometry, NOT
+// tight w*h*3/2. Emit exactly this layout so the consumer (modeld_v2) can read the
+// buffer with device strides. MUST match openpilot/system/camerad/cameras/nv12_info.py
+// get_nv12_info(width, height) -> (stride, y_height, uv_height, size); uv_offset = stride*y_height.
+@inline(__always) func alignUp(_ val: Int, _ alignment: Int) -> Int {
+    return ((val + alignment - 1) / alignment) * alignment
+}
+
+func nv12Info(_ width: Int, _ height: Int) -> (stride: Int, yHeight: Int, uvHeight: Int, size: Int) {
+    let stride = alignUp(width, 128)
+    let yHeight = alignUp(height, 32)
+    let uvHeight = alignUp(height / 2, 16)
+
+    // VENUS_BUFFER_SIZE for NV12
+    let yPlane = stride * yHeight
+    let uvPlane = stride * uvHeight + 4096
+    var size = yPlane + uvPlane + max(16 * 1024, 8 * stride)
+    size = alignUp(size, 4096)
+    size += alignUp(width, 512) * 512  // kernel padding for non-aligned frames
+    size = alignUp(size, 4096)
+
+    return (stride, yHeight, uvHeight, size)
+}
+
 // ---------- Annex-B NAL parsing ----------
 struct NAL { var start: Int; var end: Int; var type: Int; var firstSlice: Bool }
 
@@ -82,6 +116,7 @@ var submitNs: [UInt64: UInt64] = [:]      // pts -> submit ns
 var delivered = 0, submitted = 0, submitErr = 0, decodeErr = 0
 var lastErr: OSStatus = 0
 var gInfoW = 0, gInfoH = 0
+var gInfoStride = 0, gInfoUvOffset = 0, gInfoYH = 0, gInfoUVH = 0, gInfoSize = 0
 var gPixelFormat: OSType = 0
 let outLock = NSLock()
 
@@ -130,25 +165,44 @@ let decodeCallback: VTDecompressionOutputCallback = { (_, srcRefcon, status, _, 
     let planes = CVPixelBufferGetPlaneCount(ib)
     guard planes >= 1, let p0 = CVPixelBufferGetBaseAddressOfPlane(ib, 0) else { return }
     let r0 = CVPixelBufferGetBytesPerRowOfPlane(ib, 0)
-    var payload = Data(count: w * h * 3 / 2)
+    let ge = nv12Info(w, h)
+    let stride = ge.stride, yHeight = ge.yHeight, uvHeight = ge.uvHeight
+    let uvOffset = stride * yHeight
+    // OPEN-C1: emit the DEVICE-geometry NV12 buffer (stride 2048 / uv_offset 2490368 /
+    // size 4804608 for 1928x1208), i.e. exactly what camerad allocates via
+    // create_buffers_with_sizes. Data(count:) is zero-initialized, so each row's
+    // (stride - w) tail and the extra Y (yHeight - h) / UV (uvHeight - h/2) pad rows
+    // are filled as required.
+    var payload = Data(count: ge.size)
     let ySrc = p0.assumingMemoryBound(to: UInt8.self)
     payload.withUnsafeMutableBytes { dstRaw in
         let dst = dstRaw.bindMemory(to: UInt8.self)
-        for y in 0..<h { memcpy(dst.baseAddress! + y * w, ySrc + y * r0, min(w, r0)) }
+        let yRows = min(h, yHeight)
+        for y in 0..<yRows {
+            let n = min(w, r0)
+            if n > 0 { memcpy(dst.baseAddress! + y * stride, ySrc + y * r0, n) }
+        }
     }
     if planes >= 2, let p1 = CVPixelBufferGetBaseAddressOfPlane(ib, 1) {
         let r1 = CVPixelBufferGetBytesPerRowOfPlane(ib, 1)
         let uvSrc = p1.assumingMemoryBound(to: UInt8.self)
         payload.withUnsafeMutableBytes { dstRaw in
             let dst = dstRaw.bindMemory(to: UInt8.self)
-            for y in 0..<(h / 2) { memcpy(dst.baseAddress! + w * h + y * w, uvSrc + y * r1, min(w, r1)) }
+            let uvRows = min(h / 2, uvHeight)
+            for y in 0..<uvRows {
+                let n = min(w, r1)
+                if n > 0 { memcpy(dst.baseAddress! + uvOffset + y * stride, uvSrc + y * r1, n) }
+            }
         }
     }
     let decNs = cbT - sub
-    g.lock(); delivered += 1; gInfoW = w; gInfoH = h; gPixelFormat = fmt; g.unlock()
-    if infoMode {
-        // Report dimensions/pixel format for the first picture and stop; do not
-        // stream frame payloads to stdout in this mode.
+    g.lock()
+    delivered += 1; gInfoW = w; gInfoH = h; gPixelFormat = fmt
+    gInfoStride = stride; gInfoUvOffset = uvOffset; gInfoYH = yHeight; gInfoUVH = uvHeight; gInfoSize = ge.size
+    g.unlock()
+    if infoMode || geomMode {
+        // Report dimensions / pixel format (or the full NV12 geometry) for the first
+        // picture and stop; do not stream frame payloads to stdout in these modes.
         return
     }
     var rec = Data()
@@ -166,12 +220,16 @@ var paramsPath: String? = nil
 var threads = 4
 var useHW = true
 var infoMode = false
+var geomMode = false
 var i = 1
 while i < args.count {
     switch args[i] {
     case "--file": if i + 1 < args.count { filePath = args[i + 1] }; i += 2
     case "--params": if i + 1 < args.count { paramsPath = args[i + 1] }; i += 2
-    case "--format": if i + 1 < args.count, args[i + 1] == "info" { infoMode = true }; i += 2
+    case "--format":
+        if i + 1 < args.count, args[i + 1] == "info" { infoMode = true }
+        if i + 1 < args.count, args[i + 1] == "geom" { geomMode = true }
+        i += 2
     case "--threads": if i + 1 < args.count { threads = Int(args[i + 1]) ?? 4 }; i += 2
     case "--sw": useHW = false; i += 1
     default: i += 1
@@ -288,12 +346,38 @@ if let fp = filePath {
 }
 let reader = Reader(fh)
 
+// Self-check probe (--format info|geom with a raw --params .hevc and no framed input):
+// the params file is a whole Annex-B stream, so decode it in place to learn the
+// decoded picture geometry. Streaming mode (no info/geom) never takes this branch.
+var probeOnly = false
+if (infoMode || geomMode) && filePath == nil, let pp = paramsPath, let raw = FileManager.default.contents(atPath: pp) {
+    probeOnly = true
+    let d = [UInt8](raw)
+    let nals = parseNALs(d)
+    harvest(d, nals)
+    var aus: [[NAL]] = []
+    var cur: [NAL] = []
+    for n in nals where n.type <= 31 {
+        if n.firstSlice && !cur.isEmpty { aus.append(cur); cur = [] }
+        cur.append(n)
+    }
+    if !cur.isEmpty { aus.append(cur) }
+    // Submit AUs until the first picture decodes (the stream may open mid-GOP, so the
+    // leading non-IDR AUs are dropped by VT — expected). Drain asynchronously in chunks.
+    for (k, au) in aus.enumerated() {
+        if delivered > 0 { break }
+        _ = submit(au, d, UInt64(k + 1))
+        if k % 8 == 7, let s = session { VTDecompressionSessionWaitForAsynchronousFrames(s) }
+    }
+    if let s = session { VTDecompressionSessionWaitForAsynchronousFrames(s) }
+}
+
 // Per record: split VCL NALs into AUs by first_slice_segment_in_pic_flag and submit
 // each complete AU. A record with no VCL is a codec-config block (harvest only).
 // Since openpilot emits exactly one picture (3 slices) per EncodeData record, the
 // common case yields a single AU per record; the loop still handles several.
 var configOnly = true
-while true {
+while !probeOnly {
     guard let hdr = reader.readExact(4) else { break }
     let nbytes = Int(hdr.withUnsafeBytes { rd32($0, 0) })
     guard nbytes >= 0, nbytes < 64 * 1024 * 1024 else { elog("vtdec: bad nbytes \(nbytes)"); exit(1) }
@@ -328,7 +412,7 @@ while true {
     }
     if submitted > 0 { configOnly = false }
 
-    if infoMode && delivered > 0 { break }
+    if (infoMode || geomMode) && delivered > 0 { break }
 }
 
 if let s = session {
@@ -338,6 +422,7 @@ if let s = session {
 g.lock()
 let d = delivered, s = submitted, se = submitErr, de = decodeErr
 let le = lastErr, pw = gInfoW, ph = gInfoH, pf = gPixelFormat
+let pStride = gInfoStride, pUvOffset = gInfoUvOffset, pYH = gInfoYH, pUVH = gInfoUVH, pSize = gInfoSize
 g.unlock()
 
 if infoMode {
@@ -346,6 +431,15 @@ if infoMode {
         exit(0)
     }
     elog("vtdec: no frame decoded for --format info")
+    exit(1)
+}
+if geomMode {
+    if delivered > 0 {
+        print("{\"width\":\(pw),\"height\":\(ph),\"stride\":\(pStride),\"uv_offset\":\(pUvOffset),"
+            + "\"y_height\":\(pYH),\"uv_height\":\(pUVH),\"size\":\(pSize)}")
+        exit(0)
+    }
+    elog("vtdec: no frame decoded for --format geom")
     exit(1)
 }
 if submitted == 0 {

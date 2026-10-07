@@ -13,7 +13,9 @@ Responsibilities (INTERFACES.md §1-3):
   (b) Feed each camera's EncodeData to its vtdec subprocess (one per camera).
   (c) Receive decoded frames; publish into a LOCAL VisionIpcServer named
       OFFLOAD_VIPC_SERVER (default 'camerad') with the DEVICE frame_id / sof / eof.
-      create_buffers(num_buffers=4, ed.width, ed.height) from the first EncodeData.
+      Buffers use DEVICE NV12 geometry via create_buffers_with_sizes — stride/
+      y_height/uv_height/size from nv12_info (VENUS), NOT the tight create_buffers
+      w*h*3/2 (OPEN-C1).
   (d) Synthesize + publish Mac-local narrowRoadCameraState / wideRoadCameraState
       from EncodeData idx, header logMonoTime re-stamped to Mac time.monotonic_ns()
       per §1.2 (payload timestamps stay device values). Also re-publish all small
@@ -47,6 +49,7 @@ from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.offload import contract, ports
 from openpilot.offload.mac.frametable import FrameTable
 from openpilot.offload.mac import fixtures as fix
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 try:
   from msgq.visionipc import VisionIpcServer
@@ -267,13 +270,21 @@ class FrameBridge:
         return
       dims = next(iter(self._dims.values()))
       srv = VisionIpcServer(self.vipc_name)
+      geo = {}
       for c, meta in CAMERAS.items():
         cw, ch = self._dims.get(c, dims)
-        srv.create_buffers(meta["stream"], self.args.num_buffers, cw, ch)
+        # OPEN-C1: allocate buffers with DEVICE NV12 geometry (stride/y_height/uv_height/
+        # size from nv12_info), matching camerad's create_buffers_with_sizes on-device —
+        # NOT msgq's tight create_buffers (w*h*3/2, stride==width).
+        stride, y_height, uv_height, size = get_nv12_info(cw, ch)
+        uv_offset = stride * y_height
+        srv.create_buffers_with_sizes(meta["stream"], self.args.num_buffers, cw, ch, size, stride, uv_offset)
         self._vipc_streams[c] = meta["stream"]
+        geo[c] = (stride, uv_offset, size)
       srv.start_listener()
       self._vipc = srv
-      log(f"VisionIPC server '{self.vipc_name}' listening: {dims[0]}x{dims[1]}, {self.args.num_buffers} buffers")
+      s0, u0, z0 = geo[next(iter(geo))]
+      log(f"VisionIPC server '{self.vipc_name}' listening: {dims[0]}x{dims[1]}, {self.args.num_buffers} buffers, stride={s0} uv_offset={u0} size={z0}")
       self._vipc_ready.set()
 
   # --- latency jsonl ------------------------------------------------------

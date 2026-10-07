@@ -104,14 +104,26 @@ PYTHONPATH=$PWD:$PWD/opendbc_repo:$PWD/msgq_repo:$PWD/tinygrad_repo \
 
 ## OPEN items / caveats (honest)
 
-* **OPEN-C1 — pixel layout.** WS-B's framebridge creates VisionIPC buffers at tight
-  `1928*1208*3/2` but modeld copies `frame_copy_size` from stride 2048 (`~3.74 MB`). `modeld_runner`
-  zero-pads the buffer to `frame_copy_size` so the run path executes; the NV12 stride/offset still
-  differs, so pixel-exact numerics are **not** validated end to end — G4/G5 (numerics) and the
-  fork-model G8 live in WS-A/§5 scope. Only structural gates (G1/G2/G6/G7) are claimed here.
-* **First-IDR warmup.** The recorded routes start mid-GOP; vtdec needs the next IDR, so the first
-  ~1.4 s (≈28 frames) fail to decode. G1/G2 measure inside the emitted / decoded window and count
-  these as neither drops nor replayed frames; every replayed frame decodes (drops=0).
+## OPEN-C1 CLOSED — pixel layout / VisionIPC geometry
+
+WS-B's framebridge used to create VisionIPC buffers at tight `1928*1208*3/2` while the fork's
+`modeld_v2` run path reads frames at `get_nv12_info(1928,1208)` = `(stride=2048, y_height=1216,
+uv_height=608, size=4804608)`; `modeld_runner` zero-padded to `frame_copy_size=3735552` so the run
+path executed, but the NV12 stride/offset still differed (every row after the first skewed by 120 B),
+so pixel-exact numerics were not validated.
+
+**Fixed.** `vtdec` now emits device-geometry NV12 (stride 2048 / uv_offset 2490368 / size 4804608),
+`framebridge` allocates with `create_buffers_with_sizes(...)` from `get_nv12_info`, and
+`modeld_runner` asserts `len(buf) >= frame_copy_size` instead of padding. Two new tests close the hole:
+
+* `openpilot/offload/mac/tests/test_geometry.py` — `vtdec --params fcamera.hevc --format geom` must
+  equal `nv12_info.get_nv12_info(1928,1208)` exactly.
+* `openpilot/offload/replay/tests/test_geometry_inference.py` — real `modeld_runner` (5 frames, exit 0,
+  5 jsonl rows) plus an in-process forward pass over captured device-geometry frames: outputs finite
+  (nonzero_frac ≈ 0.99), deterministic across two fresh models (max rel **0.0**).
+
+## OPEN items / caveats (honest)
+
 * **Transport drops under load.** framebridge's ZMQ path is device-faithful (`ZMQ_DONTWAIT`), so under
   a busy Mac it drops ~1 % of records at the socket (HWM); those are counted as `not_replayed`, never
   as frame drops. The full-fixture wire check (G1wF) is lossless because nothing else runs then.

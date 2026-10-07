@@ -78,7 +78,7 @@ def extract_params(out_dir: str) -> str:
 
 
 def run_integration(tmpdir: str, n_frames: int = N_FRAMES, pace: float = 0.01):
-  """Run the whole flow; return (received, decode_ms_list, summary)."""
+  """Run the whole flow; return (received, decode_ms_list, summary, geo)."""
   sys.path.insert(0, REPO)
   from openpilot.cereal.visionipc import VisionStreamType
   from msgq.visionipc import VisionIpcClient
@@ -98,16 +98,21 @@ def run_integration(tmpdir: str, n_frames: int = N_FRAMES, pace: float = 0.01):
   proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
   received = []
+  geo = {}
   try:
     client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_NARROW_ROAD, False)
     # connect(True) blocks until the server is up
     ok = client.connect(True)
     assert ok, "VisionIpcClient failed to connect to camerad"
+    # OPEN-C1: the server must have allocated DEVICE-geometry buffers.
+    geo = {"buffer_len": int(client.buffer_len), "stride": int(client.stride),
+           "uv_offset": int(client.uv_offset), "width": int(client.width), "height": int(client.height)}
     deadline = time.monotonic() + max(15.0, n_frames * pace * 3 + 5)
     while time.monotonic() < deadline:
       buf = client.recv(500)
       if buf is not None:
         received.append((int(client.frame_id), int(client.timestamp_sof), int(client.timestamp_eof)))
+        geo.setdefault("payload_len", len(buf.data))
         if len(received) >= n_frames:
           break
   finally:
@@ -131,15 +136,20 @@ def run_integration(tmpdir: str, n_frames: int = N_FRAMES, pace: float = 0.01):
         continue
       if r.get("kind") == "frame" and isinstance(r.get("decode_ms"), (int, float)):
         dec.append(r["decode_ms"])
-  return received, dec, out, expect
+  return received, dec, out, expect, geo
 
 
 # --------------------------- pytest entry points --------------------------- #
 
 @pytest.mark.skipif(not _have_route(), reason="real route or built vtdec missing")
 def test_replay_exact_frame_ids_and_sof(tmp_path):
-  received, dec, out, expect = run_integration(str(tmp_path))
+  received, dec, out, expect, geo = run_integration(str(tmp_path))
   assert received, f"no frames received via VisionIPC; framebridge output:\n{out}"
+  # OPEN-C1: VisionIPC buffers carry DEVICE NV12 geometry (stride 2048 / uv_offset
+  # 2490368 / size 4804608 for 1928x1208), matching camerad's create_buffers_with_sizes.
+  assert geo["buffer_len"] == 4804608, f"buffer_len={geo['buffer_len']} != 4804608"
+  assert geo["stride"] == 2048 and geo["uv_offset"] == 2490368, f"geometry={geo}"
+  assert geo["payload_len"] == 4804608, f"published payload={geo['payload_len']} != 4804608"
   # Every received frame must carry the EXACT device frame_id / sof / eof.
   by_id = {fid: (sof, eof) for fid, sof, eof in [(e[0], e[2], e[3]) for e in expect]}
   for fid, sof, eof in received:
@@ -148,7 +158,8 @@ def test_replay_exact_frame_ids_and_sof(tmp_path):
   # decode_ms must be logged for the frames we published.
   assert dec, f"no decode_ms rows logged; framebridge output:\n{out}"
   p50, p99 = _pctl(dec, 0.50), _pctl(dec, 0.99)
-  print(f"\n[integration] received={len(received)}/{len(expect)} decode_ms p50={p50:.3f} p99={p99:.3f} (n={len(dec)})")
+  summary = f"[integration] received={len(received)}/{len(expect)} decode_ms p50={p50:.3f} p99={p99:.3f} n={len(dec)} geo={geo}"
+  print("\n" + summary)
 
 
 def _pctl(xs, p):
@@ -164,9 +175,9 @@ if __name__ == "__main__":
     raise SystemExit(0)
   import tempfile
   with tempfile.TemporaryDirectory() as td:
-    received, dec, out, expect = run_integration(td, n_frames=N_FRAMES)
+    received, dec, out, expect, geo = run_integration(td, n_frames=N_FRAMES)
     print("framebridge output:\n" + out)
-    print(f"received {len(received)} frames, {len(dec)} decode_ms rows")
+    print(f"received {len(received)} frames, {len(dec)} decode_ms rows, geo={geo}")
     if dec:
       print(f"decode_ms p50={_pctl(dec,0.5):.3f} p99={_pctl(dec,0.99):.3f} max={max(dec):.3f}")
     by_id = {e[0]: (e[2], e[3]) for e in expect}
@@ -176,4 +187,5 @@ if __name__ == "__main__":
     print("expected first 3:", expect[:3][:1] and [(e[0], e[2], e[3]) for e in expect[:3]])
     assert received, "no frames received"
     assert not bad, f"exact-match violations: {bad}"
+    assert geo["buffer_len"] == 4804608 and geo["stride"] == 2048, f"geometry={geo}"
     print("INTEGRATION OK")
