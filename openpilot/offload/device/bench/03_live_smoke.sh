@@ -34,11 +34,14 @@ OUT="/tmp/fb.jsonl"
 FB="openpilot/offload/mac/framebridge.py"
 PY=".venv/bin/python"
 
+# The offload package lives in-tree, and its imports need the submodule dirs too.
+export PYTHONPATH="$PWD:$PWD/opendbc_repo:$PWD/msgq_repo:$PWD/tinygrad_repo${PYTHONPATH:+:$PYTHONPATH}"
+
 echo ">> target device: $DEV_IP   duration: ${SECS}s   out: $OUT"
 if [[ ! -f "$FB" ]]; then
   echo "WS-B framebridge not present yet: $FB" >&2
   echo "Intended invocation (WS-B interface, INTERFACES §3):" >&2
-  echo "  $PY $FB --host $DEV_IP --out $OUT    # run for ${SECS}s" >&2
+  echo "  PYTHONPATH=... $PY $FB --host $DEV_IP --out $OUT    # run for ${SECS}s" >&2
   echo "SKIP: build WS-B first, then re-run." >&2
   exit 3
 fi
