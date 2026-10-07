@@ -71,6 +71,13 @@ CAMERAS = {
 }
 V4L2_BUF_FLAG_KEYFRAME = 8
 
+# Last-resort camera sensor enumerant for the synthesized cameraState. modeld_v2 needs a
+# (deviceType, sensor) pair present in DEVICE_CAMERAS; the capnp default `unknown` is not a
+# valid partner for this car's deviceType. The DEVICE's own cameraState is the authority and
+# is preferred whenever it has arrived (see _on_device_cam_state); this value only covers
+# the first frames, and is what this car's own rlogs report for its road cameras.
+DEVICE_SENSOR_FALLBACK = "ox03c10"
+
 # Record framing sent to / received from vtdec (all little-endian):
 IN_HDR = struct.Struct("<I")          # [u32 nbytes]
 IN_META = struct.Struct("<QI")        # [u64 pts][u32 flags]
@@ -363,10 +370,12 @@ class FrameBridge:
       # DEVICE_CAMERAS[(deviceState.deviceType, narrowRoadCameraState.sensor)] to get the
       # intrinsics, and the capnp default is `unknown`. On this car (deviceType 'tizi') that
       # pair is absent from the table -> KeyError on the first frame, killing modeld before
-      # it ever publishes. The value is not in the device's cameraState either (the field is
-      # synthesized here, never consumed), so it is pinned to what the device's own rlogs
-      # report for this unit's road cameras (ox03c10). Override with OFFLOAD_CAMERA_SENSOR.
-      fs.sensor = self._sensor_value()
+      # it ever publishes. The device's own cameraState is the authority (learned by
+      # _on_device_cam_state); the fallback covers the first frames before it arrives.
+      # The assignment is guarded: capnp raises if the value is not a valid enumerant, and an
+      # exception here runs on the ZMQ thread and would kill the whole frame path silently.
+      if not self._set_sensor(fs):
+        return
       # header logMonoTime is set by new_message to time.monotonic()*1e9 (Mac clock)
       cs.logMonoTime = recv_mac
       self.pm.send(CAMERAS[cam]["cam_state"], cs)
@@ -452,16 +461,45 @@ class FrameBridge:
         if cs is None:
           return
         sensor = str(cs.sensor)
-        if sensor and sensor != "unknown":
+        if sensor and sensor != "unknown" and sensor != getattr(self, "_cam_sensor", None):
           self._cam_sensor = sensor
+          # Log the transition: a live run must SHOW that the device value was adopted
+          # rather than the built-in fallback (the two are indistinguishable otherwise).
+          log(f"learned camera sensor from device: {service} -> {sensor}")
     except Exception as e:
       elog(f"device cameraState parse failed ({service}): {e}")
       return
 
   def _sensor_value(self) -> str:
     """Sensor enum for the synthesized cameraState: device-reported, else env, else the
-    value this car's own rlogs carry (ox03c10) — never the capnp default 'unknown'."""
-    return getattr(self, "_cam_sensor", None) or os.environ.get("OFFLOAD_CAMERA_SENSOR", "ox03c10")
+    value this car's own rlogs carry (DEVICE_SENSOR_FALLBACK) — never 'unknown'."""
+    if (s := getattr(self, "_cam_sensor", None)) is not None:
+      return s
+    fallback = os.environ.get("OFFLOAD_CAMERA_SENSOR") or DEVICE_SENSOR_FALLBACK
+    if not getattr(self, "_sensor_fallback_warned", False):
+      self._sensor_fallback_warned = True
+      log(f"no device cameraState yet — using fallback camera sensor '{fallback}'")
+    return fallback
+
+  def _set_sensor(self, fs) -> bool:
+    """Assign the camera sensor enum, never raising and never leaving `unknown` behind.
+
+    capnp rejects a name that is not a real enumerant. This runs on a ZMQ subscriber
+    thread, where an exception silently kills the frame path (proven: a bad
+    OFFLOAD_CAMERA_SENSOR value dropped the whole pipeline to zero frames). So: try the
+    preferred value, then the car's known-good value, and report which one stuck.
+    Returns False only if even the last resort fails, so the caller can drop the frame.
+    """
+    for candidate in (self._sensor_value(), DEVICE_SENSOR_FALLBACK):
+      try:
+        fs.sensor = candidate
+      except Exception as e:
+        elog(f"camera sensor '{candidate}' rejected by capnp ({e}); trying next")
+        continue
+      if str(fs.sensor) != "unknown":
+        return True
+    elog("could not set a usable camera sensor (modeld would KeyError on this frame); dropping")
+    return False
 
   # --- small-service republish --------------------------------------------
   def _on_small(self, service: str, raw: bytes):
