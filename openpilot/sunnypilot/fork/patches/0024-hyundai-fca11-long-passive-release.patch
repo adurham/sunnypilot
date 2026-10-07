@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 02:30:00 -0500
+Subject: [PATCH 1/1] hyundai: FCA11-long passive release frame + panda
+ actuation-budget mirror (G7, fixes N1)
+
+The panda's FCA11-long tx hook (safety/modes/hyundai.h:146-149, 939-975) caps a continuous
+actuation episode at 2.5 s, then refuses actuation for a 3 s cooldown. An episode ends ONLY
+on an ACCEPTED PASSIVE 0x38D frame from the host (L970-973) or by budget expiry (L948-951).
+The car layer sent NOTHING when not braking (fca11_long.py:321-327 pre-G7): the camera's own
+frame goes through the forward hook, not the transmit hook, so act_active stayed latched across
+separate brakes and the budget kept running. Measured over route 149 (round-5, v8): only
+45-57 % of the intended FCA11 brake time would actually actuate; ~10 requests per drive never
+actuated at all. With a one-frame passive release that becomes 79-85 %.
+
+- Passive release: on the braking true -> false edge, emit exactly ONE passive mirror frame -
+  the camera's own idle shape (all brake fields 0, Warn 0, CmdAct 0, DecCmdAct 0), fresh alive
+  + CRC, every other byte the camera's. The panda accepts it while controls_allowed AND
+  heartbeat_engaged; it is the clean release / hand-back frame that ENDS the episode and
+  starts the cooldown clock. Only sent when a fresh camera frame is in hand (never hardcoded),
+  on the same 50 Hz slot as the actuating frames.
+- Budget mirror: the 2.5 s / 3 s budget is mirrored in Python (FCA11_BUDGET_FRAMES /
+  FCA11_COOLDOWN_FRAMES, from the same hyundai.h constants). The car layer now deliberately
+  ENDS the episode at the budget edge (with its passive frame) and does not re-command inside
+  the cooldown, so `braking` - and therefore the gas hard-zero and the alerts - matches what
+  the panda will really accept, instead of issuing frames the panda silently refuses.
+- Tests: car-layer tests assert exactly one passive frame closes every episode (and the OFF
+  path emits none) and that the budget mirror stops/restarts the episode on the panda's clock;
+  two panda tests pin the defect (two brakes with no passive frame between them are ONE episode,
+  the second cut at the 2.5 s edge) and prove the passive frame re-arms the budget.
+
+No panda firmware change: the passive frame and the budget constants already exist in
+safety/modes/hyundai.h (148-149, 903-931, 943-976) and are already covered by its own tests;
+this is a Python-only change. The panda TX hook and the budget/cooldown behaviour are untouched.
+---
+ opendbc/safety/tests/test_hyundai.py          |  57 ++++++++++
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  | 105 +++++++++++++++++-
+ .../car/hyundai/tests/test_fca11_long.py      |  66 ++++++++++-
+ 3 files changed, 224 insertions(+), 4 deletions(-)
+
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 798add0..50467d8 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -2764,6 +2764,63 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._open_window()
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+ 
++  def test_two_episodes_without_a_passive_frame_stay_one_episode(self):
++    """G7/N1 pin: two planner brakes with NO passive 0x38D in between (exactly what the car layer did
++    before G7 - it sent NOTHING when not braking, and the camera's own frames do not pass this TX hook)
++    are ONE panda episode. act_active (hyundai.h:970-973) stays latched while actuation simply pauses,
++    so the 2.5 s budget keeps running from the FIRST brake: the second brake is silently refused at the
++    budget edge and again through the 3 s cooldown. Sending a passive frame (test below) is the fix."""
++    self._rearm()  # fixes the clock so the budget arithmetic is absolute
++    self._open_window()
++    # episode 1: brake for 1.0 s, then STOP sending (no passive frame) - exactly the pre-G7 car layer
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    t1 = 1000000 + int(1.0e6)
++    self.safety.set_timer(t1)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    # the actuation pauses here (no host frame at all for 0.4 s): act_active stays latched
++    # episode 2: brake again. Still the SAME episode, so the clock is 1.0 s + 0.4 s + 1.0 s = 2.4 s < 2.5 s
++    t2 = t1 + int(0.4e6)
++    self.safety.set_timer(t2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # accepted: still inside the same, longer episode
++    # but the budget runs from the FIRST accepted actuation: 1.0 + 0.4 + 1.2 = 2.6 s > 2.5 s -> refused
++    self.safety.set_timer(t1 + int(1.7e6))
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # the SECOND brake is silently cut at the budget edge
++    # ... and inside the cooldown every new actuation is refused
++    self.safety.set_timer(t1 + int(1.7e6) + int(1.0e6))
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # a passive host frame ends the episode; only then does the cooldown clock start and the budget re-arm
++    self.assertTrue(self._tx(self._fca11()))
++    self.safety.set_timer(t1 + int(1.7e6) + int(1.0e6) + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  def test_passive_frame_between_episodes_rearms_the_budget(self):
++    """G7 fix, panda side: the SAME two brakes, but with the passive 0x38D the car layer now sends on
++    each release. The passive frame ends episode 1 and starts the cooldown; episode 2 opens after it,
++    so each brake gets its own full 2.5 s budget (this is the G7 pairing with fca11_long.py)."""
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))                 # episode 1
++    t1 = 1000000 + int(1.0e6)
++    self.safety.set_timer(t1)
++    self.assertTrue(self._tx(self._fca11()))                     # G7: passive release on the edge
++    # the cooldown runs from the passive frame; a NEW actuation just past it opens episode 2 fresh
++    t2 = t1 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2
++    self.safety.set_timer(t2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))                # episode 2, its own budget
++    # the full 2.5 s of episode 2 is now allowed (the budget restarted, it did not continue)
++    self.safety.set_timer(t2 + HYUNDAI_FCA11_LONG_MAX_ACT_US - 1)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.safety.set_timer(t2 + HYUNDAI_FCA11_LONG_MAX_ACT_US + 1)
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++
+   # *** latched cut ***
+ 
+   def _assert_cut_latched(self):
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index d9eaed5..a7f69e6 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -31,6 +31,13 @@ Design (see car-features/fca11-long-integration.md for the full picture):
+     (which is personality-agnostic), so this is a python-only change;
+   - no auto-resume after a CUT (driver brake/gas, gear != D, pedal fault, camera request): braking
+     stays off until the next deliberate pause/resume engagement, per the owner's model.
++  - G7 (N1): on every braking true -> false transition ONE passive mirror frame goes out - all brake
++    fields 0, Warn 0, the camera's own idle shape. It is the ONLY thing besides budget expiry that
++    ends the panda's FCA11-long actuation episode (``safety/modes/hyundai.h`` 970-973). Without it
++    ``act_active`` stays latched across separate brakes, the 2.5 s budget keeps running and the panda
++    then refuses actuation for a 3 s cooldown - which is why the car layer used to be silently cut
++    to ~half its intended brake time. The same 2.5 s / 3 s budget is mirrored in Python so ``braking``
++    (and therefore the gas hard-zero and the alerts) matches what the panda will really accept.
+ 
+ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+   CF_VSM_Prefill (0,1), CF_VSM_HBACmd (1,2), CF_VSM_Warn (3,2), CF_VSM_BeltCmd (5,3),
+@@ -79,6 +86,21 @@ FCA11_ONSET_BYPASS_ACCEL = -1.2
+ FCA11_MIN_ON_S = FCA11_MIN_ON_FRAMES / 100.0
+ FCA11_ONSET_HOLD_S = FCA11_ONSET_HOLD_FRAMES / 100.0
+ 
++# *** G7 (N1): passive release frame + the panda's actuation-budget mirror ***
++# The panda's FCA11-long tx hook (safety/modes/hyundai.h:146-149, 939-975) caps a CONTINUOUS actuation
++# episode at 2.5 s, then refuses new actuation for a 3 s cooldown of passive frames. An episode ends
++# ONLY on an accepted passive 0x38D frame from the host (L970-973) or by budget expiry (L948-951).
++# Before G7 the car layer sent NOTHING when not braking, so act_active stayed latched across separate
++# brakes and the budget kept running - on the road only ~45-57 % of the intended brake time actuated
++# (round-5 N1). G7 mirrors the same 2.5 s / 3 s state machine here so `braking` (and hence the gas
++# hard-zero and the alerts) matches what the panda will really accept: the car layer deliberately
++# ends an episode at the budget edge (with its passive frame) rather than keep commanding frames the
++# panda refuses inside the cooldown.
++# Controller frames are 100 Hz, so the budget/cooldown are counted in frames; the panda times both
++# from the same microsecond clock, and the +-1-frame quantisation is sub-20 ms either side.
++FCA11_BUDGET_FRAMES = 250    # 2.5 s at 100 Hz: == HYUNDAI_FCA11_LONG_MAX_ACT_US (safety/modes/hyundai.h:148)
++FCA11_COOLDOWN_FRAMES = 300  # 3.0 s at 100 Hz: == HYUNDAI_FCA11_LONG_COOLDOWN_US (safety/modes/hyundai.h:149)
++
+ # planner-side speed floor (km/h). 3 km/h above the panda's 9 km/h backstop so the panda floor is
+ # never the thing that ends a brake; below this the planner requests coast-only (the PID limits in
+ # the interface are floored at 0) and this module never sends.
+@@ -239,7 +261,13 @@ class Fca11LongBrake:
+ 
+   Inert (``update`` returns [] and ``braking`` is False) unless ``CP_SP.fca11Brake`` is set. All
+   panda-facing state comes through ``CS`` attributes only (CarState writes them), so the class
+-  works identically against the real card loop and a test double."""
++  works identically against the real card loop and a test double.
++
++  ``braking`` is True only while an ACTUATING frame is being sent; on the true -> false edge the
++  class emits exactly one PASSIVE mirror frame (the camera's idle shape: all brake fields 0, Warn 0)
++  to close the panda's FCA11-long episode. The panda's 2.5 s budget / 3 s cooldown is mirrored here so
++  the class stops commanding at the budget edge instead of being silently refused in the cooldown.
++  """
+ 
+   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None):
+     self.CP = CP
+@@ -254,6 +282,11 @@ class Fca11LongBrake:
+     # ---- G5 anti-flap state ----
+     self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
+     self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
++    # ---- G7 panda actuation-budget mirror + passive release edge ----
++    self._budget_start = 0             # controller frame at which the current ACTUATION episode opened
++    self._in_budget = False            # inside a continuous actuation episode (== the panda's act_active)
++    self._budget_end = -1              # frame at which the episode ended (cooldown runs from here)
++    self._release_pending = False      # a passive frame is owed (the braking true -> false edge)
+ 
+   # ---- window ----
+ 
+@@ -293,6 +326,24 @@ class Fca11LongBrake:
+     closing = bool(getattr(CS, "fca11_lead_closing", False))
+     return closing and FCA11_BRAKE_MIN_KPH < v_kph <= FCA11_BRAKE_MIN_KPH + FCA11_ALERT_MARGIN_KPH
+ 
++  def _passive_frame(self, CS, frame: int) -> list[CanData]:
++    """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
++    DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
++
++    This is the clean release / hand-back frame the panda accepts while ``controls_allowed`` AND
++    ``heartbeat_engaged`` (safety/modes/hyundai.h:903-931, 963-973); it is what ENDS an actuation
++    episode and starts the cooldown clock. Only sent on the FCA11_SEND_EVERY slot, same 50 Hz stream
++    as the actuating frames, and only when a fresh camera frame is in hand (never a hardcoded frame -
++    the mirror is always sourced from the latest bus-2 0x38D).
++    """
++    cam = getattr(CS, "fca11_cam_frame", None)
++    if cam is None or len(cam[1]) != 8 or frame % FCA11_SEND_EVERY != 0:
++      return []
++    t_cam, dat = cam
++    cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
++    m = Fca11MirrorFrame(dec_cmd=0, prefill=False, warn=0, cmd_act=False, dec_cmd_act=False)
++    return [CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0)]
++
+   def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     sends: list[CanData] = []
+     if not self.enabled:
+@@ -301,6 +352,10 @@ class Fca11LongBrake:
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+       self._on_frames = 0
++      # G7: likewise no budget/cooldown state survives a disable (a re-arm is a clean panda episode too).
++      self._in_budget = False
++      self._budget_end = -1
++      self._release_pending = False
+       return sends
+ 
+     # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
+@@ -327,6 +382,11 @@ class Fca11LongBrake:
+       # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
+       self._ask_frames = 0
+       self._on_frames = 0
++      # G7: the panda's episode state resets with the arm, and longActive off means we are not sending;
++      # clear the budget/cooldown mirror and owe no passive frame.
++      self._in_budget = False
++      self._budget_end = -1
++      self._release_pending = False
+       return sends
+ 
+     accel = float(CC.actuators.accel)
+@@ -349,6 +409,27 @@ class Fca11LongBrake:
+                    (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+     want_brake = bool(onset or holding)
+ 
++    # ---- G7 panda actuation-budget mirror -------------------------------------------------------
++    # Mirror of safety/modes/hyundai.h:944-961. `self._in_budget` == the panda's act_active.
++    #   * while in an episode, a CONTINUOUS actuation runs at most FCA11_BUDGET_FRAMES (2.5 s); at the
++    #     budget edge the panda ENDS the episode and REFUSES that frame -> we must stop commanding
++    #     (not merely be cut): end here, release below with the passive frame, start the cooldown.
++    #   * after an episode ends (budget or release), a NEW actuation is refused for
++    #     FCA11_COOLDOWN_FRAMES (3 s) of passive frames -> we must not re-command inside it.
++    # A frame we would command inside the cooldown is a frame the panda refuses; refusing it here is
++    # what keeps `braking`/gas-zero/alerts honest. Safety-only paths (`ok` false, longActive off,
++    # camera owns, CUT) are evaluated BEFORE this and are untouched by the budget mirror.
++    cooldown_active = (not self._in_budget) and self._budget_end >= 0 and (frame - self._budget_end) <= FCA11_COOLDOWN_FRAMES
++    if want_brake and self._in_budget and (frame - self._budget_start) > FCA11_BUDGET_FRAMES:
++      # budget spent: the panda would refuse this very frame and end the episode here
++      self._in_budget = False
++      self._budget_end = frame
++      want_brake = False
++    elif want_brake and cooldown_active:
++      # still inside the passive cooldown: a new actuation is refused by the panda, so do not ask
++      want_brake = False
++    # ---------------------------------------------------------------------------------------------
++
+     if want_brake:
+       # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+       # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+@@ -368,12 +449,30 @@ class Fca11LongBrake:
+       self.braking = True
+       self._sent_this_episode = True
+       self._dec_last_sent = dec_cmd
++      if not self._in_budget:
++        # first accepted actuation of a new episode: open the budget clock (the panda starts it on the
++        # first accepted actuating frame, hyundai.h:967-969).
++        self._in_budget = True
++        self._budget_start = frame
++        self._budget_end = -1
+     else:
+-      # not braking: the camera's own FCA11 keeps flowing (panda's dynamic block opens within one
+-      # camera period of our last frame).
++      # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
++      # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
++      # without this the panda's act_active stays latched across brakes (round-5 N1).
++      was_braking = self.braking
+       self.braking = False
+       self._dec_last_sent = 0
+       self._sent_this_episode = False
++      if was_braking:
++        # braking true -> false edge: end the panda episode, start the cooldown clock, owe a passive frame
++        if self._in_budget:
++          self._in_budget = False
++        self._budget_end = frame
++        self._release_pending = True
++      if self._release_pending:
++        sends += self._passive_frame(CS, frame)
++        if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
++          self._release_pending = False
+ 
+     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+     self._on_frames = self._on_frames + 1 if want_brake else 0
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index ae53caa..d27d6e7 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -351,7 +351,71 @@ class TestController(unittest.TestCase):
+     b.update(self._cc(-2.0, engaged=False), _CS(cam=_cam()), 6)
+     b.update(self._cc(-2.0, engaged=True), _CS(cam=_cam()), 8)
+     self.assertFalse(b.blocked_until_resume)
+-    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 10))
++    # G7: the cut also ENDED the actuation episode (at frame 2), so the panda's 3 s passive cooldown must
++    # elapse before a new actuation is accepted. The re-engage clears the car-layer latch; the budget
++    # mirror then legitimately holds braking off inside the cooldown. Past it, braking resumes.
++    f = 2 + fl.FCA11_COOLDOWN_FRAMES + 2
++    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f))
++
++  def test_passive_release_frame_on_every_episode_end(self):
++    """G7 (N1): every braking episode must end with exactly ONE passive 0x38D (the panda needs it to
++    close its FCA11-long episode; camera frames do not pass the TX hook)."""
++    b = self._brake(self._cp_sp())
++    # a hard ask opens an episode immediately (the -1.2 bypass)
++    for f in range(0, 4):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++    self.assertTrue(b.braking)
++    # release: the ask rises above -0.30; once the 0.6 s min-on has elapsed the episode ends on a
++    # frame that must carry the passive mirror frame (all brake fields 0, Warn 0).
++    released = None
++    for f in range(4, 400):
++      s = b.update(self._cc(-0.2), _CS(cam=_cam()), f)
++      if not b.braking:
++        released = (f, s); break
++    self.assertIsNotNone(released, "episode never released")
++    f, s = released
++    if not s:  # the passive frame is on the 50 Hz slot; the release frame may have been an odd one
++      s = b.update(self._cc(-0.2), _CS(cam=_cam()), f + 1)
++    passive = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
++    self.assertEqual(1, len(passive), "exactly one passive frame must close the episode")
++    p = passive[0].dat
++    self.assertEqual(0, fl._get_bits(p, 0, 1), "Prefill")     # the camera's idle shape
++    self.assertEqual(0, fl._get_bits(p, 3, 2), "Warn")
++    self.assertEqual(0, fl._get_bits(p, 20, 1), "CmdAct")
++    self.assertEqual(0, fl._get_bits(p, 31, 1), "DecCmdAct")
++    self.assertEqual(hyundai_checksum(p[:7]), p[7])
++    # and while engaged the stream is ONLY actuating frames (never a stray passive)
++    b2 = self._brake(self._cp_sp())
++    for f in range(0, 6):
++      for x in b2.update(self._cc(-2.0), _CS(cam=_cam()), f):
++        self.assertGreaterEqual(fl._get_bits(x.dat, 8, 8), 1)
++
++  def test_budget_mirror_ends_episode_and_holds_cooldown(self):
++    """G7: the panda's 2.5 s/3 s budget is mirrored, so the car layer stops commanding at the budget
++    edge (instead of being silently refused) and does not re-command inside the cooldown."""
++    b = self._brake(self._cp_sp())
++    # a sustained hard ask brakes through the whole 2.5 s budget ...
++    for f in range(0, fl.FCA11_BUDGET_FRAMES + 1):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++      self.assertTrue(b.braking, f)
++    # ... the car layer ends the episode one frame past the budget (the panda would refuse that frame)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), fl.FCA11_BUDGET_FRAMES + 1)
++    self.assertFalse(b.braking)
++    # ... it does not re-command inside the 3 s cooldown ...
++    for f in range(fl.FCA11_BUDGET_FRAMES + 2, fl.FCA11_BUDGET_FRAMES + 2 + fl.FCA11_COOLDOWN_FRAMES):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++      self.assertFalse(b.braking, f)
++    # ... and a fresh ask past the cooldown opens a NEW episode.
++    f = fl.FCA11_BUDGET_FRAMES + 2 + fl.FCA11_COOLDOWN_FRAMES + 1
++    b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++    self.assertTrue(b.braking)
++
++  def test_off_path_emits_no_passive_frame(self):
++    """G7: the OFF path (fca11Brake False -> enabled False) is inert: no mirror frame of any kind."""
++    b = self._brake(self._cp_sp(fca11=False))
++    for f in range(0, 10):
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f), f)
++      self.assertFalse(b.braking, f)
+ 
+   def test_camera_request_latches(self):
+     b = self._brake(self._cp_sp())

@@ -54,14 +54,21 @@ def get_max_accel(v_ego, personality=log.LongitudinalPersonality.standard):
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
+def turn_accel_limit(v_ego, angle_steers, CP):
+  """Longitudinal accel budget left over after the lateral (turn) demand, from the same
+  a_total_max(v) ellipse the cruise candidate uses. Returns sqrt(a_total_max^2 - a_y^2) >= 0.
+  angle_steers is the effective (offset-removed) road-wheel angle in degrees; abs() so a
+  left/right turn both limit."""
+  a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
+  a_y = abs(v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase))
+  return math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
+
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
                      personality=log.LongitudinalPersonality.standard):
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego, personality)
 
   if not e2e:
-    a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
-    a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
-    a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
+    a_x_allowed = turn_accel_limit(v_ego, angle_steers, CP)
     max_accel = min(max_accel, a_x_allowed)
     if not allow_throttle:
       clipped_accel_coast = max(accel_coast, ACCEL_MIN)
@@ -157,6 +164,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                               action_t=action_t)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
+    # G4: the e2e candidate owns the launch and was never turn-limited (get_cruise_accel's
+    # limit_accel_in_turns only clips the cruise candidate). Limit its positive accel to the
+    # leftover longitudinal budget of the same a_total_max(v) ellipse, floored at 0.3 m/s^2 so a
+    # stopped car with the wheel turned can still pull away. min() never raises accel, so the
+    # MPC/lead candidate's braking is untouched.
+    output_a_target_e2e = min(output_a_target_e2e,
+                              max(turn_accel_limit(v_ego, steer_angle_without_offset, self.CP), 0.3))
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     is_e2e = self.is_e2e(sm)
