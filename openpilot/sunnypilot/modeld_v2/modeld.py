@@ -9,6 +9,7 @@ See the LICENSE.md file in the root directory for more details.
 from collections.abc import Callable
 import os
 os.environ['GMMU'] = '0'
+import sys
 import numpy as np
 import threading
 import time
@@ -36,7 +37,12 @@ from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.modeld import ChestnutState
+# OFFLOAD §4f: keep the eager import when not offloading (byte-identical device behavior); on
+# macOS the chestnut/AMD-heavy stock modeld module is not imported at module load.
+if os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin':
+  ChestnutState = None
+else:
+  from openpilot.selfdrive.modeld.modeld import ChestnutState
 
 from openpilot.selfdrive.modeld.compile_modeld import (
   MODELD_INPUTS,
@@ -58,6 +64,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeC
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld_tinygrad"
 BIG_MODEL_TIMEOUT = 60
+# OFFLOAD §4e: VisionIPC server name configurable; defaults to the contract's DEFAULT_VIPC_SERVER.
+OFFLOAD_VIPC_SERVER = os.environ.get('OFFLOAD_VIPC_SERVER', 'camerad')
 
 
 def _pkl_exists(path):
@@ -78,6 +86,50 @@ def _find_driving_pkl(bundle):
   if _pkl_exists(pkl_path):
     return pkl_path
   return None
+
+
+def _get_chestnut_state_class():
+  """OFFLOAD §4f: avoid importing the chestnut/AMD-heavy stock modeld module on macOS."""
+  if ChestnutState is None:
+    class _DisabledChestnutState:
+      def __init__(self, *args, **kwargs):
+        raise RuntimeError("chestnut disabled under OFFLOAD on macOS")
+
+    return _DisabledChestnutState
+  return ChestnutState
+
+
+def _offload_chestnut_present() -> bool:
+  """OFFLOAD §4f: never probe USB/chestnut on the Mac path."""
+  if os.environ.get('OFFLOAD') == '1':
+    return os.environ.get('OFFLOAD_CHESTNUT') == '1'
+  return chestnut_present()
+
+
+def _load_offload_car_params():
+  """OFFLOAD §4d: seed CarParams bytes without a working Params backend.
+
+  Priority: OFFLOAD_CARPARAMS_PKL (explicit file of serialized cereal bytes), then any
+  locally-produced CarParamsPersistent, then the shipped demo CarParams so the run loop
+  always has a valid CarParams on the Mac.
+  """
+  raw = None
+  pkl_path = os.environ.get('OFFLOAD_CARPARAMS_PKL')
+  if pkl_path and os.path.exists(pkl_path):
+    with open(pkl_path, 'rb') as f:
+      raw = f.read()
+  else:
+    try:
+      from openpilot.common.params import Params as _Params
+      raw = _Params().get("CarParamsPersistent")
+    except Exception:
+      raw = None
+  if raw:
+    try:
+      return messaging.log_from_bytes(raw, car.CarParams)
+    except Exception as e:
+      cloudlog.warning(f"OFFLOAD: could not parse CarParams bytes ({e}); using demo params")
+  return get_demo_car_params()
 
 
 class FrameMeta:
@@ -120,8 +172,14 @@ class ModelState(ModelStateBase):
     jits = load_oob(open_file_chunked(pkl_path))
 
     metadata = jits['metadata']
-    self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
-    self.DEV = ('AMD' if self.chestnut else 'QCOM') if COMMA_HARDWARE else 'CPU'
+    # OFFLOAD §4a: on macOS (Darwin-arm64) force the Metal devices instead of the
+    # COMMA_HARDWARE-gated QCOM/AMD selection. Unset => byte-identical device behavior.
+    if os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin':
+      self.WARP_DEV = os.environ.get('OFFLOAD_WARP_DEV', 'METAL')
+      self.DEV = os.environ.get('OFFLOAD_DEV', 'METAL')
+    else:
+      self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
+      self.DEV = ('AMD' if self.chestnut else 'QCOM') if COMMA_HARDWARE else 'CPU'
     self.QUEUE_DEV = self.DEV
     self.is_run_model = 'run_model' in jits
 
@@ -322,9 +380,11 @@ def main(demo=False):
   sentry.set_tag("daemon", PROCESS_NAME)
   cloudlog.bind(daemon=PROCESS_NAME)
   setproctitle(PROCESS_NAME)
-  config_realtime_process(7, 54)
+  # OFFLOAD §4b: config_realtime_process raises on macOS (SCHED_FIFO/affinity); skip it there.
+  if not (os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin'):
+    config_realtime_process(7, 54)
 
-  CHESTNUT = chestnut_present()
+  CHESTNUT = _offload_chestnut_present()
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
@@ -334,7 +394,7 @@ def main(demo=False):
 
   # visionipc clients
   while True:
-    available_streams = VisionIpcClient.available_streams("camerad", block=False)
+    available_streams = VisionIpcClient.available_streams(OFFLOAD_VIPC_SERVER, block=False)
     if available_streams:
       use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_NARROW_ROAD in available_streams
       main_wide_camera = VisionStreamType.VISION_STREAM_NARROW_ROAD not in available_streams
@@ -342,8 +402,8 @@ def main(demo=False):
     time.sleep(.1)
 
   vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_NARROW_ROAD
-  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
-  vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
+  vipc_client_main = VisionIpcClient(OFFLOAD_VIPC_SERVER, vipc_client_main_stream, True)
+  vipc_client_extra = VisionIpcClient(OFFLOAD_VIPC_SERVER, VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
 
   while not vipc_client_main.connect(False):
@@ -392,7 +452,7 @@ def main(demo=False):
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
-  chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
+  chestnut_state = _get_chestnut_state_class()(pm, model.chestnut) if CHESTNUT else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)
@@ -411,6 +471,9 @@ def main(demo=False):
 
   if demo:
     CP = get_demo_car_params()
+  elif os.environ.get('OFFLOAD') == '1':
+    # OFFLOAD §4d: Params storage may be empty/unbacked on the Mac; seed CarParams bytes explicitly.
+    CP = _load_offload_car_params()
   else:
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
