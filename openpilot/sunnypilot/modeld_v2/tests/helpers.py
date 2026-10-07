@@ -94,7 +94,9 @@ SUPERCOMBO_RUN_INPUT_SHAPES = {
 
 def write_supercombo_run_pkl(tmp_path, output_slices=None):
   """Write a run_model supercombo pkl (metadata 'model' + run_model JIT). Returns path."""
-  from openpilot.selfdrive.modeld.helpers import dump_oob
+  # POST-MERGE (2026-10-07): upstream's ONNX-compiler sync (#38922) removed dump_oob from
+  # openpilot.selfdrive.modeld.helpers; it lives in the sunnypilot helpers only.
+  from openpilot.sunnypilot.modeld_v2.helpers import dump_oob
   if output_slices is None:
     output_slices = SUPERCOMBO_SLICES  # plan/hidden_state/meta; defined below
   pkl_data = {'metadata': {'model': {'input_shapes': SUPERCOMBO_RUN_INPUT_SHAPES,
