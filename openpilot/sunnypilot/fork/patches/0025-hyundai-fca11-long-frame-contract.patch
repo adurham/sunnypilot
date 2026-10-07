@@ -1,4 +1,4 @@
-From 8fa7cd1062c3d63f8a8301e82d1bef00bd320786 Mon Sep 17 00:00:00 2001
+From 33ce7216a42372f914c125a917b7133fdf7296e8 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 02:30:00 -0500
 Subject: [PATCH] hyundai: FCA11-long frame contract (R7-A/C/D) - rate ref on
@@ -46,7 +46,7 @@ passed. Python-only: no opendbc/safety .h/.c change, the panda TX hook and budge
  2 files changed, 195 insertions(+), 15 deletions(-)
 
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index a7f69e6..68bd7cd 100644
+index a7f69e60..68bd7cd3 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -38,6 +38,15 @@ Design (see car-features/fca11-long-integration.md for the full picture):
@@ -154,7 +154,7 @@ index a7f69e6..68bd7cd 100644
      # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
      self._on_frames = self._on_frames + 1 if want_brake else 0
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index d27d6e7..3ed6c64 100644
+index d27d6e7c..3ed6c649 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -351,10 +351,11 @@ class TestController(unittest.TestCase):
@@ -345,5 +345,5 @@ index d27d6e7..3ed6c64 100644
    """Personality-indexed FCA11-long decel cap: relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g (today's cap, max).
  
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

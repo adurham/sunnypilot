@@ -1,4 +1,4 @@
-From 7607261bc6e46542f9550f4d7bc97c8d9e49ad06 Mon Sep 17 00:00:00 2001
+From 4d3fbdc9e1e8e3bd25ee94576a001722178ece36 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sun, 4 Oct 2026 00:49:44 -0500
 Subject: [PATCH] hyundai: gas interceptor buttons v2 + hold-offset refit
@@ -94,7 +94,7 @@ index 30b73e68..2c326e31 100644
    }
  }
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 972791e9..2a2affe7 100755
+index e7e9b606..672d1667 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -19,6 +19,7 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
@@ -105,7 +105,7 @@ index 972791e9..2a2affe7 100755
  
  # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
  GAS_ON = 0.1
-@@ -879,24 +880,58 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -883,24 +884,58 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self.assertTrue(self.safety.get_controls_allowed())  # exactly on the 3rd released sample
  
    def test_pause_button_disengages_when_engaged(self):
@@ -168,7 +168,7 @@ index 972791e9..2a2affe7 100755
  
    def test_pause_button_while_brake_held(self):
      self._engage_then_brake()
-@@ -925,17 +960,34 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -929,17 +964,34 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self.assertFalse(self.safety.get_controls_allowed())
  
    def test_pause_button_gas_pressed(self):
@@ -517,5 +517,5 @@ index b6f2e0a5..4ee6929f 100644
  
  def _hyundai_checksum(msg):
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

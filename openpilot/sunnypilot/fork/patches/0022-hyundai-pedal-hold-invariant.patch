@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f10b32438660d3610ec73b34859756cda2e68b00 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 01:30:00 -0500
-Subject: [PATCH 1/2] hyundai: gas-interceptor HOLD feedforward is
+Subject: [PATCH] hyundai: gas-interceptor HOLD feedforward is
  personality-invariant
 
 get_hold_command no longer multiplies the hold feedforward by personality_scale: the
@@ -20,7 +20,7 @@ move in the intended direction. Python-only, no opendbc/safety and no panda chan
  1 file changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index e106b4d..d3ff7a8 100644
+index e106b4d2..d3ff7a81 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -186,8 +186,13 @@ def get_pedal_scale(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
@@ -39,3 +39,6 @@ index e106b4d..d3ff7a8 100644
  
  
  def get_pedal_rate_up(v_ego: float) -> float:
+-- 
+2.55.0
+

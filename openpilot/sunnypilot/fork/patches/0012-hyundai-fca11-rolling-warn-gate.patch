@@ -1,4 +1,4 @@
-From 935e5ed32656106cf7b873375d35354ff10dafe8 Mon Sep 17 00:00:00 2001
+From 4bc8733e648e632ceb1aad600243ebd4a4f4adfd Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sun, 4 Oct 2026 12:19:39 -0500
 Subject: [PATCH] hyundai: FCA11 rolling test: police CF_VSM_Warn-only frames
@@ -14,7 +14,7 @@ actuation is one episode, capped at 1.2 s). Parked mode (64 without 128) is unch
  2 files changed, 111 insertions(+), 6 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index a1f9aa0f..ee099d70 100644
+index d64bdb3c..db5cb457 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -514,17 +514,22 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
@@ -45,10 +45,10 @@ index a1f9aa0f..ee099d70 100644
            } else {
            }
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 4ad58d87..f4fbd301 100755
+index d00bcb2c..aecfa49e 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -1643,10 +1643,10 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -1647,10 +1647,10 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
    def _test_sp(self) -> int:
      return HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST | self.SAFETY_PARAM_SP
  
@@ -61,7 +61,7 @@ index 4ad58d87..f4fbd301 100755
      return self.packer.make_can_msg_safety("FCA11", 0, values)
  
    def _brake_cmd(self, dec):
-@@ -2162,6 +2162,103 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+@@ -2166,6 +2166,103 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
      self.assertTrue(self._tx(self._fca11()))        # a passive frame ends the actuation ...
      self.assertTrue(self._tx(self._brake_cmd(5)))   # ... and a new one may start
  
@@ -165,7 +165,7 @@ index 4ad58d87..f4fbd301 100755
    # *** gating ***
  
    def test_rolling_bit_alone_ignored(self):
-@@ -2177,6 +2274,9 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+@@ -2181,6 +2278,9 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
      self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
      self._open_window()
      self.assertFalse(self._tx(self._brake_cmd(1)))
@@ -176,5 +176,5 @@ index 4ad58d87..f4fbd301 100755
      self.assertTrue(self._tx(self._brake_cmd(1)))
  
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

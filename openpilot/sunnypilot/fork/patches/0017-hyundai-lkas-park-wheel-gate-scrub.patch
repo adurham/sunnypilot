@@ -1,4 +1,4 @@
-From 88dbfc746d8aaeceafbc25f673b7308478cdc28e Mon Sep 17 00:00:00 2001
+From ef6f44dd0989b5558520555fe6729e950ee919dc Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 11:03:57 -0500
 Subject: [PATCH] hyundai: LKAS_PARK_TEST wheel gate 12 -> 160 raw (0.375 ->
@@ -19,7 +19,7 @@ drives both the per-frame parked check and the latched cut. No other wheel rule
  3 files changed, 10 insertions(+), 6 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 2e3a465d..1dd3eb65 100644
+index 6e97f3bf..aea8b2cb 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -370,7 +370,11 @@ static void hyundai_fca11_rolling_rx(const CANPacket_t *msg) {
@@ -36,10 +36,10 @@ index 2e3a465d..1dd3eb65 100644
  #define HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ 500    // raw CR_Mdps_StrTq (0.01 Nm): |tq| > 5.00 Nm latches the cut
  #define HYUNDAI_LKAS_PARK_GEAR_P 0U            // LVR12 CF_Lvr_Gear
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index d93297ca..798add0d 100755
+index 1b63b32e..437ffe99 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -3407,7 +3407,7 @@ class TestHyundaiNonSCCLkasParkTestSafety(TestHyundaiNonSCCSafety):
+@@ -3411,7 +3411,7 @@ class TestHyundaiNonSCCLkasParkTestSafety(TestHyundaiNonSCCSafety):
            w[i] = raw
            self._rx(self._wheel_msg(*w))
            self.assertEqual(ok, self._tx(self._lkas(3)))
@@ -75,5 +75,5 @@ index b19652cb..bfa70de6 100644
  HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM = 5.0  # |CR_Mdps_StrTq| above this latches the firmware cut
  
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

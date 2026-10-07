@@ -1,4 +1,4 @@
-From 55e0a7f1dbadd6fd68534834a48964929777830c Mon Sep 17 00:00:00 2001
+From f7f0763afc06da70479c3c0e6453620f2baf78f4 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 12:59:31 -0500
 Subject: [PATCH] hyundai: gas interceptor SCE-latch recovery (clear frame +
@@ -445,5 +445,5 @@ index f0f2baf8..fe3e7582 100644
 +    frames = self._cancel_frames(None, 100)
 +    assert frames == list(range(10, 100))
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

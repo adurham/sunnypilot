@@ -1,4 +1,4 @@
-From 8e28e5ff109aa65278b5acc066bbf3af990becf4 Mon Sep 17 00:00:00 2001
+From 8ead97433862802878b625c6edbde981ef1efc3a Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 17:04:06 -0500
 Subject: [PATCH] hyundai: gas interceptor: personality-indexed pedal law
@@ -28,7 +28,7 @@ Offline only.
  create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
 
 diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
-index eb56cff..0927e8c 100644
+index eb56cffa..0927e8c5 100644
 --- a/opendbc/car/hyundai/carcontroller.py
 +++ b/opendbc/car/hyundai/carcontroller.py
 @@ -145,7 +145,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
@@ -41,7 +41,7 @@ index eb56cff..0927e8c 100644
        CS.pedal_long_engaged = CC.enabled
  
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index b5f7cd5..87c5d90 100644
+index b5f7cd50..87c5d905 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
 @@ -145,6 +145,9 @@ class CarControlSP:
@@ -55,7 +55,7 @@ index b5f7cd5..87c5d90 100644
    @auto_dataclass
    class Param:
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 51c4a7c..57fad02 100644
+index 51c4a7c3..57fad029 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -82,6 +82,38 @@ HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
@@ -186,7 +186,7 @@ index 51c4a7c..57fad02 100644
      else:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
 new file mode 100644
-index 0000000..f4f65a7
+index 00000000..f4f65a7f
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor_personality.py
 @@ -0,0 +1,190 @@
@@ -381,5 +381,5 @@ index 0000000..f4f65a7
 +      _, dc, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.get_personality_ceiling(0., p), 0)
 +      assert abs(c[p] - ((dc[0] << 8) | dc[1])) <= 2, (p, c)
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

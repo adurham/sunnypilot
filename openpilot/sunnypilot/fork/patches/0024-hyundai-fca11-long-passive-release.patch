@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 52c304bcdb178d335d5fbe8b10540a7ca42e5abc Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 02:30:00 -0500
-Subject: [PATCH 1/1] hyundai: FCA11-long passive release frame + panda
+Subject: [PATCH] hyundai: FCA11-long passive release frame + panda
  actuation-budget mirror (G7, fixes N1)
 
 The panda's FCA11-long tx hook (safety/modes/hyundai.h:146-149, 939-975) caps a continuous
@@ -39,10 +39,10 @@ this is a Python-only change. The panda TX hook and the budget/cooldown behaviou
  3 files changed, 224 insertions(+), 4 deletions(-)
 
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 798add0..50467d8 100755
+index 437ffe99..7949cee0 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -2764,6 +2764,63 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+@@ -2768,6 +2768,63 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
      self._open_window()
      self.assertTrue(self._tx(self._brake_cmd(1)))
  
@@ -107,7 +107,7 @@ index 798add0..50467d8 100755
  
    def _assert_cut_latched(self):
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index d9eaed5..a7f69e6 100644
+index d9eaed5e..a7f69e60 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -31,6 +31,13 @@ Design (see car-features/fca11-long-integration.md for the full picture):
@@ -283,7 +283,7 @@ index d9eaed5..a7f69e6 100644
      # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
      self._on_frames = self._on_frames + 1 if want_brake else 0
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index ae53caa..d27d6e7 100644
+index ae53caa7..d27d6e7c 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -351,7 +351,71 @@ class TestController(unittest.TestCase):
@@ -359,3 +359,6 @@ index ae53caa..d27d6e7 100644
  
    def test_camera_request_latches(self):
      b = self._brake(self._cp_sp())
+-- 
+2.55.0
+

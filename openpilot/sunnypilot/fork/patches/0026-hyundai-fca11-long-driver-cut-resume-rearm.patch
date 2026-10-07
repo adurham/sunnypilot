@@ -1,4 +1,4 @@
-From 205f91178dd0dd8542b5121aa396b54171facb7a Mon Sep 17 00:00:00 2001
+From cdef8af67e5ec6b4862a2fb911280ae177d5f5dd Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 02:30:00 -0500
 Subject: [PATCH] hyundai: FCA11-long driver-input cut re-arms on the openpilot
@@ -72,7 +72,7 @@ panda H7 to a NEW binary. Flashing is a separate, explicit owner decision.
  2 files changed, 201 insertions(+), 6 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 1dd3eb6..cef56e5 100644
+index aea8b2cb..b813b6f5 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -175,9 +175,24 @@ static bool hyundai_fca11_long_act_active;    // inside a continuous actuation e
@@ -158,10 +158,10 @@ index 1dd3eb6..cef56e5 100644
  }
  
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 50467d8..79e9dad 100755
+index 7949cee0..40d9ec91 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -2531,7 +2531,9 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+@@ -2535,7 +2535,9 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
      ENGAGED (controls_allowed AND heartbeat_engaged): TX = the pedal list + FCA11 (dynamic camera blocking), the
      pedal path stays fully active. Actuating FCA11 is legal only inside the window (gear D, no pedal, every wheel
      above 9 km/h raw 288, fresh inputs, no cut), capped at 0.30 g, rate-limited, on a 2.5 s budget / 3 s cooldown,
@@ -172,7 +172,7 @@ index 50467d8..79e9dad 100755
    """
    # pedal list + FCA11 (check_relay, dynamic blocking via hyundai_fwd_hook). NO CLU11: the pedal TX list has none.
    TX_MSGS = [[0x340, 0], [0x485, 0], [0x200, 0], [0x38D, 0]]
-@@ -2869,6 +2871,155 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+@@ -2873,6 +2875,155 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
          # boot states do not latch and do not block the window by themselves
          self.assertTrue(self._tx(self._brake_cmd(1)))
  
@@ -328,7 +328,7 @@ index 50467d8..79e9dad 100755
    # *** camera hand-back ***
  
    def test_camera_request_blocks_and_unblocks_fwd(self):
-@@ -2904,6 +3055,13 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+@@ -2908,6 +3059,13 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
      self.assertFalse(self._tx(self._fca11()))
      self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
      self.assertTrue(self._tx(self._interceptor_gas_cmd(0.1)))
@@ -342,3 +342,6 @@ index 50467d8..79e9dad 100755
  
    def test_ignored_on_canfd_and_legacy(self):
      for mode in (CarParams.SafetyModel.hyundaiLegacy, CarParams.SafetyModel.hyundaiCanfd):
+-- 
+2.55.0
+

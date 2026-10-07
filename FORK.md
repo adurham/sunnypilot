@@ -1529,8 +1529,13 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 
 ## Sync mechanics notes
 
-- Upstream base this fork currently tracks: `a5f44653d7` (upstream master) / `0b2c431d`
-  (upstream prebuilt dev, "built from" a5f44653d7).
+- Upstream base this fork currently tracks: `3323aafb54` (upstream master) / `6c75649690`
+  (upstream prebuilt dev tip).
+- Upstream migrated their git-LFS store from GitLab to HuggingFace in this range; the merge
+  must take upstream's `.lfsconfig` (now `https://huggingface.co/sunnypilot/sunnypilot-lfs.git`),
+  or the fork's old GitLab URL 404s on the new model objects and `git merge` dies mid-smudge
+  ("smudge filter lfs failed"). The opendbc patch series was also rebased onto the advanced
+  pin `b2acec1d` (from `f95f996f`) so it keeps applying clean under CI's `git apply` order.
 - The sync workflow merges upstream into `main` when upstream advances; conflicts are
   resolved once as normal git merges (fork-only files — e.g. `openpilot/sunnypilot/fork/`,
   this file — should never conflict; keep fork-only code in fork-only paths when possible).

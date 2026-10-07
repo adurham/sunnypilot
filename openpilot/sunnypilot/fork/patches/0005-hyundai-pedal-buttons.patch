@@ -1,4 +1,4 @@
-From f265f99295f93b532d2be61d75d559806cd9735b Mon Sep 17 00:00:00 2001
+From 705ec793a7d785e27b090188a3a0d7a8c162a9e9 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 17:24:34 -0500
 Subject: [PATCH] hyundai: gas interceptor: zero CLU11 TX (factory cruise MAIN
@@ -95,7 +95,7 @@ index c9cc086b..0676875e 100644
      cp = can_parsers[Bus.pt]
      cp_cam = can_parsers[Bus.cam]
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 36aaaddb..5182d0ff 100644
+index 2422393a..f8bffd1c 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -295,12 +295,29 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
@@ -129,7 +129,7 @@ index 36aaaddb..5182d0ff 100644
    hyundai_common_reset_acc_main_on_mismatches();
  }
  
-@@ -403,7 +420,7 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+@@ -405,7 +422,7 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
    }
  
    // BUTTONS: used for resume spamming and cruise cancellation
@@ -138,7 +138,7 @@ index 36aaaddb..5182d0ff 100644
    if ((msg->addr == 0x4F1U) && !hyundai_longitudinal) {
      int button = msg->data[0] & 0x7U;
  
-@@ -438,15 +455,21 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -440,15 +457,21 @@ static safety_config hyundai_init(uint16_t param) {
      HYUNDAI_LONG_COMMON_TX_MSGS(0)
    };
  
@@ -292,10 +292,10 @@ index 4013819f..30b73e68 100644
      }
  
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 23a4de03..972791e9 100755
+index e88f75e3..e7e9b606 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -678,6 +678,43 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -682,6 +682,43 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        return addr, dat, bus
      return self.pedal_packer.make_can_msg_safety(ids.sensor_msg, 0, values, fix_checksum=fix_checksum)
  
@@ -339,7 +339,7 @@ index 23a4de03..972791e9 100755
    # *** CAN ID dialect: exactly one of standard (0x200/0x201) / remapped (0x700/0x701) is active ***
  
    def test_pedal_messages_use_dialect_addrs(self):
-@@ -746,17 +783,173 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -750,17 +787,173 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self._rx(self._pcm_status_msg(True))
      # SET is still held: no falling edge yet, and the factory cruise rising edge must not grant
      self.assertFalse(self.safety.get_controls_allowed())
@@ -517,7 +517,7 @@ index 23a4de03..972791e9 100755
  
    def test_cancel_button(self):
      HyundaiLongitudinalBase.test_cancel_button(self)
-@@ -1046,6 +1239,35 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -1050,6 +1243,35 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
        self.assertFalse(self._tx(common.make_msg(0, 0x700, 6)))
        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
  
@@ -1085,5 +1085,5 @@ index a8c6c497..b6f2e0a5 100644
 +  dat[5] = crc8_pedal(dat[:5])
 +  return addr, dat, bus
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

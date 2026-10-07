@@ -1,4 +1,4 @@
-From 05b5bd66c6c7f6e3fe57ee2ea9a552f9080256f2 Mon Sep 17 00:00:00 2001
+From 357b37914bec8d09e225894e68e3b66655afd717 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 00:18:28 -0500
 Subject: [PATCH] hyundai: TEST-ONLY parked LKAS11 steering sweep, safety bit
@@ -26,7 +26,7 @@ Safety tests: TestHyundaiNonSCCLkasParkTestSafety (C==Python constants, unset bi
  5 files changed, 906 insertions(+), 4 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 76f5467a..2e3a465d 100644
+index ebfad9a7..6e97f3bf 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -355,6 +355,217 @@ static void hyundai_fca11_rolling_rx(const CANPacket_t *msg) {
@@ -290,7 +290,7 @@ index 76f5467a..2e3a465d 100644
    hyundai_common_reset_acc_main_on_mismatches();
  }
  
-@@ -825,8 +1065,13 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+@@ -827,8 +1067,13 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
                                          hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT :
                                          cn7_ramp ? HYUNDAI_STEERING_LIMITS_CN7_RAMP : HYUNDAI_STEERING_LIMITS;
  
@@ -305,7 +305,7 @@ index 76f5467a..2e3a465d 100644
      }
    }
  
-@@ -945,10 +1190,19 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -947,10 +1192,19 @@ static safety_config hyundai_init(uint16_t param) {
      {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
    };
  
@@ -325,7 +325,7 @@ index 76f5467a..2e3a465d 100644
  
    safety_config ret;
    if (hyundai_longitudinal) {
-@@ -1130,8 +1384,29 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -1132,8 +1386,29 @@ static safety_config hyundai_init(uint16_t param) {
        HYUNDAI_LDA_BUTTON_ADDR_CHECK
      };
  
@@ -356,7 +356,7 @@ index 76f5467a..2e3a465d 100644
        SET_TX_MSGS(HYUNDAI_FCA11_TEST_TX_MSGS, ret);
        if (hyundai_fca11_rolling_test) {
          SET_TX_MSGS(HYUNDAI_FCA11_ROLL_TX_MSGS, ret);
-@@ -1237,6 +1512,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+@@ -1239,6 +1514,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
    hyundai_fca11_brake_test = false;
    hyundai_fca11_rolling_test = false;
    hyundai_fca11_long = false;
@@ -422,7 +422,7 @@ index 508090f5..c8ec6499 100644
    // (non-SCC ICE, no SCC-replacement longitudinal) and is mutually exclusive with the TEST bits (64/128), which
    // take over FCA11 for runner-driven research with openpilot disengaged. While armed, panda polices FCA11 decel
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 5050e51d..d93297ca 100755
+index c3b05e2b..1b63b32e 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -22,7 +22,9 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
@@ -436,7 +436,7 @@ index 5050e51d..d93297ca 100755
  from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
  
  # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
-@@ -2997,5 +2999,593 @@ class TestHyundaiNonSCCSafety_HEV_EV(TestHyundaiSafety):
+@@ -3001,5 +3003,593 @@ class TestHyundaiNonSCCSafety_HEV_EV(TestHyundaiSafety):
      return self.packer.make_can_msg_safety(self.GAS_MSG[0], 0, values, fix_checksum=checksum)
  
  
@@ -1068,5 +1068,5 @@ index bf84610c..b19652cb 100644
  
  class HyundaiFlagsSP(IntFlag):
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

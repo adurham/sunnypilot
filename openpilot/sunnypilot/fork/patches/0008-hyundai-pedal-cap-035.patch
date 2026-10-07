@@ -1,4 +1,4 @@
-From cc592f1cef4432aa47f4159f8e78671390c7b8b2 Mon Sep 17 00:00:00 2001
+From 47c0ef73dd442e4c083e959fa860e43ee2b60b54 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sun, 4 Oct 2026 01:09:59 -0500
 Subject: [PATCH] hyundai: gas interceptor cap 0.30 -> 0.35 (panda raw ceiling
@@ -17,7 +17,7 @@ the 35 % travel and the launch ramp end point.
  3 files changed, 36 insertions(+), 21 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 7e6e2674..3990567e 100644
+index c31358a2..6ef85834 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -241,11 +241,12 @@ static bool hyundai_fca11_rolling_window_ok(void) {
@@ -170,5 +170,5 @@ index 4ee6929f..40eeab03 100644
      CC2 = structs.CarControl()
      CC2.enabled = CC2.latActive = CC2.longActive = True
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

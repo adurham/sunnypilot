@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 0d3b64dbac3cbdb0348791cf77cbe302e8b5301a Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 01:30:00 -0500
-Subject: [PATCH 2/2] hyundai: FCA11-long onset debounce + release hysteresis +
+Subject: [PATCH] hyundai: FCA11-long onset debounce + release hysteresis +
  minimum on-time
 
 Fixes the route-149 brake flap (M7): a single-frame planner ask crossing -0.5 used to
@@ -27,7 +27,7 @@ no opendbc/safety and no panda change.
  2 files changed, 155 insertions(+), 4 deletions(-)
 
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index 8d0805e..d9eaed5 100644
+index 8d0805e7..d9eaed5e 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -56,6 +56,29 @@ FCA11_CAM_BUS = 2
@@ -127,7 +127,7 @@ index 8d0805e..d9eaed5 100644
 +
      return sends
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index 8191f6a..ae53caa 100644
+index 8191f6af..ae53caa7 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -196,12 +196,110 @@ class TestController(unittest.TestCase):
@@ -243,3 +243,6 @@ index 8191f6a..ae53caa 100644
    def test_no_send_below_floor(self):
      b = self._brake(self._cp_sp())
      sends = b.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_BRAKE_MIN_KPH / 3.6 - 0.01, cam=_cam()), 0)
+-- 
+2.55.0
+

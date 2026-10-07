@@ -1,4 +1,4 @@
-From 3ba5db7740f1377d8ce4355b12505da4b746b422 Mon Sep 17 00:00:00 2001
+From d1ccf79f34f838d40cbcc4abdfaba3c77dddd826 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Wed, 7 Oct 2026 12:10:03 -0500
 Subject: [PATCH] hyundai: subscribe CLU13 on the powertrain parser so
@@ -36,7 +36,7 @@ Tests (test_drive_mode.py, class TestCarStateWiring):
  2 files changed, 64 insertions(+), 1 deletion(-)
 
 diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
-index 27d00fb..ec6dfee 100644
+index 27d00fbf..ec6dfeef 100644
 --- a/opendbc/car/hyundai/carstate.py
 +++ b/opendbc/car/hyundai/carstate.py
 @@ -10,6 +10,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarContr
@@ -62,7 +62,7 @@ index 27d00fb..ec6dfee 100644
      }
      if CP_SP.enableGasInterceptor:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
-index 9193bce..565d6ba 100644
+index 9193bce7..565d6baa 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
 @@ -158,6 +158,63 @@ class _ParserShim:
@@ -129,3 +129,6 @@ index 9193bce..565d6ba 100644
    def test_update_drive_mode_end_to_end(self):
      pk = _parser()
      shim = _ParserShim(pk)
+-- 
+2.55.0
+
