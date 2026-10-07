@@ -1,4 +1,4 @@
-From f2e8b276a27bd111fdd136c051f1e2f1165a549c Mon Sep 17 00:00:00 2001
+From 1125ae0b6f40576e5112bcf7e53fafa9f3657bae Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 15:02:53 -0500
 Subject: [PATCH] hyundai: gas interceptor tune from route 00000123 (cap 0.30 +
@@ -23,7 +23,7 @@ Fitted plant aEgo = 2.76*cmd + 0.032 - 0.000935 v^2 - g*pitch (R^2 0.75, 578 bin
  4 files changed, 163 insertions(+), 30 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index df6b4834..36aaaddb 100644
+index 4a4a0278..2422393a 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -94,6 +94,13 @@ static bool hyundai_legacy = false;
@@ -40,7 +40,7 @@ index df6b4834..36aaaddb 100644
  static int hyundai_get_interceptor_gas(const CANPacket_t *msg) {
    uint16_t val1 = (uint16_t)((uint16_t)msg->data[0] << 8U) | (uint16_t)msg->data[1];
    uint16_t val2 = (uint16_t)((uint16_t)msg->data[2] << 8U) | (uint16_t)msg->data[3];
-@@ -387,6 +394,12 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+@@ -389,6 +396,12 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
      if (longitudinal_interceptor_checks(msg)) {
        tx = false;
      }
@@ -54,7 +54,7 @@ index df6b4834..36aaaddb 100644
  
    // BUTTONS: used for resume spamming and cruise cancellation
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 537e2f45..23a4de03 100755
+index 94ee99c6..e88f75e3 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -11,12 +11,18 @@ from opendbc.safety.tests.common import CANPackerSafety
@@ -78,7 +78,7 @@ index 537e2f45..23a4de03 100755
  # LDA button availability
  LDA_BUTTON = [
    {"SAFETY_PARAM_SP": HyundaiSafetyFlagsSP.DEFAULT},
-@@ -611,6 +617,41 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -615,6 +621,41 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
    def _pedal_sp(self) -> int:
      return HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.DIALECT_SP | self.SAFETY_PARAM_SP
  
@@ -120,7 +120,7 @@ index 537e2f45..23a4de03 100755
    # *** pedal messages (pedal DBC; checksum and counter are enforced by the RX check) ***
  
    def _interceptor_gas_cmd(self, gas: int, ids=None):
-@@ -650,10 +691,10 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -654,10 +695,10 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      for controls_allowed in (True, False):
        self.safety.set_controls_allowed(controls_allowed)
        self.assertTrue(self._tx(self._interceptor_gas_cmd(0)))
@@ -133,7 +133,7 @@ index 537e2f45..23a4de03 100755
  
    def test_other_dialect_sensor_ignored(self):
      # the inactive dialect's sensor neither satisfies the pedal RX check nor sets gas_pressed
-@@ -672,9 +713,9 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -676,9 +717,9 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self._rx(self._interceptor_user_gas(0x1000))
      self.assertTrue(self.safety.get_gas_pressed_prev())
      self.assertFalse(self.safety.get_longitudinal_allowed())
@@ -145,7 +145,7 @@ index 537e2f45..23a4de03 100755
  
    def test_remapped_bit_alone_is_inert(self):
      # GAS_INTERCEPTOR_REMAPPED without GAS_INTERCEPTOR selects nothing: no pedal command of either dialect
-@@ -684,7 +725,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -688,7 +729,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self.safety.set_controls_allowed(True)
      for ids in (STANDARD_IDS, REMAPPED_IDS):
        self.assertFalse(self._tx(self._interceptor_gas_cmd(0, ids=ids)))
@@ -154,7 +154,7 @@ index 537e2f45..23a4de03 100755
  
    # *** engagement is button based (like hyundai_longitudinal), not from the factory cruise state ***
  
-@@ -736,7 +777,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -740,7 +781,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self._rx(self._interceptor_user_gas(gas))
        self.assertEqual(pressed, self.safety.get_gas_pressed_prev())
        self.assertEqual(not pressed, self.safety.get_longitudinal_allowed())
@@ -163,7 +163,7 @@ index 537e2f45..23a4de03 100755
      self._rx(self._interceptor_user_gas(0))
  
    # *** pedal health: the RX check must invalidate control for a missing / frozen / corrupt pedal ***
-@@ -795,7 +836,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -799,7 +840,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
          self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
          self.safety.set_controls_allowed(True)
          self.assertFalse(self._tx(self._interceptor_gas_cmd(0)))
@@ -172,7 +172,7 @@ index 537e2f45..23a4de03 100755
  
    def test_pedal_blocked_on_unsupported_cars(self):
      sp = self._pedal_sp()
-@@ -805,7 +846,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -809,7 +850,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
          self.safety.set_current_safety_param_sp(sp)
          self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, param)
          self.safety.set_controls_allowed(True)
@@ -181,7 +181,7 @@ index 537e2f45..23a4de03 100755
  
      # stock HKG (SCC-replacement) longitudinal and the pedal are mutually exclusive. The LONG param is only honored in
      # ALLOW_DEBUG builds; a release panda ignores it (hyundai_longitudinal=false), in which case pedal-long applies.
-@@ -814,13 +855,13 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -818,13 +859,13 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, HyundaiSafetyFlags.LONG)
        self.safety.set_controls_allowed(True)
        stock_long_active = self._tx(common.make_msg(0, 0x50A, 8))  # SCC13: only in the SCC-replacement TX allowlist
@@ -395,5 +395,5 @@ index fe3e7582..a8c6c497 100644
      CI, CC, CC_SP, ids = self._setup()
      out = self._drive(CI, CC, CC_SP, ids, [0] * 300)
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

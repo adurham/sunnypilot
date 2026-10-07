@@ -1,0 +1,134 @@
+From d1ccf79f34f838d40cbcc4abdfaba3c77dddd826 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 12:10:03 -0500
+Subject: [PATCH] hyundai: subscribe CLU13 on the powertrain parser so
+ CF_Clu_DriveMode reaches CarStateSP.driveMode (drive-14)
+
+CLU13 CF_Clu_DriveMode (0x50C, 44|4) was decoded by patch 0021 but CLU13 was never SUBSCRIBED on the
+powertrain parser: get_can_parsers built the Bus.pt CANParser with an empty message list, and CANParser
+builds message_states ONLY from that list (opendbc/can/parser.py:140-150). So update_drive_mode read an
+always-empty vl_all and CarStateSP.driveMode stayed 0 on every drive, while the bus said Normal on both
+drives (0 in all 162 322 samples of routes 0000014a/0000014b). Two consequences, both verified by the
+parent at source: the DriveModePersonality feature was completely inert, AND the N / N-Custom longitudinal
+block rail was dead (12.9 s of real N-mode on 14b did NOT drop openpilot longitudinal).
+
+Fix: subscribe CLU13 at 10 Hz on the Bus.pt parser for the classic-CAN Hyundai path
+(CANParser(..., [(DRIVE_MODE_MSG, 10)], 0)). 10 Hz is the signal's own cluster broadcast rate and it only
+changes on a button press; nothing polls it at 100 Hz, and the one-source-frame debounce (DriveModeDebouncer)
+reads frames-per-tick, so 10 Hz is both sufficient and the rate that lets a dead/absent CLU13 age out
+normally (matching the explicit-subscription convention the comma pedal already uses in this method).
+
+NOT touching the DBC files: the runtime DBC (hyundai_can_generated) already contains CF_Clu_DriveMode; only
+the subscription was missing. Python-only, no opendbc/safety and no panda change (no firmware impact).
+
+Tests (test_drive_mode.py, class TestCarStateWiring):
+  - test_get_can_parsers_subscribes_clu13: exercises the REAL get_can_parsers path (the same method
+    CarInterfaceBase.__init__ resolves) and asserts 0x50C is in the parser's addresses and the drive-mode
+    signal is decodable. This is the test that would have caught the blackout; the pre-existing tests
+    subscribed CLU13 by hand, which is exactly why they did not.
+  - test_real_frames_reach_drive_mode_and_block: real CLU13 N-mode frames (0x50C, bus 0) through the real
+    parser reach CarStateSP.driveMode == 7 and map to BLOCK - the predicate the superproject's
+    driveModePersonalityBlock event keys on (the block rail was dead too).
+  Both FAIL on the shipped subscription (0x50C absent -> driveMode stays 0) and PASS here.
+---
+ opendbc/car/hyundai/carstate.py               |  8 ++-
+ .../car/hyundai/tests/test_drive_mode.py      | 57 +++++++++++++++++++
+ 2 files changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index 27d00fbf..ec6dfeef 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -10,6 +10,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarContr
+ from opendbc.car.interfaces import CarStateBase
+ 
+ from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
++from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_MSG
+ from opendbc.sunnypilot.car.hyundai.escc import EsccCarStateBase
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC, get_interceptor_ids
+ from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+@@ -345,7 +346,12 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+       return self.get_can_parsers_canfd(CP)
+ 
+     parsers = {
+-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
++      # fork (adurham): drive-mode decode. CLU13 CF_Clu_DriveMode (0x50C) is the CN7's drive mode. It is 10 Hz on
++      # C-CAN and only changes on a cluster button press, so it is subscribed at its own 10 Hz (the debounce
++      # reads frames per tick; nothing polls it at 100 Hz). CANParser builds message_states ONLY from this
++      # `messages` list, so before this subscription CLU13 was never decoded: CarStateSP.driveMode stayed 0,
++      # making DriveModePersonality inert AND killing the N/N-Custom longitudinal block (patch 0021).
++      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [(DRIVE_MODE_MSG, 10)], 0),
+       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
+     }
+     if CP_SP.enableGasInterceptor:
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
+index 9193bce7..565d6baa 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
+@@ -158,6 +158,63 @@ class _ParserShim:
+ 
+ 
+ class TestCarStateWiring:
++  def test_get_can_parsers_subscribes_clu13(self):
++    """Regression for the drive-mode blackout: CarState.get_can_parsers must SUBSCRIBE CLU13 (0x50C) on the
++    powertrain parser. CANParser builds message_states ONLY from its `messages` list, so without this the
++    parser never decoded CLU13 and CarStateSP.driveMode stayed 0 for every drive. The existing tests below
++    subscribe CLU13 by hand, which is exactly why they did not catch the missing subscription.
++    """
++    from opendbc.car.hyundai.carstate import CarState
++    from opendbc.car.hyundai.interface import CarInterface
++    from opendbc.car.hyundai.values import CAR
++    from opendbc.car import Bus, structs
++
++    CP = structs.CarParams()
++    CP.carFingerprint = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++    CP_SP = structs.CarParamsSP()
++    CP_SP.enableGasInterceptor = False
++
++    parsers = CarState.get_can_parsers(object.__new__(CarState), CP, CP_SP)
++    pt = parsers[Bus.pt]
++    assert 0x50C in pt.addresses, "CLU13 (0x50C) must be subscribed on the powertrain parser"
++    assert pt.message_states[0x50C].name == "CLU13"
++    assert "CF_Clu_DriveMode" in pt.vl["CLU13"], "the drive-mode signal must be decodable on the subscribed msg"
++    # the interface builds its parsers through this exact method (interfaces.CarInterfaceBase.__init__:114)
++    assert CarInterface.CarState.get_can_parsers is CarState.get_can_parsers
++
++  def test_real_frames_reach_drive_mode_and_block(self):
++    """End-to-end on the REAL parser: real CLU13 N-mode frames (0x50C, bus 0) through get_can_parsers must reach
++    CarStateSP.driveMode == 7 and map to BLOCK — the exact predicate the superproject's driveModePersonalityBlock
++    event keys on (openpilot/sunnypilot/fork/drive_mode_personality.py). Before the subscription this path was dead:
++    driveMode stayed 0 on every drive while the bus said the mode.
++    """
++    from opendbc.car.hyundai.carstate import CarState
++    from opendbc.car.hyundai.values import CAR
++    from opendbc.car import Bus, structs
++
++    CP = structs.CarParams()
++    CP.carFingerprint = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++    CP_SP = structs.CarParamsSP()
++    CP_SP.enableGasInterceptor = False
++    parsers = CarState.get_can_parsers(object.__new__(CarState), CP, CP_SP)
++    pt = parsers[Bus.pt]
++
++    ext = object.__new__(carstate_ext.CarStateExt)
++    ext.drive_mode = 0
++    ext.drive_mode_debouncer = dm.DriveModeDebouncer()
++
++    def tick(mode, slot, t):
++      dat = bytearray(8)
++      dat[5] = ((mode & 0xF) << 4) | (slot & 0xF)
++      pt.update([(t, [(0x50C, bytes(dat), BUS)])])
++      return ext.update_drive_mode(pt)
++
++    assert tick(1, 0, 0) == 0            # NORMAL, not yet published
++    assert tick(1, 0, 100_000_000) == 1  # NORMAL published
++    assert tick(7, 1, 200_000_000) == 1  # N (slot 1), not yet
++    assert tick(7, 1, 300_000_000) == 7  # N published -> the superproject now raises driveModePersonalityBlock
++    assert dm.map_drive_mode(7) == dm.DriveModeResult.BLOCK
++
+   def test_update_drive_mode_end_to_end(self):
+     pk = _parser()
+     shim = _ParserShim(pk)
+-- 
+2.55.0
+

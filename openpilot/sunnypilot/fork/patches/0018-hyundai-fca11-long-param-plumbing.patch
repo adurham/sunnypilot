@@ -1,4 +1,4 @@
-From d8e132ace022ba78776441a35f7bddb359faa9bf Mon Sep 17 00:00:00 2001
+From 02f17cf6513961f3e95cb62d09cf2102c5c1913a Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 16:53:09 -0500
 Subject: [PATCH] hyundai: FCA11 long arm gate accepts the python bool (Params
@@ -36,5 +36,5 @@ index 6c243ac5..c8a5f3cd 100644
      CP_SP.safetyParam |= HyundaiSafetyFlagsSP.FCA11_LONG
  
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

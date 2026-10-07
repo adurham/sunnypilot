@@ -1,4 +1,4 @@
-From 8bfa696908493aae1ac00346119cbde6fa3181c1 Mon Sep 17 00:00:00 2001
+From 285ffe274bafddf020300faba6c3b78a7bf36927 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Mon, 5 Oct 2026 20:06:14 -0500
 Subject: [PATCH] =?UTF-8?q?hyundai:=20FCA11=20LONG=20braking=20=E2=80=94?=
@@ -154,7 +154,7 @@ index 61657042..b5f7cd50 100644
    neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
  
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index f530e412..c21e4d7b 100644
+index e078369b..44be5d81 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -123,6 +123,144 @@ static bool hyundai_legacy = false;
@@ -428,7 +428,7 @@ index f530e412..c21e4d7b 100644
        if ((CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct) {
          tx = false;
        }
-@@ -689,9 +923,28 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -691,9 +925,28 @@ static safety_config hyundai_init(uint16_t param) {
      {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
    };
  
@@ -457,7 +457,7 @@ index f530e412..c21e4d7b 100644
  
    safety_config ret;
    if (hyundai_longitudinal) {
-@@ -841,6 +1094,38 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -843,6 +1096,38 @@ static safety_config hyundai_init(uint16_t param) {
        HYUNDAI_LDA_BUTTON_ADDR_CHECK
      };
  
@@ -496,7 +496,7 @@ index f530e412..c21e4d7b 100644
      SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
      if (hyundai_fca11_brake_test) {  // hyundai_common_init: non-SCC ICE only, never with any openpilot longitudinal
        SET_TX_MSGS(HYUNDAI_FCA11_TEST_TX_MSGS, ret);
-@@ -857,6 +1142,28 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -859,6 +1144,28 @@ static safety_config hyundai_init(uint16_t param) {
        } else {
          SET_RX_CHECKS(hyundai_non_scc_addr_checks, ret);
        }
@@ -525,7 +525,7 @@ index f530e412..c21e4d7b 100644
      } else if (hyundai_gas_interceptor_remapped) {  // implies hyundai_gas_interceptor (hyundai_common_init)
        // remapped pedal IDs: TX 0x700 / RX 0x701, mutually exclusive with the standard set below
        SET_TX_MSGS(HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS, ret);
-@@ -925,6 +1232,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+@@ -927,6 +1234,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
    hyundai_gas_interceptor_remapped = false;
    hyundai_fca11_brake_test = false;
    hyundai_fca11_rolling_test = false;
@@ -633,7 +633,7 @@ index 68d61c08..ebb8d348 100644
                continue
              volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 03802063..c3c28f72 100755
+index 306f727e..49cc501b 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -21,13 +21,27 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
@@ -665,7 +665,7 @@ index 03802063..c3c28f72 100755
  
  
  def fc_cancel_episode(safety, rx, ems16, clu_raw, brake_msg, period_us=19800, n=150):
-@@ -2508,6 +2522,339 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+@@ -2512,6 +2526,339 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
      dat[4] = 0x80
      return libsafety_py.make_CANPacket(addr, 0, bytes(dat))
  
@@ -1933,5 +1933,5 @@ index 7d5a7f55..6c243ac5 100644
  def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
    """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

@@ -1,7 +1,7 @@
-From 1ada465ef5e21dab15186851a3d3f863adc43b77 Mon Sep 17 00:00:00 2001
+From 701141994194f2ee30cf5a4b79b58154bd671580 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 10:24:10 -0500
-Subject: [PATCH 1/2] hyundai: FCA11 brake-injection TEST safety mode (non-SCC,
+Subject: [PATCH] hyundai: FCA11 brake-injection TEST safety mode (non-SCC,
  parked only)
 
 TEST-ONLY, NOT FOR ROAD USE. New safety_param_sp bit HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64
@@ -33,7 +33,7 @@ base already failed test_misra.sh on this exact pedal-gating line).
  6 files changed, 250 insertions(+), 10 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 0fe24459..2599245c 100644
+index 89ae94bb..5652f30e 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -90,6 +90,10 @@ static bool hyundai_legacy = false;
@@ -77,7 +77,7 @@ index 0fe24459..2599245c 100644
      }
    }
  
-@@ -414,6 +437,16 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -416,6 +439,16 @@ static safety_config hyundai_init(uint16_t param) {
      {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
    };
  
@@ -94,7 +94,7 @@ index 0fe24459..2599245c 100644
    hyundai_common_init(param);
    hyundai_legacy = false;
  
-@@ -553,7 +586,14 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -555,7 +588,14 @@ static safety_config hyundai_init(uint16_t param) {
      };
  
      SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
@@ -110,7 +110,7 @@ index 0fe24459..2599245c 100644
        // remapped pedal IDs: TX 0x700 / RX 0x701, mutually exclusive with the standard set below
        SET_TX_MSGS(HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS, ret);
        if (hyundai_has_lda_button) {
-@@ -619,6 +659,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+@@ -621,6 +661,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
    hyundai_longitudinal = false;
    hyundai_gas_interceptor = false;
    hyundai_gas_interceptor_remapped = false;
@@ -200,7 +200,7 @@ index 90a0df3c..83b26462 100644
                continue
              volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index cb547ef4..8eae462a 100755
+index 8dc5033f..6d364edc 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -15,7 +15,7 @@ from opendbc.sunnypilot.car import crc8_pedal
@@ -212,9 +212,9 @@ index cb547ef4..8eae462a 100755
  
  # LDA button availability
  LDA_BUTTON = [
-@@ -411,6 +411,21 @@ class TestHyundaiLongitudinalSafety(HyundaiLongitudinalBase, TestHyundaiSafety):
-     self.assertFalse(self._tx(self._accel_msg(0, aeb_req=True)))
+@@ -413,6 +413,21 @@ class TestHyundaiLongitudinalSafety(HyundaiLongitudinalBase, TestHyundaiSafety):
      self.assertFalse(self._tx(self._accel_msg(0, aeb_decel=1.0)))
+     self.assertFalse(self._tx(self._accel_msg(0, aeb_stop_req=True)))
  
 +  def test_fca11_rule_pinned(self):
 +    # Pins TODAY's FCA11 rule (outside the FCA11 brake test): only CR_VSM_DecCmd / FCA_CmdAct / CF_VSM_DecCmdAct are
@@ -234,7 +234,7 @@ index cb547ef4..8eae462a 100755
  
  class TestHyundaiLongitudinalSafetyCameraSCC(HyundaiLongitudinalBase, TestHyundaiSafety):
    TX_MSGS = [[0x340, 0], [0x4F1, 2], [0x485, 0], [0x420, 0], [0x421, 0], [0x50A, 0], [0x389, 0], [0x4A2, 0]]
-@@ -814,6 +829,163 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -818,6 +833,163 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
  
  
@@ -418,15 +418,14 @@ index c3e68164..bbbd792f 100644
  
  class HyundaiFlagsSP(IntFlag):
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 
-
-From 12d5a296d338a402f9299fef3f61cb446694745d Mon Sep 17 00:00:00 2001
+From 4528a1849ca8717ae7a018bff32089e679a8a367 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 17:18:50 -0500
-Subject: [PATCH 2/2] =?UTF-8?q?hyundai:=20FCA11=20brake=20test=20=E2=80=94?=
- =?UTF-8?q?=20block=20ONLY=20camera=20FCA11,=20keep=20LKAS11/LFAHDA=20forw?=
- =?UTF-8?q?arding?=
+Subject: [PATCH] =?UTF-8?q?hyundai:=20FCA11=20brake=20test=20=E2=80=94=20b?=
+ =?UTF-8?q?lock=20ONLY=20camera=20FCA11,=20keep=20LKAS11/LFAHDA=20forwardi?=
+ =?UTF-8?q?ng?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -455,10 +454,10 @@ test_lkas_tx_rejected replaces them). Mutations (revert to v1 list, add 0x340/0x
  2 files changed, 81 insertions(+), 8 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 2599245c..df6b4834 100644
+index 5652f30e..4a4a0278 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
-@@ -437,14 +437,18 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -439,14 +439,18 @@ static safety_config hyundai_init(uint16_t param) {
      {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
    };
  
@@ -482,10 +481,10 @@ index 2599245c..df6b4834 100644
  
    hyundai_common_init(param);
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 8eae462a..537e2f45 100755
+index 6d364edc..94ee99c6 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -833,12 +833,14 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -837,12 +837,14 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
  class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
    """
      TEST-ONLY FCA11 (0x38D) brake-injection mode on a non-SCC ICE car (HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST).
@@ -504,7 +503,7 @@ index 8eae462a..537e2f45 100755
  
    @classmethod
    def setUpClass(cls):
-@@ -926,6 +928,73 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -930,6 +932,73 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
      for addr in (0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x483, 0x7D0, 0x200, 0x700):
        self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
  
@@ -579,5 +578,5 @@ index 8eae462a..537e2f45 100755
      for dialect in (0, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED):
        self.safety.set_current_safety_param_sp(self._test_sp() | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | dialect)
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

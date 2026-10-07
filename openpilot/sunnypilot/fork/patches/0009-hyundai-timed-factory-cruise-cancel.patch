@@ -1,7 +1,9 @@
-From 2258c35ab6e8fd7e502f11a504217137a394ae7f Mon Sep 17 00:00:00 2001
+From 4c7aa557765523117604b08a8a188f3939281d2e Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 15:45:45 -0500
 Subject: [PATCH] hyundai: gas interceptor: panda-timed factory-cruise CANCEL
- safety net + review fixes (echo guard, fresh lamp, inter-attempt lamp confirmation)
+ safety net + review fixes (echo guard, fresh lamp, inter-attempt lamp
+ confirmation)
 
 Cumulative opendbc diff cc592f1c..2258c35a (3 commits, one patch file):
   032ded0d hyundai: gas interceptor: panda-timed factory-cruise CANCEL safety net (CLU11 only from firmware, after a cluster frame)
@@ -9,53 +11,52 @@ Cumulative opendbc diff cc592f1c..2258c35a (3 commits, one patch file):
   2258c35a hyundai: gas interceptor: timed cancel: lamp-confirmation test covers attempts 2 and 3 (no carry-over)
 
   hyundai: gas interceptor: panda-timed factory-cruise CANCEL safety net (CLU11 only from firmware, after a cluster frame)
-  
+
   If the factory cruise becomes ACTIVE (EMS16 CRUISE_LAMP_S) while openpilot longitudinal is engaged (controls_allowed
   and heartbeat), panda builds and sends CLU11 CruiseSwState=4 frames itself, each queued while a cluster CLU11 is being
   received (19.8 ms before the cluster's next one): cluster payload, button 4, AliveCnt1 = cluster+1, ParityBit1
   recomputed. 4 attempts x 3 frames, >=400 ms apart, >=15 ms rate cap, 12-frame cap, 2 s give-up, stop on lamp off,
   abort on a driver SET/RES/pause press, skip MAIN-held / bad-parity frames, none while braking. CLU11 stays out of
   the USB TX allowlist; the MAIN lockout (long dropped) is unchanged. Tests: libsafety can_send recorder + 20 tests.
-  
+
   openpilot side: carstate_ext mirrors the episode; factory cruise still on 2.5 s after it rose under engaged long ->
   accFaulted (audible 'Cruise Fault' immediate disable), cleared when the factory cruise is off.
-  
+
   integration-3: + TestHyundaiNonSCCFCA11{BrakeTest,RollingTest}Safety::test_test_bit_overrides_timed_factory_cancel
   (bits 64 / 64+128 with GAS_INTERCEPTOR, both dialects: 0 self-TX CLU11; positive control pedal-only = 12).
-  
+
   hyundai: gas interceptor: timed cancel review fixes (echo guard, fresh-lamp + inter-attempt lamp confirmation)
-  
+
   Review change #1: hyundai_fc_cancel_cluster_frame ignores packets with returned != 0 (panda's TX echo), with the
   invariant documented: only a frame the cluster put on the bus may trigger or be copied. Test: echoed frames (plain and
   CANCEL payloads, RX-valid) never trigger, the next real frame does.
-  
+
   Review change #2: the RX-IRQ -> can_send -> TX ring -> process_can call path is documented on the function, and a
   libsafety test floods the USB TX path (pedal, LKAS11, CLU11) through a whole episode: the firmware frames are
   identical (bytes, order, times), >= 15 ms apart, 4 x 3. The board TX ring/FIFO is not modelled (road checklist).
-  
+
   Toggle-back margin (routes 11c/123/127/128): EMS16 period 10.000 ms; lamp falls <= 150.5 ms after the frame the ECM
   acted on (44/45 <= 50.5 ms); ECM torque request drops <= 99.7 ms before the lamp. Every frame now needs a fresh lamp
   (EMS16 <= 30 ms old, CRUISE_LAMP_S = 1), and a later attempt needs 2 EMS16 with CRUISE_LAMP_S = 1 received >= 250 ms
   after the previous attempt's last frame. Tests: stale lamp, confirmation counting, late lamp fall (10-395 ms) never
   retried.
-  
+
   hyundai: gas interceptor: timed cancel: lamp-confirmation test covers attempts 2 and 3 (no carry-over)
-  
+
   Confirmations collected before an attempt must not count for the next one; the test now runs the 1-of-2 / 2-of-2
   confirmation check before attempt 2 AND attempt 3, killing a 'confirmation not reset after an attempt' mutant.
-  
 ---
- opendbc/safety/modes/hyundai.h                     |  12 +-
- opendbc/safety/modes/hyundai_common.h              | 203 +++++++++
- opendbc/safety/tests/libsafety/libsafety_py.py     |   5 +
- opendbc/safety/tests/libsafety/safety.c            |  50 +++
- opendbc/safety/tests/test_hyundai.py               | 480 +++++++++++++++++++++
- opendbc/sunnypilot/car/hyundai/carstate_ext.py     |  27 ++
- .../car/hyundai/tests/test_gas_interceptor.py      |  46 ++
+ opendbc/safety/modes/hyundai.h                |  12 +-
+ opendbc/safety/modes/hyundai_common.h         | 203 ++++++++
+ .../safety/tests/libsafety/libsafety_py.py    |   5 +
+ opendbc/safety/tests/libsafety/safety.c       |  50 ++
+ opendbc/safety/tests/test_hyundai.py          | 480 ++++++++++++++++++
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  27 +
+ .../car/hyundai/tests/test_gas_interceptor.py |  46 ++
  7 files changed, 821 insertions(+), 2 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 3990567e1c92f0d0b6ba7204343e29b24faf156d..a1f9aa0ff9e002a130da36ad7da0ef5943ce46ba 100644
+index 6ef85834..d64bdb3c 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -393,6 +393,10 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
@@ -81,7 +82,7 @@ index 3990567e1c92f0d0b6ba7204343e29b24faf156d..a1f9aa0ff9e002a130da36ad7da0ef59
          hyundai_factory_main_on = GET_BIT(msg, 25U);
          // factory cruise active (CRUISE_LAMP_S, implies MAIN armed): also a lockout, belt and braces
          if (hyundai_factory_main_on || GET_BIT(msg, 26U)) {
-@@ -593,7 +600,8 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+@@ -595,7 +602,8 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
    }
  
    // BUTTONS: used for resume spamming and cruise cancellation
@@ -92,7 +93,7 @@ index 3990567e1c92f0d0b6ba7204343e29b24faf156d..a1f9aa0ff9e002a130da36ad7da0ef59
      int button = msg->data[0] & 0x7U;
  
 diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
-index b9ece9430f27c06c50d5d256edbc4712555dd502..06cb5585186d90da7cda7d0d60b17d061eee2149 100644
+index b9ece943..06cb5585 100644
 --- a/opendbc/safety/modes/hyundai_common.h
 +++ b/opendbc/safety/modes/hyundai_common.h
 @@ -113,6 +113,208 @@ static bool hyundai_setres_brake_seen;       // gas interceptor: brake was press
@@ -313,7 +314,7 @@ index b9ece9430f27c06c50d5d256edbc4712555dd502..06cb5585186d90da7cda7d0d60b17d06
    acc_main_on_tx = false;
    acc_main_on_mismatches = 0U;
 diff --git a/opendbc/safety/tests/libsafety/libsafety_py.py b/opendbc/safety/tests/libsafety/libsafety_py.py
-index b4e03d4698b9171bae1b9400c66c61223a1f5917..13814b4cc768efccbe356657062efb730c5c6c5e 100644
+index b4e03d46..13814b4c 100644
 --- a/opendbc/safety/tests/libsafety/libsafety_py.py
 +++ b/opendbc/safety/tests/libsafety/libsafety_py.py
 @@ -145,6 +145,11 @@ void set_heartbeat_engaged_mads(bool c);
@@ -329,7 +330,7 @@ index b4e03d4698b9171bae1b9400c66c61223a1f5917..13814b4cc768efccbe356657062efb73
  
  class LibSafety:
 diff --git a/opendbc/safety/tests/libsafety/safety.c b/opendbc/safety/tests/libsafety/safety.c
-index 89a2b04aa5ae37041e0e007c3328cf94f4d49ac6..324ad10844a36c86999cf5f95a4a7e8434d94f3e 100644
+index 89a2b04a..324ad108 100644
 --- a/opendbc/safety/tests/libsafety/safety.c
 +++ b/opendbc/safety/tests/libsafety/safety.c
 @@ -13,6 +13,53 @@ uint32_t microsecond_timer_get(void) {
@@ -395,7 +396,7 @@ index 89a2b04aa5ae37041e0e007c3328cf94f4d49ac6..324ad10844a36c86999cf5f95a4a7e84
 +  test_tx_log_len = 0;
  }
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index abd4b7080ba1be440d0e40b894c8b33968a13880..e1249915191a4fc95e50b232f5dd92c798b903ac 100755
+index 9507f300..6cd5decd 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -1,6 +1,8 @@
@@ -458,7 +459,7 @@ index abd4b7080ba1be440d0e40b894c8b33968a13880..e1249915191a4fc95e50b232f5dd92c7
    def _user_gas_msg(self, gas):
      values = {"CF_Ems_AclAct": gas, "AliveCounter": self.cnt_gas % 4}
      self.__class__.cnt_gas += 1
-@@ -1115,6 +1154,420 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -1119,6 +1158,420 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      for addr in (0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x38D, 0x483, 0x7D0):
        self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
  
@@ -879,7 +880,7 @@ index abd4b7080ba1be440d0e40b894c8b33968a13880..e1249915191a4fc95e50b232f5dd92c7
  
  @parameterized_class(LDA_BUTTON)
  class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
-@@ -1321,6 +1774,33 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -1325,6 +1778,33 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
          # the test brake path itself is unchanged
          self.assertTrue(self._tx(self._brake_cmd(1)))
  
@@ -914,7 +915,7 @@ index abd4b7080ba1be440d0e40b894c8b33968a13880..e1249915191a4fc95e50b232f5dd92c7
  
    def _assert_not_armed(self):
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index 2cd301bf50ec9af3bacf560f74dd9ce9406b1a90..33f3035cf44a85e3c39f580455c88debcb46705e 100644
+index 2cd301bf..33f3035c 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 @@ -17,6 +17,10 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
@@ -966,7 +967,7 @@ index 2cd301bf50ec9af3bacf560f74dd9ce9406b1a90..33f3035cf44a85e3c39f580455c88deb
        pause_events = self.pause_resume.update(cp.vl_all["CLU11"]["CF_Clu_CruiseSwState"], self.pedal_long_engaged,
                                                ret.brakePressed, ret.gasPressed, factory_main)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index 40eeab034841de8f0b61b5356216c2de68478045..9bbb8764521805df3893363d23e5348dbda2e41e 100644
+index 40eeab03..9bbb8764 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 @@ -725,6 +725,52 @@ class TestFactoryMainLockout:
@@ -1023,5 +1024,5 @@ index 40eeab034841de8f0b61b5356216c2de68478045..9bbb8764521805df3893363d23e5348d
    def _disengaged_after_brake(self):
      car = _Car()
 -- 
-2.50.1
+2.55.0
 

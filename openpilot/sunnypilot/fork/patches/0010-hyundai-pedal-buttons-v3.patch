@@ -1,37 +1,40 @@
-From 0a19ee8a3a84aa9897ca933158e13ec0a06b0c26 Mon Sep 17 00:00:00 2001
+From 9cc67482532f8497d44669f04288b9774db6fc3a Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
-Subject: [PATCH] hyundai: gas interceptor: buttons v3 (pause/resume only on/off,
- up/down set speed only, no engage floor)
+Date: Wed, 7 Oct 2026 15:45:45 -0500
+Subject: [PATCH] hyundai: gas interceptor: buttons v3 (pause/resume only
+ on/off, up/down set speed only, no engage floor)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Submodule-relative opendbc diff 2258c35a..0a19ee8a (integration-3 tip -> buttons-v3).
 
   hyundai: gas interceptor: buttons v3 — pause/resume is the only on/off; up/down only set speed; no engage floor
-  
+
   Panda (hyundai_common.h): in gas-interceptor mode the SET/RES (down/up) falling edges no longer grant controls_allowed;
   the pause/resume (CruiseSwState 4) debounced release is the only grant (brake released for the whole press + debounce,
   MAIN off, no controls_allowed condition, gas allowed, no speed check). hyundai_setres_brake_seen removed. SCC
   openpilot-long (hyundai_longitudinal) keeps the upstream SET/RES edge grant.
-  
+
   Car: CarState.update_button_enable in pedal mode = resumeCruise release only (accel/decelCruise never enable);
   carstate_ext SET/RES brake tracker removed; CP.minEnableSpeed = -1 (was 25 mph); the 25 mph number survives only as
   LOW_SPEED_FULL_GAS_SPEED, the speed at which the launch limit reaches the cap (throttle limit, not a floor).
-  
+
   Tests: up/down never grant/disengage (panda + car), pause/resume at any speed, helpers engage via pause/resume,
   lockstep fuzz asserts every grant on both sides is a pause/resume release carried by resumeCruise.
-  
 ---
- opendbc/car/hyundai/carstate.py                    | 13 ++--
- opendbc/safety/modes/hyundai_common.h              | 60 ++++++----------
- opendbc/safety/tests/test_hyundai.py               | 83 +++++++++++++++++-----
- opendbc/sunnypilot/car/hyundai/carstate_ext.py     | 20 +-----
- opendbc/sunnypilot/car/hyundai/gas_interceptor.py  | 16 ++---
- opendbc/sunnypilot/car/hyundai/pause_resume.py     |  5 +-
- .../car/hyundai/tests/test_gas_interceptor.py      | 44 ++++++++----
- opendbc/sunnypilot/car/interfaces.py               | 10 +--
+ opendbc/car/hyundai/carstate.py               | 13 ++-
+ opendbc/safety/modes/hyundai_common.h         | 60 +++++---------
+ opendbc/safety/tests/test_hyundai.py          | 83 ++++++++++++++-----
+ .../sunnypilot/car/hyundai/carstate_ext.py    | 20 +----
+ .../sunnypilot/car/hyundai/gas_interceptor.py | 16 ++--
+ .../sunnypilot/car/hyundai/pause_resume.py    |  5 +-
+ .../car/hyundai/tests/test_gas_interceptor.py | 44 +++++++---
+ opendbc/sunnypilot/car/interfaces.py          | 10 +--
  8 files changed, 141 insertions(+), 110 deletions(-)
 
 diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
-index 0676875e80ef315be257ab2dbe2b0f5d00d94b72..b1d524ec1e9536a83e7a824f91c03eb088e28f92 100644
+index 0676875e..b1d524ec 100644
 --- a/opendbc/car/hyundai/carstate.py
 +++ b/opendbc/car/hyundai/carstate.py
 @@ -79,14 +79,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
@@ -56,7 +59,7 @@ index 0676875e80ef315be257ab2dbe2b0f5d00d94b72..b1d524ec1e9536a83e7a824f91c03eb0
  
    def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
 diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
-index 06cb5585186d90da7cda7d0d60b17d061eee2149..41ac9f408f70593289c2d995d34625109311f2f0 100644
+index 06cb5585..41ac9f40 100644
 --- a/opendbc/safety/modes/hyundai_common.h
 +++ b/opendbc/safety/modes/hyundai_common.h
 @@ -97,19 +97,21 @@ bool hyundai_fca11_rolling_test = false;
@@ -156,10 +159,10 @@ index 06cb5585186d90da7cda7d0d60b17d061eee2149..41ac9f408f70593289c2d995d3462510
  
      // exit controls on cancel press
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341e71dd7a3 100755
+index 6cd5decd..d00bcb2c 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
-@@ -630,7 +630,7 @@ PEDAL_DIALECTS = [
+@@ -634,7 +634,7 @@ PEDAL_DIALECTS = [
  @parameterized_class([{**lda, **d} for d in PEDAL_DIALECTS for lda in LDA_BUTTON])
  class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyundaiNonSCCSafety):
    """
@@ -168,7 +171,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      (0x200, or 0x700 when remapped), gas from the active dialect's GAS_SENSOR (0x201, or 0x701 when remapped)
    """
    PEDAL_IDS = STANDARD_IDS
-@@ -845,7 +845,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -849,7 +849,7 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
            self.assertFalse(self._tx(self._button_msg(btn)), f"{btn=} {controls_allowed=} {cruise_on=}")
  
    def test_factory_main_lockout(self):
@@ -177,7 +180,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      self.safety.set_controls_allowed(True)
      self._rx(self._acc_state_msg(True))  # MAIN armed
      self.assertFalse(self.safety.get_controls_allowed())
-@@ -854,15 +854,17 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -858,15 +858,17 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self._press(btn)
        self._release()
        self.assertFalse(self.safety.get_controls_allowed(), btn)
@@ -199,7 +202,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      for btn_prev in range(8):
        for btn_cur in range(8):
          for _ in range(5):
-@@ -871,9 +873,35 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -875,9 +877,35 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
          for _ in range(10):
            self._rx(self._button_msg(btn_prev))
            self.assertFalse(self.safety.get_controls_allowed())
@@ -237,7 +240,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
  
    # *** pause/resume button (CF_Clu_CruiseSwState 4) and NO auto-resume ***
  
-@@ -886,11 +914,12 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -890,11 +918,12 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self._rx(self._button_msg(Buttons.NONE))
  
    def _engage_then_brake(self):
@@ -252,7 +255,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      self.assertTrue(self.safety.get_controls_allowed())
      self._rx(self._user_brake_msg(True))
      self.assertFalse(self.safety.get_controls_allowed())
-@@ -948,15 +977,16 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -952,15 +981,16 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES)
        self.assertTrue(self.safety.get_controls_allowed(), bounce)
  
@@ -274,7 +277,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      self._release(40)
      self._press(Buttons.CANCEL)
      self.assertFalse(self.safety.get_controls_allowed())
-@@ -1029,7 +1059,20 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -1033,7 +1063,20 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
      self._rx(self._user_brake_msg(True))
      self.assertFalse(self.safety.get_controls_allowed())
  
@@ -296,7 +299,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
      for btn in (Buttons.SET, Buttons.RESUME):
        self._engage_then_brake()
        self._release()
-@@ -1038,9 +1081,11 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+@@ -1042,9 +1085,11 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
        self._press(btn)
        self._release(20)
        self.assertFalse(self.safety.get_controls_allowed(), btn)
@@ -312,7 +315,7 @@ index e1249915191a4fc95e50b232f5dd92c798b903ac..4ad58d8764305b1471ca28212ee75341
  
    def test_cancel_button(self):
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index 33f3035cf44a85e3c39f580455c88debcb46705e..3156ab2b31394a5474cb4fa670c7aae5bbd96d22 100644
+index 33f3035c..3156ab2b 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 @@ -36,11 +36,6 @@ class CarStateExt:
@@ -352,7 +355,7 @@ index 33f3035cf44a85e3c39f580455c88debcb46705e..3156ab2b31394a5474cb4fa670c7aae5
  
    def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index cbe0b100f492915258a0e9099eae39034b070ac3..ade8cd2890cdb98c54df53d425696c850c70d819 100644
+index cbe0b100..ade8cd28 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -9,9 +9,10 @@ comma pedal (gas interceptor) longitudinal for Hyundai CAN non-SCC ICE cars.
@@ -393,7 +396,7 @@ index cbe0b100f492915258a0e9099eae39034b070ac3..ade8cd2890cdb98c54df53d425696c85
  
  # Upward slew limit on the pedal command (fraction of travel per second); decreases are immediate. Raising the cap made
 diff --git a/opendbc/sunnypilot/car/hyundai/pause_resume.py b/opendbc/sunnypilot/car/hyundai/pause_resume.py
-index 2badbd5ea111b5fe8438f914a6c110ec2d315668..2ecf753529cc4ba9188ca5fb7102f73c59037776 100644
+index 2badbd5e..2ecf7535 100644
 --- a/opendbc/sunnypilot/car/hyundai/pause_resume.py
 +++ b/opendbc/sunnypilot/car/hyundai/pause_resume.py
 @@ -21,8 +21,9 @@ the same CLU11 sample (TestPandaLockstep), so openpilot can never be engaged whi
@@ -409,7 +412,7 @@ index 2badbd5ea111b5fe8438f914a6c110ec2d315668..2ecf753529cc4ba9188ca5fb7102f73c
      deliberate driver press. Nothing else produces resumeCruise: no timer, no brake release, no speed recovery.
    * Bounce: a release shorter than PAUSE_RELEASE_SAMPLES does not start a new press. So a press that began while
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index 9bbb8764521805df3893363d23e5348dbda2e41e..3552cd21e447eb6ab24c2d106dea480cd58e93e8 100644
+index 9bbb8764..3552cd21 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 @@ -362,8 +362,8 @@ class TestEnablement:
@@ -508,7 +511,7 @@ index 9bbb8764521805df3893363d23e5348dbda2e41e..3552cd21e447eb6ab24c2d106dea480c
        # openpilot follows its own engage requests; brake disengages (pedalPressed), cancel/MAIN disengage
        if any(r.buttonEnable for r in rets) and not brake and not main:
 diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
-index e028e1f912c3ca536eb02ad0709a87d522851099..7d5a7f559679e630ef10d2bfdeac833a70bfe05e 100644
+index e028e1f9..7d5a7f55 100644
 --- a/opendbc/sunnypilot/car/interfaces.py
 +++ b/opendbc/sunnypilot/car/interfaces.py
 @@ -16,7 +16,6 @@ from opendbc.car.hyundai.values import HyundaiFlags
@@ -537,5 +540,5 @@ index e028e1f912c3ca536eb02ad0709a87d522851099..7d5a7f559679e630ef10d2bfdeac833a
  
  
 -- 
-2.50.1
+2.55.0
 

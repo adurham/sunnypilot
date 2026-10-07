@@ -15,7 +15,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD, \
+  MAX_AUTO_DECREASE, OVERRIDE_MEMORY_S
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target, set_speed_limit_assist_availability
 
@@ -80,6 +81,13 @@ class SpeedLimitAssist:
     self.prev_v_cruise_cluster_conv = 0
     self._has_speed_limit = False
     self._speed_limit = 0.
+    # fork: manual set-speed override memory (OVERRIDE_MEMORY_S). A genuine driver set-speed change
+    # arms _override_tripped; it is only cleared once a later speed-limit change has occurred AND the
+    # memory window has elapsed (or the driver re-confirms the limit by hand).
+    self._override_tripped = False
+    self._override_ts = 0.
+    self._override_speed_limit = 0.
+    self._override_target_conv = 0
     self._speed_limit_final_last = 0.
     self.speed_limit_prev = 0.
     self.speed_limit_final_last_conv = 0
@@ -119,6 +127,51 @@ class SpeedLimitAssist:
   @property
   def v_cruise_cluster_below_confirm_speed_threshold(self) -> bool:
     return bool(self.v_cruise_cluster_conv < CONFIRM_SPEED_THRESHOLD[self.is_metric])
+
+  @property
+  def override_memory_active(self) -> bool:
+    """fork: a manual set-speed override is being honoured. It never clears on the strength of a
+    speed-limit change alone; a limit change only releases it once OVERRIDE_MEMORY_S has elapsed
+    since the driver made the change. It also clears early if the driver has adjusted back onto
+    the limit SLA is driving to (converged)."""
+    if not self._override_tripped:
+      return False
+    if self._has_speed_limit and self.target_set_speed_confirmed:
+      # driver is back on the limit target: treat as confirmed and hand control back
+      self._override_tripped = False
+      return False
+    if self.speed_limit_changed and (time.monotonic() - self._override_ts > OVERRIDE_MEMORY_S):
+      self._override_tripped = False
+      return False
+    return True
+
+  def _is_manual_override_edge(self) -> bool:
+    """fork: True only on a genuine DRIVER set-speed change edge. SLA's own auto-apply writes the
+    cluster set speed to exactly the target it is driving to (v_cruise_cluster == target), whereas a
+    driver edit lands on some other value; the very first reading (prev == 0) is not an edit. This is
+    the discriminator that stops SLA's own writes from tripping the override memory."""
+    return bool(self.v_cruise_cluster_changed and self.prev_v_cruise_cluster_conv != 0
+                and not self.target_set_speed_confirmed)
+
+  def _arm_override_memory(self) -> None:
+    """fork: start the OVERRIDE_MEMORY_S window at a genuine driver set-speed change."""
+    self._override_tripped = True
+    self._override_ts = time.monotonic()
+
+  def _on_driver_set_speed_change(self) -> None:
+    """fork: arm the override memory iff this frame's cluster change is a genuine driver edit."""
+    if self._is_manual_override_edge():
+      self._arm_override_memory()
+
+  def _mark_override_confirmed(self) -> None:
+    """fork: the driver pressed to confirm the limit (preActive/pending) -> SLA owns the set speed."""
+    self._override_tripped = False
+
+  @property
+  def target_set_speed_change_requires_confirm(self) -> bool:
+    """fork: require the driver's press only when the change would DROP the set speed by more than
+    MAX_AUTO_DECREASE; increases (and any change within the cap) auto-apply at any vehicle speed."""
+    return bool(self.target_set_speed_conv < self.v_cruise_cluster_conv - MAX_AUTO_DECREASE[self.is_metric])
 
   def update_active_event(self, events_sp: EventsSP) -> None:
     if self.v_cruise_cluster_below_confirm_speed_threshold:
@@ -190,17 +243,6 @@ class SpeedLimitAssist:
 
     self.target_set_speed_conv = pcm_long_required_max_set_speed_conv if self.pcm_op_long else self.speed_limit_final_last_conv
 
-  @property
-  def apply_confirm_speed_threshold(self) -> bool:
-    # below CST: always require user confirmation
-    if self.v_cruise_cluster_below_confirm_speed_threshold:
-      return True
-
-    # at/above CST:
-    # - new speed limit >= CST: auto change
-    # - new speed limit < CST: user confirmation required
-    return bool(self.speed_limit_final_last_conv < CONFIRM_SPEED_THRESHOLD[self.is_metric])
-
   def get_current_acceleration_as_target(self) -> float:
     return self.a_ego
 
@@ -246,8 +288,11 @@ class SpeedLimitAssist:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
           if self.v_cruise_cluster_changed:
+            self._on_driver_set_speed_change()
             self.state = SpeedLimitAssistState.inactive
-          elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
+          elif self.speed_limit_changed and self.target_set_speed_change_requires_confirm and not self.override_memory_active:
+            # fork: only a drop beyond MAX_AUTO_DECREASE asks for a press, and only when no manual
+            # override is being honoured (override memory).
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self._has_speed_limit and self.v_offset < LIMIT_SPEED_OFFSET_TH:
@@ -256,8 +301,10 @@ class SpeedLimitAssist:
         # ADAPTING
         elif self.state == SpeedLimitAssistState.adapting:
           if self.v_cruise_cluster_changed:
+            self._on_driver_set_speed_change()
             self.state = SpeedLimitAssistState.inactive
-          elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
+          elif self.speed_limit_changed and self.target_set_speed_change_requires_confirm and not self.override_memory_active:
+            # fork: see ACTIVE above.
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self.v_offset >= LIMIT_SPEED_OFFSET_TH:
@@ -274,6 +321,7 @@ class SpeedLimitAssist:
         # PRE_ACTIVE
         elif self.state == SpeedLimitAssistState.preActive:
           if self.target_set_speed_confirmed:
+            self._mark_override_confirmed()
             self._update_confirmed_state()
           elif self.pre_active_timer <= 0:
             # Timeout - session ended
@@ -289,13 +337,18 @@ class SpeedLimitAssist:
         # start or reset preActive timer if initially enabled or manual set speed change detected
         if not self.long_enabled_prev or self.v_cruise_cluster_changed:
           self.long_engaged_timer = int(DISABLED_GUARD_PERIOD / DT_MDL)
+          # fork: a genuine driver set-speed change arms the override-memory window.
+          self._on_driver_set_speed_change()
 
         elif self.long_engaged_timer <= 0:
           if self.target_set_speed_confirmed:
             self._update_confirmed_state()
-          elif self._has_speed_limit:
+          elif self._has_speed_limit and not self.override_memory_active:
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
+          elif self.override_memory_active:
+            # fork: honour the driver's manual set speed — no press prompt while override memory holds.
+            self.state = SpeedLimitAssistState.inactive
           else:
             self.state = SpeedLimitAssistState.pending
 
@@ -317,15 +370,19 @@ class SpeedLimitAssist:
         # ACTIVE
         if self.state == SpeedLimitAssistState.active:
           if self.v_cruise_cluster_changed:
+            self._on_driver_set_speed_change()
             self.state = SpeedLimitAssistState.inactive
 
-          elif self.speed_limit_changed and self.apply_confirm_speed_threshold:
+          elif self.speed_limit_changed and self.target_set_speed_change_requires_confirm and not self.override_memory_active:
+            # fork: only a drop beyond MAX_AUTO_DECREASE asks for a press (and not while an override
+            # is being honoured).
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
 
         # PRE_ACTIVE
         elif self.state == SpeedLimitAssistState.preActive:
           if self._update_non_pcm_long_confirmed_state():
+            self._mark_override_confirmed()
             self.state = SpeedLimitAssistState.active
           elif self.pre_active_timer <= 0:
             # Timeout - session ended
@@ -333,10 +390,12 @@ class SpeedLimitAssist:
 
         # INACTIVE
         elif self.state == SpeedLimitAssistState.inactive:
-          if self.speed_limit_changed:
+          if self.speed_limit_changed and not self.override_memory_active:
+            # fork: a limit change re-engages only once the manual override memory has released.
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self._update_non_pcm_long_confirmed_state():
+            self._mark_override_confirmed()
             self.state = SpeedLimitAssistState.active
 
     # DISABLED
@@ -345,11 +404,14 @@ class SpeedLimitAssist:
         # start or reset preActive timer if initially enabled or manual set speed change detected
         if not self.long_enabled_prev or self.v_cruise_cluster_changed:
           self.long_engaged_timer = int(DISABLED_GUARD_PERIOD / DT_MDL)
+          # fork: a genuine driver set-speed change arms the override-memory window.
+          self._on_driver_set_speed_change()
 
         elif self.long_engaged_timer <= 0:
           if self._update_non_pcm_long_confirmed_state():
+            self._mark_override_confirmed()
             self.state = SpeedLimitAssistState.active
-          elif self._has_speed_limit:
+          elif self._has_speed_limit and not self.override_memory_active:
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           else:

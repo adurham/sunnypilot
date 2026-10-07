@@ -1,4 +1,4 @@
-From 7f2ce28188cdd11096c9bb2fddcedb619933b10a Mon Sep 17 00:00:00 2001
+From 6e4f6a768d37315e15e531dbdb27efa04d6f799b Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 18:52:54 -0500
 Subject: [PATCH] hyundai: drive-mode decode (CLU13 CF_Clu_DriveMode) ->
@@ -435,5 +435,5 @@ index 00000000..9193bce7
 +    ext.drive_mode_debouncer = dm.DriveModeDebouncer()
 +    assert ext.update_drive_mode(shim) == 0
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

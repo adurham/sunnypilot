@@ -1,4 +1,4 @@
-From f5fc1256722982d58542dcbb2acff0b935cd3810 Mon Sep 17 00:00:00 2001
+From 4d50fd08889ac7841d27f49fb42cb42686863c19 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sun, 4 Oct 2026 14:30:34 -0500
 Subject: [PATCH] hyundai: gas interceptor: speed-scheduled pedal gain + hold
@@ -345,5 +345,5 @@ index 3552cd21..3e6a9c70 100644
      CC2 = structs.CarControl()
      CC2.enabled = CC2.latActive = CC2.longActive = True
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

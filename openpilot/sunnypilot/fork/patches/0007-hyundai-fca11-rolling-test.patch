@@ -1,4 +1,4 @@
-From 4951ec91d78a94ecd63b0acd00073a9af619dabe Mon Sep 17 00:00:00 2001
+From 6d99bee424d9f8f7ce4f1255e9a8e55498f3d620 Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Sat, 3 Oct 2026 21:35:30 -0500
 Subject: [PATCH] hyundai: FCA11 ROLLING brake test (TEST-ONLY bit 128 on top
@@ -16,7 +16,7 @@ Subject: [PATCH] hyundai: FCA11 ROLLING brake test (TEST-ONLY bit 128 on top
  6 files changed, 611 insertions(+), 4 deletions(-)
 
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index 5182d0ff..7e6e2674 100644
+index f8bffd1c..c31358a2 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -94,6 +94,152 @@ static bool hyundai_legacy = false;
@@ -221,7 +221,7 @@ index 5182d0ff..7e6e2674 100644
        if (violation) {
          tx = false;
        }
-@@ -487,8 +659,16 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -489,8 +661,16 @@ static safety_config hyundai_init(uint16_t param) {
      {0x38D, 0, 8, .check_relay = true},   // FCA11 Bus 0 (replaces the stock camera's)
    };
  
@@ -238,7 +238,7 @@ index 5182d0ff..7e6e2674 100644
  
    safety_config ret;
    if (hyundai_longitudinal) {
-@@ -603,6 +783,19 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -605,6 +785,19 @@ static safety_config hyundai_init(uint16_t param) {
        HYUNDAI_LDA_BUTTON_ADDR_CHECK
      };
  
@@ -258,7 +258,7 @@ index 5182d0ff..7e6e2674 100644
      static RxCheck hyundai_non_scc_interceptor_addr_checks[] = {
        HYUNDAI_COMMON_RX_CHECKS(false)
        HYUNDAI_GAS_INTERCEPTOR_ADDR_CHECK
-@@ -628,7 +821,15 @@ static safety_config hyundai_init(uint16_t param) {
+@@ -630,7 +823,15 @@ static safety_config hyundai_init(uint16_t param) {
      SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
      if (hyundai_fca11_brake_test) {  // hyundai_common_init: non-SCC ICE only, never with any openpilot longitudinal
        SET_TX_MSGS(HYUNDAI_FCA11_TEST_TX_MSGS, ret);
@@ -275,7 +275,7 @@ index 5182d0ff..7e6e2674 100644
          SET_RX_CHECKS(hyundai_non_scc_lda_button_addr_checks, ret);
        } else {
          SET_RX_CHECKS(hyundai_non_scc_addr_checks, ret);
-@@ -700,6 +901,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+@@ -702,6 +903,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
    hyundai_gas_interceptor = false;
    hyundai_gas_interceptor_remapped = false;
    hyundai_fca11_brake_test = false;
@@ -283,7 +283,7 @@ index 5182d0ff..7e6e2674 100644
    hyundai_camera_scc = false;
    return BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
  }
-@@ -708,6 +910,7 @@ const safety_hooks hyundai_hooks = {
+@@ -710,6 +912,7 @@ const safety_hooks hyundai_hooks = {
    .init = hyundai_init,
    .rx = hyundai_rx_hook,
    .tx = hyundai_tx_hook,
@@ -352,7 +352,7 @@ index 83b26462..68d61c08 100644
                continue
              volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index 2a2affe7..abd4b708 100755
+index 672d1667..9507f300 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -18,7 +18,8 @@ from opendbc.sunnypilot.car import crc8_pedal, create_gas_interceptor_command
@@ -365,7 +365,7 @@ index 2a2affe7..abd4b708 100755
  from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
  
  # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
-@@ -1370,6 +1371,390 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -1374,6 +1375,390 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
      self.assertFalse(self._tx(self._fca11(dec_cmd_act=1)))
  
  
@@ -780,5 +780,5 @@ index bbbd792f..9d11863a 100644
  
  class HyundaiFlagsSP(IntFlag):
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

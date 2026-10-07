@@ -1,4 +1,4 @@
-From d4ceaba0616779e1cb6e3be734b32493e05a44c7 Mon Sep 17 00:00:00 2001
+From 49d8f6871cf708e17804667a31c252a7a05223be Mon Sep 17 00:00:00 2001
 From: Adam Durham <amdnative@gmail.com>
 Date: Tue, 6 Oct 2026 17:18:58 -0500
 Subject: [PATCH] hyundai: FCA11-long personality-indexed braking strength
@@ -23,7 +23,7 @@ No panda/opendbc safety files touched (firmware 00e086b9 valid); no resume/stop 
  4 files changed, 178 insertions(+), 17 deletions(-)
 
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index 5bbb1cd..8d0805e 100644
+index 5bbb1cd9..8d0805e7 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -26,6 +26,9 @@ Design (see car-features/fca11-long-integration.md for the full picture):
@@ -112,7 +112,7 @@ index 5bbb1cd..8d0805e 100644
        t_cam, dat = cam
        if frame % FCA11_SEND_EVERY == 0:
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 57fad02..e106b4d 100644
+index 57fad029..e106b4d2 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -292,7 +292,7 @@ class GasInterceptorCarController:
@@ -125,7 +125,7 @@ index 57fad02..e106b4d 100644
      # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
      # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index 5043d6a..8191f6a 100644
+index 5043d6a6..8191f6af 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -84,10 +84,14 @@ class TestPureLogic(unittest.TestCase):
@@ -285,7 +285,7 @@ index 5043d6a..8191f6a 100644
  
    def test_toggle_off_is_inert(self):
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index 10bb84e..798ee12 100644
+index 10bb84e4..798ee12d 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 @@ -1222,6 +1222,18 @@ class TestFca11LongControllerIntegration:
@@ -309,5 +309,5 @@ index 10bb84e..798ee12 100644
 +        dats += [d for a, d, _ in sends if a == 0x38D]
 +      assert _get_bits(dats[-1], 8, 8) == cap == PERSONALITY_MAX_DEC[p], (p, cap)
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 
