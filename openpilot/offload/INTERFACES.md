@@ -104,6 +104,12 @@ that never stops.)
   at receipt, payload untouched. Stale (>OFFLOAD_STALE_MS) or non-finite messages are dropped, never forwarded.
   Eligibility counters + behind/lost events logged; eligibility is signalled by presence/age of the shadow
   messages, not by an API.
+- **SP pairing rule (added 2026-10-07):** `modelDataV2SP` carries no frameId and no timestamps
+  (custom.capnp ModelDataV2SP), so it cannot be aged on its own. offloadd forwards it ONLY when paired
+  within `OFFLOAD_SP_PAIR_MS` (default 25) of an aged-able service message that itself passed the freshness
+  gate; an unpaired SP is dropped (`dropped_unpaired`, counted) — never forwarded blind. This is the same
+  proximity rule the arbiter applies when binding SP to a frame set (OFFLOAD_ARB_SP_PROXIMITY_MS), so both
+  ends agree on which frame an SP belongs to.
 - **Arbitration (device modeld_v2, OFFLOAD-gated):** at each publish point, if remote mode is engaged and an
   eligible shadow output exists for the frame being published → publish the shadow's outputs under the real
   names (re-stamped to device-now). Else publish the locally computed outputs (today's path).

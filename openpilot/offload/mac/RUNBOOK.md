@@ -161,11 +161,11 @@ clock, exactly as on a drive — both ends share one monotonic domain through th
 - `offloadd` stdout: `forwarded` climbing; `dropped_stale == 0`, `dropped_error == 0`. When an
   offloadd SUB is down, `returnsend` keeps running (never blocks) and counts `dropped_noreader`.
 
-**Known gap — `modelDataV2SP` is NOT forwarded by `offloadd`.** Its payload
-(`custom.capnp ModelDataV2SP`) carries **no `frameId` and no `timestampSof`**, so `offloadd`'s
-freshness gate (`sof_for_service`) cannot age it and drops it as `dropped_no_sof` — the "never
-republish blind" rule. `returnsend` still ships it (it is a `RETURN_SERVICES` member and a pipe),
-and `modelV2`/`cameraOdometry`/`drivingModelData` (all carry `frameId`) forward normally. Closing
-this needs a cross-workstream decision (e.g. a `frameId` on the SP payload, or offloadd aging SP
-from the same-frame camera state under a paired policy); the integration test asserts the current
-behavior so a fix flips a visible assertion.
+**`modelDataV2SP` forwarding — SP pairing rule (resolved 2026-10-07).** SP has no `frameId` and no
+`timestampSof`, so it can't be aged directly. `offloadd` forwards it only when it is **paired within
+`OFFLOAD_SP_PAIR_MS` (25 ms, inclusive)** with a partner (`modelV2`/`cameraOdometry`/`drivingModelData`)
+that itself passed the freshness + finite gate; otherwise it is dropped as `dropped_unpaired` and
+never forwarded blind. Pairs are one-to-one (a partner is consumed) and use true drain-time stamps
+(never the step-top clock, which can over-pair after a blocking camera update). The §7 arbiter binds
+SP to a frame by the same 25 ms proximity rule. Success counter: `sp_paired`. `returnsend` ships all
+four `RETURN_SERVICES` unchanged; the device end decides pairing.

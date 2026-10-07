@@ -27,6 +27,7 @@ from openpilot.offload.device import offloadd as od
 from openpilot.offload.device.tests.test_offloadd import (
   _HAVE_CEREAL,
   _load,
+  _modeldatav2sp,
   _modelv2,
   needs_cereal,
 )
@@ -94,22 +95,33 @@ class HoldFixture:
     self.pub.monitor(f"inproc://holdpolicy-mon-{id(self)}", zmq.EVENT_ACCEPTED)
     self.mon = self.pub.get_monitor_socket()
 
+    # a second PUB for the SP return service (own port) — the §7 pairing test needs it.
+    self.sp_pub = self.ctx.socket(zmq.PUB)
+    self.sp_pub.setsockopt(zmq.LINGER, 0)
+    self.sp_pub.bind(self.cfg.endpoint_for("modelDataV2SP"))
+    self.sp_pub.monitor(f"inproc://holdpolicy-sp-mon-{id(self)}", zmq.EVENT_ACCEPTED)
+    self.sp_mon = self.sp_pub.get_monitor_socket()
+
     self.daemon = od.Offloadd(self.cfg, cereal=_HoldCereal(self.cfg))
     self.daemon.open()
 
     shadow = self.cfg.shadow_map["modelV2"]
     self.shadow_sub = msgq.sub_sock(shadow, addr="127.0.0.1", timeout=200,
                                     segment_size=SERVICE_LIST[shadow].queue_size)
+    self.sp_shadow = self.cfg.shadow_map["modelDataV2SP"]
+    self.sp_shadow_sub = msgq.sub_sock(self.sp_shadow, addr="127.0.0.1", timeout=200,
+                                       segment_size=SERVICE_LIST[self.sp_shadow].queue_size)
 
-    self._wait_accepted()
+    self._wait_accepted(self.mon)
+    self._wait_accepted(self.sp_mon)
     time.sleep(0.25)                 # let SUBSCRIBE propagate past the ACCEPTED edge
 
-  def _wait_accepted(self, timeout=5.0):
+  def _wait_accepted(self, mon, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-      if self.mon.poll(100):
+      if mon.poll(100):
         try:
-          frames = self.mon.recv_multipart()
+          frames = mon.recv_multipart()
         except zmq.ZMQError:
           continue
         if struct.unpack("<H", frames[0][:2])[0] & zmq.EVENT_ACCEPTED:
@@ -132,6 +144,23 @@ class HoldFixture:
 
   def send_modelv2(self, fid, t_ns, eof_offset_ms=2):
     self.pub.send(_modelv2(fid, t_ns + eof_offset_ms * MS))
+
+  def send_sp(self, turn=2):
+    """Send one modelDataV2SP on its own return port (no frameId/timestamps)."""
+    raw = _modeldatav2sp(turn)
+    self.sp_pub.send(raw)
+    return raw
+
+  def recv_sp_raw(self, timeout_s=2.0):
+    """Raw bytes from the SP shadow topic, or None (payload stays a modelDataV2SP)."""
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+      d = self.sp_shadow_sub.receive()
+      if d:
+        with _load(bytes(d)) as r:
+          assert r.which() == "modelDataV2SP"
+        return bytes(d)
+    return None
 
   def step_until(self, pred, t_ns, timeout=5.0):
     end = time.monotonic() + timeout
@@ -163,7 +192,12 @@ class HoldFixture:
       self.mon.close(0)
     except Exception:
       pass
+    try:
+      self.sp_mon.close(0)
+    except Exception:
+      pass
     self.pub.close(0)
+    self.sp_pub.close(0)
     self.ctx.term()
 
 
@@ -402,5 +436,52 @@ def test_default_off_path_unchanged():
     fx.close()
 
 
+# ---------------------------------------------------------------------------
+# INTERFACES §7 'SP pairing rule' under the hold policy: the SP is forwarded only
+# when paired with a freshness-passing aged message. An SP has no frameId, so it never
+# marks a frame handled and cannot perturb the HOLD accounting (it still counts as a
+# message from the Mac, i.e. proof of link liveness, like any other return message).
+# ---------------------------------------------------------------------------
+
+@needs_cereal
+def test_sp_pairs_with_fresh_modelv2_under_hold_policy():
+  fx = HoldFixture({"settling_frames": 0, "proving_frames": 0})
+  try:
+    fx.inject_frame(50, T0)
+    assert fx.forward_reply(50, T0)              # modelV2 forwarded -> the pairing anchor
+    assert fx.daemon.forwarded == 1
+
+    sp_t = T0 + 5 * MS                           # within the 25 ms window of the anchor
+    sp_wire = fx.send_sp(turn=2)
+    assert fx.step_until(lambda: fx.daemon.forwarded == 2, sp_t)
+    got = fx.recv_sp_raw()
+    assert got is not None
+    with _load(sp_wire) as a, _load(got) as b:
+      assert b.which() == "modelDataV2SP"
+      assert b.modelDataV2SP.laneTurnDirection == a.modelDataV2SP.laneTurnDirection == 2
+      assert b.logMonoTime == sp_t               # header re-stamped to device now
+    assert fx.daemon.dropped_unpaired == 0
+    assert fx.daemon.hold_count == 0             # pairing did not perturb the HOLD machine
+  finally:
+    fx.close()
+
+
+@needs_cereal
+def test_lone_sp_under_hold_policy_dropped_unpaired_never_forwarded():
+  fx = HoldFixture({"settling_frames": 0, "proving_frames": 0, "lost_ms": 10**9})
+  try:
+    fx.inject_frame(50, T0)
+    fx.send_sp(turn=1)                           # no aged message ever forwarded
+    assert fx.step_until(lambda: fx.daemon.pending_sp is not None, T0)
+    assert fx.step_until(lambda: fx.daemon.dropped_unpaired >= 1, T0 + 30 * MS)
+    assert fx.daemon.forwarded == 0
+    assert fx.recv_sp_raw(timeout_s=0.5) is None
+  finally:
+    fx.close()
+
+
 if __name__ == "__main__":
   raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+

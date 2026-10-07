@@ -23,6 +23,11 @@ Steps:
       A msg whose payload carries any non-finite float -> DROP + count (never forward). Else ->
       keep the payload byte-identical, set header ``logMonoTime = time.monotonic_ns()``, and
       forward into local msgq under the SHADOW service name (``shadow_map``), never the real one.
+      ``modelDataV2SP`` has neither frameId nor timestamps, so it cannot be aged on its own; per
+      the §7 SP pairing rule it is forwarded ONLY when paired within ``OFFLOAD_SP_PAIR_MS``
+      (default 25 ms) of an aged-able message that itself passed the gate (buffered in a single
+      slot while it waits); an unpaired SP is dropped as ``dropped_unpaired`` — never forwarded
+      blind. Other un-ageable services keep the ``dropped_no_sof`` path.
   (c) Output / staleness: the real modelV2/cameraOdometry/drivingModelData/modelDataV2SP are the
       device's OWN model's — this daemon neither publishes nor removes them. When no eligible
       remote output exists for a frame, the shadow name simply goes quiet; that absence is the
@@ -48,6 +53,8 @@ Failure-mode table (design reference / operational rules)
   | bridge death (device)       | local narrowRoadCameraState stalls   | SOF map ages out -> all drops    | shadow quiet; LOCAL model still drives         |
   | Mac pipeline stall/lag      | age of return frame SOF > stale_ms   | drop + count stale (never forward)| shadow missing; arbitration sees remote stale  |
   | segment boundary / route end| cameraOdometry frameId resets/gap    | drop unmatched; keep forwarding  | brief shadow gap; loggerd unaffected           |
+  | unpaired modelDataV2SP     | no aged-able msg forwarded within   | hold pending; drop + count        | SP shadow goes quiet; arbitration sees the set |
+  |                            | OFFLOAD_SP_PAIR_MS (default 25 ms)  | dropped_unpaired (never blind)   | incomplete -> remote ineligible (§7 pairing)    |
   | encoder GOP gap            | no return msg for a frame id         | nothing to forward for that frame| handled upstream (WS-B); not this daemon's job |
   | ZMQ HWM drops              | SUB side: messages silently dropped  | (see note) count via recv gaps   | gap watchdog covers the symptom                |
   | non-finite remote output   | any NaN/Inf float in the payload     | drop + count nonfinite           | shadow missing; never a bad plan into msgq     |
@@ -100,6 +107,24 @@ Notes:
   * ``drivingModelData`` has no ``timestampSof`` field; its SOF is taken from the same-frame
     camera state (by ``frameId``), exactly like the others. If no camera SOF is known for a
     frame, the message is dropped as un-ageable (never republished blind).
+  * ``modelDataV2SP`` (custom.ModelDataV2SP: laneTurnDirection + 2 bools) has no frameId and no
+    timestamps, so it can never be aged. SP PAIRING RULE (INTERFACES §7): it is forwarded ONLY when
+    paired — by device-clock receipt time, within ``OFFLOAD_SP_PAIR_MS`` (default 25 ms) — with an
+    aged-able message (modelV2/cameraOdometry/drivingModelData) that itself passed the freshness +
+    finite gate and was forwarded; either side may arrive first. An SP waits in a single-slot
+    pending buffer; with no fresh partner inside the window it is dropped and counted as
+    ``dropped_unpaired`` (a newer SP supersedes an older pending one, also counted). A stale- or
+    non-finite-dropped aged message never anchors a pair. The SP's header is restamped at forward
+    time like every other message. Proximity is measured on TRUE receipt stamps (a fresh monotonic
+    read when each message is drained — NOT the step-top clock, which predates the blocking camera
+    ``update`` and would let a long block in the later step silently over-pair an SP with a partner
+    that is really tens of ms away); the injected ``now_ns`` is the receipt stamp in tests. The main
+    loop is paced by the camera ``SubMaster.update``, so while an SP pairing is in flight (an SP is
+    pending, or a partner was just forwarded and its SP has not been seen) the camera poll is
+    shortened to ``SP_PAIR_POLL_MS`` (5 ms), so a straggler that straddles two drains is picked up
+    within ~5 ms and still pairs. Pairing is one-to-one: a partner is consumed by the SP it pairs with.
+    Failure is always the safe direction (counted ``dropped_unpaired``; the arbiter sees an incomplete
+    remote set and the local model publishes that frame).
   * ZMQ SUB socket ``RCVTIMEO`` is set (default 100 ms) so the gap watchdog and SIGTERM handling
     are promptly serviced even when the Mac goes quiet. ``CONFLATE`` is deliberately NOT set:
     every frame must be seen so the stale accounting is exact.
@@ -130,6 +155,9 @@ RING_SIZE = 4096                # recent republish timestamps for the watchdog
 CAMERA_SERVICES = ("narrowRoadCameraState", "wideRoadCameraState")
 ENABLED_MODES = ("shadow", "drive", "holds")  # 'holds' = drive + the HOLD/BEHIND/LOST policy
 HOLD_POLICY_MODE = "holds"                    # OffloadMode sub-value that turns the policy on
+SP_SERVICE = "modelDataV2SP"                  # the one return service with no frameId/timestamps
+DEFAULT_SP_PAIR_MS = 25                       # OFFLOAD_SP_PAIR_MS — SP<->aged-msg pairing window
+SP_PAIR_POLL_MS = 5                           # camera-poll timeout while an SP pairing is in flight
 
 # Remote (Mac) return service -> the DEVICE msgq SHADOW service name it is forwarded under.
 # Never the real modelV2/cameraOdometry/... : those are the device's own model's, and the local
@@ -220,9 +248,11 @@ def sof_for_service(msg, camera_sof: dict) -> int | None:
   """Device-clock SOF (ns) of the camera frame a return message refers to, or None if unknown.
 
   Prefers an inline ``timestampSof`` when the message carries one (cameraOdometry does not —
-  it has only ``timestampEof``/``frameId``; modelV2/drivingModelData/modelDataV2SP carry
-  ``timestampEof`` and ``frameId``). Falls back to the ``frameId`` -> SOF map fed by the local
-  camera states; that map is the authoritative device-clock reference.
+  it has only ``timestampEof``/``frameId``; modelV2/drivingModelData carry ``frameId``).
+  ``modelDataV2SP`` carries NEITHER a frameId nor any timestamp, so it has no age source here at
+  all: it never reaches this function and is handled by the SP pairing rule instead (see
+  ``Offloadd._handle_sp``). Falls back to the ``frameId`` -> SOF map fed by the local camera
+  states; that map is the authoritative device-clock reference.
   """
   fid = None
   if hasattr(msg, "frameId"):
@@ -259,6 +289,12 @@ class Config:
   shadow_map: dict = field(default_factory=lambda: dict(DEFAULT_SHADOW_MAP))
   # shadow service names to open a device msgq PubMaster on (defaults to shadow_map's values).
   shadow_services: tuple = field(default_factory=lambda: SHADOW_SERVICES)
+
+  # modelDataV2SP pairing (INTERFACES §7 'SP pairing rule'): SP carries no frameId and no
+  # timestamps, so it cannot be aged on its own. It is forwarded only when paired within this
+  # window of an aged-able message (modelV2/cameraOdometry/drivingModelData) that itself passed
+  # the freshness gate; otherwise it is dropped as ``dropped_unpaired`` (never forwarded blind).
+  sp_pair_ms: int = field(default_factory=lambda: _env_ms("OFFLOAD_SP_PAIR_MS", DEFAULT_SP_PAIR_MS))
 
   # --- HOLD/BEHIND/LOST eligibility policy (Jetlink borrow; default OFF) --------
   # When hold_policy is False every field below is inert and the daemon behaves exactly
@@ -381,7 +417,17 @@ class Offloadd:
     self.dropped_stale = 0
     self.dropped_nonfinite = 0
     self.dropped_no_sof = 0
+    self.dropped_unpaired = 0
     self.dropped_error = 0
+    # -- modelDataV2SP pairing (INTERFACES §7 'SP pairing rule') ------------------
+    # SP has no frameId/timestamps -> un-ageable. Single-slot pending buffer holds the last SP
+    # (raw bytes, receipt device-monotonic ns) until an aged-able message within cfg.sp_pair_ms
+    # is forwarded; otherwise it is dropped as ``dropped_unpaired`` (never forwarded blind).
+    self.pending_sp: tuple[bytes, int] | None = None
+    self.last_forwarded_msg_ns: int | None = None   # receipt ns of the last forwarded aged msg (pairing anchor)
+    self.sp_paired = 0                       # SPs forwarded via the pairing rule
+    self._clock = time.monotonic_ns          # tests may swap in a fake monotonic source
+    self._injected_ns: int | None = None     # step(now_ns=...) test clock; None in production
     self.gap_open = False
     self.last_forward_mono: float | None = None
     self.last_republish_mono: float | None = None   # DEPRECATED alias of last_forward_mono
@@ -453,19 +499,53 @@ class Offloadd:
 
     ``now_ns`` injects the device clock for deterministic tests; production callers omit it.
     """
+    self._injected_ns = now_ns
     if now_ns is None:
-      now_ns = time.monotonic_ns()
+      now_ns = self._clock()
     now_mono = now_ns / 1e9
     self._refresh_camera_sof(now_mono)
     if self.cfg.hold_policy:
       self._note_frame_arrivals(now_mono)
     self._drain_zmq(now_ns, now_mono)
+    self._resolve_pending_sp(now_ns, now_mono)
     self._watchdog(now_mono)
     if self.cfg.hold_policy:
       self._hold_policy_tick(now_mono)
 
+  def _recv_ns(self) -> int:
+    """Receipt stamp used ONLY for SP pairing proximity (never for freshness or the header restamp).
+
+    Production (no injected clock): a fresh monotonic read, i.e. when the message was actually drained.
+    The step's top-of-step stamp is NOT used for this: it predates the blocking camera ``update`` (up to
+    ``recv_timeout_ms``), so two messages drained in different steps would be "paired" or "unpaired"
+    according to the length of the camera block instead of the real gap between them — and a long block in
+    the LATER step would silently OVER-pair an SP with a partner that is really tens of ms away (the unsafe
+    direction; nothing downstream can see it). Tests inject ``step(now_ns=...)``; that clock is then the
+    receipt stamp, exactly as it is for every other rule. Residual limit: ZMQ gives no arrival timestamp, so
+    "receipt" is the moment the message is drained from the SUB socket.
+    """
+    return self._injected_ns if self._injected_ns is not None else self._clock()
+
+  def _anchor_fresh(self) -> bool:
+    """True while an aged partner was forwarded within the pairing window and no SP has claimed it yet."""
+    last = self.last_forwarded_msg_ns
+    return last is not None and (self._recv_ns() - last) <= self.cfg.sp_pair_ms * 1_000_000
+
+  def _camera_poll_ms(self) -> int:
+    """Camera-poll timeout for this step.
+
+    The camera ``SubMaster.update`` paces the loop and normally blocks up to ``recv_timeout_ms``. While an SP
+    pairing is in flight (an SP is pending, or a partner was just forwarded and its SP has not been seen) poll
+    briefly instead, so the straggler is drained within ~``SP_PAIR_POLL_MS`` of its arrival: the receipt-stamp
+    proximity then measures the network spread of the frame's messages, not the camera block. Costs a few
+    extra ~50 us iterations per frame, only inside the <= OFFLOAD_SP_PAIR_MS window.
+    """
+    if SP_SERVICE in self._sub_socks and (self.pending_sp is not None or self._anchor_fresh()):
+      return min(self.cfg.recv_timeout_ms, SP_PAIR_POLL_MS)
+    return self.cfg.recv_timeout_ms
+
   def _refresh_camera_sof(self, now_mono: float) -> None:
-    self.cereal.update(self.cfg.recv_timeout_ms)
+    self.cereal.update(self._camera_poll_ms())
     for svc in CAMERA_SERVICES:
       got = self.cereal.camera_sof(svc)
       if got is not None:
@@ -497,15 +577,22 @@ class Offloadd:
     """Freshness-validate one remote message and, if eligible, forward it under its shadow name.
 
     Never forwards a stale message; never forwards a message with a non-finite payload float;
-    never publishes a real service name (the local model owns those). Any message at all is
-    proof the link is alive, so it clears LOST (the 'comma re-hellos' equivalent).
+    never publishes a real service name (the local model owns those). ``modelDataV2SP`` has no
+    frameId/timestamps, so it is NOT aged here: it is held pending (INTERFACES §7 'SP pairing
+    rule') and forwarded only when paired within ``OFFLOAD_SP_PAIR_MS`` of a message that itself
+    passed the freshness gate (see ``_handle_sp``). Any message at all is proof the link is alive,
+    so it clears LOST (the 'comma re-hellos' equivalent).
     """
+    recv_ns = self._recv_ns()          # TRUE receipt stamp: used ONLY for SP pairing proximity
     if self.cfg.hold_policy:
       self.last_received_mono = now_mono
       if self.lost:
         self.lost = False
         self._reset_hold_accounting()
         self._event("recovered", now_mono)
+    if svc == SP_SERVICE:
+      self._handle_sp(raw, recv_ns)
+      return
     try:
       from openpilot.cereal import log
       limit = 2 ** 64 - 1
@@ -545,20 +632,97 @@ class Offloadd:
       self.handled_frames.add(fid)
       self.holds_in_a_row = 0
 
-    shadow = self.cfg.shadow_map.get(svc)
-    if shadow is None:
+    # fresh + finite: a valid "aged" partner. Forward it; its receipt stamp becomes the anchor an SP may pair with.
+    self._forward(svc, out, now_ns, now_mono, anchor_ns=recv_ns)
+
+  def _handle_sp(self, raw: bytes, recv_ns: int) -> None:
+    """Buffer one ``modelDataV2SP`` for pairing (INTERFACES §7 'SP pairing rule'). Never forwards here.
+
+    SP carries no frameId and no timestamps, so it cannot be aged on its own. It is validated once
+    (shadow name mapped / really a modelDataV2SP / all floats finite / decodable — each counted like
+    any other message if not, and a bad SP never evicts a good pending one) and held in a SINGLE-SLOT
+    pending buffer as (raw bytes, receipt ns). A newer SP supersedes an older pending one (the older
+    never found a partner -> ``dropped_unpaired``), so a burst of queued SPs can never be forwarded
+    en masse under one fresh partner. The pair / forward / drop decision is made by
+    ``_resolve_pending_sp`` once per step AFTER the whole drain, so it does not depend on the order
+    in which the per-service sockets happen to be drained.
+    """
+    if self.cfg.shadow_map.get(SP_SERVICE) is None:
       self.dropped_error += 1          # no shadow name mapped: never forward under the real one
       return
+    try:
+      from openpilot.cereal import log
+      limit = 2 ** 64 - 1
+      with log.Event.from_bytes(raw, traversal_limit_in_words=limit) as reader:
+        if reader.which() != SP_SERVICE:
+          self.dropped_error += 1      # wrong service on the SP port: never forward
+          return
+        if not _all_finite(reader):
+          self.dropped_nonfinite += 1
+          return
+    except Exception:
+      self.dropped_error += 1
+      return
+    if self.pending_sp is not None:
+      self.dropped_unpaired += 1
+    self.pending_sp = (raw, recv_ns)
+
+  def _resolve_pending_sp(self, now_ns: int, now_mono: float) -> None:
+    """Pair, forward, or drop the pending SP (called once per step, after the ZMQ drain).
+
+    Forward ONLY if an aged-able message that passed the freshness+finite gate was received within
+    ``OFFLOAD_SP_PAIR_MS`` of the SP's receipt (either side: SP just before its partner, or just
+    after it), comparing TRUE receipt stamps (``_recv_ns``), not the step-top clock. The SP's header
+    is restamped at FORWARD time with the step clock like every other message. A stale- or
+    non-finite-dropped aged message never became an anchor (``last_forwarded_msg_ns`` only moves on a
+    successful aged forward), so it cannot pair. Pairing is one-to-one: the anchor is consumed, so one
+    fresh message cannot launder a stream of SPs. With no partner and the window elapsed, the SP is
+    dropped as ``dropped_unpaired`` — never forwarded blind.
+    """
+    if self.pending_sp is None:
+      return
+    raw, recv_ns = self.pending_sp
+    window_ns = self.cfg.sp_pair_ms * 1_000_000
+    last = self.last_forwarded_msg_ns
+    if last is not None and abs(recv_ns - last) <= window_ns:
+      self.pending_sp = None
+      self.last_forwarded_msg_ns = None    # consume the anchor: it pairs with at most one SP
+      try:
+        out = _restamp(raw, now_ns)
+      except Exception:
+        self.dropped_error += 1
+        return
+      if self._forward(SP_SERVICE, out, now_ns, now_mono):
+        self.sp_paired += 1
+    elif self._recv_ns() - recv_ns > window_ns:
+      self.pending_sp = None
+      self.dropped_unpaired += 1       # window elapsed, no fresh partner
+
+  def _forward(self, svc: str, out: bytes, now_ns: int, now_mono: float, *, anchor_ns: int | None = None) -> bool:
+    """Write one restamped payload to its shadow topic; on success update counters and the anchor.
+
+    ``anchor_ns`` is passed only for a message that carried an age source (modelV2/cameraOdometry/
+    drivingModelData) and passed the freshness+finite gate: after a SUCCESSFUL publish its receipt
+    stamp becomes ``last_forwarded_msg_ns``, the anchor a nearby modelDataV2SP may pair with
+    (``_resolve_pending_sp``). Returns True when the message reached the shadow topic.
+    """
+    shadow = self.cfg.shadow_map.get(svc)
+    if shadow is None:
+      self.dropped_error += 1
+      return False
     try:
       self.cereal.publish(shadow, out)
     except Exception:
       self.dropped_error += 1
-      return
+      return False
     self.forwarded += 1
     self.published = self.forwarded    # compat alias
     self.recent_republish.append(now_mono)
     self.last_forward_mono = now_mono
     self.last_republish_mono = now_mono
+    if anchor_ns is not None:
+      self.last_forwarded_msg_ns = anchor_ns
+    return True
 
   # -- HOLD/BEHIND/LOST eligibility (Jetlink borrow; only when cfg.hold_policy) -----
   def _note_frame_arrivals(self, now_mono: float) -> None:
@@ -701,6 +865,8 @@ class Offloadd:
       "dropped_stale": self.dropped_stale,
       "dropped_nonfinite": self.dropped_nonfinite,
       "dropped_no_sof": self.dropped_no_sof,
+      "dropped_unpaired": self.dropped_unpaired,
+      "sp_paired": self.sp_paired,
       "dropped_error": self.dropped_error,
       "sof_frames_tracked": len(self.sof_by_frame),
       "gap_open": self.gap_open,

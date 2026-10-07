@@ -121,13 +121,12 @@ tuple. (3) `modeld_runner` drops the zero-pad and now **asserts** `len(buf) >= f
 
 ## Blockers / OPEN items
 
-0. **`modelDataV2SP` cannot be forwarded by offloadd (ageable-gate gap).** Its payload
-   (`custom.capnp ModelDataV2SP`) carries **no `frameId`/`timestampSof`**, so offloadd's freshness
-   gate drops it as `dropped_no_sof` ("never republish blind"). `returnsend` ships all four
-   `RETURN_SERVICES` as a pipe; the other three (all carry `frameId`) forward. Fix is a
-   cross-workstream call (add a frame id to the SP payload, or offloadd ages SP from the same-frame
-   camera state). The return-chain test asserts current behavior so a fix flips a visible assertion.
-   See `RUNBOOK.md` "Return path (Mac -> device)".
+0. **RESOLVED (2026-10-07, SP pairing rule).** `modelDataV2SP` carries no `frameId`/timestamps so it
+   cannot be aged directly; offloadd now forwards it only when **paired within `OFFLOAD_SP_PAIR_MS`
+   (25 ms)** with a gate-passing partner (modelV2/cameraOdometry/drivingModelData), else
+   `dropped_unpaired` — never blind. Counters: `dropped_unpaired`, `sp_paired`. Pairing is
+   one-to-one and uses true drain-time stamps. The §7 arbiter binds SP to a frame by the same
+   25 ms proximity, so both ends agree. See `RUNBOOK.md` "Return path (Mac -> device)".
 
 1. **BLOCKER — this repo's msgq has NO ZMQ transport.** `MSGQSubSocket::connect`
    hard-asserts `address == "127.0.0.1"` (`msgq_repo/msgq/impl_msgq.cc:40`), so

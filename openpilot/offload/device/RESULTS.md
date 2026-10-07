@@ -67,6 +67,7 @@ MISSING: []          # every FORWARD + RETURN service is present on the device s
 ## 2. offloadd unit tests (offline, no device) — 13/13 PASS
 
 > Reframe 2026-10-07: the suite is now **27** tests (these 13 + `test_holdpolicy.py`); see §5.
+> SP pairing rule 2026-10-07: now **47** (`openpilot/offload/device`); see §8.
 
 ```
 $ PYTHONPATH=... .venv/bin/python -m pytest openpilot/offload/device/tests/test_offloadd.py -v
@@ -222,5 +223,63 @@ Default off: enabled only by `OFFLOAD_ARBITRATION` (bench) or (device: `COMMA_HA
 shadow topics with **raw msgq sockets** (no `log.Event` union member exists), publishes the remote
 set under the real names only when ENGAGED and an eligible+settled complete set exists, re-stamping
 only the header `logMonoTime` to device-now, and otherwise publishes its own local outputs.
+
+## 8. SP pairing rule (INTERFACES §7, added 2026-10-07) — `modelDataV2SP` forwarding
+
+**Gap closed.** `modelDataV2SP` (`custom.capnp ModelDataV2SP`: `laneTurnDirection` + 2 bools) has
+no `frameId` and no timestamps, so offloadd could not age it and dropped it as `dropped_no_sof`.
+But the arbiter's candidate set requires all four pieces (`has_ids() and _resolve_sp(fs) is not
+None`), so without SP forwarding the remote path could never engage. offloadd now forwards SP under
+a **pairing rule**, still never blind.
+
+| Rule | Behavior (`offloadd.py`) |
+|---|---|
+| Buffering | SP is NOT aged. Validated once (right service / finite / decodable), then held in a **single-slot** pending buffer as (raw bytes, receipt ns). |
+| Pair | Forwarded (shadow `offloadModelDataV2SP`, header restamped at forward time, payload byte-identical) **only** if a message that passed freshness+finite (modelV2 / cameraOdometry / drivingModelData) was received within `OFFLOAD_SP_PAIR_MS` (default 25, **inclusive**) of the SP. Either may arrive first. |
+| No partner | Window elapsed with no partner → dropped, `dropped_unpaired += 1`. SP shadow topic stays silent. |
+| Stale / non-finite partner | Dropped before it can anchor anything → its nearby SP goes unpaired. |
+| One-to-one | A partner is consumed by the SP it pairs with; a newer pending SP supersedes an older one (older counted `dropped_unpaired`). One fresh message cannot launder a stream of SPs. |
+| Counters | New `dropped_unpaired` (replaces `dropped_no_sof` for SP) and `sp_paired`, both in the stats JSON. `dropped_no_sof` is unchanged for any other service without an age source. |
+| Env | `OFFLOAD_SP_PAIR_MS` (default 25; garbage → default). |
+
+**Receipt stamps are true drain times, not the step clock.** The step stamps `now_ns` at the TOP of
+`step()`, before the camera `SubMaster.update` that paces the loop and can block up to
+`recv_timeout_ms` (100 ms). Pairing proximity therefore uses a fresh monotonic read taken when each
+message is drained (`_recv_ns`; the injected `now_ns` in tests). Using the step stamp would let a
+long camera block in the *later* step silently over-pair an SP with a partner that is really tens of
+ms away — the unsafe direction, invisible downstream (the arbiter cannot tell). A review (consult)
+flagged exactly this; `test_long_camera_block_in_later_step_does_not_overpair_sp` pins it. While a
+pairing is in flight (pending SP, or a fresh unclaimed partner) the camera poll is shortened to
+`SP_PAIR_POLL_MS` (5 ms) so a straggler straddling two drains still lands inside the window
+(`test_sp_straddling_two_steps_still_pairs_on_true_stamps`). Residual limit: ZMQ gives no arrival
+timestamp, so "receipt" is the moment the message is drained from the SUB socket.
+
+**Deviations from the §7 text (all stricter, none looser):**
+1. The pair/forward/drop decision runs once per `step()` AFTER the whole socket drain (not inside the
+   per-message handler), so it does not depend on which per-service socket is drained first.
+2. Pairing is one-to-one (partner consumed; newer SP supersedes older). The literal text would
+   forward both SPs when two frames' messages are drained in one step (a backlog).
+3. `sp_paired` counter added (observability for the new path; not in the §7 text).
+
+**Tests** — `openpilot/offload/device`: **47 passed** (was 27). New/flipped:
+`test_sp_alone_without_partner_is_dropped_unpaired` (c), `test_sp_before_modelv2_within_window_pairs_both`
+(a), `test_sp_and_modelv2_same_drain_either_send_order_pairs[True/False]` (a, order-irrelevant),
+`test_sp_after_modelv2_within_window_pairs_both` (b), `test_stale_modelv2_with_nearby_sp_forwards_neither`
+(d), `test_nonfinite_modelv2_with_nearby_sp_forwards_neither`, `test_full_pair_frameid_preserved_and_sp_payload_byte_identical`
+(e), `test_sp_after_partner_window_boundary[25/26 ms]`, `test_sp_burst_single_slot_only_newest_pairs`,
+`test_one_anchor_pairs_at_most_one_sp`, `test_no_fresh_partner_never_forwards_sp` (the "no fresh
+partner ⇒ not forwarded" safety property), `test_wrong_service_on_sp_port_is_not_buffered`,
+`test_sp_pair_ms_default_and_env`, the two true-stamp tests above, `test_camera_poll_shortens_only_while_sp_pairing_in_flight`,
+and in `test_holdpolicy.py` the pair / lone-SP cases under the hold policy. `test_stats_json_shape`
+now also asserts `dropped_unpaired` and `sp_paired`.
+
+**Integration test needs a PM edit.** `mac/tests/test_returnsend.py::test_full_return_chain_into_shadow_topics`
+(the target of the frozen `mac/return_path_test.sh`, which itself only delegates to that pytest id
+and hard-codes no counts) pins the OLD behavior — `fwd_delta == 3`, `noseof_delta == 1`,
+`"offloadModelDataV2SP" not in msgs` — and now fails with `expected 3 forwards for the round, got 4`.
+A ready-to-apply flipped version (proven 3× against the final daemon, and `patch --dry-run` clean
+against the frozen file) is at `~/.hermes/cache/scratch/sp-pair/test_returnsend_sp_pairing.patch`;
+it also fixes the test helper `_drain_shadow(want_frame=...)`, which silently discarded the SP because
+`_frame_id()` is `None` for a frameId-less message.
 
 

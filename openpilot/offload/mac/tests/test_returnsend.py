@@ -356,7 +356,8 @@ def _drain_shadow(shadow_subs, want_frame: int | None = None) -> dict:
       if not d:
         break
       d = bytes(d)
-      if want_frame is None or _frame_id(d) == want_frame:
+      # modelDataV2SP has no frameId (custom.ModelDataV2SP) -> _frame_id() is None; keep it (the sub is per-topic)
+      if want_frame is None or _frame_id(d) in (want_frame, None):
         out[name] = d
   return out
 
@@ -426,14 +427,13 @@ def test_full_return_chain_into_shadow_topics(tmp_path):
     publish_mono_ns = time.monotonic_ns()
     wire = _publish_round(cam_pub, out_pub, DEF_FRAME, ts_ns=publish_mono_ns)
 
-    # wait until the round is fully accounted: +3 forwards, +1 no-SOF
+    # wait until the round is fully accounted: +4 forwards (modelV2/cameraOdometry/drivingModelData + the PAIRED modelDataV2SP)
     end = time.monotonic() + 5.0
     od_after = od_before
     while time.monotonic() < end:
       od_after = _stats_snapshot(open(od_out).read(), "forwarded")
       fwd = od_after.get("forwarded", 0) - od_before["forwarded"]
-      nosof = od_after.get("dropped_no_sof", 0) - od_before.get("dropped_no_sof", 0)
-      if fwd >= 3 and nosof >= 1:
+      if fwd >= 4:
         break
       time.sleep(0.1)
     recv_after_ns = time.monotonic_ns()          # observation upper bound on receipt time
@@ -442,27 +442,31 @@ def test_full_return_chain_into_shadow_topics(tmp_path):
     # --- assertions --------------------------------------------------------------------------
     fwd_delta = od_after["forwarded"] - od_before["forwarded"]
     noseof_delta = od_after.get("dropped_no_sof", 0) - od_before.get("dropped_no_sof", 0)
+    unpaired_delta = od_after.get("dropped_unpaired", 0) - od_before.get("dropped_unpaired", 0)
 
     # sender side: everything fresh reached the wire
     assert rt_warm.get("dropped_age", 0) == 0, rt_out
     assert rt_warm.get("dropped_error", 0) == 0, rt_out
 
-    # offloadd side: exactly the three frame-carrying services were forwarded for the round, and
-    # modelDataV2SP was refused as un-ageable (see the deviation note below).
-    assert fwd_delta == 3, f"expected 3 forwards for the round, got {fwd_delta}\n{open(od_out).read()}"
-    assert noseof_delta == 1, f"expected 1 no-SOF drop (modelDataV2SP), got {noseof_delta}"
+    # offloadd side (INTERFACES §7 SP pairing rule): the three frame-carrying services were forwarded for the
+    # round AND the modelDataV2SP that arrived within OFFLOAD_SP_PAIR_MS of them was forwarded too (4 total);
+    # SP no longer rides dropped_no_sof, and nothing went unpaired.
+    assert fwd_delta == 4, f"expected 4 forwards for the round (3 aged + paired SP), got {fwd_delta}\n{open(od_out).read()}"
+    assert noseof_delta == 0, f"modelDataV2SP must not count as dropped_no_sof any more, got {noseof_delta}"
+    assert unpaired_delta == 0, f"modelDataV2SP should have paired, got dropped_unpaired+={unpaired_delta}"
     assert od_after.get("dropped_stale", 0) == 0
     assert od_after.get("dropped_error", 0) == 0
 
-    # each ageable shadow topic arrived: same frameId, same payload type, payload identical except
-    # the header, and the header re-stamped into the receipt window.
-    assert set(msgs) >= {"offloadModelV2", "offloadCameraOdometry", "offloadDrivingModelData"}, \
+    # each shadow topic arrived: same payload type, payload identical except the header, the header
+    # re-stamped into the receipt window, and (for the three ageable ones) the same frameId.
+    assert set(msgs) >= {"offloadModelV2", "offloadCameraOdometry", "offloadDrivingModelData", "offloadModelDataV2SP"}, \
         f"shadow topics missing: got {sorted(msgs)}\n{open(od_out).read()}"
-    for name in ("offloadModelV2", "offloadCameraOdometry", "offloadDrivingModelData"):
+    for name in ("offloadModelV2", "offloadCameraOdometry", "offloadDrivingModelData", "offloadModelDataV2SP"):
       svc = SHADOW_TO_SVC[name]
       got = msgs[name]
       assert _which(got) == svc, f"{name}: payload type changed to {_which(got)}"
-      assert _frame_id(got) == DEF_FRAME, f"{name}: frameId not preserved"
+      if name != "offloadModelDataV2SP":          # custom.ModelDataV2SP carries no frameId
+        assert _frame_id(got) == DEF_FRAME, f"{name}: frameId not preserved"
       # the wire header was the MAC publish time; offloadd re-stamps to its device-now. Its clock is
       # sampled at the TOP of step() and it may then block up to recv_timeout_ms (100 ms) in the
       # camera update before draining ZMQ, so a message arriving during that block is stamped up to
@@ -474,14 +478,11 @@ def test_full_return_chain_into_shadow_topics(tmp_path):
       assert _fields_without_header(got) == _fields_without_header(wire[svc]), \
           f"{name}: payload changed besides the header"
 
-    # modelDataV2SP must NOT have been forwarded (offloadd cannot age it: no frameId/timestampSof).
-    assert "offloadModelDataV2SP" not in msgs
-
     print(" ".join([
       "[return-chain] PASS —",
-      f"offloadd forwarded={fwd_delta} (modelV2+cameraOdometry+drivingModelData,",
+      f"offloadd forwarded={fwd_delta} (modelV2+cameraOdometry+drivingModelData+paired modelDataV2SP,",
       f"frameIds={DEF_FRAME} preserved, header re-stamped into [{publish_mono_ns - 5_000_000},{recv_after_ns + 5_000_000}]);",
-      f"dropped_no_sof+={noseof_delta} (modelDataV2SP un-ageable);",
+      f"dropped_unpaired+={unpaired_delta} dropped_no_sof+={noseof_delta};",
       f"sender forwarded={rt_warm['forwarded']} received={rt_warm['received']}",
       f"dropped_age={rt_warm['dropped_age']} dropped_noreader={rt_warm['dropped_noreader']};",
       f"shadows={sorted(msgs)}",

@@ -70,8 +70,19 @@ device/
    stdout events, not a stop-publishing action. Default off preserves the pre-port behavior.
 6. **OffloadMode gates everything.** `offloadd` is inert unless the device param `OffloadMode` ∈
    {`shadow`,`drive`,`holds`}. With the param absent (default) nothing offload-related starts.
-7. **Stats go to stdout only** (JSONL: `forwarded`, `dropped_stale`, `dropped_nonfinite`, …).
-   Bench mode may append `/tmp/offloadd_bench.jsonl`. **No `/data` writes** — `/data` is ~90% full.
+7. **Stats go to stdout only** (JSONL: `forwarded`, `dropped_stale`, `dropped_nonfinite`,
+   `dropped_unpaired`, `sp_paired`, …). Bench mode may append `/tmp/offloadd_bench.jsonl`.
+   **No `/data` writes** — `/data` is ~90% full.
+8. **`modelDataV2SP` is forwarded only when paired (INTERFACES §7 "SP pairing rule").** It carries
+   no `frameId` and no timestamps (`custom.ModelDataV2SP`), so it cannot be aged on its own. It is
+   held in a single-slot buffer and forwarded **only** if a message that passed the freshness +
+   finite gate (`modelV2` / `cameraOdometry` / `drivingModelData`) was received within
+   `OFFLOAD_SP_PAIR_MS` (default **25** ms) of it, either side first. Otherwise it is dropped and
+   counted `dropped_unpaired` — never forwarded blind. A stale- or non-finite-dropped partner never
+   anchors a pair; pairing is one-to-one (a newer SP supersedes an older pending one, also counted
+   `dropped_unpaired`). `dropped_no_sof` still counts any *other* service that lacks an age source.
+   Without this the arbiter (modeld_v2) can never see a complete 4-piece remote set, so the remote
+   path could never engage.
 
 ### Shadow service names — a capnp prerequisite (INTERFACES §7)
 
@@ -122,6 +133,7 @@ OFFLOAD_MODE=shadow /usr/local/venv/bin/python3 -m openpilot.offload.device.offl
 | bridge death (device) | local camera state stalls | SOF map ages out → all drops | gap → soft-disable |
 | Mac pipeline stall/lag | return frame SOF age > stale_ms | drop + count stale | no fresh modelV2 → soft-disable |
 | segment boundary | cameraOdometry frameId reset/gap | drop unmatched; keep publishing | brief stale window; loggerd unaffected |
+| unpaired `modelDataV2SP` | no fresh aged-able msg within `OFFLOAD_SP_PAIR_MS` (25 ms) | hold pending; drop + count `dropped_unpaired` | SP shadow quiet → arbiter sees an incomplete set → local publishes that frame |
 | encoder GOP gap | no return msg for a frame id | nothing to publish for it | handled upstream (WS-B) |
 | ZMQ HWM drops | SUB silently drops | counted via recv gaps | gap watchdog covers the symptom |
 | echo loop | Mac SUB sees its own republish | MUST NOT HAPPEN | operational rule 1 |
