@@ -63,7 +63,7 @@ offload path write nothing to `/data` but confirming headroom first is cheap ins
 |---|---|---|
 | link-local | `169.254.x.x/16`, autoconf | both ends |
 | tether ping RTT | **< 1 ms** | direct link |
-| narrowRoadEncodeData | **~10–12 Mbps** sustained | 1080p H.264 |
+| narrowRoadEncodeData | **~10–12 Mbps** sustained | 1928x1208 HEVC (fullHEVC, 10 Mbps cap) |
 | join window | **≤ 2 s** | FrameTable |
 | decode | p50 ≤ 3 / p99.9 ≤ 10 ms | gate G7 |
 | encode→Mac-arrival | **p50 15–25 ms** | 30-min soak |
