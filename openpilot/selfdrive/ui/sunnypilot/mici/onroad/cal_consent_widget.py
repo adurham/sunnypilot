@@ -6,6 +6,11 @@ See the LICENSE.md file in the root directory for more details.
 
 Fork (adurham): FCA11-long CAL driver-consent prompt -- "tap to fire" (opendbc patch 0033).
 
+0034 adds a STEERING-WHEEL path to the same consent (opendbc patch 0034): a double-press of the UP cruise
+arrow fires the parked rep, a double-press of the DOWN arrow dismisses it. That path writes the SAME
+``consent.json`` this widget writes, so the prompt below also shows a small "wheel: double-press" hint.
+The touch path is unchanged -- the owner may still tap.
+
 WHAT THIS IS
 ------------
 The companion UI to the car-layer consent gate in
@@ -217,6 +222,11 @@ class CalConsentWidget(Widget):
     text_x = p.x + DISMISS_W + 26
     rl.draw_text_ex(font, msg, rl.Vector2(text_x, p.y + 30), 44, 0, rl.Color(255, 255, 255, 235))
     rl.draw_text_ex(font, sub, rl.Vector2(text_x, p.y + 82), 40, 0, rl.Color(200, 200, 205, 220))
+    # 0034: the STEERING-WHEEL hint. The touch path is unchanged (the TAP button below still fires); this
+    # only tells the owner the wheel gesture exists. Rendered in the pill's left region, clear of the TAP
+    # button, in a smaller font so it never competes with the level/band readout.
+    rl.draw_text_ex(font, "wheel: double-press  \u25b2 / \u25bc", rl.Vector2(text_x, p.y + 120), 24, 0,
+                    rl.Color(170, 175, 185, 210))
 
     if self._state == CalConsentState.FIRING:
       firing = "firing..."
