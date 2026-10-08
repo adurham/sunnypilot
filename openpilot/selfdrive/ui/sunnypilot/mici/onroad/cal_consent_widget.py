@@ -59,6 +59,9 @@ import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
+from openpilot.selfdrive.ui.ui_state import ui_state
+
+KPH_TO_MPH = 0.621371
 
 CAL_DIR = os.environ.get("FCA11_CAL_DIR", "/data/fca11-cal")
 POLL_INTERVAL_S = 0.2      # re-stat the two tiny files at 5 Hz -- never every frame
@@ -216,7 +219,9 @@ class CalConsentWidget(Widget):
     rl.draw_rectangle_rounded_lines_ex(p, 0.28, 8, rl.Color(255, 255, 255, 90))
 
     level_txt = f"{self._level_g:.2f} g"
-    band_txt = f"{self._band_kph:.0f} km/h"
+    # fork: show the owner's own units -- the prompt is for HIM to approve, and this car is imperial.
+    band_txt = (f"{self._band_kph:.0f} km/h" if ui_state.is_metric
+                else f"{self._band_kph * KPH_TO_MPH:.0f} mph")
     msg = "CAL REP READY"
     sub = f"{level_txt} / {band_txt}"
     text_x = p.x + DISMISS_W + 26
