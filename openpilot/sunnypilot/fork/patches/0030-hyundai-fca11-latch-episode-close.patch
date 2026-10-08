@@ -1,8 +1,42 @@
 diff --git a/opendbc/car/interfaces.py b/opendbc/car/interfaces.py
-index f36a7460..10802ee5 100644
+index f36a746..bd7eb3a 100644
 --- a/opendbc/car/interfaces.py
 +++ b/opendbc/car/interfaces.py
-@@ -264,6 +264,13 @@ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
+@@ -96,6 +96,33 @@ class RadarInterfaceBase(ABC):
+     return None
+ 
+ 
++def collect_fca11_echoes(can_packets) -> list[tuple[int, bytes]]:
++  """0030 (D2-iii): the pandad echo of our own 0x38D frames, as (src, dat) pairs.
++
++  src 128 = the panda ACCEPTED/forwarded the frame, 192 = it was REJECTED by the TX hook. FCA11-long uses
++  this to confirm its passive close frame really CLOSED the panda episode before it starts the cooldown
++  (fca11_long.observe_echo).
++
++  WHY THIS IS A NAMED FUNCTION (not an inline comprehension): ``can_capnp_to_list`` in
++  openpilot/selfdrive/pandad/pandad_api_impl.py yields ``(logMonoTime, [(address, data, src), ...])`` --
++  the frames are plain TUPLES. An earlier revision of this code did ``c.address`` on them, which raised
++  AttributeError and crash-looped card on the first CAN frame in the field (the car showed "Unknown
++  Vehicle Variant" because card never got far enough to fingerprint). Keeping the shape handling in ONE
++  named, unit-tested place is the fix; the fork's offline harnesses pass CanData objects with the same
++  three fields, so both shapes are accepted.
++  """
++  echoes: list[tuple[int, bytes]] = []
++  for _t, frames in can_packets:
++    for c in frames:
++      if isinstance(c, tuple):
++        addr, dat, src = int(c[0]), bytes(c[1]), int(c[2])
++      else:
++        addr, dat, src = int(c.address), bytes(c.dat), int(c.src)
++      if addr == 0x38D and src in (128, 192):
++        echoes.append((src, dat))
++  return echoes
++
++
+ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
+   CarState: type['CarStateBase']
+   CarController: type['CarControllerBase']
+@@ -264,6 +291,12 @@ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
      tune.torque.steeringAngleDeadzoneDeg = steering_angle_deadzone_deg
  
    def update(self, can_packets: list[tuple[int, list[CanData]]]) -> tuple[structs.CarState, structs.CarStateSP]:
@@ -11,13 +45,12 @@ index f36a7460..10802ee5 100644
 +    # CLOSED the panda episode before it starts the cooldown (fca11_long.observe_echo). Gated on the feature so the
 +    # hot loop pays nothing when it is off; a plain list attribute, never a capnp field.
 +    if self.CP_SP.fca11Brake:
-+      self.CS.fca11_echoes = [(int(c.src), bytes(c.dat)) for _t, cs_ in can_packets for c in cs_
-+                              if c.address == 0x38D and c.src in (128, 192)]
++      self.CS.fca11_echoes = collect_fca11_echoes(can_packets)
      # parse can
      for cp in self.can_parsers.values():
        if cp is not None:
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index e72167ba..8a5c7b23 100644
+index e72167b..8a5c7b2 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
 @@ -172,4 +172,9 @@ class CarStateSP:
@@ -34,7 +67,7 @@ index e72167ba..8a5c7b23 100644
 +  fca11Unavailable: bool = auto_field()
 \ No newline at end of file
 diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
-index b7eab91e..9cf7075f 100644
+index b7eab91..9cf7075 100644
 --- a/opendbc/safety/modes/hyundai.h
 +++ b/opendbc/safety/modes/hyundai.h
 @@ -986,7 +986,15 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
@@ -55,7 +88,7 @@ index b7eab91e..9cf7075f 100644
        violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
  
 diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
-index cf920f86..7ed2d599 100755
+index cf920f8..7ed2d59 100755
 --- a/opendbc/safety/tests/test_hyundai.py
 +++ b/opendbc/safety/tests/test_hyundai.py
 @@ -2630,6 +2630,13 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
@@ -124,7 +157,7 @@ index cf920f86..7ed2d599 100755
      lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
      for raw, ok in ((lo, False), (lo + 1, True), (raw_hi := 200 * self.RAW_PER_KPH, True)):
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index ed22be6e..8d4b970a 100644
+index ed22be6..8d4b970 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 @@ -46,6 +46,9 @@ class CarStateExt:
@@ -148,7 +181,7 @@ index ed22be6e..8d4b970a 100644
    def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                         speed_factor: float) -> None:
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index 7a8925ad..ecf7fcef 100644
+index 7a8925a..ecf7fce 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -299,6 +299,21 @@ class Fca11LongBrake:
@@ -260,7 +293,7 @@ index 7a8925ad..ecf7fcef 100644
      # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
      self._on_frames = self._on_frames + 1 if want_brake else 0
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 998db24a..ca7a8a97 100644
+index 998db24..ca7a8a9 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -297,7 +297,13 @@ class GasInterceptorCarController:
@@ -278,7 +311,7 @@ index 998db24a..ca7a8a97 100644
      # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
      # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index d1530a31..2f2052be 100644
+index d1530a3..68e4cf9 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -168,6 +168,7 @@ class _CS:
@@ -289,7 +322,7 @@ index d1530a31..2f2052be 100644
  
  
  def _cam(v=0.0):
-@@ -1426,5 +1427,179 @@ class TestCalModeActuation(unittest.TestCase):
+@@ -1426,5 +1427,216 @@ class TestCalModeActuation(unittest.TestCase):
        self.assertTrue(ran, "with the lead gone the rep actuates")
  
  
@@ -465,6 +498,43 @@ index d1530a31..2f2052be 100644
 +    b.observe_echo([(128, bytes(p[0].dat))])
 +    self.assertFalse(b._release_pending)
 +    self.assertEqual(f_emit + 4, b._budget_end)
++
++
++class TestEchoCollectionShape(unittest.TestCase):
++  """0030 field regression: the echo collector must accept the REAL transport shape.
++
++  ``can_capnp_to_list`` (openpilot/selfdrive/pandad/pandad_api_impl.py) yields
++  ``(logMonoTime, [(address, data, src), ...])`` -- plain TUPLES. The first shipped revision of 0030 read
++  ``c.address``/``c.src`` on them, so card raised AttributeError on the very first CAN frame and
++  crash-looped: no fingerprint -> "Unknown Vehicle Variant" on screen, openpilot dead. These tests pin
++  BOTH shapes (real tuples from the device, CanData objects from the offline harnesses) so the mistake
++  cannot come back.
++  """
++
++  def test_tuples_from_the_real_transport(self):
++    from opendbc.car.interfaces import collect_fca11_echoes
++    # exactly what can_capnp_to_list produces
++    cans = [(123456, [(0x38D, b"\x01\x08\x00\x00\x00\x00\x00\x00", 128),
++                      (0x38D, b"\x01\x08\x00\x00\x00\x00\x00\x00", 192),
++                      (0x340, b"\x00" * 8, 2),
++                      (0x38D, b"\x02" * 8, 0)])]          # src 0 (camera) must be ignored
++    out = collect_fca11_echoes(cans)
++    self.assertEqual([(128, b"\x01\x08\x00\x00\x00\x00\x00\x00"),
++                      (192, b"\x01\x08\x00\x00\x00\x00\x00\x00")], out)
++
++  def test_objects_from_the_offline_harness(self):
++    from opendbc.car.interfaces import collect_fca11_echoes
++
++    class C:
++      def __init__(self, address, dat, src):
++        self.address, self.dat, self.src = address, dat, src
++    cans = [(0, [C(0x38D, b"\xaa" * 8, 128), C(0x1FF, b"\xbb" * 8, 128)])]
++    self.assertEqual([(128, b"\xaa" * 8)], collect_fca11_echoes(cans))
++
++  def test_empty_and_mixed(self):
++    from opendbc.car.interfaces import collect_fca11_echoes
++    self.assertEqual([], collect_fca11_echoes([]))
++    self.assertEqual([], collect_fca11_echoes([(0, [])]))
 +
 +
  if __name__ == "__main__":
