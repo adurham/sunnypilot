@@ -745,7 +745,7 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 
 ### setspeed-ease: personality-dependent easing toward a raised set speed — 2026-10-05 (offline-tested + closed-loop sim; NOT road-run; no firmware change)
 
-> **Driver notes:** raising the set speed (button, Speed Limit Assist, long-press-down to current speed) or a lead pulling
+> **Driver notes:** raising the set speed (button, Speed Limit Assist, a manual set-speed change) or a lead pulling
 > away no longer gets the full 1.0-1.2 m/s² (2.0 in experimental) at once. The car eases up to the new speed, and the
 > personality (distance button) now sets how fast: **relaxed** gentle (~0.35-0.55 m/s²), **standard** moderate
 > (~0.40-0.75), **aggressive** about like before. Lowering the set speed still takes effect immediately. Launches from a
@@ -1149,9 +1149,10 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 - Wheel buttons (CF_Clu_CruiseSwState up=1, down=2, pause/resume=4, from routes 127/128):
   - pause/resume is the ONLY on/off for openpilot long, at any speed incl. standstill; deliberate press only, NO auto-resume (panda + openpilot lockstep).
   - up/down ONLY change the set speed (±1 mph short, +5 long-up), engaged or not; they never engage or disengage (panda grant removed in pedal mode).
-  - long press down (0.5 s) sets the set speed to the current speed, never engages.
+  - long press down (0.5 s): the standard long-press step DOWN (the mirror of long press up), never engages.
+    (Changed 2026-10-08 at the owner's request; it used to set the set speed to the current speed.)
 - `minEnableSpeed = -1` (no floor); the 25 mph refusal beep/alert and "Press Set to Engage" removed in pedal mode. The launch limit (12% at standstill -> 35% cap by 25 mph) stays; it caps throttle, it is not an engage floor. openpilot still cannot brake.
-- Driver notes: pause/resume engages at the stored set speed (or current speed rounded to mph if none yet; 5 mph from a stop). A stored speed far BELOW current speed coasts down; a stored speed far ABOVE (e.g. 65 from the highway, resumed at a city light) accelerates toward it, launch-limited. Check the grey MAX number or long-press down first.
+- Driver notes: pause/resume engages at the stored set speed (or current speed rounded to mph if none yet; 5 mph from a stop). A stored speed far BELOW current speed coasts down; a stored speed far ABOVE (e.g. 65 from the highway, resumed at a city light) accelerates toward it, launch-limited. Check the grey MAX number first.
 - Verification: opendbc 2408 passed; openpilot 99 passed; mutations 60/61 killed (+6 reviewer mutants killed; the survivor is the known equivalent); 0001-0010 apply clean on pristine f95f996f; MISRA 0 findings. Review: car-features/buttons-v3-review.md.
 
 ### integration-3: integration-2 + opendbc 0009 timed factory-cruise cancel — 2026-10-04 (one firmware build; offline-tested, NOT road-validated)

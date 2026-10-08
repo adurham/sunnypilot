@@ -137,9 +137,10 @@ class VCruiseHelper(VCruiseHelperSP):
     (resumeCruise) is the only on/off. Disengaged changes are kept and shown, and the next pause/resume engages at them.
       * short press (released before CRUISE_LONG_PRESS = 0.5 s): +/- one display unit (1 mph / 1 km/h), on release
       * long press UP: openpilot's normal long-press step every 0.5 s held (5 units, to the next multiple of 5)
-      * long press DOWN: set speed = current speed rounded to the display unit, once per press (replaces the -5 step);
-        it never engages, and its release applies nothing (no extra -1)
-    Without a set speed this drive (V_CRUISE_UNSET) short presses and long UP do nothing; long DOWN creates one."""
+      * long press DOWN: the same standard long-press step DOWN (the mirror of long press UP: 5 units, to the next
+        multiple of 5); it never engages, and its release applies nothing (no extra -1)
+    Without a set speed this drive (V_CRUISE_UNSET) NOTHING does anything: short up/down and long up/down all do
+    nothing until a pause/resume press creates the set speed."""
     long_press = False
     button_type = None
 
@@ -157,11 +158,6 @@ class VCruiseHelper(VCruiseHelperSP):
           break
 
     if button_type is None:
-      return
-
-    if button_type == ButtonType.decelCruise and long_press:
-      if self.button_timers[button_type] == CRUISE_LONG_PRESS:  # first long-press tick only: once per press
-        self.v_cruise_kph = self.pedal_v_cruise_from_speed(CS.vEgo, is_metric)
       return
 
     if not self.v_cruise_initialized:

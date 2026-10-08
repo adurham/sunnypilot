@@ -27,6 +27,7 @@ def _run(v_ego: float, long_active: bool = False, interceptor: bool = True, butt
   CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=min_enable,
                        openpilotLongitudinalControl=True)
   CP_SP = SimpleNamespace(enableGasInterceptor=interceptor, fca11Brake=False)
+  CS_SP = SimpleNamespace()   # CarSpecificEventsSP reads only a few SP fields; fca11Brake is False above
   be = [SimpleNamespace(type=button, pressed=p) for p in (True, False)]
   CS = SimpleNamespace(vEgo=v_ego, buttonEvents=be, cruiseState=SimpleNamespace(nonAdaptive=non_adaptive))
   events = Events()
@@ -34,7 +35,7 @@ def _run(v_ego: float, long_active: bool = False, interceptor: bool = True, butt
     events.add(EventName.buttonEnable)
   if resume_blocked:
     events.add(EventName.resumeBlocked)
-  events_sp = CarSpecificEventsSP(CP, CP_SP).update(CS, events, long_active)
+  events_sp = CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, events, long_active)
   return events, events_sp
 
 

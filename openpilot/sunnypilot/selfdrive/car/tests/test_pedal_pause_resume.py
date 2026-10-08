@@ -9,8 +9,8 @@ StateMachine -> real VCruiseHelper (card.py call order).
 The model under test:
   * pause/resume (CF_Clu_CruiseSwState 4) is the ONLY on/off for openpilot long. On: at the set speed stored this drive,
     else at the current speed rounded to the display unit (>= 5 mph). Any speed incl. standstill. Never by itself.
-  * up / down (1 / 2) ONLY change the set speed (engaged or not): short +/-1 mph, long up = openpilot's long step (+5),
-    long down = set speed := current speed (once, no extra -1 on release). They never engage or disengage.
+  * up / down (1 / 2) ONLY change the set speed (engaged or not): short +/-1 mph, long up / long down = openpilot's
+    standard long step (+/-5, to the next multiple of 5), once per 0.5 s held. They never engage or disengage.
 """
 from opendbc.can import CANPacker
 from opendbc.car import DT_CTRL, structs
@@ -95,8 +95,9 @@ class _Openpilot:
       self.k += 1
       # carcontroller stored CarControl.enabled on the previous frame (CI.apply -> CS.pedal_long_engaged)
       self.CI.CS.pedal_long_engaged = self.enabled
-      CS, _ = self.CI.update([(self.t, frames)])
+      CS, CS_SP = self.CI.update([(self.t, frames)])
       CS = CS.as_reader()
+      CS_SP = CS_SP.as_reader() if hasattr(CS_SP, "as_reader") else CS_SP
 
       # card.py order: update_v_cruise, then initialize on the enable edge using the previous CarState
       self.vch.update_v_cruise(CS, self.enabled, is_metric=self.is_metric)
@@ -118,7 +119,7 @@ class _Openpilot:
                                        structs.CarState.ButtonEvent.Type.resumeCruise) for be in CS.buttonEvents)
       if self.vch.v_cruise_kph > 250 and resume_pressed:
         events.add(EventName.resumeBlocked)
-      events_sp = self.car_events_sp.update(CS, events, self.enabled)
+      events_sp = self.car_events_sp.update(CS, CS_SP, events, self.enabled)
       self.alerts |= set(events.names) | {f"sp:{n}" for n in events_sp.names}
 
       self.enabled, _ = self.sm.update(events)
@@ -325,43 +326,70 @@ class TestPedalButtons(OpenpilotTestCase):
     op.press(UP, 60)  # 1.2 s held (120 frames): ticks at 50 and 100 frames -> two steps
     assert op.v_set_mph == 60
 
-  def test_long_down_sets_current_speed_engaged(self):
+  def test_long_down_steps_down_not_current_speed(self):
+    # long DOWN is openpilot's standard long-press step DOWN, the mirror of long UP: NOT 'set speed := current speed'
     op = _Openpilot()
     self._engaged(op, v=20.)  # 47 mph set, driving 44.7 mph
     op.press(DOWN, LONG, v=26.)  # now at 58.2 mph
     assert op.enabled
-    assert op.v_set_mph == 58  # current speed, no extra -1 on release
-    assert op.vch.v_cruise_kph == round(58 * CV.MPH_TO_KPH, 1)  # exactly 58 mph (display unit), not rounded km/h
-    op.press(DOWN, 150, v=17.)  # held 3 s: only once per press (no repeated action)
-    assert op.v_set_mph == round(17. * CV.MS_TO_MPH)
+    assert op.v_set_mph == 45  # floor(47/5)*5: one standard 5 mph step DOWN, no extra -1 on release
+    assert op.v_set_mph != round(26. * CV.MS_TO_MPH)  # 58: NOT the current speed (the behaviour that was removed)
+    assert op.vch.v_cruise_kph == 72.0  # floor(75.6 / 8)*8: the standard long-press step lands on a 5 mph multiple
+    # held 3 s (150 samples): only the standard 0.5 s ticks fire (at 0.5/1.0/1.5/... s), no re-capture of anything
+    op.press(DOWN, 150, v=17.)  # 45 -> 40 -> 35 -> 30 -> 25 -> 20 over 7 ticks
+    assert op.v_set_mph == 20
+    assert op.v_set_mph != round(17. * CV.MS_TO_MPH)  # 38: still never the current speed
 
-  def test_long_down_acts_once_per_press(self):
-    # the speed is captured when the long press is recognised (0.5 s), once: holding on while the speed changes (and
-    # past the next 0.5 s ticks) does not re-capture it, and the release applies nothing
+  def test_long_down_never_captures_vehicle_speed(self):
+    # the vehicle speed changes under a held DOWN; a standard step never reads it, so the only moves are the 0.5 s ticks
     op = _Openpilot()
-    self._engaged(op, v=20.)
-    op.run(LONG, btn=DOWN, v=26.)    # tick at 0.5 s: 58 mph
-    op.run(60, btn=DOWN, v=17.)      # still held 1.2 s more at 38 mph (ticks at 1.0 / 1.5 s)
-    op.run(10, v=17.)
-    assert op.enabled and op.v_set_mph == 58
+    self._engaged(op, v=20.)  # 47 mph
+    op.run(80, btn=DOWN, v=26.)  # 1.6 s held: ticks at 0.5 / 1.0 / 1.5 s (samples 26 / 51 / 76) all while driving 58.2 mph
+    op.run(10, v=17.)            # release while driving 38 mph
+    assert op.enabled
+    assert op.v_set_mph == 35  # 47 -> 45 -> 40 -> 35: exactly three standard step-DOWN ticks, no re-capture
+    for captured in (round(26. * CV.MS_TO_MPH), round(12. * CV.MS_TO_MPH), round(17. * CV.MS_TO_MPH)):
+      assert op.v_set_mph != captured  # never 58 / 27 / 38: the speed under the button is never read
 
-  def test_long_down_sets_current_speed_disengaged_no_engage(self):
+  def test_long_down_without_set_speed_does_nothing(self):
+    # this is the case that used to create a set speed: long DOWN with no set speed yet this drive must do NOTHING (and
+    # must not engage). Only the pause/resume press ever creates/uses a set speed.
     op = _Openpilot()
     op.run(10, v=13.)
-    op.press(DOWN, LONG, v=13.)  # no set speed yet: creates one = current speed (29 mph), shown
-    assert not op.enabled and op.v_set_mph == 29
+    op.press(DOWN, LONG, v=13.)
+    assert op.vch.v_cruise_kph == V_CRUISE_UNSET, op.vch.v_cruise_kph
     op.run(10, v=25.)
     op.press(DOWN, LONG, v=25.)
-    assert not op.enabled and op.v_set_mph == 56
-    op.press(PAUSE, v=25.)  # pause/resume then uses it
+    assert op.vch.v_cruise_kph == V_CRUISE_UNSET, op.vch.v_cruise_kph  # repeated long downs still do nothing
+    assert not op.enabled and not op.enable_frames
+    op.press(PAUSE, v=25.)  # pause/resume then engages at the current speed as usual
     assert op.enabled and op.v_set_mph == 56
 
-  def test_long_down_at_standstill_min_set_speed(self):
+  def test_long_down_at_standstill_standard_step(self):
     op = _Openpilot()
-    self._engaged(op)
+    self._engaged(op)  # 47 mph
     op.run(5, brake=True, v=0.)
     op.press(DOWN, LONG, v=0.)
-    assert not op.enabled and op.v_set_mph == 5  # openpilot's minimum set speed (V_CRUISE_MIN 8 km/h -> 5 mph)
+    assert not op.enabled
+    # a standard step DOWN from 47: 45 mph. NOT the 5 mph minimum and NOT the current speed (0)
+    assert op.v_set_mph == 45
+    assert op.vch.v_cruise_kph != round(0 * CV.MPH_TO_KPH, 1) and op.vch.v_cruise_kph != 0
+    # and with no set speed, a long DOWN at a standstill does nothing at all
+    op = _Openpilot()
+    op.run(10, v=0.)
+    op.press(DOWN, LONG, v=0.)
+    assert op.vch.v_cruise_kph == V_CRUISE_UNSET and not op.enabled
+
+  def test_long_down_never_snaps_to_current_speed(self):
+    # headline falsifiable check: the owner's bug was long-DOWN jumping the set speed to the current speed. With a set
+    # speed that is clearly different from the vehicle speed, a long DOWN must leave the standard 45 mph step, whatever
+    # the car is doing at the time.
+    for v, current in ((5., 11), (12., 27), (26., 58), (35., 78)):
+      op = _Openpilot()
+      self._engaged(op, v=20.)  # 47 mph set
+      op.press(DOWN, LONG, v=v)
+      assert op.v_set_mph == 45, (v, op.v_set_mph)
+      assert op.v_set_mph != current, (v, op.v_set_mph)
 
   def test_set_speed_adjusted_while_disengaged_is_used(self):
     # stored set speed retained across a brake disengage, changed by up/down while disengaged (shown), reused by pause
