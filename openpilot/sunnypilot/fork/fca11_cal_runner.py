@@ -102,7 +102,21 @@ R2_SPACING_LSB = 4
 R2_LADDER = [12, 16, 20, 24, 30]        # the fit-resolvable ladder @60: gaps 4,4,4,6 (all >= 4);
                                        # 12 = smallest resolvable, 24 = the release level, 30 = the panda gate
 R2_REPS_PER_LEVEL = 1                  # one clean plateau per rung @60 (the staircase repeats them)
-R2_BANDS_HI = ((20, 2), (28, 1))        # the 2nd speed band @90: 20 LSB x2, 28 LSB x1
+# rev 3 (review guidance: 'prefer high-g reps at the lower speed band -- both crash energy and
+# follower surprise scale with speed'): the 90 km/h band keeps ONLY its existing 20-LSB level (2 reps,
+# unchanged); the high-g 28-LSB rep MOVES to the 60 km/h band. Total stays 24 reps. The moved rep gets
+# a FRESH id (``r3-step-28-60-0``) because completion keys on rep id -- the unchanged r2-* reps keep
+# their recorded state, and only the moved rep re-runs.
+R2_BANDS_HI = ((20, 2),)               # 2nd speed band @90 km/h: 20 LSB x2 (only; the 28 LSB moved out)
+R2_MOVED_28_BAND = 60.0                # the 28-LSB rep's NEW band (was 90)
+R2_MOVED_28_ID = "r3-step-28-60-0"     # fresh id -> it RUNS even if a rev-2 plan recorded an r2 28 rep
+R2_PLAN_REV = 4                        # rev 4: adds the 0033 driver-consent (tap-to-fire) config
+# 0033 driver consent ("tap to fire"): the default the builder emits. "off" = the backward-
+# compatible autonomous behaviour; "all" / "high" require a driver tap per rep (see cal_mode.py).
+# min_level_lsb 22 = 0.22 g: at/above it a rep is "high-g" and (in "high" mode) needs a tap.
+CONSENT_MODE_DEFAULT = "off"
+CONSENT_MIN_LEVEL_LSB = 22
+CONSENT_TIMEOUT_S = 8.0
 R2_STAIR = [12, 16, 20, 24, 30]         # up + down sweep: 5 clean plateaus each way
 R2_REL_RELEASE_LSB = 24                # release-from-24 plateau x3 (release-to-zero repeatability)
 R2_REL_PART = (24, 12)                 # partial release 24 -> 12 x3
@@ -116,9 +130,16 @@ def _mk_rep(rid, phase, level, band, hold=DEFAULT_HOLD_S, level2=None, switch_at
   return r
 
 
-def _conditions():
+def _conditions(consent_mode=CONSENT_MODE_DEFAULT, consent_min_level=CONSENT_MIN_LEVEL_LSB,
+                consent_timeout=CONSENT_TIMEOUT_S):
   return {"min_lead_m": 60.0, "turn_lat_max": 0.5, "straight_min_s": 2.0,
-          "band_tol_kph": 5.0, "band_stable_s": 5.0, "recovery_s": 3.5}
+          "band_tol_kph": 5.0, "band_stable_s": 5.0, "recovery_s": 3.5,
+          # 0032 blind-spot veto: fail-closed default ON; 5 s hold-off after the last set sample.
+          "blindspot_veto": True, "blindspot_holdoff_s": 5.0,
+          # 0033 driver consent (tap-to-fire). "off" is the compat default; a collection drive that
+          # wants a per-rep tap sets "all" (every rep) or "high" (only reps >= min_level_lsb).
+          "consent_mode": str(consent_mode), "consent_min_level_lsb": int(consent_min_level),
+          "consent_timeout_s": float(consent_timeout)}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -139,12 +160,14 @@ def plan_id(obj: dict) -> str:
 # rev 2 builders
 # ------------------------------------------------------------------------------------------------
 def build_steps_rev2(bands=(BAND_LO_KPH, BAND_HI_KPH)):
-  """Rev-2 steps @60: the {12,16,20,24,27,30} ladder, R2_REPS_PER_LEVEL reps each, plus the 2nd
-  high-speed band pass (R2_BANDS_HI) @90."""
+  """Rev-3 steps: the {12,16,20,24,30} ladder @60, R2_REPS_PER_LEVEL reps each; the high-g 28-LSB
+  rep MOVED to the 60 km/h band (rev 3); plus the 2nd high-speed band pass (R2_BANDS_HI) @90."""
   reps = []
   for lv in R2_LADDER:
     for i in range(R2_REPS_PER_LEVEL):
       reps.append(_mk_rep(f"r2-step-{lv}-{bands[0]:.0f}-{i}", "steps", lv, bands[0]))
+  # rev 3: the moved high-g rep (was 28 LSB @90) now lives at the LOWER speed band, fresh id.
+  reps.append(_mk_rep(R2_MOVED_28_ID, "steps", 28, R2_MOVED_28_BAND))
   for lv, n in R2_BANDS_HI:
     for i in range(n):
       reps.append(_mk_rep(f"r2-step-{lv}-{bands[1]:.0f}-{i}", "steps", lv, bands[1]))
@@ -170,14 +193,16 @@ def build_releases_rev2(bands=(BAND_LO_KPH,)):
   return reps
 
 
-def _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond):
+def _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond,
+              consent_mode=CONSENT_MODE_DEFAULT, consent_min_level=CONSENT_MIN_LEVEL_LSB,
+              consent_timeout=CONSENT_TIMEOUT_S):
   doc = {
     "rev": int(rev),
     "issued_at": float(issued_at if issued_at is not None else time.time()),
     "ttl_s": float(ttl_s) if ttl_s is not None else float(expires_days * 86400.0),
     "expires_at": float(time.time() + expires_days * 86400.0),
     "per_drive_cap": int(per_drive_cap),
-    "conditions": _conditions(),
+    "conditions": _conditions(consent_mode, consent_min_level, consent_timeout),
     "reps": reps,
   }
   if cond:
@@ -186,8 +211,10 @@ def _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond):
   return doc
 
 
-def build_plan_rev2(phases, rev=2, issued_at=None, ttl_s=DEFAULT_TTL_S, expires_days=DEFAULT_EXPIRES_DAYS,
-                    per_drive_cap=DEFAULT_PER_DRIVE_CAP, cond=None):
+def build_plan_rev2(phases, rev=R2_PLAN_REV, issued_at=None, ttl_s=DEFAULT_TTL_S, expires_days=DEFAULT_EXPIRES_DAYS,
+                    per_drive_cap=DEFAULT_PER_DRIVE_CAP, cond=None,
+                    consent_mode=CONSENT_MODE_DEFAULT, consent_min_level=CONSENT_MIN_LEVEL_LSB,
+                    consent_timeout=CONSENT_TIMEOUT_S):
   reps = []
   if "steps" in phases:
     reps += build_steps_rev2()
@@ -195,7 +222,8 @@ def build_plan_rev2(phases, rev=2, issued_at=None, ttl_s=DEFAULT_TTL_S, expires_
     reps += build_staircase_rev2()
   if "releases" in phases:
     reps += build_releases_rev2()
-  return _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond)
+  return _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond,
+                   consent_mode, consent_min_level, consent_timeout)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -248,7 +276,7 @@ def build_plan_rev1(phases, rev=1, issued_at=None, ttl_s=DEFAULT_TTL_S, expires_
 def build_matrix(matrix, phases, rev=None, **kwargs):
   if matrix == "rev1":
     return build_plan_rev1(phases, rev=1 if rev is None else rev, **kwargs)
-  return build_plan_rev2(phases, rev=2 if rev is None else rev, **kwargs)
+  return build_plan_rev2(phases, rev=R2_PLAN_REV if rev is None else rev, **kwargs)
 
 
 def build_plan(phases, *args, matrix="rev2", **kwargs):
@@ -352,7 +380,9 @@ def _load(path):
 def cmd_write_plan(args):
   phases = [k for k in ("steps", "staircase", "releases") if "all" in args.phase or k in args.phase]
   doc = build_matrix(args.matrix, phases, rev=args.rev,
-                     expires_days=args.expires_days, per_drive_cap=args.per_drive_cap)
+                     expires_days=args.expires_days, per_drive_cap=args.per_drive_cap,
+                     consent_mode=args.consent_mode, consent_min_level=args.consent_min_level,
+                     consent_timeout=args.consent_timeout)
   os.makedirs(CAL_DIR, exist_ok=True)
   if os.path.exists(PLAN_PATH) and not args.force:
     old = _load(PLAN_PATH)
@@ -378,6 +408,32 @@ def cmd_write_plan(args):
   print(f"plan_id {plan_id(doc)}  (informational: completion is keyed on REP ID, not this hash)")
   print("ARM: only with the owner's FCA11 toggle ON. DISARM: toggle it off, delete the file, or let "
         "the TTL/expiry lapse.")
+  return 0
+
+
+def cmd_consent(args):
+  """0033: operator helper for a MANUAL consent tap (used in the on-device smoke test). Writes /
+  removes /data/fca11-cal/consent.json bound to the rep_id currently in pending.json. Read-only with
+  respect to the plan; it can only ever request a rep the sequencer already parked."""
+  pend = _load(os.path.join(CAL_DIR, "pending.json")) or {}
+  rep_id = pend.get("rep_id")
+  if not pend.get("pending") or not rep_id:
+    print("no rep is pending (pending.json absent or pending=false) -- nothing to consent to.")
+    return 0
+  path = os.path.join(CAL_DIR, "consent.json")
+  if args.consent == "clear":
+    try:
+      os.remove(path)
+      print(f"cleared {path}")
+    except OSError:
+      print(f"{path} already absent")
+    return 0
+  doc = {"rep_id": rep_id, "ts": time.time(), "accept": args.consent == "accept"}
+  tmp = path + ".tmp"
+  with open(tmp, "w") as f:
+    json.dump(doc, f, sort_keys=True)
+  os.replace(tmp, path)
+  print(f"wrote {path}: rep_id={rep_id} accept={doc['accept']} (consumed only if fresh <= 2 s)")
   return 0
 
 
@@ -456,6 +512,9 @@ def main(argv=None):
   g.add_argument("--tail", action="store_true", help="tail the per-rep log")
   g.add_argument("--dry-run", action="store_true", help="offline pacing validator (no state writes)")
   g.add_argument("--why", action="store_true", help="per-rep redo report (read-only)")
+  g.add_argument("--consent", choices=["accept", "dismiss", "clear"],
+                  help="0033: write a driver-consent tap (accept/dismiss) or clear it, for the cal "
+                       "dir (operates on pending.json's rep_id; read-only w.r.t. the plan)")
   ap.add_argument("--matrix", choices=["rev1", "rev2"], default="rev2",
                   help="which matrix to build: rev2 (default, slimmed ~24 reps) or rev1 (the original 72)")
   ap.add_argument("--phase", nargs="+", choices=["steps", "staircase", "releases", "all"],
@@ -464,11 +523,17 @@ def main(argv=None):
   ap.add_argument("--expires-days", type=float, default=DEFAULT_EXPIRES_DAYS)
   ap.add_argument("--per-drive-cap", type=int, default=DEFAULT_PER_DRIVE_CAP)
   ap.add_argument("--force", action="store_true", help="overwrite an existing different plan.json")
+  ap.add_argument("--consent-mode", choices=["off", "all", "high"], default=CONSENT_MODE_DEFAULT,
+                  help="0033 driver consent: off (autonomous, default) / all / high")
+  ap.add_argument("--consent-min-level", type=int, default=CONSENT_MIN_LEVEL_LSB,
+                  help="0033: in 'high' mode, reps at/above this LSB need a tap (default 22 = 0.22 g)")
+  ap.add_argument("--consent-timeout", type=float, default=CONSENT_TIMEOUT_S,
+                  help="0033: seconds an untouched prompt waits before it is dropped (default 8)")
   ap.add_argument("-n", type=int, default=25, help="--tail: how many lines")
   args = ap.parse_args(argv)
 
   if args.rev is None:
-    args.rev = 2 if args.matrix == "rev2" else 1
+    args.rev = R2_PLAN_REV if args.matrix == "rev2" else 1
 
   phases = [k for k in ("steps", "staircase", "releases") if "all" in args.phase or k in args.phase]
 
@@ -480,6 +545,8 @@ def main(argv=None):
     return cmd_tail(args)
   if args.why:
     return cmd_why(args)
+  if args.consent:
+    return cmd_consent(args)
   if args.dry_run:
     dry_run(phases, args.matrix)
     return 0

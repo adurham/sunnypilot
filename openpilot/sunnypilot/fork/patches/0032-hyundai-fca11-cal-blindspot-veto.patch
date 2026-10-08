@@ -1,0 +1,231 @@
+From 0000032000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Thu, 8 Oct 2026 10:00:00 -0500
+Subject: [PATCH] hyundai: FCA11-long CAL blind-spot veto (0032)
+
+The 0029/0031 cal sequencer arms a rep on engaged + no lead + near-straight, but NOTHING looks
+BEHIND the car. A 2.2 s scripted brake hold (0.12-0.30 g) can start with a vehicle closing in the
+rear quarter -- a follower surprise and a real risk the review flagged. The rear-corner radar bits
+are ALREADY decoded and published (LCA11 CF_Lca_IndLeft/IndRight -> carState.leftBlindspot/
+rightBlindspot, hyundai carstate.py:184-185, gated on enableBsm which is ON for this car), so this is
+a read-only consumer: no new CAN, no safety model, no firmware.
+
+0032 adds a blind-spot VETO to ``CalSequencer._conditions_ok``:
+  * a SET bit in EITHER rear quarter (CF_Lca_IndLeft/IndRight can be 1/2/3; ANY non-zero counts) -> skip;
+  * the veto is HELD ``blindspot_holdoff_s`` (default 5 s) past the most recent set sample, so one
+    clear frame is not mistaken for a clear quarter;
+  * configurable on the plan's ``conditions`` block: ``blindspot_veto`` (bool, DEFAULT true) and
+    ``blindspot_holdoff_s`` (float, default 5.0); an old plan without the keys gets the veto anyway
+    (FAIL-CLOSED);
+  * the veto reason surfaces as ``_block_reason == 'blindspot'`` (--status / per-rep log).
+ONE-WAY SEMANTICS: a set bit means "something is there" -> skip; a clear bit NEVER means "the rear is
+clear". The veto can only ADD a skip and makes no claim of an empty rear quarter.
+
+Python-only: no safety/ file, no panda change -> the panda FIRMWARE BYTES ARE UNCHANGED (no reflash).
+Inert when cal mode is off (the sequencer is never reached).
+
+---
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index d73d9f2..3c06028 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -90,6 +90,18 @@
+ CAL_COOLDOWN_MARGIN_FRAMES = 2    # == fca11_long.FCA11_COOLDOWN_MARGIN_FRAMES
+ CAL_HOLD_MARGIN_FRAMES = 10       # extra slack on top of a rep's hold (quantisation/ordering)
+ 
++# --- 0032: the blind-spot veto hold-off. A rep is a 2.2 s scripted brake hold on a live road; the
++# rear quarter radars (LCA11 CF_Lca_IndLeft/IndRight -> carState.leftBlindspot/rightBlindspot) can
++# show an approaching vehicle AFTER the current frame looked clear. Holding the veto for a few
++# seconds past the last set sample makes the decision depend on a recent window, not one frame.
++#
++# *** ONE-WAY SEMANTICS (do not weaken) *** : a SET bit means "something IS in that rear quarter"
++# -> skip. A CLEAR bit NEVER means "the rear quarter is verified empty" -- it only means "no
++# blind-spot sample in the retained window was set". The veto can only ADD a skip; it makes no
++# claim about the rear being clear, and NO log/UI wording may imply otherwise.
++CAL_BLINDSPOT_HOLDOFF_FRAMES = 500   # default 5.0 s @ 100 Hz -- the FCA11_LONG-style constant
++                                    # (plan override ``conditions.blindspot_holdoff_s`` wins)
++
+ # --- defaults (all overridable in plan.json)
+ DEFAULT_TTL_S = 900.0              # a plan is inert if not refreshed/valid within this many seconds of "now"
+ DEFAULT_EXPIRES_DAYS = 30.0        # optional plan expiry
+@@ -101,6 +113,10 @@
+ DEFAULT_BAND_STABLE_S = 5.0        # the band must be held this long before a rep may start
+ DEFAULT_HOLD_S = 2.2               # hold length (budget 2.5 s minus margin)
+ DEFAULT_RECOVERY_S = 3.5           # >= the panda's 3 s cooldown + margin, before the next rep
++# 0032 blind-spot veto: FAIL-CLOSED DEFAULT ON. An old plan that predates 0032 therefore still gets
++# the veto (one-way information; absence of the key must not silently disable a safety addition).
++DEFAULT_BLINDSPOT_VETO = True      # skip a rep while either rear-quarter blind-spot bit is set
++DEFAULT_BLINDSPOT_HOLDOFF_S = 5.0  # hold the veto this long after the last SET sample
+ PLAN_HINT_TTL_S = 300.0            # a plan older than this is "stale": refuse to start a NEW rep
+ 
+ CAL_DIR = "/data/fca11-cal"
+@@ -130,6 +146,25 @@
+     return int(v)
+   except (TypeError, ValueError):
+     return default
++
++
++def _to_bool(v, default):
++  """Bool coercion for plan flags. Only an EXPLICIT false-like value disables; a missing key (None)
++  falls back to ``default``. This keeps the 0032 blind-spot veto fail-closed for plans that predate
++  the key. Accepts real bools, JSON ints 0/1, and the usual string spellings."""
++  if v is None:
++    return default
++  if isinstance(v, bool):
++    return v
++  if isinstance(v, (int, float)):
++    return bool(v)
++  if isinstance(v, str):
++    s = v.strip().lower()
++    if s in ("0", "false", "no", "off", ""):
++      return False
++    if s in ("1", "true", "yes", "on"):
++      return True
++  return default
+ 
+ 
+ def _fca11_budget_predicate(hold_s: float, in_budget: bool, budget_start: int, budget_end: int,
+@@ -224,6 +259,10 @@
+     "band_tol_kph": _to_float(cond.get("band_tol_kph"), DEFAULT_BAND_TOL_KPH),
+     "band_stable_s": _to_float(cond.get("band_stable_s"), DEFAULT_BAND_STABLE_S),
+     "recovery_s": _to_float(cond.get("recovery_s"), DEFAULT_RECOVERY_S),
++    # 0032 blind-spot veto: default ON (fail-closed). ``blindspot_veto`` is a bool; anything that is
++    # not an explicit false (incl. a missing key) leaves the veto ON. Hold-off seconds -> frames.
++    "blindspot_veto": _to_bool(cond.get("blindspot_veto"), DEFAULT_BLINDSPOT_VETO),
++    "blindspot_holdoff_s": _to_float(cond.get("blindspot_holdoff_s"), DEFAULT_BLINDSPOT_HOLDOFF_S),
+   }
+   return reps, opts
+ 
+@@ -253,10 +292,10 @@
+   (inside the ``enabled`` branch, so it is structurally dead when the FCA11 toggle is off).
+ 
+   Reads ``plan.json`` + ``progress.json``; decides which rep is due NOW (engaged + band stable + feet
+-  off + no lead + near-straight + not expired + drive cap not hit); commands the level (the brake's
+-  ``update`` consumes ``level_lsb``/``active_actuation``); on the hold elapsing it releases and, after
+-  the cooldown + band recovery, records the rep and moves on. Progress keys on ``plan_id`` so a new
+-  plan revision resets completion; a completed rep is never re-run.
++  off + no lead + near-straight + no rear-quarter blind spot + not expired + drive cap not hit);
++  commands the level (the brake's ``update`` consumes ``level_lsb``/``active_actuation``); on the hold
++  elapsing it releases and, after the cooldown + band recovery, records the rep and moves on. Progress
++  keys on ``plan_id`` so a new plan revision resets completion; a completed rep is never re-run.
+   """
+ 
+   def __init__(self, dir_path: str = CAL_DIR):
+@@ -309,6 +348,13 @@
+     self._budget_mirror: dict = {"in_budget": False, "budget_start": 0, "budget_end": -1}
+     self._budget_published = False
+     self._last_budget_reason = ""
++    # ---- 0032: blind-spot veto hold-off ------------------------------------------------
++    # ``_blindspot_last_set`` is the frame of the most recent SET sample in EITHER rear quarter;
++    # the veto is held for ``blindspot_holdoff_s`` after it. -1 means "no set sample this session".
++    # Reset alongside the rest of the sequencer state (on a new plan/session), NOT carried across.
++    self._blindspot_last_set = -1
++    self._blindspot_vetoed = False   # True if the veto is what blocked arming on the last tick
++    self._last_pid = ""              # 0032: last plan_id seen, to reset the hold-off on a new revision
+ 
+   # ------------------------------------------------------------------ config
+   def set_phases(self, phases) -> None:
+@@ -328,6 +374,9 @@
+     counted per drive (the superproject restarts card per drive)."""
+     self._session = int(session)
+     self._session_reps = 0
++    # 0032: a new session clears the blind-spot hold-off window (like the rest of the run state).
++    self._blindspot_last_set = -1
++    self._blindspot_vetoed = False
+ 
+   # ------------------------------------------------------------------ 0031 budget gate
+   def set_budget_mirror(self, in_budget: bool, budget_start: int, budget_end: int) -> None:
+@@ -370,6 +419,12 @@
+       return
+     self.plan, self.opts = parsed
+     self.pid = plan_id(obj)
++    # 0032: a NEW plan revision resets the blind-spot hold-off window (the same way a new plan resets
++    # the other per-plan sequencer state); a plan whose rev has not changed keeps its window.
++    if self.pid != self._last_pid:
++      self._last_pid = self.pid
++      self._blindspot_last_set = -1
++      self._blindspot_vetoed = False
+     # expiry (absolute) + issued_at staleness (relative)
+     expires_at = self.opts.get("expires_at")
+     if expires_at is not None and now_wall > expires_at:
+@@ -459,6 +514,38 @@
+       return True
+     return float(d) >= self.opts.get("min_lead_m", DEFAULT_MIN_LEAD_M)
+ 
++  def _blindspot_ok(self, CS) -> bool:
++    """0032 BLIND-SPOT VETO (one-way information). Read the ALREADY-DECODED rear-quarter radar bits
++    ``CarState.leftBlindspot`` / ``CarState.rightBlindspot`` (hyundai carstate.py:184-185, from LCA11
++    ``CF_Lca_IndLeft``/``CF_Lca_IndRight``, gated on ``enableBsm`` which is ON for this car; the raw
++    CAN bits can be 1, 2 or 3), via the same ``CS.out.<field>`` access pattern the rest of the car
++    layer uses for CarState fields. ANY non-zero sample in EITHER field is treated as SET.
++
++    ONE-WAY SEMANTICS (do NOT weaken): a SET bit -> do not arm. A CLEAR bit NEVER certifies the rear
++    quarter is empty -- it only means no sample in the retained window was set. This veto is the
++    ONLY thing that looks behind the car; it can only ADD a skip and makes no claim of a clear rear.
++    The veto is held ``blindspot_holdoff_s`` (default 5 s) past the most recent SET sample, so one
++    clear frame cannot be mistaken for a clear quarter.
++    """
++    if not self.opts.get("blindspot_veto", DEFAULT_BLINDSPOT_VETO):
++      self._blindspot_vetoed = False
++      return True                                   # inert flag -> the pre-0032 path, byte-identical
++    try:
++      left = bool(getattr(CS.out, "leftBlindspot", False))
++      right = bool(getattr(CS.out, "rightBlindspot", False))
++    except (AttributeError, TypeError):
++      left = right = False
++    if left or right:                               # a SET sample refreshes the hold-off window
++      self._blindspot_last_set = self._frame
++      self._blindspot_vetoed = True
++      return False
++    hold = int(round(self.opts.get("blindspot_holdoff_s", DEFAULT_BLINDSPOT_HOLDOFF_S) * 100.0))
++    if hold > 0 and self._blindspot_last_set >= 0 and (self._frame - self._blindspot_last_set) < hold:
++      self._blindspot_vetoed = True                 # still inside the hold-off after the last set
++      return False
++    self._blindspot_vetoed = False
++    return True
++
+   def _conditions_ok(self, CC, CS) -> tuple[bool, str]:
+     if not (bool(CC.enabled) and bool(CC.longActive)):
+       return False, "not_engaged"
+@@ -466,6 +553,8 @@
+       return False, "lead_close"
+     if not self._straight_ok():
+       return False, "not_straight"
++    if not self._blindspot_ok(CS):
++      return False, "blindspot"
+     return True, ""
+ 
+   # ------------------------------------------------------------------ record
+@@ -578,14 +667,17 @@
+       self.level_lsb = 0
+       self._block_reason = "plan_lapsed_mid_rep"
+       return
+-    if not self._conditions_ok(CC, CS)[0]:
+-      # a condition lapsed mid-rep (a lead closed, entered a turn, or disengaged). Abandon the rep; the
+-      # brake's own fca11_ok/fade path releases the episode. No record: the rep is simply retried when
+-      # conditions return (reps are <= 2.2 s, so the cost is negligible and the log stays clean).
++    cond_ok, cond_why = self._conditions_ok(CC, CS)
++    if not cond_ok:
++      # a condition lapsed mid-rep (a lead closed, entered a turn, disengaged, or -- 0032 -- a rear
++      # quarter blind-spot bit went set). Abandon the rep; the brake's own fca11_ok/fade path releases
++      # the episode. No record: the rep is simply retried when conditions return (reps are <= 2.2 s, so
++      # the cost is negligible and the log stays clean). 0032 surfaces the veto reason so the operator
++      # can see WHY reps are being skipped.
+       self._active = None
+       self.active_actuation = False
+       self.level_lsb = 0
+-      self._block_reason = "conditions_lapsed"
++      self._block_reason = "blindspot" if cond_why == "blindspot" else "conditions_lapsed"
+       return
+     # 0031: an armed rep must not spend its whole hold delivering nothing. The arming gate can still
+     # be one frame stale (the release that starts a cooldown happens AFTER the publish on its frame),
+@@ -647,4 +739,9 @@
+       "phases": list(self._phase_enabled),
+       "budget_mirror": self._budget_mirror,
+       "budget_reason": self._last_budget_reason,
++      # 0032: blind-spot veto diagnostics. ``blindspot_veto`` is the configured flag; ``is_vetoing``
++      # reports whether the veto is HELD right now (a set sample inside the hold-off window).
++      "blindspot_veto": bool(self.opts.get("blindspot_veto", DEFAULT_BLINDSPOT_VETO)),
++      "blindspot_holdoff_s": self.opts.get("blindspot_holdoff_s", DEFAULT_BLINDSPOT_HOLDOFF_S),
++      "blindspot_is_vetoing": self._blindspot_vetoed,
+     }

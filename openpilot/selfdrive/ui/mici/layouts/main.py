@@ -14,6 +14,9 @@ from openpilot.system.ui.lib.application import gui_app
 if gui_app.sunnypilot_ui():
   from openpilot.selfdrive.ui.sunnypilot.mici.layouts.settings import SettingsLayoutSP as SettingsLayout
   from openpilot.selfdrive.ui.sunnypilot.mici.layouts.home import MiciHomeLayoutSP as MiciHomeLayout
+  # fork (0033): swap in the SP on-road view that draws the FCA11-cal driver-consent prompt. Same
+  # precedent as the two swaps above -- upstream AugmentedRoadView is untouched.
+  from openpilot.selfdrive.ui.sunnypilot.mici.onroad.augmented_road_view import AugmentedRoadViewSP as AugmentedRoadView
 
 ONROAD_DELAY = 2.5  # seconds
 
