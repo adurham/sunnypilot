@@ -287,7 +287,7 @@ class SelfdriveD(CruiseHelper):
       car_events = self.car_events.update(CS, self.CS_prev, self.sm['carControl']).to_msg()
       self.events.add_from_msg(car_events)
 
-      car_events_sp = self.car_events_sp.update(CS, self.events, self.sm['carControl'].longActive).to_msg()
+      car_events_sp = self.car_events_sp.update(CS, self.sm['carStateSP'], self.events, self.sm['carControl'].longActive).to_msg()
       self.events_sp.add_from_msg(car_events_sp)
 
       # fork (adurham): drive-mode-follows-personality. Param OFF -> inert. ON:

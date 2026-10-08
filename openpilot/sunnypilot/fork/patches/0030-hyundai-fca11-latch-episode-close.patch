@@ -1,0 +1,471 @@
+diff --git a/opendbc/car/interfaces.py b/opendbc/car/interfaces.py
+index f36a7460..10802ee5 100644
+--- a/opendbc/car/interfaces.py
++++ b/opendbc/car/interfaces.py
+@@ -264,6 +264,13 @@ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
+     tune.torque.steeringAngleDeadzoneDeg = steering_angle_deadzone_deg
+ 
+   def update(self, can_packets: list[tuple[int, list[CanData]]]) -> tuple[structs.CarState, structs.CarStateSP]:
++    # 0030 (D2-iii): the car layer's view of the pandad echo of every host 0x38D we transmit (src 128 = accepted,
++    # 192 = REJECTED by the panda TX hook). FCA11-long reads it to confirm that its passive close frame really
++    # CLOSED the panda episode before it starts the cooldown (fca11_long.observe_echo). Gated on the feature so the
++    # hot loop pays nothing when it is off; a plain list attribute, never a capnp field.
++    if self.CP_SP.fca11Brake:
++      self.CS.fca11_echoes = [(int(c.src), bytes(c.dat)) for _t, cs_ in can_packets for c in cs_
++                              if c.address == 0x38D and c.src in (128, 192)]
+     # parse can
+     for cp in self.can_parsers.values():
+       if cp is not None:
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index e72167ba..8a5c7b23 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -172,4 +172,9 @@ class CarStateSP:
+   speedLimit: float = auto_field()
+   # fork (adurham): raw CLU13 CF_Clu_DriveMode (44|4) — the current drive mode (1 normal / 2 eco /
+   # 3 sport / 6 N-custom / 7 N), debounced one frame. 0 = not decoded / unknown. See drive_mode.py.
+-  driveMode: int = auto_field()
+\ No newline at end of file
++  driveMode: int = auto_field()
++  # 0030 (D1-b): FCA11-long braking is unavailable for the REST of this ignition — the panda's fail-closed
++  # hyundai_fca11_long_cut (camera owns FCA11 / pedal fault) is set and only hyundai_init can clear it. The
++  # superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
++  # fails silently while openpilot keeps planning stops it cannot execute). Coupled with custom.capnp CarStateSP.
++  fca11Unavailable: bool = auto_field()
+\ No newline at end of file
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index b7eab91e..9cf7075f 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -986,7 +986,15 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       violation |= CF_VSM_DecCmdAct;           // variant B: FCA_CmdAct carries the command, not DecCmdAct
+       violation |= actuation ? (CF_VSM_Warn != 3) : (CF_VSM_Warn != 0);
+       violation |= hyundai_fca11_long_camera_owns;
+-      violation |= !controls_allowed || !heartbeat_engaged;
++      // 0030 (D2-i): the controls_allowed / heartbeat gate applies to ACTUATING frames only. A PASSIVE frame is the
++      // camera's own idle shape (all brake fields 0, Warn 0, DecCmd 0); accepting it can only ever CLOSE an episode
++      // (hyundai_fca11_long_act_active -> false, cooldown clock starts) and can never command the ESC. Requiring the
++      // engagement gate for it meant a close frame sent at an engage edge (!heartbeat_engaged, the heartbeat only
++      // lands at pandad's 10 Hz step) or a disengage edge (!controls_allowed) was REFUSED, so the panda episode never
++      // closed and the NEXT brake hit budget-expiry on frame 1 + a 3 s cooldown (the 860-frame stale act_active
++      // defect, 14f). The CAMERA-OWNS hand-back below still blocks EVERY host frame (a passive host frame injected
++      // while the camera is actuating could cancel its AEB), and !camera_owns is checked before any state change.
++      violation |= actuation && (!controls_allowed || !heartbeat_engaged);
+       violation |= actuation && !hyundai_fca11_long_window_ok();
+       violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
+ 
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index cf920f86..7ed2d599 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -2630,6 +2630,13 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+ 
+   # *** window: controls_allowed AND heartbeat_engaged ***
+ 
++  def test_no_scc_actuation_allowed(self):
++    # 0030: FCA11_LONG deliberately allows the 0x38D mirror (that IS the feature), so the inherited pedal-long
++    # sweep is overridden to drop 0x38D and keep every OTHER SCC-replacement address blocked.
++    self.safety.set_controls_allowed(True)
++    for addr in (0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x483, 0x7D0):
++      self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
++
+   def test_needs_controls_and_heartbeat(self):
+     for controls, heartbeat in ((False, False), (True, False), (False, True)):
+       with self.subTest(controls=controls, heartbeat=heartbeat):
+@@ -2637,13 +2644,49 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+         self._open_window()
+         self._engage(controls, heartbeat)
+         self.assertFalse(self._tx(self._brake_cmd(1)))
+-        self.assertFalse(self._tx(self._fca11()))  # the passive shape is gated too (panda never needs to send it)
++        # 0030 (D2-i): a PASSIVE frame is NOT engagement-gated any more. It is the camera's own idle shape (all
++        # brake fields 0, Warn 0) and accepting it can only CLOSE the panda episode, never actuate - so it is
++        # accepted even while disengaged / with a stale heartbeat. FALSIFIABLE CONTRAST: on the 29-patch tree this
++        # asserted False (the close frame was refused at an engage/disengage edge -> the episode never closed).
++        self.assertTrue(self._tx(self._fca11()))
+     self._rearm()
+     self._open_window()
+     self._engage(True, True)
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+     self.assertTrue(self._tx(self._fca11()))
+ 
++  def test_passive_close_accepted_while_disengaged_or_heartbeat_stale(self):
++    """0030 (D2-i) regression, the 860-frame stale act_active defect (drives 14f): the passive close frame the car
++    layer sends on an engage/disengage edge must be ACCEPTED even with !controls_allowed / !heartbeat_engaged, so
++    the panda episode CLOSES and the NEXT brake starts fresh with its own 2.5 s budget. ACTUATING frames stay gated
++    exactly as before (safety unchanged). FALSIFIABLE CONTRAST: every assertTrue on a passive frame below fails on
++    the deployed 29-patch tree (the passive frame was refused -> act_active stayed latched -> the next brake hit
++    budget-expiry on frame 1 + the 3 s cooldown)."""
++    # (a) passive close at a DISENGAGE edge (!controls_allowed): must be accepted -> episode ends
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))               # episode open
++    self._engage(False, False)                                 # disengaged: !controls_allowed
++    self.assertTrue(self._tx(self._fca11()), "passive close must be accepted on a disengage edge")
++    # the accepted passive frame ENDED the episode; the cooldown runs from it, and the next brake is a NEW episode
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    # (b) passive close at an ENGAGE edge with the heartbeat still stale (!heartbeat_engaged): accepted
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self._engage(True, False)                                  # engaged but heartbeat not yet (pandad 10 Hz step)
++    self.assertTrue(self._tx(self._fca11()), "passive close must be accepted with a stale heartbeat")
++    # an ACTUATING frame is still refused while the heartbeat is stale (actuation gate unchanged)
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._engage(True, True)
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))            # inside the cooldown the accepted passive started
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))             # fresh episode, own budget
++
+   def test_floor_and_no_ceiling(self):
+     lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
+     for raw, ok in ((lo, False), (lo + 1, True), (raw_hi := 200 * self.RAW_PER_KPH, True)):
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index ed22be6e..8d4b970a 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -46,6 +46,9 @@ class CarStateExt:
+     # neutralization below reads it. Both are inert (False / None) unless cal mode is running.
+     self.fca11_lead_drel_m: float | None = None
+     self.fca11_cal_active = False
++    # 0030 (D1-b): the FCA11-long hand-back flag (camera owns / pedal fault), written by the controller each frame
++    # (same pattern as fca11_cal_active) and mirrored onto CarStateSP.fca11Unavailable for the superproject alert.
++    self.fca11_unavailable = False
+     # pause/resume button (gas interceptor only). pedal_long_engaged = CarControl.enabled, written by the CarController
+     # every frame (this CarState instance is the CS it receives), so it is the engagement state BEFORE a new press.
+     self.pause_resume = PauseResumeTracker()
+@@ -185,6 +188,9 @@ class CarStateExt:
+ 
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
+     ret_sp.driveMode = self.update_drive_mode(cp)
++    # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
++    # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
++    ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
+ 
+   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
+                        speed_factor: float) -> None:
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 7a8925ad..ecf7fcef 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -299,6 +299,21 @@ class Fca11LongBrake:
+     self._hard_cut = False
+     self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+     self.low_speed_alert = False       # hand-over-before-the-floor warning (this frame)
++    # 0030 (D1-b): the panda's camera-owns / pedal-fault hand-back (hyundai_fca11_long_cut) is fail-closed for the
++    # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed and that latch is set the panda will
++    # refuse EVERY actuating frame for the whole drive. Today that failure is silent (the driver sees openpilot plan
++    # stops it cannot execute). This mirrors the panda state the car layer CAN observe (_hard_cut); CarStateExt
++    # publishes it as CarStateSP.fca11Unavailable for the superproject to raise a persistent driver alert.
++    self.fca11_unavailable = False
++    # 0030 (D2-iii): echo-confirmation of the passive close frame. The panda only CLOSES its FCA11-long episode on an
++    # ACCEPTED passive 0x38D (hyundai.h:1027-1030); if the close frame was REFUSED (engage/disengage edge), the
++    # episode never closes. The car layer sees the pandad echo of every 0x38D it sends (src 128 = sent, 192 = REJECTED)
++    # and can re-owe a refused close frame instead of starting the cooldown on a frame that never landed. Inert until
++    # the car layer feeds it via observe_echo (a no-op otherwise, so shipping it unwired is safe).
++    self._pending_echo: bytes | None = None   # the last passive frame we emitted, awaiting its echo
++    self._pending_echo_frame = -1              # controller frame at which it was emitted
++    self._echo_rejected = False               # that frame came back 192 (never closed the episode)
++    self._echo_wired = False                  # observe_echo has been called -> the car layer owns the cooldown stamp
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+     self._sent_this_episode = False
+@@ -360,6 +375,38 @@ class Fca11LongBrake:
+     closing = bool(getattr(CS, "fca11_lead_closing", False))
+     return closing and FCA11_BRAKE_MIN_KPH < v_kph <= FCA11_BRAKE_MIN_KPH + FCA11_ALERT_MARGIN_KPH
+ 
++  def observe_echo(self, echoes) -> None:
++    """0030 (D2-iii): the car layer's half of the echo-confirmed close.
++
++    ``echoes`` is the pandad echo of every host 0x38D we sent this CAN tick: an iterable of (src, dat) with
++    src 128 = accepted / forwarded by the panda TX hook, src 192 = REJECTED by it. The panda CLOSES its
++    FCA11-long episode ONLY on an ACCEPTED passive 0x38D (safety/modes/hyundai.h:1027-1030); a refused close
++    frame leaves ``act_active`` latched, so the NEXT brake hits budget-expiry on frame 1 + a 3 s cooldown (the
++    860-frame stale defect). Until the echo for OUR close frame comes back accepted we must not treat the
++    episode as closed, and if it comes back REFUSED we must RE-OWE the close frame and retry - never start the
++    cooldown on a frame that never landed.
++
++    Called once per controller frame from create_gas_command. Inert (and byte-identical to the shipped
++    behaviour) until the first call, which is what sets ``_echo_wired``.
++    """
++    self._echo_wired = True
++    if not echoes or self._pending_echo is None:
++      return
++    pending = self._pending_echo
++    for src, dat in echoes:
++      if bytes(dat) != pending:
++        continue
++      if int(src) == 192:
++        # the close frame was REFUSED: the panda episode is STILL OPEN. Re-owe it (a later send slot retries) and
++        # do NOT start the cooldown - the panda has not started its own either.
++        self._echo_rejected = True
++        self._release_pending = True
++      else:
++        # accepted: the panda closed the episode and started its cooldown at THIS emission frame.
++        self._budget_end = self._pending_echo_frame
++      self._pending_echo = None
++      return
++
+   def _passive_frame(self, CS, frame: int) -> list[CanData]:
+     """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+@@ -425,11 +472,20 @@ class Fca11LongBrake:
+       self._driver_cut = False
+       self._rearm_pending = False
+     cam = getattr(CS, "fca11_cam_frame", None)
+-    if CC.longActive and cam is not None and camera_requesting(cam[1]):
++    # 0030 (D1-a): latch the camera hand-back on the camera request REGARDLESS of longActive, matching the panda
++    # EXACTLY. The panda's hyundai_fca11_long_rx sets camera_owns / cut on ANY bus-2 0x38D with an actuation/warning
++    # field, with no host-engagement condition at all (hyundai.h:228-236), and only hyundai_init clears it. The old
++    # `CC.longActive and ...` gate was the divergence: the triggering stock FCW on drive 14d arrived while openpilot
++    # was DISENGAGED, so Python never latched, kept believing it could brake, and kept commanding into a refused
++    # wall for the remaining ~16 min of the ignition (1983 refused actuating frames, all three 20@90 cal reps).
++    if cam is not None and camera_requesting(cam[1]):
+       self._hard_cut = True
+     if not engaged:
+       self._rearm_pending = False
+     self.blocked_until_resume = self._driver_cut or self._hard_cut
++    # 0030 (D1-b): surface the hand-back. _hard_cut == the panda's hyundai_fca11_long_cut (camera owns / pedal fault)
++    # and is NOT re-armed, so while it is set FCA11-long braking is unavailable for the rest of this ignition.
++    self.fca11_unavailable = bool(self.enabled and self._hard_cut)
+ 
+     self.low_speed_alert = self._alert(CS)
+ 
+@@ -581,10 +637,20 @@ class Fca11LongBrake:
+         sends += self._passive_frame(CS, frame)
+         if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
+           self._release_pending = False
+-          # R7-C: the panda starts its cooldown on the ACCEPTED passive frame (hyundai.h:970-973), which
+-          # is THIS emission frame - not the (possibly odd) release frame. Stamping it here, plus the
+-          # conservative margin in cooldown_active, keeps the mirror a strict subset of the panda.
+-          self._budget_end = frame
++          if self._echo_wired:
++            # 0030 (D2-iii): do NOT start the cooldown on EMISSION. Record the frame we just put on the wire and
++            # wait for the pandad echo (observe_echo): accepted (src 128) stamps _budget_end; refused (src 192)
++            # RE-OWES the close frame, so the episode is retried instead of the cooldown starting on a frame that
++            # never landed (the 860-frame stale act_active defect).
++            self._pending_echo = bytes(sends[-1].dat)
++            self._pending_echo_frame = frame
++            self._echo_rejected = False
++          else:
++            # R7-C: the panda starts its cooldown on the ACCEPTED passive frame (hyundai.h:970-973), which is THIS
++            # emission frame - not the (possibly odd) release frame. Stamping it here, plus the conservative margin
++            # in cooldown_active, keeps the mirror a strict subset of the panda. (Echo-unwired fallback: the shipped
++            # behaviour, byte-for-byte, so this patch is inert until the car layer wires observe_echo.)
++            self._budget_end = frame
+ 
+     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+     self._on_frames = self._on_frames + 1 if want_brake else 0
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 998db24a..ca7a8a97 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -297,7 +297,13 @@ class GasInterceptorCarController:
+     # flowing (zero frames), which also keeps the pedal fault-clear path alive.
+     # Freshness reference for the mirrored camera frame: the same now_nanos CarInterface.apply received (replay-safe).
+     CS.fca11_now_nanos = now_nanos
++    # 0030 (D2-iii): feed the pandad echo of our own 0x38D frames (collected in CarInterface.update) so the class can
++    # confirm the passive close frame was ACCEPTED before it starts the cooldown; a refused close frame is re-owed.
++    self.fca11_brake.observe_echo(getattr(CS, "fca11_echoes", None))
+     brake_sends = self.fca11_brake.update(CC, CS, frame, personality)
++    # 0030 (D1-b): publish the FCA11-long hand-back so the CarState side can surface it (CarStateSP.fca11Unavailable);
++    # _hard_cut == the panda's fail-closed hyundai_fca11_long_cut (camera owns / pedal fault), NOT re-armed this ignition.
++    CS.fca11_unavailable = bool(self.fca11_brake.fca11_unavailable)
+     # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
+     # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
+     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index d1530a31..2f2052be 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -168,6 +168,7 @@ class _CS:
+     self.fca11_cam_frame = cam
+     self.fca11_now_nanos = now
+     self.fca11_lead_closing = lead_closing
++    self.fca11_echoes = []
+ 
+ 
+ def _cam(v=0.0):
+@@ -1426,5 +1427,179 @@ class TestCalModeActuation(unittest.TestCase):
+       self.assertTrue(ran, "with the lead gone the rep actuates")
+ 
+ 
++class Test0030CameraLatchWithoutLongActive(unittest.TestCase):
++  """0030 (D1-a): the camera hand-back latch must mirror the panda EXACTLY - set on a camera request even while
++  openpilot is DISENGAGED (longActive False). The panda's hyundai_fca11_long_rx sets camera_owns/cut on ANY bus-2
++  0x38D carrying an actuation/warning field with NO host-engagement condition (safety/modes/hyundai.h:228-236), and
++  only hyundai_init clears it. FALSIFIABLE CONTRAST: on the deployed 29-patch tree every latch assert below FAILS
++  (the old `CC.longActive and camera_requesting(...)` gate meant a stock FCW seen while disengaged never latched, so
++  openpilot kept believing it could brake and kept commanding into a refused wall - 1983 refused actuating frames on
++  drive 14d, incl. all three 20@90 cal reps)."""
++
++  def _brake(self):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def test_camera_request_latches_while_long_inactive(self):
++    b = self._brake()
++    cam_req = (0, _real_camera_frame(warn=2))       # the camera itself is braking/warning
++    # longActive OFF (and disengaged): the OLD update() returned in its `not CC.longActive` branch BEFORE the latch,
++    # so the camera request was never seen at all.
++    b.update(self._cc(long_active=False, engaged=False), _CS(cam=cam_req), 0)
++    self.assertTrue(b._hard_cut, "camera request must latch the hand-back even when long is inactive")
++    self.assertTrue(b.blocked_until_resume)
++    self.assertTrue(b.fca11_unavailable)            # D1-b: surfaced
++    # and it stays latched (not re-armed) once long comes back: openpilot must not silently keep braking
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 2)
++    self.assertTrue(b.blocked_until_resume)
++    self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 4))
++    self.assertFalse(b.braking)
++
++  def test_camera_request_latches_while_long_inactive_through_controller(self):
++    """The same divergence through the real controller entry point (create_gas_command), where longActive is the
++    live CarControl value and openpilot can be disengaged at the moment of the stock FCW."""
++    CarInterface, CP, CP_SP = _get_ci(True, "1")
++    CI = CarInterface(CP, CP_SP)
++    # use the real CarState (with its pedal_fault_monitor etc.) and just feed the camera frame + params; the
++    # divergence we are pinning is the latch, not the pedal stream.
++    cs = CI.CS
++    cs.out = structs.CarState()
++    cs.out.vEgo = 20.0
++    cs.out.gearShifter = structs.CarState.GearShifter.drive
++    cs.interceptor_state = 0
++    cs.fca11_cam_frame = (0, _real_camera_frame(warn=2))
++    cs.fca11_now_nanos = 0
++    cs.fca11_echoes = []
++    cc = self._cc(-2.0, engaged=False, long_active=False)
++    sends = CI.CC.create_gas_command(cc, cs, 0, 0)
++    self.assertFalse(any(int(a) == fl.FCA11_ADDR for a, _d, _s in sends))
++    self.assertTrue(CI.CC.fca11_brake._hard_cut)
++
++  def test_no_camera_request_does_not_latch_while_inactive(self):
++    """Guard: the widened latch must NOT fire on an ordinary idle camera frame (else FCA11-long would self-cut)."""
++    b = self._brake()
++    b.update(self._cc(long_active=False, engaged=False), _CS(cam=_cam()), 0)   # idle camera shape
++    self.assertFalse(b._hard_cut)
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_fca11_unavailable_only_when_armed(self):
++    """D1-b: the flag is exactly 'FCA11-long is unavailable now' - off (and never latched) when the toggle is off."""
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = False
++    cp_sp.enableGasInterceptor = True
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 0)
++    self.assertFalse(b.fca11_unavailable)
++
++
++class Test0030EchoConfirmedClose(unittest.TestCase):
++  """0030 (D2-iii): the car layer must stamp ``_budget_end`` only on an ECHO-CONFIRMED accepted passive close frame,
++  and RE-OWE the close frame when the panda REFUSED it (src 192). The panda closes its FCA11-long episode ONLY on an
++  ACCEPTED passive 0x38D (safety/modes/hyundai.h:1027-1030); a refused close frame leaves act_active latched, so the
++  next brake hits budget-expiry on frame 1 + the 3 s cooldown (the 860-frame stale defect, drive 14f). FALSIFIABLE
++  CONTRAST: on the deployed 29-patch tree the refused-close test FAILS (the old code stamped _budget_end at EMISSION,
++  with no echo) - observe_echo() does not even exist."""
++
++  def _brake(self):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _emit_close(self, b):
++    """Open a hard-ask episode, then let the ask rise so the episode releases on the 50 Hz send slot; return
++    (frame, passive_dat) of the single passive close frame."""
++    for f in range(0, 6):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)        # hard ask (<= -1.2) opens immediately
++    self.assertTrue(b.braking)
++    for f in range(6, 400):
++      s = b.update(self._cc(-0.2), _CS(cam=_cam()), f)    # ask above -0.30 -> release after min-on
++      if not b.braking:
++        if not s:
++          s = b.update(self._cc(-0.2), _CS(cam=_cam()), f + 1)
++        p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
++        if p:
++          return f + (1 if not s else 0), bytes(p[0].dat)
++    raise AssertionError("no passive close frame emitted")
++
++  def test_wired_refused_close_is_re_owed_and_re_emitted(self):
++    b = self._brake()
++    b.observe_echo([])                                     # wire the echo path (as create_gas_command does each frame)
++    f_emit, dat = self._emit_close(b)
++    self.assertEqual(dat, b._pending_echo, "the emitted close frame must be recorded for echo confirmation")
++    self.assertEqual(-1, b._budget_end, "no cooldown may start until the echo confirms the close")
++    self.assertFalse(b._release_pending)
++    # the panda REFUSED it (engage/disengage edge): re-owe and do NOT start the cooldown
++    b.observe_echo([(192, dat)])
++    self.assertTrue(b._release_pending, "a refused close frame must be re-owed")
++    self.assertEqual(-1, b._budget_end)
++    self.assertIsNone(b._pending_echo)
++    # the re-owed close frame goes out on the NEXT send slot
++    s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 2)
++    p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
++    self.assertEqual(1, len(p), "the re-owed passive frame must be re-emitted")
++
++  def test_wired_accepted_close_stamps_the_cooldown_at_the_emission_frame(self):
++    b = self._brake()
++    b.observe_echo([])
++    f_emit, dat = self._emit_close(b)
++    b.observe_echo([(128, dat)])                          # accepted by the panda TX hook
++    self.assertEqual(f_emit, b._budget_end, "the cooldown starts at the ACCEPTED close frame, not at emission blindly")
++    self.assertFalse(b._release_pending)
++    self.assertIsNone(b._pending_echo)
++    # inside the cooldown a new actuation is not commanded; past it, it is
++    for f in range(f_emit + 1, f_emit + 1 + fl.FCA11_COOLDOWN_FRAMES):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++      self.assertFalse(b.braking, f)
++    f_new = f_emit + 1 + fl.FCA11_COOLDOWN_FRAMES + fl.FCA11_COOLDOWN_MARGIN_FRAMES + 1
++    b.update(self._cc(-2.0), _CS(cam=_cam()), f_new)
++    self.assertTrue(b.braking)
++
++  def test_unwired_falls_back_to_the_shipped_r7c_behaviour(self):
++    """Guard: without an observe_echo call the class must behave EXACTLY as the deployed 29-patch tree (stamp at
++    emission). This is what makes the patch inert until the car layer wires the echo."""
++    b = self._brake()
++    f_emit, dat = self._emit_close(b)
++    self.assertEqual(f_emit, b._budget_end)              # R7-C, unchanged
++    self.assertIsNone(b._pending_echo)
++
++  def test_wired_retries_until_an_echo_is_accepted(self):
++    b = self._brake()
++    b.observe_echo([])
++    f_emit, dat = self._emit_close(b)
++    b.observe_echo([(192, dat)])                         # refused
++    self.assertTrue(b._release_pending)
++    # re-emit and refuse again: still owed, still no cooldown stamped
++    s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 2)
++    p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
++    self.assertEqual(1, len(p))
++    b.observe_echo([(192, bytes(p[0].dat))])
++    self.assertTrue(b._release_pending)
++    self.assertEqual(-1, b._budget_end)
++    # finally accepted
++    s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 4)
++    p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
++    self.assertEqual(1, len(p))
++    b.observe_echo([(128, bytes(p[0].dat))])
++    self.assertFalse(b._release_pending)
++    self.assertEqual(f_emit + 4, b._budget_end)
++
++
+ if __name__ == "__main__":
+   unittest.main()

@@ -24,7 +24,7 @@ class CarSpecificEventsSP:
 
     self.low_speed_alert = False
 
-  def update(self, CS: structs.CarState, events: Events, long_active: bool):
+  def update(self, CS: structs.CarState, CS_SP: structs.CarStateSP, events: Events, long_active: bool):
     events_sp = EventsSP()
 
     if self.CP.brand == 'chrysler':
@@ -62,6 +62,12 @@ class CarSpecificEventsSP:
         # (the controller stops asking at the floor; panda backs that at 9). The driver takes the stop, as always.
         if self.CP_SP.fca11Brake and long_active and not CS.brakePressed and CS.vEgo * 3.6 <= 14.:
           events_sp.add(EventNameSP.fca11BrakeLowSpeed)
+
+        # fork (adurham), patch 0030: FCA11-long is unavailable for the rest of this ignition (the panda has
+        # handed FCA11 back to the camera / latched a pedal fault). Surfaced from CarStateSP.fca11Unavailable
+        # (the opendbc half, CarStateExt): without it, openpilot silently plans stops it cannot execute.
+        if self.CP_SP.fca11Brake and CS_SP.fca11Unavailable:
+          events_sp.add(EventNameSP.fca11Unavailable)
 
     elif self.CP.brand == 'toyota':
       if self.CP.openpilotLongitudinalControl:

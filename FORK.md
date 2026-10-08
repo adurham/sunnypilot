@@ -91,10 +91,92 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
 | 54 | **SLA auto-applies speed-limit changes at ANY speed + driver override memory** (drive-14 §6): the old rule required a press whenever the set speed was below 50 mph / 80 km/h or the target fell below that floor — so every sub-50 limit change asked (and this fork's whole driving is sub-50). The confirm decision is now a pure function of (current set speed, target set speed) that ignores vehicle speed entirely: a change auto-applies UNLESS it would decrease the set speed by more than `MAX_AUTO_DECREASE` (15 mph / 24 km/h; strict `>`, so 15 mph still applies); increases always apply. Override memory: a driver's manual set-speed edit wins until the next limit change AND `OVERRIDE_MEMORY_S` = 600 s (a real confirm press clears it), so a stretch of changing limits cannot make SLA fight the driver. Own-write disambiguation: on this car (`pcmCruise=False`) SLA writes the cluster set speed itself, and `_is_manual_override_edge` now tells a driver edit apart from SLA's own write. `CONFIRM_SPEED_THRESHOLD` survives only as the pcm max-set-speed ceiling. 51 tests pass on the new code; 24 of 26 new tests FAIL pristine (2 deliberate parity pins); real-log replay of 14a/14b: **18/18 confirm prompts removed, 0 new friction** (largest decrease −10 mph, cap never approached) | feature (SLA, Python only) | fork-local (`sunnypilot/.../speed_limit/`); NOT on main |
 | 55 | **FCA11 calibration command mode** (opendbc patch `0029`) — file-gated, AUTONOMOUS scripted FCA11-long decel for the ONE brake-calibration drive that pins the ESC `BITE`/`K` (the shipped 0.30 is an un-identified placeholder). NOT a road feature and NOT a second switch: the whole cal path lives INSIDE the `if not self.enabled: return` guard of `Fca11LongBrake.update` (`self.enabled = CP_SP.fca11Brake and CP_SP.enableGasInterceptor`), so the owner's existing `HyundaiFca11Brake` toggle — which also arms panda bit 256 — is the single kill switch and the plan file alone can NEVER actuate. New `cal_mode.CalSequencer` (ticked at 100 Hz, on the 50 Hz send slot) reads `/data/fca11-cal/plan.json` and executes due reps opportunistically (engaged + `fca11_ok` gates + speed band stable + no lead within 60 m + near-straight `\|v·yawRate\| < 0.5`), holding 2.2 s then releasing through the PRODUCTION fade; progress (`/data/fca11-cal/progress.json`) is keyed by rep id and persists across reboots; a new plan revision's NEW reps run, done reps never re-run; self-terminating. Absent/malformed/expired/TTL-stale plan OR malformed progress -> INERT (byte-identical); a plan lapse MID-hold is an explicit veto. The scripted level is a FLOOR `max(planner_ask, clamp(level,2,30))`, clamped to the PANDA gate 30 LSB = 0.30 g (NOT the personality cap — a deliberate, disclosed exception; still no new authority), entered via the existing +4 LSB-per-SENT-frame ramp (the clean step the BITE fit needs). REQUIRED gas neutralization: while a hold is active the interceptor forces the commanded pedal to 0 (else the planner gases, `gas_pressed` sets, and the panda driver-cut latch kills the very episode — it can only REDUCE actuation, inert when cal is off; `CarState` still reports the driver's pedal honestly). `status()` exposes a pre-flight summary. Superproject: `openpilot/sunnypilot/fork/fca11_cal_runner.py` (plan writer / gap-fill `--write-plan`, read-only `--status` / `--tail`, offline `--dry-run`) — the runner is NOT in the actuation path. Tests +26 (76 total; 18 of 26 FAIL on the 28-tree); apply-chain 28/28 + 0029 clean, 0 fuzz, byte-identical; roundB 14a window plan-absent byte-identical to the 28-tree; a cal-active window holds 20 LSB with gas exactly 0 | test-tool (car layer, Python only) | fork-local; opendbc patch `0029`; NOT on main |
 | 56 | **Mac offload pipeline, phase 1 — LIVE-PROVEN** (2026-10-07): run the fork's driving model (`modeld_v2`, tinygrad) on a tethered M4 Max over the comma 3X's AUX USB-C port; the comma stays the camera + CAN device (`controlsd`/panda untouched, Mac never transmits CAN). Adds `openpilot/offload/` — frozen interfaces/ports parity-tested against the device bridge; Mac frame path (`vtdec` VideoToolbox decode of the device's own `narrowRoadEncodeData`/`wideRoadEncodeData`, AU-grouped, device NV12 geometry via `create_buffers_with_sizes`) → local VisionIPC → modeld_v2; offline replay harness (`replayd`/`metrics`/`p1_gate`, byte-integrity harness with 40800/40800 digest match + 5× reconnect stress); device-side `offloadd` (shadow-name forwarder, SP pairing rule) + §7 arbitration hook (remote outputs publish only on continuous freshness; local model is the always-on fallback — a dead-man-switch on the big model); tether bench scripts `01..07`. **OFFLOAD=1-gated**: device path byte-identical when unset (guard script verifies). LIVE MEASURED on the car: tether ping ~1 ms, iperf3 ~310 Mbit/s; camera stream 19.8 fps / 9.9 Mbit/s over the wire; decode p50 1.54 ms / p99 3.38 ms; 30-min soak = 43 model passes / 25,800 inference frames / **decode p50 1.49 ms p99 3.50 ms flat across all 6 five-minute buckets**, zero crashes. Also fixed a real `vtdec` leak (~7 GB/h — autoreleased `FileHandle.readData` retained forever in a pool-less Swift CLI; before/after 3.5 GB→flat in 9 s). **Not yet road-validated** (no driving yet); shadow-mode return-path run is the next step | feature (offload, Python + Swift; no C++, no submodule, no firmware) | **LANDED on main** 2026-10-07 (branch `offload-mac`); OFFLOAD/OffloadMode-gated, default off |
+| 57 | **FCA11-long latch & episode-close coherence** (opendbc patch `0030`) — **the fix that stops intentional brake requests being silently dropped.** Found by REPLAYING the real compiled panda safety (`libsafety`) frame-by-frame over the owner's own drives: 164/164 episodes matched within ±2 frames, 16 841/16 847 host `0x38D` frames reproduced individually, and swapping in any other firmware drops agreement to 3–89 % — so the replay discriminates, it is not a model. Verdict: **21.8 % of actuating frames refused, and it was NOT the budget** (budget-edge = 33 single frames, 0.9 %). Three latch/stale-state defects refuse WHOLE episodes from frame 1: **(D1) camera_owns divergence, 1 983 frames / 14d** — the panda latches on a stock-camera FCW and holds until ignition, but the Python mirror only latched while `longActive`, so the car layer kept sending into a refused wall: **one** low-speed stock FCW (v = 2 m/s, driver braking, openpilot OFF) silently killed FCA11 for the last ~16 min of 14d — including all three 0.20 g calibration reps, which is why the high end has no clean data. Python now latches `_hard_cut` on the camera request regardless of `longActive` (matches the rx hook exactly) **and `CarStateSP.fca11Unavailable` drives a PERMANENT driver alert** so the loss is never silent again. **(D2) stale `act_active`, 860 frames / 14f** — the passive close frame was refused at an engage edge (`!heartbeat_engaged`; the heartbeat only lands at pandad's 10 Hz step) or a disengage edge (`!controls_allowed`), leaving the panda episode open so the NEXT brake, 11–166 s later, was refused end to end; the panda now accepts the PASSIVE close frame regardless of controls/heartbeat (a passive frame is the camera's idle shape — it can only CLOSE an episode, never actuate), and the car layer stamps the cooldown only on an echo-confirmed accept. **(D3)** the engage-with-gas latch (753 frames / 14a-14b) was already fixed by `0027` — zero occurrences here, re-confirmed. **Replay result: 3 631 refused actuating frames → 37** (14a 116→0, 14b 638→2, 14d 1 986→3, 14e 5→5, 14f 886→27); the remainder is the unavoidable benign set (budget-edge singles + disengage edges). D2 is a direct compiled result; D1's number is modelled on the C side (the replay injects recorded frames and cannot show a car layer that stops sending) but pinned by unit tests, and the model only ever REMOVES refusals. Tests: 8 new/strengthened Python tests FAIL on the 29-patch tree and PASS on `0030`; 8 panda subfailures likewise; panda 2 977 passed, `test_fca11_long.py` 84, adjacent 281. **`hyundai.h` is compiled into the panda → reflash required.** Fable's ruling on the deeper question (should `camera_owns` ever self-clear): yes, but ONLY on freshly-received bus-2 evidence of camera idle (alive-counter + ≤100 ms bound, ~50 consecutive idle frames) — never on silence, time, or host state; the conservative option (hard latch kept, mirror fixed, alert added) is what shipped; the predicate is recorded in `fix-latch/LATCH-FIX.md` §3 for a later decision | fix (FIRMWARE, safety) | fork-local; opendbc patch `0030`; NOT on main |
+| 58 | **Calibration acquisition: budget-aware rep arming + rev-2 matrix** (opendbc patch `0031`, superproject runner) — hardens the `0029` cal tool after the first drive proved it could burn reps into a wall. **Progress was mostly fake: of the 16 reps recorded `ok`, only 1 was valid** — 7 delivered nothing (3 × 20@90 refused by D1 above, 3 × `step-5-60` refused by D2, 1 unmatched), 2 were degenerate (levels ≤ 8 LSB are all lifted to the production onset floor of 8, so they measure the same command), 6 were planner-contaminated (the planner asked HARDER than the cal level). `0031` gates arming on the mirrored panda budget: `can_arm := in_budget ? (budget_start + 250 − frame) ≥ (round(hold_s·100) + 10) : (budget_end < 0) or (frame − budget_end) > 302`, plus a hold-time abort, so a rep can no longer start one frame before a cooldown and still record `ok`. Tests: 0/6 pass on the deployed 29-patch tree, 6/6 on `0031`. The rev-2 matrix is **24 reps** (not 72): steps {12,16,20,24,30} LSB @60 km/h + {20,28} @90, a 12→30→12 staircase, releases 24→0 and 24→12 — nothing ≤ 8 LSB, spacing ≥ 4 LSB, and the refused/degenerate ones redone under fresh `r2-*` ids (completion keys on REP ID, not plan id, so a bare `rev` bump does NOT reset progress — verified against the shipped code). Runner gains `--matrix`, the rev-2 builders and a working `--why` report | test-tool (car layer + runner, Python only) | fork-local; opendbc patch `0031`; NOT on main |
 
 ---
 
 ## Entries
+
+### fca11-latch: FCA11-long latch & episode-close coherence — the silent brake-loss fix (2026-10-07) (compiled-safety replay over the owner's own drives; opendbc patch `0030` REQUIRES a firmware rebuild + re-sign + explicit owner flash; the alert half is Python + capnp)
+
+> **Driver notes:** this one is about the brakes you *didn't* get. On the 14d drive, **one** stock-camera
+> collision warning — at walking pace, while openpilot was off and you were already braking — hard-latched
+> the panda's FCA11 cut until the ignition cycled. openpilot kept planning brakes it could not execute, and
+> **nothing told you**: FCA11 was silently dead for the last ~16 minutes of that drive. That is your
+> "plenty of instances where I thought braking should be applied and wasn't". The same class of bug (a close
+> frame refused at an engage edge, leaving the panda's episode open) killed the *next* brake 2 minutes later
+> on 14f. Both are fixed: the car layer now mirrors the panda's camera latch exactly, the panda accepts the
+> harmless close frame, and **if FCA11 goes away for the rest of a drive you get a permanent alert** instead
+> of silence — "FCA11 Unavailable: Camera Has Brake". This ships the same braking you have, minus the
+> dropouts; it needs a reflash because the panda's C changed.
+
+- **Why:** the 173-segment calibration drive showed 21.8 % of actuating frames refused. The first pass guessed
+  "budget exhaustion, mid-episode". The second pass **replayed the real compiled panda safety** over the
+  history instead of guessing: 164/164 episodes reproduced within ±2 frames, 16 841/16 847 host `0x38D` frames
+  matched individually, and swapping firmware dropped agreement to 3-89 % — so the replay discriminates.
+  Verdict: not the budget (33 single frames, 0.9 %); three latch/stale-state defects refuse **whole** episodes.
+- **What (opendbc `0030` + the superproject companion):**
+  - **D1 — camera_owns divergence (1 983 frames, route 14d; the dominant cause, and the reason all three
+    0.20 g calibration reps are missing):** the panda's `hyundai_fca11_long_camera_owns` latches on a stock
+    camera FCA11 request and holds until ignition, but the Python mirror only latched while `longActive`, so
+    the car layer kept sending into a refused wall. `fca11_long.py` now latches `_hard_cut` on the camera
+    request **regardless of `CC.longActive`**, matching the rx hook exactly.
+  - **D1-b — surfaced, not silent:** opendbc publishes `CarStateSP.fca11Unavailable`; the superproject raises a
+    **permanent driver alert** (`EventNameSP.fca11Unavailable`, raised from `car_specific.py` only while
+    `CP_SP.fca11Brake` is armed), following the deployed `fca11BrakeLowSpeed` / `driveModePersonalityLockout`
+    pattern. Without it openpilot silently plans stops it cannot execute.
+  - **D2 — stale `act_active` (860 frames, route 14f):** the passive close frame was refused at an engage edge
+    (`!heartbeat_engaged`; the heartbeat only lands at pandad's 10 Hz step) or a disengage edge
+    (`!controls_allowed`), so the panda's episode never closed and the next brake 11-166 s later was refused
+    end to end. The panda now **accepts the passive close frame regardless of controls/heartbeat** — a passive
+    frame is the camera's idle shape and can only close an episode, never actuate — and the car layer stamps
+    the cooldown only on an **echo-confirmed** accept (the 192 echo is available to the car layer). The
+    alternative considered (end the episode after >100 ms with no accepted actuating frame) is documented.
+  - **D3 — engage-with-gas latch (753 frames, 14a/14b):** already fixed by `0027`; zero occurrences here.
+- **Replay result (the falsifiable proof):** refused actuating frames **3 631 → 37** — 14a 116→0, 14b 638→2,
+  14d 1 986→3, 14e 5→5, 14f 886→27. The remainder is the unavoidable benign set (budget-edge singles +
+  disengage edges). D2 is a direct compiled result; D1's C-side number is modelled (the replay injects recorded
+  frames and cannot show a car layer that stops sending) but pinned by unit tests, and the model only ever
+  *removes* refusals.
+- **Tests:** 8 new/strengthened Python tests FAIL on the deployed 29-patch tree and PASS on `0030`; 8 panda
+  subfailures likewise; panda `-k Fca11Long` 2 977 passed, car-layer `test_fca11_long.py` 84, adjacent 281.
+  Apply-chain: fresh `b2acec1d` + the 29-patch series + `0030` = every patch 0 fuzz, all 8 touched files
+  byte-identical to the build tree (re-verified independently).
+- **Fable's ruling on the deeper question** (should `camera_owns` ever self-clear?): **yes — but only on
+  freshly-received bus-2 evidence of camera idle** (alive-counter + ≤100 ms bound, ~50 consecutive idle
+  frames), never on silence, time, or host state. Its argument: the panda is the sole bridge, so "camera wins"
+  is re-asserted every frame; the sticky latch only buys immunity to unobservable camera frames that cannot
+  exist, at the cost of a silent ignition-length loss of openpilot's *only* braking authority. The conservative
+  option (hard latch untouched, mirror fixed, alert added) is what shipped; the predicate is recorded in
+  `fix-latch/LATCH-FIX.md` §3 for a later, separate decision.
+- **Merge note:** fork-local; opendbc `0030` (8 files) + the superproject alert companion (4 files: capnp
+  field, `car_specific.py`, `events.py`, `selfdrived.py` wiring) + these FORK.md rows. `hyundai.h` is compiled
+  into the panda → CI sets `FW_NEEDED=true` and rebuilds/re-signs; **flashing is an explicit owner decision.**
+
+### fca11-cal-rev2: budget-aware rep arming + the corrected calibration matrix (2026-10-07) (unit + validity analysis of the real drive; Python only, no firmware change)
+
+> **Driver notes:** the calibration tool was burning its reps into walls it couldn't see. Of the 16 brake
+> pulses it recorded as successful on your drive, **only one actually delivered a brake** — the rest were
+> refused by the two latch bugs above, or measured the wrong thing. Nothing you need to do differently: this
+> just means the tool now refuses to take a rep it cannot finish, and it will re-take the missing ones.
+
+- **Validity of the 16 recorded reps:** **1 VALID** / 7 REFUSED-INVALID (3 × `step-20-90` camera-latch,
+  3 × `step-5-60` stale-episode, 1 unmatched) / 2 DEGENERATE (`step-8-60-*`; levels ≤ 8 LSB are all lifted to
+  the production onset floor of 8, so they command the same value) / 6 CONTAMINATED (`step-2/3-60-*`; the
+  planner's own ask exceeded the cal level, so the plateau measures a mix). True progress: **1 of 72**.
+- **What:** `0031` gates rep arming on the mirrored panda budget —
+  `can_arm := in_budget ? (budget_start + 250 − frame) ≥ (round(hold_s·100) + 10) : (budget_end < 0) or (frame − budget_end) > 302`
+  — plus a hold-time abort so a rep can no longer start a frame before a cooldown and still record `ok`.
+  The rev-2 matrix is **24 reps**: steps {12,16,20,24,30} LSB @60 km/h + {20,28} @90, a 12→30→12 staircase,
+  releases 24→0 and 24→12. Nothing ≤ 8 LSB, spacing ≥ 4 LSB, refused/degenerate reps redone under fresh
+  `r2-*` ids. **Completion keys on REP ID, not the plan id** (verified against the shipped code), so a bare
+  `rev` bump does NOT reset progress — the fresh ids are what re-run the redo set. Runner gains `--matrix`,
+  the rev-2 builders and a working `--why` report.
+- **Tests:** 0/6 of the new arming tests pass on the deployed 29-patch tree; 6/6 pass on `0031`; existing cal
+  suites 26/26 and the full 76-test module still pass.
+- **Merge note:** fork-local; opendbc `0031` + the runner changes + these rows. Python only — no reflash.
+  Resume procedure for after the latch fix is flashed: `cal-refresh/RESUME.md`.
 
 ### fca11-cal: the calibration command path + ladder runner (drive-14 follow-up) — 2026-10-07 (unit + apply-chain + roundB sim; Python-only, no firmware change)
 

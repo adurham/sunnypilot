@@ -280,4 +280,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventNameSP.driveModePersonalityLockout: {
     ET.PERMANENT: NormalPermanentAlert("N Mode: openpilot Long Off", "Drive mode N blocks openpilot longitudinal"),
   },
+
+  # fork (adurham), patch 0030: FCA11-long braking has been HANDED BACK to the stock camera for the REST OF THIS
+  # IGNITION (the panda's fail-closed camera_owns latch: a stock FCA11 actuation/warning frame on bus 2, or a
+  # pedal fault). The panda now refuses every openpilot 0x38D until the next ignition, so openpilot plans stops
+  # it cannot execute; without this the loss is completely silent. Permanent + driver-facing, the same pattern as
+  # pedalFactoryCruiseLockout. Raised by car_specific.py from CarStateSP.fca11Unavailable (the opendbc half) only
+  # when CP_SP.fca11Brake is on (the feature is armed).
+  EventNameSP.fca11Unavailable: {
+    ET.PERMANENT: NormalPermanentAlert("FCA11 Unavailable: Camera Has Brake", "openpilot braking is off until restart"),
+  },
 }
