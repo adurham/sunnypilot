@@ -85,6 +85,10 @@ DEFAULT_TTL_S = None    # None -> derive from expires_days: under the autonomous
 DEFAULT_EXPIRES_DAYS = 30.0
 DEFAULT_PER_DRIVE_CAP = 15
 DEFAULT_HOLD_S = 2.2
+# 0035: the panda no longer bounds an actuation episode (the 2.5 s budget / 3 s cooldown are deleted), so the TOOL
+# bounds its holds. Must equal opendbc cal_mode.CAL_MAX_HOLD_S (the car layer refuses an over-cap rep and runs a
+# watchdog; the plan writer refuses to WRITE one, so a bad plan is caught off-car first).
+MAX_HOLD_S = 10.0
 BAND_LO_KPH = 60.0
 BAND_HI_KPH = 90.0
 STAIRCASE_STEP_LSB = 3          # ~2-3 LSB per step (rev 1)
@@ -123,6 +127,8 @@ R2_REL_PART = (24, 12)                 # partial release 24 -> 12 x3
 
 
 def _mk_rep(rid, phase, level, band, hold=DEFAULT_HOLD_S, level2=None, switch_at=None):
+  if not (0.0 < float(hold) <= MAX_HOLD_S):
+    raise ValueError(f"rep {rid}: hold_s {hold} outside (0, {MAX_HOLD_S}] s (0035 tool-side hold cap)")
   r = {"id": rid, "phase": phase, "band_kph": float(band), "level_lsb": int(level), "hold_s": float(hold)}
   if level2 is not None:
     r["level2_lsb"] = int(level2)
@@ -287,7 +293,7 @@ def build_plan(phases, *args, matrix="rev2", **kwargs):
 # ------------------------------------------------------------------------------------------------
 # --dry-run : offline pacing validator (NO state writes)
 # ------------------------------------------------------------------------------------------------
-def dry_run(phases, matrix="rev2", *, band_assumed=60.0, cooldown_s=3.5, recovery_s=2.0, start=0.0):
+def dry_run(phases, matrix="rev2", *, band_assumed=60.0, release_gap_s=3.5, recovery_s=2.0, start=0.0):
   doc = build_matrix(matrix, phases)
   t = start
   rows = []
@@ -298,15 +304,15 @@ def dry_run(phases, matrix="rev2", *, band_assumed=60.0, cooldown_s=3.5, recover
     if "level2_lsb" in r:
       step = f" (step {r['level_lsb']}->{r['level2_lsb']} @{r['switch_at_s']:.2f}s)"
     rows.append((r["id"], r["phase"], r["level_lsb"], band, t, t + hold, step))
-    t += hold + cooldown_s + recovery_s
+    t += hold + release_gap_s + recovery_s
   total = t - start
   print(f"[dry-run] matrix={matrix} plan_id={plan_id(doc)} phases={sorted(phases)} reps={len(doc['reps'])} "
-        f"assumed band={band_assumed:.0f} km/h cooldown={cooldown_s}s recovery={recovery_s}s")
+        f"assumed band={band_assumed:.0f} km/h release-gap={release_gap_s}s recovery={recovery_s}s")
   print(f"[dry-run] {'rep':28s} {'phase':10s} {'LSB':>4s} {'band':>5s} {'start':>8s} {'end':>8s}  step")
   for rid, ph, lv, band, s, e, step in rows:
     print(f"[dry-run] {rid:28s} {ph:10s} {lv:4d} {band:5.0f} {s:8.1f} {e:8.1f}  {step}")
   print(f"[dry-run] TOTAL active sequence approx {total:.1f} s ({total / 60.0:.1f} min) across "
-        f"{len(rows)} reps; per-rep rep time = hold {DEFAULT_HOLD_S}s + {cooldown_s}s cooldown + "
+        f"{len(rows)} reps; per-rep rep time = hold {DEFAULT_HOLD_S}s + {release_gap_s}s release gap + "
         f"{recovery_s}s recovery")
   if matrix == "rev2":
     print("[dry-run] NOTE: one clean plateau rep per staircase level is used instead of the "
