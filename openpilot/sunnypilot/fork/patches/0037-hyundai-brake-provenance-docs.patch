@@ -1,0 +1,97 @@
+From: <stage0 lineage hygiene> Mon Sep 17 00:00:00 2001
+Subject: [PATCH DRAFT] hyundai: brake-constant PROVENANCE docs only (no value change)
+
+Documentation-only follow-up to 0001..0036. No constant value, no firmware and no
+safety file is touched. It (a) consolidates the three ESC-gain figures into ONE
+provenance block on FCA11_BRAKE_GAIN, (b) corrects the two stale cross-references,
+and (c) relabels CAL_MIN_LSB, whose comment named a constant that lives only in the
+never-shipped brake-shaping patch. See normal-braking/LINEAGE.md.
+---
+diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
+index d2eaa93..5852dc0 100644
+--- a/opendbc/car/hyundai/interface.py
++++ b/opendbc/car/hyundai/interface.py
+@@ -31,9 +31,12 @@ class CarInterface(CarInterfaceBase):
+   @staticmethod
+   def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
+     # fork: FCA11 longitudinal braking (HyundaiFca11Brake). Above the planner's 12 km/h floor the PID may ask for brake
+-    # (down to -FCA11_A_MAX_MSS2 = 0.30 g * 0.67 gain + margin); below it the plan is coast-only (+0.0 floor) so the
+-    # controller never sends FCA11 near the panda's 9 km/h backstop. With the toggle OFF this returns exactly today's
+-    # (-3.5, +2.0) bounds, so pedal-only behavior is byte-for-byte unchanged (the pedal law ignores negative accel).
++    # (down to -FCA11_A_MAX_MSS2); the "0.30 g" figure is the personality-agnostic PANDA cap, and the accel<->command
++    # conversion uses FCA11_BRAKE_GAIN, whose value, meaning and provenance (three non-interchangeable estimates) are
++    # documented in ONE place: the FCA11_BRAKE_GAIN block in sunnypilot/car/hyundai/fca11_long.py. Do not restate a
++    # "correct" slope here. Below the floor the plan is coast-only (+0.0 floor) so the controller never sends FCA11
++    # near the panda's 9 km/h backstop. With the toggle OFF this returns exactly today's (-3.5, +2.0) bounds, so
++    # pedal-only behavior is byte-for-byte unchanged (the pedal law ignores negative accel).
+     if CP_SP.fca11Brake:
+       from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_BRAKE_MIN_KPH, FCA11_A_MAX_MSS2
+       if current_speed * CV.MS_TO_KPH > FCA11_BRAKE_MIN_KPH:
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index 16f8b37..c5bfa3c 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -108,7 +108,12 @@ import time
+ # Duplicated here (not imported) so this module has no import cycle with fca11_long.py; the unit tests
+ # pin them against the shipped values.
+ CAL_MAX_LSB = 30           # HYUNDAI_FCA11_LONG_MAX_DEC: the PANDA gate (personality-agnostic)
+-CAL_MIN_LSB = 2            # FCA11_DEC_ACTIVE_FLOOR: an episode never commands 0
++CAL_MIN_LSB = 2            # tool-side LOWER clamp on a scripted rep's command level, in LSB
++#   (see Rep.__init__: level = max(CAL_MIN_LSB, min(CAL_MAX_LSB, level))). It bounds the CAL
++#   TOOL's own plan, not the car layer and not the panda. NOTE: an earlier, never-shipped
++#   brake-shaping patch had a similarly-named constant, FCA11_DEC_ACTIVE_FLOOR (also 2), and
++#   this label used to borrow that name. That constant is a different thing (an active floor
++#   inside the brake-shaping law) and does not exist in this tree. Do not conflate the two.
+ CAL_RATE_STEP_LSB = 4      # HYUNDAI_FCA11_LONG_RATE_STEP: +LSB per SENT frame ceiling
+ 
+ # --- 0035: TOOL-SIDE hold bound. 0031's arming predicate only existed to fit a rep inside the panda's
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 90b27bc..8ceff8b 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -110,12 +110,41 @@ FCA11_BRAKE_MIN_KPH = 12.
+ # before the planner runs out of FCA11 authority.
+ FCA11_ALERT_MARGIN_KPH = 2.
+ 
+-# PID accel bound the interface hands the planner above the floor: -0.30 g cap x the measured 0.67
+-# gain (2.03 m/s^2) + margin. A -2.0 request commands 0.30 g raw (clamped) and delivers ~2.0 m/s^2.
++# PID accel bound the interface hands the planner above the floor: 0.30 g cap x the measured
++# delivered/commanded ratio (FCA11_BRAKE_GAIN) + margin. A -2.0 request commands 0.30 g raw
++# (clamped). See the FCA11_BRAKE_GAIN block below for what that ratio is and is NOT.
+ FCA11_A_MAX_MSS2 = 2.0
+ 
+-# measured ESC gain: delivered decel / commanded decel = 0.67 (2.03 m/s^2 per 0.30 g; fit slope
+-# 6.46 m/s^2 per g). The request INVERTS it, so a -2.0 m/s^2 accel ask commands 0.30 g.
++# *** FCA11_BRAKE_GAIN — ONE provenance block (the single source of truth for this constant) ***
++#
++# WHAT IT MEANS (exactly): the delivered-decel / commanded-decel RATIO, fitted THROUGH THE ORIGIN
++# (zero intercept):  delivered_extra[m/s^2] = FCA11_BRAKE_GAIN * (cmd_LSB * 0.01 * 9.81).
++# The request path INVERTS it (dec_cmd_from_accel):  dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81,
++# so an accel ask of -2.0 m/s^2 commands ~0.30 g raw. It is a scalar here, not a slope+offset.
++#
++# THE VALUE THE DEPLOYED CODE USES: FCA11_BRAKE_GAIN = 0.67.
++#
++# THERE ARE THREE HISTORICALLY CITED FIGURES, FROM THREE DIFFERENT ESTIMATORS. They were measured
++# on DIFFERENT FRAME SHAPES AND DURATIONS and are NOT interchangeable. Do not "reconcile" them
++# by picking one; quote each with its origin.
++#   1. "2/3 gain", fit slope 6.46 m/s^2 per g  -- the ROLLING-TEST measurement: ~31 km/h,
++#      0.6 s pulses, 0.10 / 0.20 / 0.30 g commands delivering 0.74 / 1.28 / 2.03 m/s^2 extra.
++#      This is a SLOPE fit over short pulses and it is stated in delivered-decel-per-g-of-command.
++#   2. Ratio 0.67 (== this constant) -- the same rolling run read as a through-origin
++#      delivered/commanded RATIO (2.03 / (0.30 * 9.81) ~= 0.69; ~0.67 across the points).
++#   3. Affine fit of the route-151 PRODUCTION frames: extra = BITE + K * cmd_g, with
++#      K ~ 9.7-10.1 (m/s^2 per g) and BITE ~ 0.63-0.75 (m/s^2). This is a TWO-PARAMETER (slope +
++#      offset) fit on long, real production brake frames at 50-80 km/h -- a different model
++#      shape from (1)/(2).
++#
++# NOTE THE DISAGREEMENT, PLAINLY: 0.67 x 9.81 = 6.57, so figures (1) and (2) -- both "6.4x" --
++# do not even agree with each other (6.46 vs 6.57). Figure (3)'s K ~ 9.7-10.1 is ~1.5x either.
++# These are NOT three measurements of one number; they are three different estimators on
++# different data. This comment exists so the next reader SEES the disagreement and the
++# provenance, not so it is papered over with a single "correct" slope.
++#
++# The live refit is Stage-1 of car-features/normal-braking/PLAN.md (K ~ 9.9, BITE ~ 0.68), which
++# supersedes 0.67. Until that ships, 0.67 is what the car runs -- CHANGE NO VALUE WITHOUT THE REFIT.
+ FCA11_BRAKE_GAIN = 0.67
+ 
+ # camera-frame freshness for the mirror source (s): the camera sends ~50 Hz; anything older than
