@@ -2,13 +2,14 @@ from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
-from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.interfaces import CarInterfaceBase, ACCEL_MAX, ACCEL_MIN
 from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.radar_interface import RadarInterface
 
 from opendbc.sunnypilot.car.hyundai.escc import ESCC_MSG
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import REMAPPED_IDS, STANDARD_IDS
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import get_longitudinal_tune
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
@@ -25,6 +26,21 @@ class CarInterface(CarInterfaceBase):
   RadarInterface = RadarInterface
 
   DRIVABLE_GEARS = (structs.CarState.GearShifter.sport, structs.CarState.GearShifter.manumatic)
+
+  @staticmethod
+  def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
+    # fork: FCA11 longitudinal braking (HyundaiFca11Brake). 0040: the planner-side 12 km/h floor is DELETED - the PID
+    # may ask for brake (down to -FCA11_A_MAX_MSS2) at ANY speed, down to and through zero, so the car layer can guide
+    # the car to a complete stop and hold it. The "0.30 g" figure is the personality-agnostic PANDA cap, and the
+    # accel<->command conversion uses FCA11_BRAKE_GAIN, whose value, meaning and provenance (three non-interchangeable
+    # estimates) are documented in ONE place: the FCA11_BRAKE_GAIN block in sunnypilot/car/hyundai/fca11_long.py. Do not
+    # restate a "correct" slope here. With the toggle OFF this returns exactly today's (-3.5, +2.0) bounds, so
+    # pedal-only behavior is byte-for-byte unchanged (the pedal law ignores negative accel).
+    if CP_SP.fca11Brake:
+      from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_A_MAX_MSS2
+      return -FCA11_A_MAX_MSS2, ACCEL_MAX
+    return ACCEL_MIN, ACCEL_MAX
+
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -192,6 +208,22 @@ class CarInterface(CarInterfaceBase):
       stock_cp.pcmCruise = True
       ret.safetyParam |= HyundaiSafetyFlagsSP.NON_SCC
 
+      # Elantra N: panda permits the faster CarControllerParams.STEER_DELTA_UP (4) for this platform only
+      if stock_cp.carFingerprint == CAR.HYUNDAI_ELANTRA_2022_NON_SCC:
+        ret.safetyParam |= HyundaiSafetyFlagsSP.CN7_STEER_RAMP
+
+      # comma pedal (gas interceptor): capability ONLY. Pedal-long is activated in
+      # opendbc/sunnypilot/car/interfaces.py:_initialize_hyundai_gas_interceptor when the user ALSO enables the
+      # HyundaiGasInterceptor param; otherwise every CarParams/CarParamsSP value stays exactly as above.
+      # ICE only: EV/HEV/FCEV non-SCC cars read gas/cruise from other messages the safety pedal path doesn't cover.
+      # Two pedal CAN ID dialects: standard comma pedal (sensor 0x201) and remapped custom firmware (sensor 0x701).
+      # Each sets its own capability bit; the dialect is chosen in _initialize_hyundai_gas_interceptor.
+      if not stock_cp.flags & (HyundaiFlags.EV | HyundaiFlags.HYBRID | HyundaiFlags.FCEV):
+        if STANDARD_IDS.sensor_addr in fingerprint[0]:
+          ret.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
+        if REMAPPED_IDS.sensor_addr in fingerprint[0]:
+          ret.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED.value
+
     # untested non-SCC platforms, need user validations
     if stock_cp.carFingerprint in (CAR.HYUNDAI_BAYON_1ST_GEN_NON_SCC, CAR.KIA_FORTE_2021_NON_SCC,
                                    CAR.KIA_SELTOS_2023_NON_SCC, CAR.GENESIS_G70_2021_NON_SCC):
@@ -229,8 +261,9 @@ class CarInterface(CarInterfaceBase):
     if communication_control is None:
       communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.DISABLE_RX_DISABLE_TX, uds.MESSAGE_TYPE.NORMAL])
 
-    if CP.openpilotLongitudinalControl and not ((CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)) or
-                                                (CP_SP.flags & HyundaiFlagsSP.ENHANCED_SCC)):
+    # gas interceptor (pedal) longitudinal has no SCC/radar ECU to silence
+    if CP.openpilotLongitudinalControl and not CP_SP.enableGasInterceptor and \
+       not ((CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)) or (CP_SP.flags & HyundaiFlagsSP.ENHANCED_SCC)):
       addr, bus = 0x7d0, CanBus(CP).ECAN if CP.flags & HyundaiFlags.CANFD else 0
       if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
         addr, bus = 0x730, CanBus(CP).ECAN

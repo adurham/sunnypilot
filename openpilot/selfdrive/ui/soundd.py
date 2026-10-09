@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import threading
 import time
 import wave
 
@@ -8,7 +9,6 @@ from openpilot.cereal import log, messaging, custom
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import Ratekeeper
-from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.system import micd
@@ -68,6 +68,58 @@ def check_selfdrive_timeout_alert(sm):
       return True
 
   return False
+
+
+class AudioStreamSlot:
+  """Single-slot, thread-safe holder for a PortAudio stream acquired in the background.
+
+  Acquisition never blocks the caller. If the held stream goes inactive it is dropped
+  and closed so a fresh one can be acquired: 'audio not ready yet' is an operational
+  state the daemon keeps retrying, never a fatal error.
+  """
+
+  def __init__(self, open_fn, *, log_prefix: str):
+    self._open_fn = open_fn
+    self._log_prefix = log_prefix
+    self._lock = threading.Lock()
+    self._stream = None
+    self._acquiring = False
+
+  def ensure(self) -> None:
+    """Start a background acquire unless one is in flight or a stream is held."""
+    with self._lock:
+      if self._acquiring or self._stream is not None:
+        return
+      self._acquiring = True
+    threading.Thread(target=self._acquire, daemon=True).start()
+
+  def get_active(self):
+    """Return the held stream while it is active; drop (and close) it when it is not.
+
+    The check and the drop share one critical section, so a stream installed by a
+    concurrent acquire is never discarded.
+    """
+    with self._lock:
+      s = self._stream
+      if s is not None and s.active:
+        return s
+      self._stream = None
+    if s is not None:
+      cloudlog.error(f"{self._log_prefix} stream inactive, re-acquiring")
+      try:
+        s.close()
+      except Exception:
+        pass
+    return None
+
+  def _acquire(self) -> None:
+    try:
+      s = self._open_fn()
+      with self._lock:
+        self._stream = s
+    finally:
+      with self._lock:
+        self._acquiring = False
 
 
 class Soundd(QuietMode):
@@ -168,13 +220,6 @@ class Soundd(QuietMode):
     volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
     return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
 
-  @retry(attempts=10, delay=3)
-  def get_stream(self, sd):
-    # reload sounddevice to reinitialize portaudio
-    sd._terminate()
-    sd._initialize()
-    return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
-
   def soundd_thread(self):
     # sounddevice must be imported after forking processes
     import sounddevice as sd
@@ -182,32 +227,43 @@ class Soundd(QuietMode):
 
     sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP', 'soundPressure'])
 
-    with self.get_stream(sd) as stream:
-      rk = Ratekeeper(20)
+    # acquire in the background so the alert loop is never blocked by audio bring-up
+    def open_stream():
+      s = micd.open_audio_stream(
+        sd, lambda d: d.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER),
+        log_prefix="soundd")
+      if s is not None:
+        cloudlog.info(f"soundd stream started: {s.samplerate=} {s.channels=} {s.dtype=} {s.device=}, {s.blocksize=}")
+      return s
 
-      cloudlog.info(f"soundd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
-      while True:
-        sm.update(0)
+    slot = AudioStreamSlot(open_stream, log_prefix="soundd")
+    slot.ensure()
 
-        self.load_param()
+    rk = Ratekeeper(20)
+    while True:
+      sm.update(0)
 
-        # freeze volume during alerts to avoid mic feedback increasing volume
-        if sm.updated['soundPressure']:
-          self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
-          if self.current_alert == AudibleAlert.none:
-            self.current_volume = self.calculate_volume(float(self.spl_filter_weighted.x))
+      self.load_param()
 
-        self.get_audible_alert(sm)
+      # freeze volume during alerts to avoid mic feedback increasing volume
+      if sm.updated['soundPressure']:
+        self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
+        if self.current_alert == AudibleAlert.none:
+          self.current_volume = self.calculate_volume(float(self.spl_filter_weighted.x))
 
-        # Ramp up immediate warning sound over 4s
-        if self.current_alert == AudibleAlert.warningImmediate:
-          elapsed = time.monotonic() - self.ramp_start_time
-          ramp_vol = float(np.interp(elapsed, [0, ALERT_RAMP_TIME], [self.ramp_start_volume, MAX_VOLUME]))
-          self.current_volume = max(self.current_volume, ramp_vol)
+      self.get_audible_alert(sm)
 
-        rk.keep_time()
+      # Ramp up immediate warning sound over 4s
+      if self.current_alert == AudibleAlert.warningImmediate:
+        elapsed = time.monotonic() - self.ramp_start_time
+        ramp_vol = float(np.interp(elapsed, [0, ALERT_RAMP_TIME], [self.ramp_start_volume, MAX_VOLUME]))
+        self.current_volume = max(self.current_volume, ramp_vol)
 
-        assert stream.active
+      rk.keep_time()
+
+      # stream unready/lost: get_active() dropped it; keep the loop running and re-acquire
+      if slot.get_active() is None:
+        slot.ensure()
 
 
 def main():

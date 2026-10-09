@@ -1,0 +1,521 @@
+From 4d3fbdc9e1e8e3bd25ee94576a001722178ece36 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sun, 4 Oct 2026 00:49:44 -0500
+Subject: [PATCH] hyundai: gas interceptor buttons v2 + hold-offset refit
+ (route 00000128)
+
+- pause/resume (CruiseSwState 4): panda grant no longer conditioned on controls_allowed (route 128 @139.2 s: a
+  stale SET grant made panda judge the press a disengage while openpilot judged it a resume); brake/MAIN checked at
+  press start, throughout, and at the debounced release; gas no longer blocks (engages into override, like SET).
+  Python tracker mirrors it; lockstep fuzz asserts every openpilot engage has a panda grant on the same sample.
+- no low-speed pedal cut: pause/resume may engage from a standstill (green-light resume); launch ceiling
+  LOW_SPEED_MAX_GAS 0.12 @0 / 0.20 @5 / 0.30 @11.2 m/s (pedal is 4-5x stronger per unit below 6 m/s).
+- hold-speed offset table refit on routes 127+128 at vEgo*1.0125: [0,.10,.24,.34,.43,.49,.56] @ [0..35 m/s];
+  the old v^2 table was +0.10..+0.27 too high above 23 m/s (steady overspeed + 1.0 s truck gap with the P-only loop).
+  On-ramp speeds (12-20 m/s) unchanged or higher.
+---
+ opendbc/safety/modes/hyundai_common.h         | 30 ++++---
+ opendbc/safety/tests/test_hyundai.py          | 74 +++++++++++++---
+ .../sunnypilot/car/hyundai/gas_interceptor.py | 43 ++++++---
+ .../sunnypilot/car/hyundai/pause_resume.py    | 43 +++++----
+ .../car/hyundai/tests/test_gas_interceptor.py | 87 +++++++++++++++++--
+ 5 files changed, 214 insertions(+), 63 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index 30b73e68..2c326e31 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -91,10 +91,15 @@ extern bool hyundai_factory_main_on;
+ bool hyundai_factory_main_on = false;
+ 
+ // Gas interceptor only: the steering-wheel pause/resume button (CLU11 CF_Clu_CruiseSwState 4, "CANCEL" in the DBC).
+-// A press while longitudinal is engaged disengages (as before). A press while disengaged re-engages, but ONLY when the
+-// press started with brake and gas released, neither was pressed at any time during the press, and the button was then
+-// released for HYUNDAI_PAUSE_RELEASE_SAMPLES consecutive NONE samples (debounce: a one-frame bounce inside a disengage
+-// press must never turn it into a resume). Nothing else re-grants controls: no timer, brake release or speed recovery.
++// Holding it clears controls (as before). Its debounced release (HYUNDAI_PAUSE_RELEASE_SAMPLES consecutive NONE samples)
++// grants controls_allowed, but ONLY when the press started with the brake released and the factory MAIN off, the brake
++// was not pressed at any sample of the press or its debounce, and MAIN is still off at the release. The grant is a
++// PERMISSION superset of openpilot: openpilot itself only engages on it when it was disengaged at the press start
++// (pause_resume.py); after a disengage press openpilot stays off, sends zero gas, and the 1 Hz heartbeat clears the
++// unused grant. Deliberately NOT conditioned on controls_allowed: a stale SET/RES grant that openpilot refused (e.g.
++// below its 25 mph SET floor) made panda judge the next press a 'disengage' while openpilot judged it a 'resume'
++// (route 00000128 @139.2 s). Gas may be held (engages into override, like SET). Speed is not checked (green-light
++// resume from standstill). Nothing else re-grants controls: no timer, brake release or speed recovery.
+ // MUST equal PAUSE_RELEASE_SAMPLES in opendbc/sunnypilot/car/hyundai/pause_resume.py (a unit test enforces this).
+ #define HYUNDAI_PAUSE_RELEASE_SAMPLES 3U  // CLU11 is 50 Hz: 60 ms
+ static bool hyundai_setres_brake_seen;       // gas interceptor: brake was pressed during the current SET/RES press
+@@ -189,11 +194,11 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+   }
+ }
+ 
+-// Gas interceptor: called on every RX message (hyundai_rx_hook), so a brake/gas press is caught even when it falls
+-// between two CLU11 samples. Brake or gas during a pause/resume press (or its release debounce) cancels that resume,
++// Gas interceptor: called on every RX message (hyundai_rx_hook), so a brake press is caught even when it falls
++// between two CLU11 samples. Brake during a pause/resume press (or its release debounce) cancels that resume,
+ // and brake during a SET/RES press makes that press unable to engage.
+ static void hyundai_gas_interceptor_pedal_check(void) {
+-  if (brake_pressed || gas_pressed) {
++  if (brake_pressed) {
+     hyundai_pause_armed = false;
+   }
+   bool setres_active = (cruise_button_prev == HYUNDAI_BTN_SET) || (cruise_button_prev == HYUNDAI_BTN_RESUME);
+@@ -205,11 +210,10 @@ static void hyundai_gas_interceptor_pedal_check(void) {
+ // pause/resume button state machine, gas interceptor only. Must run BEFORE the CANCEL-held clear below: a new press
+ // samples whether longitudinal was engaged at the moment the press began.
+ static void hyundai_gas_interceptor_pause_button_check(const int cruise_button) {
+-  bool pedal_pressed = brake_pressed || gas_pressed;
+   if (cruise_button == HYUNDAI_BTN_CANCEL) {
+     if (hyundai_pause_released_cnt >= HYUNDAI_PAUSE_RELEASE_SAMPLES) {
+-      // new press (not a bounce of the previous one): resume press only if disengaged with no pedal pressed
+-      hyundai_pause_armed = !controls_allowed && !pedal_pressed && !hyundai_factory_main_on;
++      // new press (not a bounce of the previous one): may grant on its release if the brake is up and MAIN is off
++      hyundai_pause_armed = !brake_pressed && !hyundai_factory_main_on;
+     }
+     hyundai_pause_released_cnt = 0U;
+   } else if (cruise_button != HYUNDAI_BTN_NONE) {
+@@ -218,15 +222,15 @@ static void hyundai_gas_interceptor_pause_button_check(const int cruise_button)
+     hyundai_pause_released_cnt = HYUNDAI_PAUSE_RELEASE_SAMPLES;
+   } else if (hyundai_pause_released_cnt < HYUNDAI_PAUSE_RELEASE_SAMPLES) {
+     hyundai_pause_released_cnt += 1U;
+-    if (hyundai_pause_armed && !pedal_pressed && !hyundai_factory_main_on &&
++    if (hyundai_pause_armed && !brake_pressed && !hyundai_factory_main_on &&
+         (hyundai_pause_released_cnt == HYUNDAI_PAUSE_RELEASE_SAMPLES)) {
+       controls_allowed = true;
+       hyundai_pause_armed = false;
+     }
+   } else {
+   }
+-  // brake or gas at any time during the press or its release debounce cancels the resume
+-  if (pedal_pressed) {
++  // brake at any time during the press or its release debounce cancels the resume
++  if (brake_pressed) {
+     hyundai_pause_armed = false;
+   }
+ }
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index e7e9b606..672d1667 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -19,6 +19,7 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
+                                                          MAX_INTERCEPTOR_GAS, REMAPPED_IDS, STANDARD_IDS
+ 
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC
++from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+ 
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+ GAS_ON = 0.1
+@@ -883,24 +884,58 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+     self.assertTrue(self.safety.get_controls_allowed())  # exactly on the 3rd released sample
+ 
+   def test_pause_button_disengages_when_engaged(self):
++    # held: controls cleared immediately (the disengage). The debounced release re-grants the PERMISSION only: openpilot
++    # stays disengaged after a disengage press (pause_resume.py: no resumeCruise when engaged at the press start), sends
++    # zero gas, and the heartbeat clears the unused grant. Panda can't tell a stale grant from an engagement, so it may not
++    # condition on controls_allowed (route 00000128 @139.2 s divergence).
+     self.safety.set_controls_allowed(True)
+     self._release()
+     self._press(Buttons.CANCEL, 1)
+     self.assertFalse(self.safety.get_controls_allowed())
+     self._press(Buttons.CANCEL)
+-    self._release(20)
+     self.assertFalse(self.safety.get_controls_allowed())
++    self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES - 1)
++    self.assertFalse(self.safety.get_controls_allowed())
++    self._release(1)
++    self.assertTrue(self.safety.get_controls_allowed())
+ 
+-  def test_pause_button_bounce_stays_disengaged(self):
+-    # engaged press with 1-2 sample bounces inside it must not turn into a resume
++  def test_pause_button_bounce_grants_once(self):
++    # a press with 1-2 sample bounces inside it is ONE press: nothing granted until the final debounced release
+     for bounce in (1, 2):
+       self.safety.set_controls_allowed(True)
+       self._release()
+       self._press(Buttons.CANCEL, 3)
+       self._release(bounce)
++      self.assertFalse(self.safety.get_controls_allowed(), bounce)
+       self._press(Buttons.CANCEL, 3)
+-      self._release(20)
+       self.assertFalse(self.safety.get_controls_allowed(), bounce)
++      self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES)
++      self.assertTrue(self.safety.get_controls_allowed(), bounce)
++
++  def test_pause_button_after_stale_setres_grant(self):
++    # route 00000128 @138.3-139.4 s: SET released at 24.7 mph granted panda (openpilot refused it: belowEngageSpeed),
++    # then pause/resume 0.9 s later. Old rule: panda saw controls_allowed and treated it as a DISENGAGE press (cleared,
++    # never re-granted) while openpilot treated it as a resume. Now the release grants regardless.
++    self._rx(self._user_brake_msg(False))
++    self._release()
++    self._press(Buttons.SET)
++    self._release(1)
++    self.assertTrue(self.safety.get_controls_allowed())  # stale grant (openpilot did not engage)
++    self._release(40)
++    self._press(Buttons.CANCEL)
++    self.assertFalse(self.safety.get_controls_allowed())
++    self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES)
++    self.assertTrue(self.safety.get_controls_allowed())
++
++  def test_pause_button_main_armed_during_press(self):
++    # MAIN armed mid-press (or still armed at the release): no grant
++    self._engage_then_brake()
++    self._rx(self._user_brake_msg(False))
++    self._release()
++    self._press(Buttons.CANCEL)
++    self._rx(self._acc_state_msg(True))
++    self._release(20)
++    self.assertFalse(self.safety.get_controls_allowed())
+ 
+   def test_pause_button_while_brake_held(self):
+     self._engage_then_brake()
+@@ -929,17 +964,34 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+     self.assertFalse(self.safety.get_controls_allowed())
+ 
+   def test_pause_button_gas_pressed(self):
+-    self._engage_then_brake()
+-    self._rx(self._user_brake_msg(False))
+-    self._release()
+-    for phase in ("start", "during"):
+-      self._rx(self._interceptor_user_gas(0x1000 if phase == "start" else 0))
++    # gas held does NOT block a resume (route 00000128 @2152.9/2154.2/2155.7: three presses refused with the foot on the
++    # gas). It engages into override, exactly like SET with gas; longitudinal_allowed stays False while gas is pressed.
++    for phase in ("start", "during", "throughout"):
++      self._engage_then_brake()
++      self._rx(self._user_brake_msg(False))
++      self._rx(self._interceptor_user_gas(0x1000 if phase in ("start", "throughout") else 0))
++      self._release()
+       self._press(Buttons.CANCEL)
+       if phase == "during":
+         self._rx(self._interceptor_user_gas(0x1000))
++      if phase != "throughout":
++        self._rx(self._interceptor_user_gas(0))
++      self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES)
++      self.assertTrue(self.safety.get_controls_allowed(), phase)
++      self.assertEqual(phase != "throughout", self.safety.get_longitudinal_allowed(), phase)
+       self._rx(self._interceptor_user_gas(0))
+-      self._release(20)
+-      self.assertFalse(self.safety.get_controls_allowed(), phase)
++
++  def test_pause_button_resumes_at_standstill(self):
++    # green-light resume: panda has no speed floor for the deliberate pause/resume press (brake released)
++    self._rx(self._user_brake_msg(False))
++    self._rx(self._speed_msg(0))
++    self._release()
++    self._press(Buttons.CANCEL)
++    self._release(HYUNDAI_PAUSE_RELEASE_SAMPLES)
++    self.assertTrue(self.safety.get_controls_allowed())
++    # and brake still takes it away instantly, at standstill too (rising edge)
++    self._rx(self._user_brake_msg(True))
++    self.assertFalse(self.safety.get_controls_allowed())
+ 
+   def test_set_held_across_brake_release(self):
+     for btn in (Buttons.SET, Buttons.RESUME):
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index fe35ba13..2516fbec 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -9,7 +9,9 @@ comma pedal (gas interceptor) longitudinal for Hyundai CAN non-SCC ICE cars.
+ Driver-supervisory contract (there is NO brake actuator on these cars):
+   - accel request >= 0  -> pedal command (throttle), capped at MAX_INTERCEPTOR_GAS
+   - accel request <  0  -> pedal command drops toward 0 = lift-off/coast, engine braking only, NEVER service brakes
+-  - no stop-and-go: openpilot longitudinal is disengaged below minEnableSpeed; the driver must brake
++  - SET/RES engage only at >= minEnableSpeed (25 mph). The deliberate pause/resume press may engage at ANY speed,
++    including a standstill (green-light resume, drive-128 report); once engaged the throttle is not cut at low speed,
++    it is only limited by LOW_SPEED_MAX_GAS. openpilot can still never brake: the driver stops the car.
+ """
+ from collections import deque
+ from dataclasses import dataclass
+@@ -74,19 +76,30 @@ HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
+ # foot off and confirm GAS_SENSOR does not move. test_gas_interceptor.py pins the DBC mapping in raw counts.
+ MAX_INTERCEPTOR_GAS = 0.30
+ 
+-# TBD-BENCH: conservative. Pedal-long can't be engaged below this (NoEntry) and the pedal command is cut once speed
+-# falls GAS_CUT_HYSTERESIS below it, so there is no low-speed/stop-and-go throttle. Driver brakes to stop.
++# SET/RES engage floor (car_specific.py raises belowEngageSpeed below it). NOT applied to the pause/resume button, and the
++# pedal command is no longer cut below it once engaged (the old cut made a green-light resume impossible).
+ HYUNDAI_GAS_INTERCEPTOR_MIN_ENABLE_SPEED = 25. * CV.MPH_TO_MS
+-GAS_CUT_HYSTERESIS = 2.0  # m/s
+-
+-# accel (m/s^2) -> pedal fraction gain, and a speed-dependent "hold speed" feedforward (m/s^2 equivalent) that offsets
+-# drag/rolling resistance so a 0 m/s^2 request holds speed instead of coasting. Fitted on route 00000123 (578 engaged
+-# 0.5 s bins, pedal state 0, 14-24 m/s): aEgo(t+0.5 s) = 2.76*cmd + 0.032 - 0.000935*v^2 - g*pitch (R^2 0.75,
+-# rmse 0.06 m/s^2; per-speed-band gain 2.66-2.87). PEDAL_SCALE = 1/2.76; the offset is the fitted drag term
+-# (0.03 - 0.000935 v^2, clamped >= 0). >24 m/s is extrapolated, and the planner closes residual error either way.
++GAS_CUT_HYSTERESIS = 2.0  # m/s; kept for car_specific.py's low-speed 'driver must brake' warning band
++
++# accel (m/s^2) -> pedal fraction gain (route 00000123 fit: aEgo(t+0.5 s) = 2.76*cmd + ..., PEDAL_SCALE = 1/2.76), and a
++# speed-dependent "hold speed" feedforward (m/s^2 equivalent) so a 0 m/s^2 request holds speed instead of coasting.
++# Hold table refit on routes 00000127 + 00000128 (drive-128 planner report §1.4 + drive-128 buttons report §6): steady
++# hold (1 s mean |aEgo| < 0.06, pedal state 0, no pedals), residual accel removed at k = 2.76, speed axis = vEgo * 1.0125
++# (wheelSpeedFactor of superproject branch planner-tune, so the table is right once that lands; without it the
++# breakpoints sit <= 0.4 m/s off). Measured median offset per band: 15 m/s 0.31, 20 0.31, 25 0.43, 30 0.52, 33-35 0.57
++# (planner report: 0.25/0.33/0.35/0.43/0.47/0.49/0.53/0.55). The old v^2 table (fit 14-24 m/s, extrapolated) was
++# +0.10..+0.27 too high above 23 m/s; with the P-only accel loop (kiV = 0) that bias WAS the steady overspeed (+0.235 m/s
++# at 69.6 mph set) and the 1.0 s truck gap (MPC distance error x gain = bias).
+ PEDAL_SCALE = 0.36
+-HOLD_SPEED_OFFSET_BP = [0., 10., 15., 20., 25., 30.]        # vEgo, m/s
+-HOLD_SPEED_OFFSET_V = [0., 0.06, 0.18, 0.34, 0.55, 0.76]    # m/s^2 equivalent
++HOLD_SPEED_OFFSET_BP = [0., 10., 15., 20., 25., 30., 35.]          # vEgo, m/s
++HOLD_SPEED_OFFSET_V = [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]     # m/s^2 equivalent
++
++# Low-speed ceiling on the command (openpilot side; panda keeps its flat 0.30 raw ceiling, it has no vEgo). The pedal is
++# far stronger at low speed (driver data 127+128, aEgo(+0.3 s) per unit pedal: 0-1 m/s 10.9, 1-3 13.2, 3-6 10.0,
++# 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6 m/s^2,
++# 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a 0.30 (~3 m/s^2) jump. Full 0.30 from 11.2 m/s.
++LOW_SPEED_MAX_GAS_BP = [0., 5., 11.2]        # vEgo, m/s
++LOW_SPEED_MAX_GAS_V = [0.12, 0.20, 0.30]     # pedal fraction
+ 
+ # Upward slew limit on the pedal command (fraction of travel per second); decreases are immediate. Raising the cap made
+ # the engage step (0 -> cap in one frame, seen 8x on route 00000123) twice as large; 0.75/s = 0 -> 0.30 in 0.4 s,
+@@ -98,7 +111,8 @@ PEDAL_RATE_UP_PER_FRAME = PEDAL_RATE_UP * DT_CTRL
+ def get_pedal_command(accel: float, v_ego: float) -> float:
+   """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake."""
+   offset = float(np.interp(v_ego, HOLD_SPEED_OFFSET_BP, HOLD_SPEED_OFFSET_V))
+-  return float(np.clip(PEDAL_SCALE * (accel + offset), 0., MAX_INTERCEPTOR_GAS))
++  ceiling = min(MAX_INTERCEPTOR_GAS, float(np.interp(v_ego, LOW_SPEED_MAX_GAS_BP, LOW_SPEED_MAX_GAS_V)))
++  return float(np.clip(PEDAL_SCALE * (accel + offset), 0., ceiling))
+ 
+ 
+ def rate_limit_pedal_command(gas: float, gas_last: float) -> float:
+@@ -181,7 +195,8 @@ class GasInterceptorCarController:
+ 
+     # send exactly zero when not actively controlling: the pedal outputs max(driver, command), and zero + ENABLE=0
+     # also clears any latched pedal fault (pedal firmware)
+-    active = CC.longActive and CS.out.vEgo >= self.CP.minEnableSpeed - GAS_CUT_HYSTERESIS
++    # (no low-speed cut: a pause/resume engagement may start from a standstill; LOW_SPEED_MAX_GAS limits the launch)
++    active = CC.longActive
+     # slew-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+     self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas) if active else 0.
+diff --git a/opendbc/sunnypilot/car/hyundai/pause_resume.py b/opendbc/sunnypilot/car/hyundai/pause_resume.py
+index cad79f38..2badbd5e 100644
+--- a/opendbc/sunnypilot/car/hyundai/pause_resume.py
++++ b/opendbc/sunnypilot/car/hyundai/pause_resume.py
+@@ -11,19 +11,25 @@ Route 11c: four presses of it with the factory cruise off all made the factory c
+ car it is a toggle and not a plain cancel. openpilot used to treat it only as cancel, which is why it could not
+ re-engage pedal-long after a brake press.
+ 
+-Mirror of hyundai_gas_interceptor_pause_button_check() in opendbc/safety/modes/hyundai_common.h. The two MUST stay in
+-lockstep: if they diverge, the panda refuses (controlsMismatch) or openpilot refuses (heartbeat clears panda
+-controls), and both outcomes fail safe.
++Mirror of hyundai_gas_interceptor_pause_button_check() in opendbc/safety/modes/hyundai_common.h. The panda grant is a
++PERMISSION and must be a superset of openpilot's engage: every resumeCruise emitted here coincides with a panda grant on
++the same CLU11 sample (TestPandaLockstep), so openpilot can never be engaged while panda refuses the pedal.
+ 
+-  * Press while engaged: emits `cancel`, which disengages (unchanged).
++  * Press while engaged: emits `cancel`, which disengages (unchanged). Panda clears controls while it is held; it may
++    re-grant on the release, but openpilot stays disengaged (sends zero gas) and the heartbeat clears the unused grant.
+   * Press while disengaged: emits `resumeCruise` (pressed + released in the same frame) only if ALL of these hold:
+-      - the press started with brake and gas released and the factory cruise MAIN off;
+-      - neither pedal was pressed at any sample during the press or its release debounce;
++      - the press started with the brake released and the factory cruise MAIN off;
++      - the brake was not pressed at any sample during the press or its release debounce, and MAIN is still off;
+       - the button then stayed released for PAUSE_RELEASE_SAMPLES consecutive samples.
++    Gas may be held (engages into override, same as SET). Speed is NOT checked here: pause/resume is the deliberate
++    green-light resume and may engage from a standstill (car_specific.py exempts it from minEnableSpeed).
+     openpilot's buttonEnable (CarState.update_button_enable) is the only consumer, so the engage source is always a
+     deliberate driver press. Nothing else produces resumeCruise: no timer, no brake release, no speed recovery.
+   * Bounce: a release shorter than PAUSE_RELEASE_SAMPLES does not start a new press. So a press that began while
+     engaged (a disengage) can never be re-interpreted as a resume.
++
++Route 00000128 @139.2 s: the old panda rule (arm only if !controls_allowed) diverged from this tracker after a SET that
++openpilot refused below 25 mph left a stale panda grant: openpilot judged the press a resume, panda a disengage.
+ """
+ from opendbc.car import structs
+ 
+@@ -37,22 +43,25 @@ PAUSE_RELEASE_SAMPLES = 3
+ 
+ class PauseResumeTracker:
+   def __init__(self):
+-    self.armed = False                      # current/last press resumes on its debounced release
+-    self.cancel_press = False               # current/last press is a disengage (cancel) press
++    self.armed = False                      # panda mirror: the current/last press grants on its debounced release
++    self.resume_press = False               # the current/last press started while disengaged
++    self.cancel_press = False               # the current/last press is a disengage (cancel) press
+     self.released_cnt = PAUSE_RELEASE_SAMPLES
+ 
+   def update(self, samples, engaged: bool, brake: bool, gas: bool, factory_main: bool) -> list[structs.CarState.ButtonEvent]:
+     """samples: every CF_Clu_CruiseSwState value received since the last call (CLU11 is 50 Hz, CarState 100 Hz).
+     engaged: openpilot longitudinal engaged (CarControl.enabled from the previous frame, i.e. before this press).
++    gas: accepted for interface stability; a held gas pedal does not block a resume (engages into override).
+     Returns the button events for this frame: cancel and/or resumeCruise."""
++    del gas
+     events: list[structs.CarState.ButtonEvent] = []
+-    pedal = brake or gas
+     for b in samples:
+       if b == PAUSE_BUTTON:
+         if self.released_cnt >= PAUSE_RELEASE_SAMPLES:
+-          # a new press: is it a resume or a disengage?
+-          self.armed = not engaged and not pedal and not factory_main
+-          self.cancel_press = not self.armed
++          # a new press: panda arms its grant on brake/MAIN only; openpilot resumes only if it was disengaged
++          self.armed = not brake and not factory_main
++          self.cancel_press = engaged
++          self.resume_press = not engaged
+           if self.cancel_press:
+             events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
+         self.released_cnt = 0
+@@ -60,18 +69,20 @@ class PauseResumeTracker:
+         # rolled onto another cruise button: abandon the pause press (that button follows its own rules)
+         self._finish_cancel(events)
+         self.armed = False
++        self.resume_press = False
+         self.released_cnt = PAUSE_RELEASE_SAMPLES
+       elif self.released_cnt < PAUSE_RELEASE_SAMPLES:
+         self.released_cnt += 1
+         if self.released_cnt == PAUSE_RELEASE_SAMPLES:
+           self._finish_cancel(events)
+-          if self.armed and not pedal and not factory_main:
++          if self.armed and self.resume_press and not brake and not factory_main:
+             events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.resumeCruise))
+             events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.resumeCruise))
+           self.armed = False
+-      if pedal:
+-        self.armed = False  # brake or gas at any time during the press / release debounce cancels the resume
+-    if pedal:
++          self.resume_press = False
++      if brake:
++        self.armed = False  # brake at any time during the press / release debounce cancels the resume
++    if brake:
+       self.armed = False  # also on frames with no new CLU11 sample (CarState runs at 100 Hz, CLU11 at 50 Hz)
+     return events
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index b6f2e0a5..4ee6929f 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -214,9 +214,34 @@ class TestThresholds:
+       assert ((dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3]) == raw(frac)
+ 
+   def test_hold_speed_matches_road_fit(self):
+-    # route 00000123: steady-speed (|aEgo| < 0.08, flat) median pedal command per speed band, pedal state 0
+-    for v_ego, measured_hold in ((15., 0.064), (19.9, 0.128)):
+-      assert gi.get_pedal_command(0., v_ego) == pytest.approx(measured_hold, abs=0.015), v_ego
++    # routes 00000127+00000128 steady hold (1 s mean |aEgo| < 0.06, pedal state 0, no pedals), speed axis vEgo*1.0125:
++    # measured median hold command 0.089 / 0.118 / 0.155 / 0.177 / 0.192 at 15 / 20 / 25 / 30 / 33 m/s
++    # (drive-128 planner report §1.4; independent refit in the drive-128 buttons report §6)
++    for v_ego, measured_hold in ((15., 0.089), (20., 0.118), (25., 0.155), (30., 0.177), (33., 0.192)):
++      assert gi.get_pedal_command(0., v_ego) == pytest.approx(measured_hold, abs=0.012), v_ego
++
++  def test_hold_table_pinned(self):
++    # the corrected table itself; the old v^2 table (0.55 @25, 0.76 @30, flat beyond) was +0.10..+0.27 m/s^2 too high
++    # above 23 m/s, and with the P-only loop that bias was the steady overspeed and the 1.0 s truck gap on route 128
++    assert gi.HOLD_SPEED_OFFSET_BP == [0., 10., 15., 20., 25., 30., 35.]
++    assert gi.HOLD_SPEED_OFFSET_V == [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]
++    for v in (25., 28., 31., 34.):
++      assert gi.get_pedal_command(0., v) < 0.36 * (0.55 if v < 26 else 0.70), v  # well below the old table's hold
++
++  def test_onramp_authority_kept(self):
++    # route 128 on-ramps (335-350, 1699-1704, 1757-1763, 2033-2039 s) ran at 12-20 m/s with the planner asking
++    # +0.5..1.2 m/s^2: there the new table is equal or higher than the old one, so the fix can't weaken on-ramp pull
++    old = lambda a, v: float(np.clip(0.36 * (a + np.interp(v, [0, 10, 15, 20, 25, 30], [0, .06, .18, .34, .55, .76])), 0, .3))
++    for v in (12., 14., 16., 18., 20.):
++      for a in (0.5, 0.8, 1.2):
++        assert gi.get_pedal_command(a, v) >= old(a, v) - 1e-9, (a, v)
++
++  def test_low_speed_launch_ceiling(self):
++    # pause/resume may engage from a standstill: the launch is limited (pedal ~4-5x stronger per unit at <6 m/s)
++    assert gi.get_pedal_command(5., 0.) == pytest.approx(0.12)
++    assert gi.get_pedal_command(5., 5.) == pytest.approx(0.20)
++    assert gi.get_pedal_command(5., 11.2) == pytest.approx(gi.MAX_INTERCEPTOR_GAS)
++    assert gi.get_pedal_command(0.3, 0.) > 0.  # it does move off from a stop when the planner asks
+ 
+   def test_cap_has_authority_for_route_123_hill(self):
+     # route 00000123 t=362-382 s: ~3.5-4% climb at 17-20 m/s, planner asked +0.93..1.01 m/s^2, the command sat pinned
+@@ -485,6 +510,18 @@ class TestPedalFaultClearEndToEnd:
+       out.append((cmd[0] if cmd else None, ret.accFaulted))
+     return out
+ 
++  @pytest.mark.parametrize("v_ego", [0., 2., 6.])
++  def test_low_speed_commands_through_real_path(self, v_ego):
++    # pause/resume may engage at a standstill: the CarController must command throttle there (no low-speed cut), but
++    # never above the launch ceiling. Through CarInterface.apply -> 0x700 on the wire.
++    CI, CC, CC_SP, ids = self._setup()
++    out = self._drive(CI, CC, CC_SP, ids, [0] * 80, v_ego=v_ego)
++    a = [_cmd_fields(d) for d, _ in out if d is not None]
++    ceiling = float(np.interp(v_ego, gi.LOW_SPEED_MAX_GAS_BP, gi.LOW_SPEED_MAX_GAS_V))
++    _, dc, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), ceiling, 0)
++    assert a[-1][2] == 1 and abs(a[-1][0] - ((dc[0] << 8) | dc[1])) <= 2, (v_ego, a[-1])
++    assert all(x[0] <= ((dc[0] << 8) | dc[1]) + 2 for x in a)
++
+   @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
+   def test_clear_frame_on_fault(self, pedal, ids):
+     CI, CC, CC_SP, ids = self._setup(ids, pedal)
+@@ -746,11 +783,26 @@ class TestPauseResumeButton:
+     assert _enables(rets) == 0
+ 
+   def test_gas_pressed(self):
++    # route 00000128 @2152.9 / 2154.2 / 2155.7: three pause/resume presses with the foot on the gas, all refused.
++    # Gas no longer blocks the resume: it engages into override (same as SET with gas)
+     car = self._disengaged_after_brake()
+     car.run(5)
+-    rets = car.run(5, btn=4, gas=True) + car.run(20)
+-    rets += car.run(3, btn=4) + car.run(1, btn=4, gas=True) + car.run(20)
+-    assert _enables(rets) == 0
++    rets = car.run(5, btn=4, gas=True) + car.run(5, gas=True)
++    assert _enables(rets) == 1
++    car = self._disengaged_after_brake()
++    car.run(5)
++    rets = car.run(3, btn=4) + car.run(1, btn=4, gas=True) + car.run(5)
++    assert _enables(rets) == 1
++
++  def test_resume_after_refused_set(self):
++    # route 00000128 @138.3 / 139.2: SET refused by openpilot (below 25 mph) left a stale panda grant; the pause press
++    # that followed must still be a resume (openpilot was disengaged), and panda must grant it too (lockstep test)
++    car = _Car()
++    car.run(10)
++    car.run(5, btn=2)
++    car.run(40)  # openpilot did NOT engage (car.engaged stays False)
++    rets = car.run(5, btn=4) + car.run(5)
++    assert _enables(rets) == 1
+ 
+   @pytest.mark.parametrize("btn", [1, 2], ids=["RES", "SET"])
+   def test_setres_held_across_brake_release(self, btn):
+@@ -796,6 +848,7 @@ class TestPandaLockstep:
+     car = _Car()
+     btn, brake, gas, main = 0, False, False, False
+     grants_panda, grants_car, trace = [], [], []
++    pause_rel, pause_started_engaged = pr.PAUSE_RELEASE_SAMPLES, False  # shadow of the press boundaries
+     for k in range(3000):
+       if rng.random() < 0.15:
+         btn = int(rng.choice([0, 0, 0, 1, 2, 4, 4]))
+@@ -814,8 +867,18 @@ class TestPandaLockstep:
+       mid = safety.get_controls_allowed()
+       safety.safety_rx_hook(spk.make_can_msg_safety("CLU11", 0, {"CF_Clu_CruiseSwState": btn, "CF_Clu_AliveCnt1": k % 16}))
+       after = safety.get_controls_allowed()
++      if btn == 4:
++        if pause_rel >= pr.PAUSE_RELEASE_SAMPLES:
++          pause_started_engaged = car.engaged
++        pause_rel = 0
++      elif btn != 0:
++        pause_rel = pr.PAUSE_RELEASE_SAMPLES
++      elif pause_rel < pr.PAUSE_RELEASE_SAMPLES:
++        pause_rel += 1
+       if after and not mid:
+-        grants_panda.append(k)
++        # a panda-only grant is allowed ONLY on the debounced release of a press that began while openpilot was engaged
++        # (a disengage press: openpilot stays off, the unused permission is cleared by the heartbeat)
++        grants_panda.append((k, btn == 0 and pause_rel == pr.PAUSE_RELEASE_SAMPLES and pause_started_engaged))
+       was_engaged = car.engaged
+       rets = car.step(btn=btn, brake=brake, gas=gas, main=main)
+       # an engage request only counts while disengaged (re-pressing SET while engaged is a set-speed change)
+@@ -829,8 +892,14 @@ class TestPandaLockstep:
+         car.engaged = False
+       del before
+     assert len(grants_car) > 10, "fuzz never exercised an engagement"
+-    first = next((k for k in sorted(set(grants_panda) ^ set(grants_car))), None)
+-    assert grants_panda == grants_car, "\n".join(str(t) for t in trace if first is not None and first - 25 <= t[0] <= first)
++    panda_k = {k for k, _ in grants_panda}
++    benign = {k for k, ok in grants_panda if ok}
++    # 1. every openpilot engagement coincides with a panda grant on the same sample (never engaged-but-refused)
++    # 2. every panda grant openpilot didn't take is the release of a disengage press
++    bad = sorted((set(grants_car) - panda_k) | (panda_k - set(grants_car) - benign))
++    first = bad[0] if bad else None
++    assert not bad, "\n".join(str(t) for t in trace if first - 25 <= t[0] <= first)
++    assert benign, "fuzz never exercised a disengage-press release"
+ 
+ 
+ def _hyundai_checksum(msg):
+-- 
+2.55.0
+

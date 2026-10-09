@@ -9,6 +9,7 @@ See the LICENSE.md file in the root directory for more details.
 from collections.abc import Callable
 import os
 os.environ['GMMU'] = '0'
+import sys
 import numpy as np
 import threading
 import time
@@ -33,7 +34,14 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.modeld import ChestnutGpuState
+# OFFLOAD §4f: keep the eager import when not offloading (byte-identical device behavior); on
+# macOS the chestnut/AMD-heavy stock modeld module is not imported at module load.
+# NOTE (2026-10-07 rebase): upstream renamed ChestnutState -> ChestnutGpuState; the guard tracks
+# the new name. `ChestnutState` is kept as an alias so the local helper stays readable.
+if os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin':
+  ChestnutState = None
+else:
+  from openpilot.selfdrive.modeld.modeld import ChestnutGpuState as ChestnutState
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
@@ -46,9 +54,15 @@ from openpilot.sunnypilot.modeld_v2.helpers import load_oob
 from openpilot.sunnypilot.modeld_v2.model_adapters import get_model_adapter
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
+# OFFLOAD §7: output-arbitration hook (default off). Importing this module has no side effects and
+# opens no sockets; make_arbiter() only builds the arbiter when explicitly enabled. Device path
+# (arbiter is None) is byte-identical. See openpilot/offload/ARBITRATION.md.
+from openpilot.sunnypilot.modeld_v2.offload_arbiter import make_arbiter
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld_tinygrad"
 BIG_MODEL_TIMEOUT = 60
+# OFFLOAD §4e: VisionIPC server name configurable; defaults to the contract's DEFAULT_VIPC_SERVER.
+OFFLOAD_VIPC_SERVER = os.environ.get('OFFLOAD_VIPC_SERVER', 'camerad')
 
 
 def _pkl_exists(path):
@@ -69,6 +83,71 @@ def _find_driving_pkl(bundle):
   if _pkl_exists(pkl_path):
     return pkl_path
   return None
+
+
+def _get_chestnut_state_class():
+  """OFFLOAD §4f: avoid importing the chestnut/AMD-heavy stock modeld module on macOS."""
+  if ChestnutState is None:
+    class _DisabledChestnutState:
+      def __init__(self, *args, **kwargs):
+        raise RuntimeError("chestnut disabled under OFFLOAD on macOS")
+
+    return _DisabledChestnutState
+  return ChestnutState
+
+
+def _offload_chestnut_present() -> bool:
+  """OFFLOAD §4f: never probe USB/chestnut on the Mac path."""
+  if os.environ.get('OFFLOAD') == '1':
+    return os.environ.get('OFFLOAD_CHESTNUT') == '1'
+  return chestnut_present()
+
+
+def _load_offload_car_params():
+  """OFFLOAD §4d: seed CarParams bytes without a working Params backend.
+
+  Priority: OFFLOAD_CARPARAMS_PKL (explicit file of serialized cereal bytes), then any
+  locally-produced CarParamsPersistent, then the shipped demo CarParams so the run loop
+  always has a valid CarParams on the Mac.
+  """
+  raw = None
+  pkl_path = os.environ.get('OFFLOAD_CARPARAMS_PKL')
+  if pkl_path and os.path.exists(pkl_path):
+    with open(pkl_path, 'rb') as f:
+      raw = f.read()
+  else:
+    try:
+      from openpilot.common.params import Params as _Params
+      raw = _Params().get("CarParamsPersistent")
+    except Exception:
+      raw = None
+  if raw:
+    try:
+      return messaging.log_from_bytes(raw, car.CarParams)
+    except Exception as e:
+      cloudlog.warning(f"OFFLOAD: could not parse CarParams bytes ({e}); using demo params")
+  return get_demo_car_params()
+
+
+# OFFLOAD §4g: a non-finite frame must not tear down the offload host. jetlink's
+# server-side queues adopt the same rule (keep the last good hidden state, report
+# NOT_FINITE, keep serving) — JetlinkKit/.../Queues.swift:122-125. We preserve the
+# last good recurrent state (prev_feat feeds features_buffer) and publish nothing
+# for that frame; the absence is the staleness signal downstream. Device behavior
+# (OFFLOAD unset) is unchanged: the stock chestnut raise below still fires.
+_NONFINITE_OFFLOAD_STATE = {'count': 0, 'warned': False, 'last_warn_t': 0.0}
+_NONFINITE_WARN_INTERVAL_S = 5.0
+
+
+def _note_nonfinite_offload() -> None:
+  """Log a preserved non-finite frame once, then rate-limit while counting."""
+  st = _NONFINITE_OFFLOAD_STATE
+  st['count'] += 1
+  now = time.monotonic()
+  if not st['warned'] or (now - st['last_warn_t'] >= _NONFINITE_WARN_INTERVAL_S):
+    cloudlog.warning("OFFLOAD: non-finite model output (%d so far); keeping last-good state, publishing nothing", st['count'])
+    st['warned'] = True
+    st['last_warn_t'] = now
 
 
 class FrameMeta:
@@ -111,8 +190,14 @@ class ModelState(ModelStateBase):
     jits = load_oob(open_file_chunked(pkl_path))
 
     metadata = jits['metadata']
-    self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
-    self.DEV = ('AMD' if self.chestnut else 'QCOM') if COMMA_HARDWARE else 'CPU'
+    # OFFLOAD §4a: on macOS (Darwin-arm64) force the Metal devices instead of the
+    # COMMA_HARDWARE-gated QCOM/AMD selection. Unset => byte-identical device behavior.
+    if os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin':
+      self.WARP_DEV = os.environ.get('OFFLOAD_WARP_DEV', 'METAL')
+      self.DEV = os.environ.get('OFFLOAD_DEV', 'METAL')
+    else:
+      self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
+      self.DEV = ('AMD' if self.chestnut else 'QCOM') if COMMA_HARDWARE else 'CPU'
     self.QUEUE_DEV = self.DEV
     self.adapter = get_model_adapter(jits, cam_w, cam_h, self.DEV, self.QUEUE_DEV, self.WARP_DEV, self.chestnut)
     self.vision_output_slices = self.adapter.vision_output_slices
@@ -186,7 +271,15 @@ class ModelState(ModelStateBase):
 
     if self._combined_model_type == 'supercombo':
       model_output = raw_outputs.numpy().flatten()
-      if self.chestnut and not np.all(np.isfinite(model_output)):
+      # OFFLOAD §4g: on the offload host a non-finite frame preserves the last-good
+      # recurrent state and publishes nothing, instead of crashing (stock chestnut
+      # raise) or silently poisoning prev_feat. OFFLOAD unset => the original
+      # `self.chestnut and not finite: raise`, byte-identical device behavior.
+      if os.environ.get('OFFLOAD') == '1':
+        if not np.all(np.isfinite(model_output)):
+          _note_nonfinite_offload()
+          return None
+      elif self.chestnut and not np.all(np.isfinite(model_output)):
         raise RuntimeError("model output not finite")
       sliced = {k: model_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
       outputs = self.parser.parse_outputs(sliced)
@@ -195,6 +288,10 @@ class ModelState(ModelStateBase):
           model_output[self.vision_output_slices['hidden_state']]
     else:
       vision_output = raw_outputs[0].numpy().flatten()
+      if os.environ.get('OFFLOAD') == '1' and not np.all(np.isfinite(vision_output)):
+        # OFFLOAD §4g: same last-good policy for the split/multi-policy host path.
+        _note_nonfinite_offload()
+        return None
       vision_sliced = {k: vision_output[np.newaxis, v] for k, v in self.vision_output_slices.items()}
       outputs = self.parser.parse_vision_outputs(vision_sliced)
 
@@ -204,6 +301,10 @@ class ModelState(ModelStateBase):
 
       for i, policy_slices in enumerate(self._policy_slices_list):
         policy_output = raw_outputs[i + 1].numpy().flatten()
+        if os.environ.get('OFFLOAD') == '1' and not np.all(np.isfinite(policy_output)):
+          # OFFLOAD §4g: same last-good policy as the supercombo branch (jetlink Queues.swift:122-125).
+          _note_nonfinite_offload()
+          return None
         policy_sliced = {k: policy_output[np.newaxis, v] for k, v in policy_slices.items()}
         parsed = self.parser.parse_policy_outputs(policy_sliced)
         if 'off' in self._policy_keys[i] and self._has_on_policy:
@@ -254,9 +355,11 @@ def main(demo=False):
 
   cloudlog.bind(daemon=PROCESS_NAME)
   setproctitle(PROCESS_NAME)
-  config_realtime_process(7, 54)
+  # OFFLOAD §4b: config_realtime_process raises on macOS (SCHED_FIFO/affinity); skip it there.
+  if not (os.environ.get('OFFLOAD') == '1' and sys.platform == 'darwin'):
+    config_realtime_process(7, 54)
 
-  CHESTNUT = chestnut_present()
+  CHESTNUT = _offload_chestnut_present()
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
@@ -266,7 +369,7 @@ def main(demo=False):
 
   # visionipc clients
   while True:
-    available_streams = VisionIpcClient.available_streams("camerad", block=False)
+    available_streams = VisionIpcClient.available_streams(OFFLOAD_VIPC_SERVER, block=False)
     if available_streams:
       use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_NARROW_ROAD in available_streams
       main_wide_camera = VisionStreamType.VISION_STREAM_NARROW_ROAD not in available_streams
@@ -274,8 +377,8 @@ def main(demo=False):
     time.sleep(.1)
 
   vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_NARROW_ROAD
-  vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
-  vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
+  vipc_client_main = VisionIpcClient(OFFLOAD_VIPC_SERVER, vipc_client_main_stream, True)
+  vipc_client_extra = VisionIpcClient(OFFLOAD_VIPC_SERVER, VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
 
   while not vipc_client_main.connect(False):
@@ -319,8 +422,13 @@ def main(demo=False):
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
+  # OFFLOAD §7: remote-output arbitration (a dead-man-switch on the Mac's big model). Enabled only
+  # by OFFLOAD_ARBITRATION (bench) or (device: COMMA_HARDWARE and Params OffloadMode == 'drive');
+  # otherwise None, no sockets are opened, and the publish path below is byte-identical.
+  arbiter = make_arbiter(params)
+
   publish_state = PublishState()
-  chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
+  chestnut_state = _get_chestnut_state_class()(pm, model.chestnut) if CHESTNUT else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)
@@ -339,6 +447,9 @@ def main(demo=False):
 
   if demo:
     CP = get_demo_car_params()
+  elif os.environ.get('OFFLOAD') == '1':
+    # OFFLOAD §4d: Params storage may be empty/unbacked on the Mac; seed CarParams bytes explicitly.
+    CP = _load_offload_car_params()
   else:
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
@@ -385,6 +496,9 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    # OFFLOAD §7: drain the remote (Mac) shadow outputs once per model loop, non-blocking.
+    if arbiter is not None:
+      arbiter.poll(time.monotonic_ns())
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
@@ -485,6 +599,14 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      # OFFLOAD §7: when remote mode is engaged and an eligible shadow set exists for this frame,
+      # publish the REMOTE model's outputs under the real names (re-stamped logMonoTime) instead of
+      # the local ones. Cohesion: all four come from ONE source (never mixed). `remote` is None on
+      # the device / when unengaged / when ineligible => the four local sends below are unchanged.
+      remote = arbiter.select(meta_main.frame_id, time.monotonic_ns()) if arbiter is not None else None
+      if remote is not None:
+        modelv2_send, drivingdata_send = remote['modelV2'], remote['drivingModelData']
+        posenet_send, mdv2sp_send = remote['cameraOdometry'], remote['modelDataV2SP']
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)

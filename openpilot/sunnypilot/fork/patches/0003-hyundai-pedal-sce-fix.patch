@@ -1,0 +1,449 @@
+From f7f0763afc06da70479c3c0e6453620f2baf78f4 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sat, 3 Oct 2026 12:59:31 -0500
+Subject: [PATCH] hyundai: gas interceptor SCE-latch recovery (clear frame +
+ escalation) and bursted CLU11 cancel
+
+Route 11c forensics: during commanded engagements the pedal latched FAULT_SCE (state 3, passthrough) from CAN error
+frames caused by our 100 Hz CLU11 CANCEL colliding with the cluster's own 50 Hz CLU11; only an ENABLE=0 zero frame
+clears it, so the pedal applied 6.56 s of 55.1 s commanded (11.9 %).
+
+FIX 1 (gas_interceptor.py PedalFaultMonitor): while commanding, if the pedal's broadcast STATE is nonzero, the 50 Hz
+send slot carries one ENABLE=0 zero frame instead (counter continuous, valid CRC; costs no torque, the pedal is already
+in passthrough), at most once per 60 ms. Escalation: fault visible > 0.5 s or > 8 clears in 2 s -> CarState.accFaulted
+(standard "Cruise Fault" immediate disable), held until longitudinal disengages.
+Plumbing: CarStateExt owns the monitor next to interceptor_state; that CarState instance is the CS passed to
+create_gas_command, so the controller reads STATE and latches escalation on it, and CarStateExt.update reports it on
+the next frame. No capnp/schema change; inert unless CP_SP.enableGasInterceptor.
+
+FIX 2 (carcontroller.py, gas interceptor only): CLU11 CANCEL after the existing 10-frame delay is sent as 5-frame
+bursts with rotating 150/200/250 ms pauses (20 % duty) instead of every frame. Stock pcmCruise cars and the CAN FD
+path are unchanged.
+---
+ opendbc/car/hyundai/carcontroller.py          |   6 +-
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  11 +-
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  87 ++++++-
+ .../car/hyundai/tests/test_gas_interceptor.py | 238 ++++++++++++++++++
+ 4 files changed, 336 insertions(+), 6 deletions(-)
+
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index 26539f41..f4dcaf14 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -9,7 +9,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParam
+ from opendbc.car.interfaces import CarControllerBase
+ 
+ from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
+-from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController
++from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController, cancel_burst_active
+ from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
+ from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
+ from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
+@@ -172,7 +172,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     # openpilot wants to coast: controlsd requests cancel whenever it is on (pcmCruise=False), so keep cancelling it.
+     if not self.CP.openpilotLongitudinalControl or self.CP_SP.enableGasInterceptor:
+       if self.cancel_counter > CANCEL_BUTTON_DELAY_FRAMES:
+-        can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
++        # gas interceptor: bursts with pauses, not every frame (CLU11 collisions with the cluster latch pedal faults)
++        if not self.CP_SP.enableGasInterceptor or cancel_burst_active(self.cancel_counter - CANCEL_BUTTON_DELAY_FRAMES - 1):
++          can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
+       elif CC.cruiseControl.resume and not self.CP_SP.enableGasInterceptor:
+         # send resume at a max freq of 10Hz
+         if (self.frame - self.last_button_frame) * DT_CTRL > 0.1:
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 4a91a4ae..d6db93a0 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -11,7 +11,7 @@ from opendbc.car import Bus, structs
+ from opendbc.can.parser import CANParser
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+-                                                         get_interceptor_gas, get_interceptor_ids
++                                                         PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ 
+@@ -21,7 +21,10 @@ class CarStateExt:
+     self.CP_SP = CP_SP
+ 
+     self.aBasis = 0.0
+-    self.interceptor_state = 0  # GAS_SENSOR STATE, 0 = NO_FAULT (parsed for visibility only; see FORK.md open items)
++    # GAS_SENSOR STATE, 0 = NO_FAULT. Read by GasInterceptorCarController.create_gas_command (this CarState instance is
++    # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
++    self.interceptor_state = 0
++    self.pedal_fault_monitor = PedalFaultMonitor()
+ 
+   def update_speed_limit(self, cp, cp_cam) -> float:
+     speed_limit = 0
+@@ -85,6 +88,10 @@ class CarStateExt:
+       sensor_msg = get_interceptor_ids(self.CP_SP).sensor_msg  # GAS_SENSOR (0x201) or GAS_SENSOR_R (0x701)
+       ret.gasPressed = get_interceptor_gas(cp_gas, sensor_msg) > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+       self.interceptor_state = int(cp_gas.vl[sensor_msg]["STATE"])
++      # pedal fault the clear frames could not recover (set by the controller on the previous frame): standard cruise
++      # fault -> immediate disengage + alert, so the driver knows openpilot no longer has throttle authority
++      if self.pedal_fault_monitor.escalated:
++        ret.accFaulted = True
+ 
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 296fc102..62ff0174 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -11,6 +11,7 @@ Driver-supervisory contract (there is NO brake actuator on these cars):
+   - accel request <  0  -> pedal command drops toward 0 = lift-off/coast, engine braking only, NEVER service brakes
+   - no stop-and-go: openpilot longitudinal is disengaged below minEnableSpeed; the driver must brake
+ """
++from collections import deque
+ from dataclasses import dataclass
+ 
+ import numpy as np
+@@ -91,6 +92,84 @@ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
+   return (cp.vl[sensor_msg]["INTERCEPTOR_GAS"] + cp.vl[sensor_msg]["INTERCEPTOR_GAS2"]) // 2
+ 
+ 
++# *** pedal fault latch recovery (route 11c forensics, FORK.md #14) ***
++# The pedal firmware latches ANY fault (GAS_SENSOR STATE != 0, e.g. 3 = FAULT_SCE from a CAN error frame) and then
++# ignores every ENABLE=1 command (passthrough = no openpilot throttle). Only a valid ENABLE=0 / all-zero frame clears it.
++# While commanding we therefore spend ONE send slot on a zero frame when the pedal reports a fault. It costs no torque:
++# a faulted pedal is already in passthrough. Frame units are the 100 Hz carcontroller frame (DT_CTRL).
++# Holdoff: zero frame -> 0x701 with STATE 0 measured 16-26 ms on the road, + <=10 ms until CarState sees it; 60 ms
++# bounds re-clearing on stale state to at most one extra clear.
++PEDAL_CLEAR_HOLDOFF_FRAMES = 6         # >= 60 ms between clear frames
++# Escalation: the clear isn't working -> tell the driver throttle authority is gone (accFaulted -> "Cruise Fault").
++PEDAL_FAULT_TIMEOUT_FRAMES = 50        # fault continuously visible while commanding for > 0.5 s
++PEDAL_MAX_CLEARS = 8                   # more than this many clears ...
++PEDAL_CLEAR_WINDOW_FRAMES = 200        # ... within 2 s
++
++
++class PedalFaultMonitor:
++  """Clear-frame policy + escalation. Owned by CarStateExt (which also reads `escalated` into accFaulted) and stepped
++  by GasInterceptorCarController once per controller frame; inert unless the gas interceptor is enabled."""
++  def __init__(self):
++    self.last_clear_frame: int | None = None
++    self.clear_frames: deque[int] = deque()
++    self.fault_start_frame: int | None = None
++    self.escalated = False
++
++  def reset(self) -> None:
++    self.fault_start_frame = None
++    self.clear_frames.clear()
++    self.escalated = False
++
++  def update(self, frame: int, active: bool, state: int, send_slot: bool, gas: float) -> bool:
++    """-> True if this send slot must carry the zero (clear) frame instead of `gas`."""
++    if not active:
++      # not commanding: the stream is all zero frames, which clear any fault by themselves. Re-arm.
++      self.reset()
++      return False
++
++    if state == 0:
++      self.fault_start_frame = None
++    elif self.fault_start_frame is None:
++      self.fault_start_frame = frame
++
++    while self.clear_frames and frame - self.clear_frames[0] >= PEDAL_CLEAR_WINDOW_FRAMES:
++      self.clear_frames.popleft()
++
++    send_clear = (send_slot and state != 0 and gas > 0. and
++                  (self.last_clear_frame is None or frame - self.last_clear_frame >= PEDAL_CLEAR_HOLDOFF_FRAMES))
++    if send_clear:
++      self.last_clear_frame = frame
++      self.clear_frames.append(frame)
++
++    if (self.fault_start_frame is not None and frame - self.fault_start_frame > PEDAL_FAULT_TIMEOUT_FRAMES) or \
++       len(self.clear_frames) > PEDAL_MAX_CLEARS:
++      self.escalated = True  # held until longitudinal disengages (active -> False)
++    return send_clear
++
++
++# *** bursted CLU11 CANCEL (gas interceptor mode only) ***
++# Our CANCEL CLU11 (0x4F1) shares the ID with the cluster's own 50 Hz CLU11. Sent every 10 ms frame, the two collide
++# (panda bit1Errors/bus-offs, 100 % inside cancel streams on route 11c) and every error frame can latch the pedal's
++# FAULT_SCE. Send short bursts with pauses instead: CANCEL_BURST_FRAMES frames, then a pause that rotates through
++# CANCEL_PAUSE_FRAMES (150/200/250 ms: a fixed period could phase-lock with the cluster's 20 ms schedule).
++CANCEL_BURST_FRAMES = 5
++CANCEL_PAUSE_FRAMES = (15, 20, 25)
++_CANCEL_CYCLE = tuple((CANCEL_BURST_FRAMES, p) for p in CANCEL_PAUSE_FRAMES)
++CANCEL_CYCLE_FRAMES = sum(b + p for b, p in _CANCEL_CYCLE)
++
++
++def cancel_burst_active(n: int) -> bool:
++  """n = frames since the cancel button send became due (0 = first frame). True -> send CANCEL on this frame."""
++  k = n % CANCEL_CYCLE_FRAMES
++  for burst, pause in _CANCEL_CYCLE:
++    if k < burst:
++      return True
++    k -= burst + pause
++    if k < 0:
++      return False
++  return False  # unreachable
++
++
+ class GasInterceptorCarController:
+   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict):
+     self.CP = CP
+@@ -111,8 +190,12 @@ class GasInterceptorCarController:
+     self.gas = get_pedal_command(CC.actuators.accel, CS.out.vEgo) if active else 0.
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+-    if frame % 2 == 0:
+-      can_sends.append(create_gas_interceptor_command(self.interceptor_packer, self.gas, frame // 2,
++    send_slot = frame % 2 == 0
++    # pedal reports a latched fault while we command -> this slot carries the clear (zero) frame instead
++    # (counter stays continuous: the clear frame simply occupies the slot)
++    clear = CS.pedal_fault_monitor.update(frame, active, CS.interceptor_state, send_slot, self.gas)
++    if send_slot:
++      can_sends.append(create_gas_interceptor_command(self.interceptor_packer, 0. if clear else self.gas, frame // 2,
+                                                      self.interceptor_ids.command_msg))
+ 
+     return can_sends
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index f0f2baf8..fe3e7582 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -316,3 +316,241 @@ class TestEnablement:
+     assert ids.command_addr in sent and other.command_addr not in sent
+     # no SCC replacement / radar disable traffic
+     assert not sent & {0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x38D, 0x483, 0x7D0}
++
++
++# *** pedal fault latch recovery: clear frame + escalation (FORK.md #14, route 11c) ***
++
++def _sensor_frame_state(ids, gas: int, counter: int, state: int):
++  dat = bytearray(_sensor_frame(ids, gas, counter)[1])
++  dat[4] = ((state & 0xF) << 4) | (counter & 0xF)
++  dat[5] = crc8_pedal(dat[:5])
++  return ids.sensor_addr, bytes(dat)
++
++
++def _cmd_fields(dat: bytes) -> tuple[int, int, int, int]:
++  """-> (track A, track B, ENABLE, counter)"""
++  return (dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3], dat[4] >> 7, dat[4] & 0xF
++
++
++class TestPedalFaultMonitor:
++  """Policy unit: 100 Hz frames, send slot on even frames, gas > 0 while active."""
++  def _run(self, states, active=True, gas=0.1):
++    mon = gi.PedalFaultMonitor()
++    clears, escalated = [], []
++    for frame, st in enumerate(states):
++      if mon.update(frame, active, st, frame % 2 == 0, gas):
++        clears.append(frame)
++      escalated.append(mon.escalated)
++    return clears, escalated
++
++  def test_no_fault_no_clear(self):
++    clears, esc = self._run([0] * 1000)
++    assert clears == [] and not any(esc)
++
++  def test_fault_clears_rate_limited(self):
++    # fault visible for 40 frames (state stale/sticky): clears only on send slots, >= holdoff apart
++    clears, _ = self._run([0] * 10 + [3] * 40 + [0] * 50)
++    assert clears == [10, 16, 22, 28, 34, 40, 46]
++    assert all(c % 2 == 0 for c in clears)
++    assert all(b - a >= gi.PEDAL_CLEAR_HOLDOFF_FRAMES for a, b in zip(clears, clears[1:], strict=False))
++    # exactly one clear per 60 ms window
++    for start in range(100):
++      assert sum(start <= c < start + gi.PEDAL_CLEAR_HOLDOFF_FRAMES for c in clears) <= 1
++
++  def test_fault_on_odd_frame_waits_for_send_slot(self):
++    clears, _ = self._run([0] * 11 + [3] + [0] * 10)
++    assert clears == []  # one-tick blip on a non-send frame, gone before the slot: nothing to clear
++    clears, _ = self._run([0] * 11 + [3, 3] + [0] * 10)
++    assert clears == [12]
++
++  @pytest.mark.parametrize("state", [1, 2, 3, 4, 5, 6])
++  def test_any_fault_state_is_cleared(self, state):
++    clears, _ = self._run([0] * 4 + [state] + [0] * 10)
++    assert clears == [4]
++
++  def test_inactive_never_clears_or_escalates(self):
++    clears, esc = self._run([3] * 500, active=False)
++    assert clears == [] and not any(esc)
++
++  def test_zero_gas_never_clears(self):
++    # commanding gas 0 already sends the (clearing) zero frame; no substitution needed
++    clears, _ = self._run([3] * 30, gas=0.)
++    assert clears == []
++
++  def test_escalates_on_persistent_fault_timeout(self):
++    # time path in isolation: gas 0 -> no clear substitutions (the stream is already zero), fault stays anyway
++    clears, esc = self._run([0] * 10 + [3] * 100, gas=0.)
++    assert clears == []
++    first = esc.index(True)
++    assert first == 10 + gi.PEDAL_FAULT_TIMEOUT_FRAMES + 1  # strictly more than 0.5 s of continuous fault
++    assert all(esc[first:])
++    # 0.5 s exactly does not escalate
++    _, esc = self._run([0] * 10 + [3] * (gi.PEDAL_FAULT_TIMEOUT_FRAMES + 1) + [0] * 100, gas=0.)
++    assert not any(esc)
++
++  def test_escalates_on_persistent_fault_while_clearing(self):
++    # a fault the clears can't recover: one clear per 60 ms, the 9th lands 480 ms in -> count path fires (<= 0.5 s)
++    clears, esc = self._run([0] * 10 + [3] * 100)
++    first = esc.index(True)
++    assert first == clears[gi.PEDAL_MAX_CLEARS] == 10 + gi.PEDAL_MAX_CLEARS * gi.PEDAL_CLEAR_HOLDOFF_FRAMES
++    assert first - 10 <= gi.PEDAL_FAULT_TIMEOUT_FRAMES and all(esc[first:])
++
++  def test_escalates_on_too_many_clears(self):
++    # short blips (each cleared, never 0.5 s long) every 200 ms: 10 clears in 2 s -> 9th clear escalates
++    states = ([3, 3] + [0] * 18) * 15
++    clears, esc = self._run(states)
++    first = esc.index(True)
++    assert first == clears[gi.PEDAL_MAX_CLEARS]  # the (MAX+1)th clear
++    assert len([c for c in clears if c <= first]) == gi.PEDAL_MAX_CLEARS + 1
++    assert clears[gi.PEDAL_MAX_CLEARS] - clears[0] < gi.PEDAL_CLEAR_WINDOW_FRAMES
++
++  def test_slow_blips_do_not_escalate(self):
++    # 8 clears per 2 s is tolerated indefinitely (blip every 250 ms)
++    clears, esc = self._run(([3, 3] + [0] * 23) * 40)
++    assert len(clears) == 40 and not any(esc)
++
++  def test_escalation_held_until_disengage_then_rearms(self):
++    mon = gi.PedalFaultMonitor()
++    for f in range(100):
++      mon.update(f, True, 3, f % 2 == 0, 0.1)
++    assert mon.escalated
++    mon.update(100, True, 0, True, 0.1)
++    assert mon.escalated  # recovery while still engaged doesn't silently re-arm
++    mon.update(101, False, 0, False, 0.)
++    assert not mon.escalated and mon.fault_start_frame is None and not mon.clear_frames
++
++
++class TestPedalFaultClearEndToEnd:
++  """Through the real call path: CarInterface.update (CarState parses 0x701 STATE) -> CarInterface.apply
++  (CarController.create_gas_command) -> the 0x700 frames on the wire, and accFaulted back out of CarState."""
++  def _setup(self, ids=gi.REMAPPED_IDS, pedal=REM):
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **pedal}, True)
++    CI = CarInterface(CP, CP_SP)
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = CC.longActive = True
++    CC.actuators.accel = 1.0
++    return CI, CC.as_reader(), structs.CarControlSP(), ids
++
++  def _drive(self, CI, CC, CC_SP, ids, states, v_ego=25.):
++    t = 0
++    out = []
++    for i, st in enumerate(states):
++      t += int(DT_CTRL * 1e9)
++      ret, _ = CI.update([(t, [(*_sensor_frame_state(ids, 0, i, st), 0)])])
++      CI.CS.out.vEgo = v_ego
++      _, sends = CI.apply(CC, CC_SP, t)
++      cmd = [dat for addr, dat, _ in sends if addr == ids.command_addr]
++      out.append((cmd[0] if cmd else None, ret.accFaulted))
++    return out
++
++  @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
++  def test_clear_frame_on_fault(self, pedal, ids):
++    CI, CC, CC_SP, ids = self._setup(ids, pedal)
++    out = self._drive(CI, CC, CC_SP, ids, [0] * 20 + [3] * 20 + [0] * 20)
++    cmds = [(f, _cmd_fields(d)) for f, (d, _) in enumerate(out) if d is not None]
++    assert all(f % 2 == 0 for f, _ in cmds) and len(cmds) == 30
++    # counter continuous across clear frames
++    assert all((b[1][3] - a[1][3]) % 16 == 1 for a, b in zip(cmds, cmds[1:], strict=False))
++    zero = [f for f, c in cmds if c[2] == 0]
++    assert zero == [20, 26, 32, 38]
++    for f, (a, b, en, _) in cmds:
++      if f in zero:
++        assert (a, b, en) == (0, 0, 0)  # the firmware's clear frame: ENABLE=0, both tracks 0
++      else:
++        assert en == 1 and abs(a - 788) <= 2  # commanding at the cap
++    assert not any(acc for _, acc in out)
++    # every frame (incl. clears) has a valid pedal checksum
++    assert all(d[5] == crc8_pedal(d[:5]) for d, _ in out if d is not None)
++
++  def test_no_fault_unchanged(self):
++    CI, CC, CC_SP, ids = self._setup()
++    out = self._drive(CI, CC, CC_SP, ids, [0] * 300)
++    cmds = [_cmd_fields(d) for d, _ in out if d is not None]
++    assert len(cmds) == 150 and all(en == 1 for _, _, en, _ in cmds)
++    assert not any(acc for _, acc in out)
++
++  def test_persistent_fault_sets_acc_faulted(self):
++    CI, CC, CC_SP, ids = self._setup()
++    out = self._drive(CI, CC, CC_SP, ids, [0] * 10 + [3] * 80)
++    acc = [a for _, a in out]
++    first = acc.index(True)
++    # the 9th clear (frame 10 + 8*6) latches escalation in the controller; the next CarState update reports it
++    assert first == 10 + gi.PEDAL_MAX_CLEARS * gi.PEDAL_CLEAR_HOLDOFF_FRAMES + 1
++    assert first - 10 <= gi.PEDAL_FAULT_TIMEOUT_FRAMES + 1
++    assert all(acc[first:])
++
++  def test_disengaged_never_clears(self):
++    CI, _, CC_SP, ids = self._setup()
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = True  # lateral only
++    out = self._drive(CI, CC.as_reader(), CC_SP, ids, [3] * 200)
++    assert all(_cmd_fields(d)[:3] == (0, 0, 0) for d, _ in out if d is not None)
++    assert not any(a for _, a in out)
++
++  def test_no_interceptor_car_inert(self):
++    CarInterface, CP, CP_SP = _get_ci(BASE_FINGERPRINT, None)
++    CI = CarInterface(CP, CP_SP)
++    assert not CP_SP.enableGasInterceptor
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = CC.longActive = True
++    for i in range(50):
++      CI.update([])
++      CI.CS.interceptor_state = 3  # even a bogus state can't produce anything
++      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i)
++      assert not {a for a, _, _ in sends} & {0x200, 0x700}
++    assert not CI.CS.pedal_fault_monitor.escalated and not CI.CS.pedal_fault_monitor.clear_frames
++
++
++class TestCancelBursts:
++  def _cancel_frames(self, pedal: dict | None, n: int = 400) -> list[int]:
++    fp = BASE_FINGERPRINT if pedal is None else {**BASE_FINGERPRINT, **pedal}
++    CarInterface, CP, CP_SP = _get_ci(fp, None if pedal is None else True)
++    CI = CarInterface(CP, CP_SP)
++    CC = structs.CarControl()
++    CC.cruiseControl.cancel = True
++    frames = []
++    for i in range(n):
++      CI.update([])
++      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i)
++      if any(a == 0x4F1 for a, _, _ in sends):
++        frames.append(i)
++    return frames
++
++  def test_burst_pattern(self):
++    pat = [gi.cancel_burst_active(n) for n in range(gi.CANCEL_CYCLE_FRAMES * 2)]
++    assert sum(pat) == 2 * gi.CANCEL_BURST_FRAMES * len(gi.CANCEL_PAUSE_FRAMES)
++    assert pat[:5] == [True] * 5 and not any(pat[5:20]) and all(pat[20:25]) and not any(pat[25:45]) and all(pat[45:50])
++    assert gi.CANCEL_CYCLE_FRAMES == 75 and not any(pat[50:75]) and all(pat[75:80])
++    # pauses within the specified 150-250 ms
++    assert all(15 <= p <= 25 for p in gi.CANCEL_PAUSE_FRAMES) and 3 <= gi.CANCEL_BURST_FRAMES <= 5
++
++  def test_interceptor_cancel_bursted(self):
++    frames = self._cancel_frames(REM)
++    # same 10-frame delay as before, then bursts of 5 consecutive frames with 150/200/250 ms pauses
++    assert frames[0] == 10
++    bursts = []
++    for f in frames:
++      if bursts and f == bursts[-1][-1] + 1:
++        bursts[-1].append(f)
++      else:
++        bursts.append([f])
++    assert all(len(b) == gi.CANCEL_BURST_FRAMES for b in bursts[:-1])
++    gaps = [b[0] - a[-1] - 1 for a, b in zip(bursts, bursts[1:], strict=False)]
++    assert gaps[:6] == [15, 20, 25, 15, 20, 25]
++    assert len(frames) < 0.25 * 390  # duty 20 % vs 100 % before
++
++  def test_cancel_stops_immediately(self):
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    CI = CarInterface(CP, CP_SP)
++    CC = structs.CarControl()
++    for i in range(60):
++      CC.cruiseControl.cancel = i < 30
++      CI.update([])
++      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i)
++      if i >= 30:
++        assert not any(a == 0x4F1 for a, _, _ in sends)
++
++  def test_non_interceptor_cancel_unchanged(self):
++    # stock (pcmCruise) cars keep the continuous stream after the delay
++    frames = self._cancel_frames(None, 100)
++    assert frames == list(range(10, 100))
+-- 
+2.55.0
+

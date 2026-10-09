@@ -1,0 +1,218 @@
+From 52458a579e3f2a150304e7f498c95538741042e6 Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Wed, 7 Oct 2026 22:27:45 -0500
+Subject: [PATCH] hyundai: FCA11-long CAL budget-aware arming (0031)
+
+The 0029 cal sequencer arms a rep whenever the plan is due and the drive conditions hold, with no
+knowledge of the panda's 2.5 s actuation budget / 3 s cooldown. A rep that is armed into a cooldown
+(or with too little budget left) commands frames the panda refuses, yet the sequencer still records
+it as outcome=ok -- so progress.json reports done reps that delivered nothing. On the drive-14 cal
+matrix 5 of 16 "ok" reps were exactly this (3 camera_owns + 2 stale-act_active; see REFUSALS.md).
+
+0031 surfaces the car layer's EXISTING panda budget mirror (_in_budget / _budget_start /
+_budget_end in fca11_long.py) to the CalSequencer and gates rep ARMING on it:
+
+  can_arm := in_budget
+               ? (budget_start + CAL_BUDGET_FRAMES - frame) >= need
+               : (budget_end < 0) or (frame - budget_end) > CAL_COOLDOWN_FRAMES + CAL_COOLDOWN_MARGIN_FRAMES
+  need    := round(hold_s * 100) + CAL_HOLD_MARGIN_FRAMES   (2.2 s -> 220 + 10 = 230 frames)
+
+A second guard aborts a rep whose hold has never seen a live episode (the arming gate can be one
+frame stale when the release that starts the cooldown happens after the publish on its frame), so a
+rep can no longer burn its hold inside a cooldown and still be recorded. Python-only: no safety
+model, no firmware, no panda change. Inert when cal mode is off (byte-identical).
+---
+ opendbc/sunnypilot/car/hyundai/cal_mode.py   | 99 +++++++++++++++++++-
+ opendbc/sunnypilot/car/hyundai/fca11_long.py |  7 ++
+ 2 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index fe1e5a5..d73d9f2 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -81,6 +81,15 @@ CAL_MAX_LSB = 30           # HYUNDAI_FCA11_LONG_MAX_DEC: the PANDA gate (persona
+ CAL_MIN_LSB = 2            # FCA11_DEC_ACTIVE_FLOOR: an episode never commands 0
+ CAL_RATE_STEP_LSB = 4      # HYUNDAI_FCA11_LONG_RATE_STEP: +LSB per SENT frame ceiling
+ 
++# --- 0031: the panda actuation-budget / cooldown mirror constants, DUPLICATED from fca11_long.py
++# (same no-import-cycle rationale as CAL_MAX_LSB above; the unit tests PIN them against the shipped
++# fca11_long values). The sequencer gates rep ARMING on this mirror so it never starts a rep the
++# panda will refuse for budget/cooldown reasons -- a refused rep still counts as `ok` in progress.
++CAL_BUDGET_FRAMES = 250           # == fca11_long.FCA11_BUDGET_FRAMES   (2.5 s @ 100 Hz)
++CAL_COOLDOWN_FRAMES = 300         # == fca11_long.FCA11_COOLDOWN_FRAMES (3.0 s @ 100 Hz)
++CAL_COOLDOWN_MARGIN_FRAMES = 2    # == fca11_long.FCA11_COOLDOWN_MARGIN_FRAMES
++CAL_HOLD_MARGIN_FRAMES = 10       # extra slack on top of a rep's hold (quantisation/ordering)
++
+ # --- defaults (all overridable in plan.json)
+ DEFAULT_TTL_S = 900.0              # a plan is inert if not refreshed/valid within this many seconds of "now"
+ DEFAULT_EXPIRES_DAYS = 30.0        # optional plan expiry
+@@ -123,6 +132,38 @@ def _to_int(v, default):
+     return default
+ 
+ 
++def _fca11_budget_predicate(hold_s: float, in_budget: bool, budget_start: int, budget_end: int,
++                            frame: int) -> tuple[bool, str]:
++  """THE 0031 ARMED-ONLY-IF-PROVABLY-FULL PREDICATE. ``m`` are the car layer's panda budget mirror
++  values ``(in_budget, budget_start, budget_end)`` and ``frame`` is the 100 Hz controller frame.
++
++  Returns ``(can_arm, reason)``. A rep may be armed ONLY when the mirror PROVABLY has room for the
++  whole hold (the release/passive frame needs no budget). If the answer is not an unambiguous yes
++  (e.g. the mirror has not been published yet) the caller must NOT arm.
++
++  Semantics (mirror of ``fca11_long.Fca11LongBrake.update``):
++    in_budget True   -> inside a continuous actuation episode opened at ``budget_start``; the panda
++                        allows ``FCA11_BUDGET_FRAMES`` frames from there.
++    in_budget False  -> not in an episode; ``budget_end >= 0`` is the frame the closing passive frame
++                        was EMITTED, and a new actuation is refused until the cooldown has run.
++  """
++  need = int(round(float(hold_s) * 100.0)) + CAL_HOLD_MARGIN_FRAMES
++  if in_budget:
++    if budget_end >= 0:
++      return False, "budget_mirror_inconsistent"          # can't be both in-episode and ended
++    remaining = (int(budget_start) + CAL_BUDGET_FRAMES) - int(frame)
++    if remaining < need:
++      return False, f"budget_low(remaining={remaining},need={need})"
++    return True, f"budget_room(remaining={remaining},need={need})"
++  if budget_end >= 0:
++    # cooldown: the panda refuses a new actuation until
++    #   frame - budget_end > CAL_COOLDOWN_FRAMES + CAL_COOLDOWN_MARGIN_FRAMES
++    if (int(frame) - int(budget_end)) <= (CAL_COOLDOWN_FRAMES + CAL_COOLDOWN_MARGIN_FRAMES):
++      return False, f"cooldown(frame={int(frame)},end={int(budget_end)})"
++    return True, "budget_full"
++  return True, "budget_room(fresh_episode)"
++
++
+ def plan_id(obj: dict) -> str:
+   """Stable id over the rep matrix + revision. A NEW plan revision resets all progress, as required."""
+   reps = obj.get("reps") or []
+@@ -245,6 +286,7 @@ class CalSequencer:
+     self._session_reps = 0
+     self._active: CalRep | None = None
+     self._hold_frames = 0
++    self._rep_saw_budget = False   # 0031: the armed rep has seen a live (in-budget) episode
+     self._on_start = -1          # frame the current rep's actuation opened on
+     self._release_frame = -1     # frame braking last went False
+     self._last_outcome = ""
+@@ -255,6 +297,18 @@ class CalSequencer:
+     self._yaw_hist: list[tuple[int, float]] = []
+     self._block_reason = "no_plan"
+     self._last_act_frame = -1
++    # ---- 0031: the panda budget/cooldown mirror published by Fca11LongBrake.update ----
++    # The car layer already mirrors the panda's 2.5 s budget / 3 s cooldown (``_in_budget``,
++    # ``_budget_start``, ``_budget_end`` in fca11_long.py). 0031 surfaces that mirror here so the
++    # sequencer gates ARMING on it: never start a rep whose hold+release would run past the
++    # remaining budget, and never start one while the cooldown is running.
++    # Default = a FRESH episode: at process start the panda has just ``hyundai_init``'d
++    # (act_active false, no cooldown), and ``update`` publishes this frame's exact values before
++    # every ``tick`` in production. ``_budget_published`` records whether a real mirror has been
++    # seen (diagnostics only).
++    self._budget_mirror: dict = {"in_budget": False, "budget_start": 0, "budget_end": -1}
++    self._budget_published = False
++    self._last_budget_reason = ""
+ 
+   # ------------------------------------------------------------------ config
+   def set_phases(self, phases) -> None:
+@@ -275,6 +329,22 @@ class CalSequencer:
+     self._session = int(session)
+     self._session_reps = 0
+ 
++  # ------------------------------------------------------------------ 0031 budget gate
++  def set_budget_mirror(self, in_budget: bool, budget_start: int, budget_end: int) -> None:
++    """Publish the car layer's panda budget/cooldown mirror (fca11_long ``_in_budget`` /
++    ``_budget_start`` / ``_budget_end``) for the arming gate below. Called by
++    ``Fca11LongBrake.update`` every frame, before ``tick``."""
++    self._budget_mirror = {"in_budget": bool(in_budget), "budget_start": int(budget_start),
++                           "budget_end": int(budget_end)}
++    self._budget_published = True
++
++  def budget_can_arm(self, hold_s: float, frame: int) -> tuple[bool, str]:
++    """THE 0031 PREDICATE. True only when the panda's budget/cooldown mirror provably has room
++    for a ``hold_s`` rep (as ``_fca11_budget_predicate``), so the sequencer never arms a rep the
++    panda will refuse."""
++    m = self._budget_mirror
++    return _fca11_budget_predicate(hold_s, m["in_budget"], m["budget_start"], m["budget_end"], frame)
++
+   # ------------------------------------------------------------------ gate
+   def _reload_plan(self, now_wall: float, frame: int) -> None:
+     if frame - self._stat_at < _STAT_EVERY and self._loaded_at > 0:
+@@ -466,19 +536,27 @@ class CalSequencer:
+       if not self._conditions_ok(CC, CS)[0]:
+         self._block_reason = self._conditions_ok(CC, CS)[1]
+         return
++      # remaining budget (0031): never arm a rep the panda will refuse for budget/cooldown
+       pick = None
++      blocked_by_budget = False
+       for rep in self._enabled_reps():
+         if self._is_complete(rep):
+           continue
+         if not self._band_ready(rep.band_kph):
+           continue
++        can, why = self.budget_can_arm(rep.hold_s, frame)
++        if not can:
++          blocked_by_budget = True
++          self._last_budget_reason = why
++          continue
+         pick = rep
+         break
+       if pick is None:
+-        self._block_reason = "band_not_ready"
++        self._block_reason = "budget_block" if blocked_by_budget else "band_not_ready"
+         return
+       # START the rep: command the level NOW. The brake enters on the panda-rate ramp (a clean step).
+       self._active = pick
++      self._rep_saw_budget = False
+       self.level_lsb = pick.level_lsb
+       self.active_actuation = True
+       self._on_start = frame
+@@ -509,6 +587,23 @@ class CalSequencer:
+       self.level_lsb = 0
+       self._block_reason = "conditions_lapsed"
+       return
++    # 0031: an armed rep must not spend its whole hold delivering nothing. The arming gate can still
++    # be one frame stale (the release that starts a cooldown happens AFTER the publish on its frame),
++    # so re-check here. A rep that has NEVER seen a live episode since it was armed (the mirror says
++    # we still cannot arm) is commanding frames the panda refuses -- abort it. Once the rep's own (or
++    # a production) episode has opened, `_rep_saw_budget` latches and the hold proceeds normally.
++    m = self._budget_mirror
++    if not m["in_budget"] and not self._rep_saw_budget:
++      can, why = self.budget_can_arm(self._active.hold_s, frame)
++      if not can:
++        self._last_budget_reason = why
++        self._active = None
++        self.active_actuation = False
++        self.level_lsb = 0
++        self._block_reason = "budget_abort"
++        return
++    elif m["in_budget"]:
++      self._rep_saw_budget = True
+     if (frame - self._on_start) < int(round(self._active.hold_s * 100.0)):
+       # an optional MID-HOLD STEP-DOWN (the partial-release test): drop the command to level2 once
+       # switch_at_s of the hold has elapsed. A downward step is emitted immediately.
+@@ -550,4 +645,6 @@ class CalSequencer:
+       "session_reps": self._session_reps,
+       "active_rep": self._active.id if self._active is not None else None,
+       "phases": list(self._phase_enabled),
++      "budget_mirror": self._budget_mirror,
++      "budget_reason": self._last_budget_reason,
+     }
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 7a8925a..651ca80 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -462,6 +462,13 @@ class Fca11LongBrake:
+     # the first dec_cmd frame (Fable's gas-neutralization timing item). cal_on is LATCHED between
+     # ticks; it can only ever be true while the last tick commanded a hold AND a gate still holds.
+     if self.cal_seq is not None and frame % FCA11_SEND_EVERY == 0:
++      # 0031: publish the panda budget/cooldown mirror BEFORE ticking, so the sequencer's ARMING
++      # gate sees this frame's exact state. `_in_budget` == the panda's act_active; `_budget_start`
++      # is the frame the current episode opened; `_budget_end` is the frame the closing passive
++      # frame was emitted (the cooldown clock). The sequencer will not start a rep whose hold +
++      # release would exceed the remaining budget, nor while the cooldown is running -- a rep the
++      # panda refuses still lands in progress.json as outcome=ok, which is what we are fixing.
++      self.cal_seq.set_budget_mirror(self._in_budget, self._budget_start, self._budget_end)
+       self.cal_seq.tick(CC, CS, frame)
+     # cal_on is the scripted ASK, gated by `ok` exactly like a planner ask: a production veto (camera
+     # owns, gear out of D, below floor, pedal fault, driver-cut latch) suppresses it on the SAME frame.
+-- 
+2.54.0 (Apple Git-157)
+

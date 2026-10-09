@@ -104,6 +104,12 @@ class ControlsExt(ModelStateBase):
     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
 
+    # fork (adurham): carry the driver's longitudinal personality to the car controller so car-brand actuation can be
+    # scaled by the feel dial (Hyundai pedal law: launch ceiling / pull gain / interceptor cap). Personality is
+    # live (distance button mid-drive). selfdriveState.personality is a capnp _DynamicEnum; .raw is the enum int. A
+    # missing / not-yet-seen selfdriveState must NOT silently read as 0 (aggressive) -> fall back to standard.
+    CC_SP.personality = int(sm['selfdriveState'].personality.raw) if sm.seen.get('selfdriveState') else int(log.LongitudinalPersonality.standard)
+
     return CC_SP
 
   @staticmethod

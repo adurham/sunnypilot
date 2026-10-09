@@ -180,7 +180,9 @@ class DeveloperLayoutMici(NavScroller):
 
   def _on_lat_maneuver_mode(self, state: bool):
     ui_state.params.put_bool("LateralManeuverMode", state, block=True)
-    ui_state.params.put_bool("ExperimentalMode", False, block=True)
+    # fork #30: do NOT overwrite the owner's stored ExperimentalMode here. While this mode is on,
+    # experimental mode is suppressed at runtime (fork/cruise_prefs.experimental_active, consumed by
+    # card/selfdrived), so the stored preference survives toggling this on and off.
     ui_state.params.put_bool("JoystickDebugMode", False, block=True)
     self._joystick_toggle.set_checked(False)
     ui_state.params.put_bool("LongitudinalManeuverMode", False, block=True)

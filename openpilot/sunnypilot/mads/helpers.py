@@ -6,6 +6,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from openpilot.common.params import Params
+from openpilot.sunnypilot.fork.vehicle_specs import apply_fork_vehicle_specs
 from opendbc.car import structs
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
@@ -54,6 +55,11 @@ def set_alternative_experience(CP: structs.CarParams, CP_SP: structs.CarParamsSP
 
 
 def set_car_specific_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params):
+  # Fork-specific vehicle spec overrides (this fork is the deploy target for a
+  # 2022 Elantra N, which upstream configures with base-Elantra specs).
+  # Runs before card.py persists CarParams, so every consumer sees these values.
+  apply_fork_vehicle_specs(CP)
+
   if CP.brand == "hyundai":
     # TODO-SP: This should be separated from MADS module for future implementations
     #          Use "HyundaiLongitudinalMainCruiseToggleable" param

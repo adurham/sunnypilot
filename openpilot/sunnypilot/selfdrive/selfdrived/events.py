@@ -253,11 +253,62 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 0.1),
   },
 
+  # fork: Hyundai comma pedal. The factory cruise MAIN is armed, so pedal-long is locked out (wrongCruiseMode). MADS strips
+  # wrongCruiseMode before the alerts are built (so lateral survives), which made this lockout completely silent.
+  EventNameSP.pedalFactoryCruiseLockout: {
+    ET.PERMANENT: NormalPermanentAlert("Factory Cruise Armed: openpilot Long Off", "Press the CC button to turn it off"),
+  },
+
+  # fork (0040): the low-speed hand-over alert "FCA11: Take Over Below 12 km/h" is DELETED - the speed floors it
+  # warned about (panda 9 km/h, planner 12 km/h) are gone and FCA11 now commands through zero and holds. It is
+  # replaced by the three owner-approved alerts below. EventNameSP.fca11BrakeLowSpeedDEPRECATED @28 holds the retired
+  # ordinal so old logs still decode; no alert is defined for it and nothing raises it.
+  #
+  # steady YELLOW "supervise stop": a stop is being guided at low speed. Warning only.
+  EventNameSP.fca11SuperviseStop: {
+    ET.WARNING: Alert("supervise stop", "FCA11 is braking to a stop - be ready to press the brake",
+                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  # steady YELLOW "stop complete - hold brake pedal": FCA11 has brought the car to a stop and is STILL holding. This
+  # is an explicit HAND-OFF, not a cap: the brake command keeps flowing. It tells the driver to put a foot on the
+  # brake so releasing openpilot/ignition leaves the car held.
+  EventNameSP.fca11StopComplete: {
+    ET.WARNING: Alert("stop complete - hold brake pedal", "FCA11 is holding the stop; keep a foot ready",
+                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  # RED persistent "BRAKE NOW": the ESC is not delivering what we asked (non-response) or the hold was lost. Urgent,
+  # driver-facing, cleared ONLY by the driver pressing the brake (the opendbc flag clears on that edge). Deliberately
+  # NOT a hold-duration alert.
+  EventNameSP.fca11BrakeNow: {
+    ET.PERMANENT: Alert("BRAKE NOW", "FCA11 braking is not responding - press the brake",
+                        AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                        AudibleAlert.warningImmediate, 3.),
+  },
+
   EventNameSP.bigModelReady: {
     ET.PERMANENT: Alert(
       "Big Model Ready",
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 2.),
+  },
+
+  # fork (adurham): drive mode N / N-Custom with DriveModePersonality ON. On a MADS car the log-level
+  # driveModePersonalityBlock is stripped so lateral survives, which would make the lockout silent — this is the
+  # driver-facing permanent alert, the same pattern as pedalFactoryCruiseLockout.
+  EventNameSP.driveModePersonalityLockout: {
+    ET.PERMANENT: NormalPermanentAlert("N Mode: openpilot Long Off", "Drive mode N blocks openpilot longitudinal"),
+  },
+
+  # fork (adurham), patch 0030: FCA11-long braking has been HANDED BACK to the stock camera for the REST OF THIS
+  # IGNITION (the panda's fail-closed camera_owns latch: a stock FCA11 actuation/warning frame on bus 2, or a
+  # pedal fault). The panda now refuses every openpilot 0x38D until the next ignition, so openpilot plans stops
+  # it cannot execute; without this the loss is completely silent. Permanent + driver-facing, the same pattern as
+  # pedalFactoryCruiseLockout. Raised by car_specific.py from CarStateSP.fca11Unavailable (the opendbc half) only
+  # when CP_SP.fca11Brake is on (the feature is armed).
+  EventNameSP.fca11Unavailable: {
+    ET.PERMANENT: NormalPermanentAlert("FCA11 Unavailable: Camera Has Brake", "openpilot braking is off until restart"),
   },
 }

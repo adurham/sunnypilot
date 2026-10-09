@@ -1,0 +1,1707 @@
+From bdd9ef45b7de0301f348aa5342cbcc67ef0c716f Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Thu, 8 Oct 2026 15:50:05 -0500
+Subject: [PATCH] hyundai: FCA11-long - delete the 2.5 s actuation budget and
+ the 3 s cooldown (0035)
+
+The owner saw "about 2 seconds of braking per event". That was OUR limit, not the ESC: the panda's FCA11-long TX
+hook capped a continuous actuation episode at 2.5 s (HYUNDAI_FCA11_LONG_MAX_ACT_US), then REFUSED all new
+actuation for 3 s (HYUNDAI_FCA11_LONG_COOLDOWN_US). The car layer mirrored both and deliberately stopped commanding
+at the budget edge. Route 151 (the first drive with 0030 live): 54 of 77 normal-driving episodes were clipped exactly
+at 2.5 s, 45 of them while the planner was still asking to brake (68.5 s of live demand dropped), 37 mid-stop. 30 of
+the 31 refused 0x38D frames on that drive are the 2.5 s edge frame.
+
+The budget only ever bounded a live-but-wedged host. That case is covered without it: the 30 LSB (0.30 g) cap, the
++4 LSB per accepted frame rate limit, the 100 ms stale-TX hand-back, the heartbeat, the driver-cut latch, the
+camera-owns hand-back and - decisively - braking is kinematically self-terminating (it drives the slowest wheel
+below the 9 km/h floor, where every actuating frame is refused). Any cap below that time truncates real stops; any
+cap above it is dead code. A 2.5 s cap with a 3 s refusal window after it was the worst of both.
+
+Panda (opendbc/safety/modes/hyundai.h):
+  * DELETED: MAX_ACT_US, COOLDOWN_US, act_active, ts_act, ts_act_end and the whole budget/cooldown block.
+  * ONSET rule (the one control change): the rate-limit reference is 0 - so the frame is capped at RATE_STEP
+    (4 LSB) - whenever the ESC is not currently seeing our command: no accepted frame this arm, the last
+    accepted frame was PASSIVE (already true before 0035: a passive frame stores dec_last = 0), or our stream
+    went STALE past TX_STALE (NEW: the same predicate hyundai_fwd_hook uses to forward the camera again).
+    Without the stale term a host could brake at 30, go silent > 100 ms (camera re-owns, ESC sees 0) and reopen
+    at 30 - a 0 -> 30 step at the ESC that the cooldown used to space out and that would now be unbounded.
+    The ramp law, the 30 LSB cap, the speed floor, the driver-cut latch and camera-owns are UNCHANGED.
+
+Car layer (opendbc/sunnypilot/car/hyundai/fca11_long.py):
+  * DELETED: FCA11_BUDGET_FRAMES / FCA11_COOLDOWN_FRAMES / FCA11_COOLDOWN_MARGIN_FRAMES, the _in_budget /
+    _budget_start / _budget_end mirror, the budget-edge stop-commanding, the cooldown hold-off and the cooldown
+    stamping on echo-confirmed passive frames.
+  * KEPT: the passive close frame on every braking true -> false edge (the clean hand-back), the echo re-owe of a
+    refused close frame (now never while braking again - re-owing then would cut the live brake for a slot).
+    The only remaining hold-off is close-frame ORDERING: an owed passive frame goes out first, so a re-brake
+    waits at most one 50 Hz send slot (<= 20 ms).
+
+Cal tool (opendbc/sunnypilot/car/hyundai/cal_mode.py, replaces 0031's predicate):
+  * arming is budget-free under the existing conditions;
+  * CAL_MAX_HOLD_S = 10 s: a rep with a longer (or non-positive / unparseable) hold is refused, never armed;
+  * a tool-side WATCHDOG in Fca11LongBrake drops any scripted ask held > CAL_MAX_HOLD_S + 0.2 s, forces the
+    production release (passive close frame), records the rep 'watchdog' (not ok) and never re-arms it this
+    session. It bounds only the scripted ask - a planner ask is never silenced by it.
+
+Evidence (car-features/fca11-budget-removal/REPORT.md): panda suite 12 test functions red -> green, 273 unchanged
+green; car layer 12 red -> green, 83 unchanged green; real compiled-safety replay of route 151, old vs new in
+lock-step: 11 240 host frames, 30 REFUSED -> SENT (all budget-expiry only), 0 SENT -> REFUSED.
+---
+ opendbc/car/interfaces.py                     |   4 +-
+ opendbc/safety/modes/hyundai.h                |  77 ++--
+ opendbc/safety/tests/test_hyundai.py          | 338 +++++++++++++-----
+ opendbc/sunnypilot/car/hyundai/cal_mode.py    | 173 ++++-----
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  | 195 ++++------
+ .../sunnypilot/car/hyundai/gas_interceptor.py |   2 +-
+ .../car/hyundai/tests/test_fca11_long.py      | 292 +++++++++++----
+ opendbc/sunnypilot/car/hyundai/values.py      |   3 +-
+ .../sunnypilot/car/hyundai/wheel_consent.py   |   2 +-
+ 9 files changed, 656 insertions(+), 430 deletions(-)
+
+diff --git a/opendbc/car/interfaces.py b/opendbc/car/interfaces.py
+index bd7eb3a..13b9d87 100644
+--- a/opendbc/car/interfaces.py
++++ b/opendbc/car/interfaces.py
+@@ -100,7 +100,7 @@ def collect_fca11_echoes(can_packets) -> list[tuple[int, bytes]]:
+   """0030 (D2-iii): the pandad echo of our own 0x38D frames, as (src, dat) pairs.
+ 
+   src 128 = the panda ACCEPTED/forwarded the frame, 192 = it was REJECTED by the TX hook. FCA11-long uses
+-  this to confirm its passive close frame really CLOSED the panda episode before it starts the cooldown
++  this to confirm its passive close frame really CLOSED the panda episode, and re-owes it if refused
+   (fca11_long.observe_echo).
+ 
+   WHY THIS IS A NAMED FUNCTION (not an inline comprehension): ``can_capnp_to_list`` in
+@@ -293,7 +293,7 @@ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
+   def update(self, can_packets: list[tuple[int, list[CanData]]]) -> tuple[structs.CarState, structs.CarStateSP]:
+     # 0030 (D2-iii): the car layer's view of the pandad echo of every host 0x38D we transmit (src 128 = accepted,
+     # 192 = REJECTED by the panda TX hook). FCA11-long reads it to confirm that its passive close frame really
+-    # CLOSED the panda episode before it starts the cooldown (fca11_long.observe_echo). Gated on the feature so the
++    # CLOSED the panda episode, re-owing it if refused (fca11_long.observe_echo). Gated on the feature so the
+     # hot loop pays nothing when it is off; a plain list attribute, never a capnp field.
+     if self.CP_SP.fca11Brake:
+       self.CS.fca11_echoes = collect_fca11_echoes(can_packets)
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 9cf7075..29c2225 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -143,10 +143,15 @@ static bool hyundai_legacy = false;
+ // decel RATE limit per camera period (20 ms): a frame's CR_VSM_DecCmd may exceed the last accepted one by at most
+ // 0.04 g -> 2.0 g/s of ramp, 0 -> 0.30 g in 150 ms. Release (smaller decel) is immediate, like the pedal slew.
+ #define HYUNDAI_FCA11_LONG_RATE_STEP 4
+-// continuous-actuation budget and cooldown: after this long actuating, a passive frame is REQUIRED for the cooldown
+-// before the budget re-arms (a real lead-brake event is 2-3 s; the driver alert has long since fired by then).
+-#define HYUNDAI_FCA11_LONG_MAX_ACT_US 2500000U   // 2.5 s
+-#define HYUNDAI_FCA11_LONG_COOLDOWN_US 3000000U  // 3 s of passive frames after the budget is spent
++// 0035: there is NO actuation-duration budget and NO cooldown. The old 2.5 s budget / 3 s cooldown sat AT the typical
++// event length, so it clipped real stops mid-brake and then refused new braking for 3 s. A braking command is
++// kinematically self-terminating (it drives the slowest wheel below HYUNDAI_FCA11_LONG_MIN_SPEED, where actuation is
++// refused), and a live-but-wedged host is bounded by the cap, the rate limit, the stale-TX hand-back, the heartbeat,
++// the driver-cut latch and the camera-owns hand-back. What the cooldown incidentally did - bound how often an episode
++// can (re)open at a high level - is now done by the ONSET rule: the rate-limit reference restarts from 0 whenever the
++// ESC is not currently seeing our command (no accepted frame this arm, the last accepted frame was PASSIVE, or our
++// stream went stale and the camera's own FCA11 has been forwarded again), so every (re)opened episode starts at
++// <= HYUNDAI_FCA11_LONG_RATE_STEP and climbs at most +RATE_STEP per accepted frame.
+ // freshness of every window input (wheels/gear/brake/gas), and the stale-TX hand-back, as the rolling test
+ #define HYUNDAI_FCA11_LONG_RX_MAX_AGE_US 100000U
+ #define HYUNDAI_FCA11_LONG_TX_STALE_US 100000U
+@@ -171,9 +176,6 @@ static uint32_t hyundai_fca11_long_ts_gas;
+ static bool hyundai_fca11_long_camera_owns;   // LATCHED: camera requested actuation -> camera FCA11 forwarded, our TX blocked
+ static bool hyundai_fca11_long_tx_seen;       // panda has transmitted an accepted 0x38D since this arm
+ static uint32_t hyundai_fca11_long_ts_tx;     // ... last one at
+-static bool hyundai_fca11_long_act_active;    // inside a continuous actuation episode
+-static uint32_t hyundai_fca11_long_ts_act;    // ... which started at
+-static uint32_t hyundai_fca11_long_ts_act_end;// ... which ended at (cooldown runs from here)
+ static int hyundai_fca11_long_dec_last;       // last ACCEPTED CR_VSM_DecCmd (rate-limit reference; -1 = none this arm)
+ // G9 (R7-B): the DRIVER-INPUT cut (brake / gas / gear != D) is kept in its own latch so it can re-arm on the
+ // openpilot resume edge (controls_allowed rising), mirroring the car layer's blocked_until_resume. The camera
+@@ -211,9 +213,6 @@ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_camera_owns = false;
+   hyundai_fca11_long_tx_seen = false;
+   hyundai_fca11_long_ts_tx = 0U;
+-  hyundai_fca11_long_act_active = false;
+-  hyundai_fca11_long_ts_act = 0U;
+-  hyundai_fca11_long_ts_act_end = 0U;
+   hyundai_fca11_long_dec_last = -1;
+ }
+ 
+@@ -965,15 +964,14 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+     if (hyundai_fca11_long) {
+       // PRODUCTION FCA11 long braking (bit 256, on top of the gas interceptor). Openpilot is ENGAGED: every frame
+       // (actuating or passive) requires controls_allowed AND the openpilot heartbeat engaged, on top of the
+-      // window/cap/rate/budget rules. Allowed shapes:
++      // window/cap/rate rules. Allowed shapes:
+       //   * ACTUATING: the car layer's mirror of the camera frame (variant B) with CR_VSM_DecCmd 1..30 (0.01 g/LSB),
+       //     CF_VSM_Prefill (bit 0), CF_VSM_Warn = 3 (bits 3-4), FCA_CmdAct (bit 20), CF_VSM_DecCmdAct = 0;
+       //   * PASSIVE: the camera's own idle shape (all brake fields 0, Warn = 0) - the clean release/hand-back frame,
+       //     byte-identical to what the ESC sees from the camera every idle frame.
+       // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2), FCA_StopReq (bit 21), CF_VSM_DecCmdAct,
+       // Warn 1/2 (never a shape this car answered), Warn 3 on a passive frame (a warning we have no reason to send),
+-      // any ACTUATION outside the window / after a cut / below the floor / during the cooldown / while the camera
+-      // owns FCA11.
++      // any ACTUATION outside the window / after a cut / below the floor / while the camera owns FCA11.
+       int CF_VSM_HBACmd = (msg->data[0] >> 1) & 0x3U;
+       bool CF_VSM_Prefill = GET_BIT(msg, 0U);
+       int CF_VSM_Warn = (msg->data[0] >> 3) & 0x3U;
+@@ -988,12 +986,12 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       violation |= hyundai_fca11_long_camera_owns;
+       // 0030 (D2-i): the controls_allowed / heartbeat gate applies to ACTUATING frames only. A PASSIVE frame is the
+       // camera's own idle shape (all brake fields 0, Warn 0, DecCmd 0); accepting it can only ever CLOSE an episode
+-      // (hyundai_fca11_long_act_active -> false, cooldown clock starts) and can never command the ESC. Requiring the
+-      // engagement gate for it meant a close frame sent at an engage edge (!heartbeat_engaged, the heartbeat only
+-      // lands at pandad's 10 Hz step) or a disengage edge (!controls_allowed) was REFUSED, so the panda episode never
+-      // closed and the NEXT brake hit budget-expiry on frame 1 + a 3 s cooldown (the 860-frame stale act_active
+-      // defect, 14f). The CAMERA-OWNS hand-back below still blocks EVERY host frame (a passive host frame injected
+-      // while the camera is actuating could cancel its AEB), and !camera_owns is checked before any state change.
++      // (the rate-limit reference drops to 0, so the next episode restarts its onset ramp) and can never command the
++      // ESC. Requiring the engagement gate for it meant a close frame sent at an engage edge (!heartbeat_engaged, the
++      // heartbeat only lands at pandad's 10 Hz step) or a disengage edge (!controls_allowed) was REFUSED, so the panda
++      // episode never closed (the 860-frame stale act_active defect, 14f). The CAMERA-OWNS hand-back still blocks
++      // EVERY host frame (a passive host frame injected while the camera is actuating could cancel its AEB), and
++      // !camera_owns is checked before any state change.
+       violation |= actuation && (!controls_allowed || !heartbeat_engaged);
+       violation |= actuation && !hyundai_fca11_long_window_ok();
+       violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
+@@ -1001,43 +999,22 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       uint32_t ts = microsecond_timer_get();
+       if (actuation && !violation) {
+         // rate limit on decel growth: at most +0.04 g above the last ACCEPTED frame (release is immediate, and an
+-        // accepted smaller value RESETS the reference down, so the next ramp starts from the released level)
+-        int dec_ref = (hyundai_fca11_long_dec_last < 0) ? 0 : hyundai_fca11_long_dec_last;
++        // accepted smaller value RESETS the reference down, so the next ramp starts from the released level).
++        // 0035 ONSET rule: the reference is 0 - so this frame is capped at RATE_STEP - whenever the ESC is not
++        // currently seeing our command: no accepted frame yet this arm (dec_last < 0), the last accepted frame was
++        // PASSIVE (dec_last == 0), or our stream went STALE (the SAME predicate hyundai_fwd_hook uses to forward the
++        // camera's own FCA11 again, so the ESC has been back on the camera's idle frame). Without the stale term a
++        // host could brake at 30, go silent past TX_STALE (camera re-owns, ESC sees 0) and reopen at 30: a 0 -> 30
++        // step at the ESC, repeatable without bound now that no cooldown spaces episodes apart.
++        bool stream_stale = !hyundai_fca11_long_tx_seen ||
++                            (safety_get_ts_elapsed(ts, hyundai_fca11_long_ts_tx) > HYUNDAI_FCA11_LONG_TX_STALE_US);
++        int dec_ref = ((hyundai_fca11_long_dec_last < 0) || stream_stale) ? 0 : hyundai_fca11_long_dec_last;
+         violation |= (CR_VSM_DecCmd > (dec_ref + HYUNDAI_FCA11_LONG_RATE_STEP));
+       }
+-      if (actuation && !violation) {
+-        // episode budget: a continuous actuation runs at most MAX_ACT_US, then a COOLDOWN_US gap of passive frames
+-        // is required before the budget re-arms. Budget spent -> the episode ENDS here (the cooldown starts) and
+-        // this frame is refused, so the state can never wedge in "episode over budget" refusing everything forever.
+-        if (hyundai_fca11_long_act_active) {
+-          if (safety_get_ts_elapsed(ts, hyundai_fca11_long_ts_act) > HYUNDAI_FCA11_LONG_MAX_ACT_US) {
+-            hyundai_fca11_long_act_active = false;
+-            hyundai_fca11_long_ts_act_end = ts;
+-            violation = true;
+-          } else {
+-          }
+-        } else if (hyundai_fca11_long_ts_act_end != 0U) {
+-          // still inside the passive cooldown? then a NEW actuation is refused
+-          if (safety_get_ts_elapsed(ts, hyundai_fca11_long_ts_act_end) <= HYUNDAI_FCA11_LONG_COOLDOWN_US) {
+-            violation = true;
+-          } else {
+-          }
+-        } else {
+-        }
+-      }
+       if (!violation) {
+         hyundai_fca11_long_tx_seen = true;
+         hyundai_fca11_long_ts_tx = ts;
+         hyundai_fca11_long_dec_last = CR_VSM_DecCmd;
+-        if (actuation && !hyundai_fca11_long_act_active) {
+-          hyundai_fca11_long_act_active = true;
+-          hyundai_fca11_long_ts_act = ts;
+-        } else if (!actuation && hyundai_fca11_long_act_active) {
+-          // a passive frame ends the episode and starts the cooldown clock
+-          hyundai_fca11_long_act_active = false;
+-          hyundai_fca11_long_ts_act_end = ts;
+-        } else {
+-        }
+       }
+       if (violation) {
+         tx = false;
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 7ed2d59..77c694f 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -34,8 +34,6 @@ HYUNDAI_COMMON_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
+ HYUNDAI_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai.h")
+ 
+ # C-only FCA11-long constants (seconds), read straight from the header so the safety tests pin them
+-HYUNDAI_FCA11_LONG_MAX_ACT_US = 2500000
+-HYUNDAI_FCA11_LONG_COOLDOWN_US = 3000000
+ HYUNDAI_FCA11_LONG_TX_STALE_US = 100000
+ 
+ 
+@@ -2534,8 +2532,9 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     PRODUCTION FCA11 long braking (bit 256, HyundaiFca11Brake). Rides ON TOP of the comma pedal with openpilot
+     ENGAGED (controls_allowed AND heartbeat_engaged): TX = the pedal list + FCA11 (dynamic camera blocking), the
+     pedal path stays fully active. Actuating FCA11 is legal only inside the window (gear D, no pedal, every wheel
+-    above 9 km/h raw 288, fresh inputs, no cut), capped at 0.30 g, rate-limited, on a 2.5 s budget / 3 s cooldown,
+-    camera request hands back the same frame. A DRIVER-INPUT cut (brake / gas / gear != D) re-arms on the next
++    above 9 km/h raw 288, fresh inputs, no cut), capped at 0.30 g, rate-limited (+4 LSB per accepted frame, the
++    reference restarting from 0 after a passive frame or a stale stream), with NO duration budget and NO cooldown
++    (0035), camera request hands back the same frame. A DRIVER-INPUT cut (brake / gas / gear != D) re-arms on the next
+     openpilot RESUME edge (controls_allowed rising, mirroring the car layer's blocked_until_resume) but CLEARS only
+     on the first CLEAN frame after that grant (G9b): an input merely HELD at the grant (the drive-14 engage-with-foot-
+     on-gas) keeps the latch for that frame and stops barring actuation the moment it is actually released. A pedal
+@@ -2658,18 +2657,16 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+   def test_passive_close_accepted_while_disengaged_or_heartbeat_stale(self):
+     """0030 (D2-i) regression, the 860-frame stale act_active defect (drives 14f): the passive close frame the car
+     layer sends on an engage/disengage edge must be ACCEPTED even with !controls_allowed / !heartbeat_engaged, so
+-    the panda episode CLOSES and the NEXT brake starts fresh with its own 2.5 s budget. ACTUATING frames stay gated
+-    exactly as before (safety unchanged). FALSIFIABLE CONTRAST: every assertTrue on a passive frame below fails on
+-    the deployed 29-patch tree (the passive frame was refused -> act_active stayed latched -> the next brake hit
+-    budget-expiry on frame 1 + the 3 s cooldown)."""
++    the panda episode CLOSES and the NEXT brake starts fresh (0035: from the onset step, with no cooldown). ACTUATING
++    frames stay gated exactly as before. FALSIFIABLE CONTRAST: every assertTrue on a passive frame below fails on
++    the deployed 29-patch tree (the passive frame was refused, so the episode never closed)."""
+     # (a) passive close at a DISENGAGE edge (!controls_allowed): must be accepted -> episode ends
+     self._rearm()
+     self._open_window()
+     self.assertTrue(self._tx(self._brake_cmd(1)))               # episode open
+     self._engage(False, False)                                 # disengaged: !controls_allowed
+     self.assertTrue(self._tx(self._fca11()), "passive close must be accepted on a disengage edge")
+-    # the accepted passive frame ENDED the episode; the cooldown runs from it, and the next brake is a NEW episode
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    # the accepted passive frame ENDED the episode; the next brake is a NEW episode, accepted at once (0035: no cooldown)
+     self._open_window()
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+     # (b) passive close at an ENGAGE edge with the heartbeat still stale (!heartbeat_engaged): accepted
+@@ -2682,10 +2679,7 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertFalse(self._tx(self._brake_cmd(1)))
+     self._engage(True, True)
+     self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))            # inside the cooldown the accepted passive started
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
+-    self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))             # fresh episode, own budget
++    self.assertTrue(self._tx(self._brake_cmd(1)))             # 0035: fresh episode at once, no cooldown
+ 
+   def test_floor_and_no_ceiling(self):
+     lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
+@@ -2790,87 +2784,263 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertTrue(self._tx(self._brake_cmd(1 + step)))
+     self.assertFalse(self._tx(self._brake_cmd(1 + step * 2 + 1)))
+ 
+-  # *** budget / cooldown ***
++  # *** 0035: NO duration budget, NO cooldown; the onset rule bounds every (re)open ***
++  # All durations below are WALL-CLOCK MILLISECONDS on the panda's microsecond timer, never frame counts: the car
++  # layer sends every 20 ms (the camera period) and the panda polices per accepted frame, so a frame-count test with
++  # the wrong period assumption could hide a clip. PERIOD_MS is the real host send period.
++  PERIOD_MS = 20
+ 
+-  def test_budget_and_cooldown(self):
+-    self._rearm()  # fixes the clock at 1e6 so the budget arithmetic is absolute
+-    self._open_window()
+-    # 2.5 s of continuous actuation is allowed (same dec value: no rate growth, episode stays open)
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US - 1)
+-    self._open_window()  # inputs must be fresh again after the 2.5 s jump
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
+-    # past the budget: refused, episode ends, cooldown starts
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + 1)
+-    self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
+-    # a passive frame during the cooldown is fine (camera keeps its idle shape / hand-back)
+-    self.assertTrue(self._tx(self._fca11()))
+-    # still inside the cooldown: any NEW actuation is refused
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + HYUNDAI_FCA11_LONG_COOLDOWN_US - 1)
+-    self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
+-    # cooldown over: re-armed (budget was spent at +2.5 s+1, so 3 s later is +5.5 s+1; strictly past it)
+-    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
+-    self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
++  def _feed_inputs(self, speed_raw=None):
++    """One fresh sample of every window input (brake/gas/pedal/gear/wheels) WITHOUT touching controls_allowed."""
++    self._rx(self._user_brake_msg(False))
++    self._rx(self._user_gas_msg(0))
++    self._rx(self._interceptor_user_gas(0))
++    self._rx(self._gear_msg(5))
++    self._rx(self._wheel_msg(self.IN_WINDOW_RAW if speed_raw is None else speed_raw))
++
++  def _stream(self, t0_us, dur_ms, target=HYUNDAI_FCA11_LONG_MAX_DEC, start_dec=0, feed=True, hook=None):
++    """A legal-slew actuating stream: every PERIOD_MS the inputs are refreshed and one variant-B frame goes out,
++    ramping +RATE_STEP from `start_dec` to `target` and then holding it. Returns (t_end_us, last_dec, refusals) where
++    refusals is the list of (t_ms_since_t0, dec) of every refused frame. `hook(t_ms)` runs before each frame (fault
++    injection)."""
++    dec = start_dec
++    refusals = []
++    t = t0_us
++    for i in range(dur_ms // self.PERIOD_MS + 1):
++      t = t0_us + i * self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      if feed:
++        self._feed_inputs()
++      if hook is not None:
++        hook(i * self.PERIOD_MS)
++      dec = min(target, dec + HYUNDAI_FCA11_LONG_RATE_STEP)
++      if not self._tx(self._brake_cmd(dec)):
++        refusals.append((i * self.PERIOD_MS, dec))
++    return t, dec, refusals
+ 
+-  def test_two_episodes_without_a_passive_frame_stay_one_episode(self):
+-    """G7/N1 pin: two planner brakes with NO passive 0x38D in between (exactly what the car layer did
+-    before G7 - it sent NOTHING when not braking, and the camera's own frames do not pass this TX hook)
+-    are ONE panda episode. act_active (hyundai.h:970-973) stays latched while actuation simply pauses,
+-    so the 2.5 s budget keeps running from the FIRST brake: the second brake is silently refused at the
+-    budget edge and again through the 3 s cooldown. Sending a passive frame (test below) is the fix."""
+-    self._rearm()  # fixes the clock so the budget arithmetic is absolute
+-    self._open_window()
+-    # episode 1: brake for 1.0 s, then STOP sending (no passive frame) - exactly the pre-G7 car layer
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
+-    t1 = 1000000 + int(1.0e6)
+-    self.safety.set_timer(t1)
++  def test_f1_no_truncation_30s_continuous(self):
++    """F1: gates held, a legal-slew actuating stream for 30 000 ms wall clock -> ZERO refusals. RED on the 0034 tree:
++    the 2.5 s budget refuses the frame after 2500 ms and the cooldown refuses everything for the next 3000 ms."""
++    self._rearm()
+     self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
+-    # the actuation pauses here (no host frame at all for 0.4 s): act_active stays latched
+-    # episode 2: brake again. Still the SAME episode, so the clock is 1.0 s + 0.4 s + 1.0 s = 2.4 s < 2.5 s
+-    t2 = t1 + int(0.4e6)
+-    self.safety.set_timer(t2)
++    _, last, refusals = self._stream(1000000, 30000)
++    self.assertEqual(last, HYUNDAI_FCA11_LONG_MAX_DEC)
++    self.assertEqual([], refusals, f"{len(refusals)} refusals, first at {refusals[:1]} ms")
++
++  def test_f1_no_truncation_at_every_level(self):
++    """F1 (each level): a 10 000 ms hold at a constant mid level is never cut (a cut would show at ~2500 ms)."""
++    for level in (4, 12, 20):
++      with self.subTest(level=level):
++        self._rearm()
++        self._open_window()
++        _, _, refusals = self._stream(1000000, 10000, target=level)
++        self.assertEqual([], refusals)
++
++  def test_f2_reactuation_right_after_close_is_accepted(self):
++    """F2: close an episode, then re-actuate on the very next camera period -> accepted (no cooldown). RED on 0034."""
++    self._rearm()
+     self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))     # accepted: still inside the same, longer episode
+-    # but the budget runs from the FIRST accepted actuation: 1.0 + 0.4 + 1.2 = 2.6 s > 2.5 s -> refused
+-    self.safety.set_timer(t1 + int(1.7e6))
++    t, _, refusals = self._stream(1000000, 1000)
++    self.assertEqual([], refusals)
++    t += self.PERIOD_MS * 1000
++    self.safety.set_timer(t)
++    self.assertTrue(self._tx(self._fca11()))                       # passive close
++    t += self.PERIOD_MS * 1000
++    self.safety.set_timer(t)
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)), "re-actuation 20 ms after close")
++
++  def test_f2_back_to_back_episodes_both_fully_actuate(self):
++    """F2: back-to-back episodes separated by gaps well under the old 3 s cooldown, each held LONGER than the old
++    2.5 s budget, all fully actuate (zero refusals across the whole profile). RED on 0034."""
++    self._rearm()
+     self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # the SECOND brake is silently cut at the budget edge
+-    # ... and inside the cooldown every new actuation is refused
+-    self.safety.set_timer(t1 + int(1.7e6) + int(1.0e6))
++    t = 1000000
++    for gap_ms in (20, 500, 1500, 2980):
++      t, _, refusals = self._stream(t, 4000)
++      self.assertEqual([], refusals, f"episode before gap {gap_ms} ms refused at {refusals[:1]}")
++      t += self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self.assertTrue(self._tx(self._fca11()))                     # passive close
++      t += gap_ms * 1000
++    _, _, refusals = self._stream(t, 4000)
++    self.assertEqual([], refusals)
++
++  def test_f3_churn_reopen_after_passive_restarts_the_onset(self):
++    """F3 (the companion rule): actuate at 30 -> accepted passive -> a reopen requesting 30 is REFUSED, and so is
++    anything above RATE_STEP; a reopen at RATE_STEP (4) is accepted, then the legal +4/20 ms slew climbs back to 30.
++    The onset cap is RATE_STEP = 4 LSB, i.e. the panda's EXISTING reference reset (an accepted passive frame stores
++    dec_last = 0), which is <= the ruling's 8 LSB first-frame cap. RED on 0034: the reopen at 4 is refused by the
++    cooldown."""
++    self._rearm()
+     self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
+-    # a passive host frame ends the episode; only then does the cooldown clock start and the budget re-arm
+-    self.assertTrue(self._tx(self._fca11()))
+-    self.safety.set_timer(t1 + int(1.7e6) + int(1.0e6) + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    t, last, refusals = self._stream(1000000, 500)
++    self.assertEqual((30, []), (last, refusals))
++    t += self.PERIOD_MS * 1000
++    self.safety.set_timer(t)
++    self.assertTrue(self._tx(self._fca11()))                       # accepted passive
++    t += self.PERIOD_MS * 1000
++    self.safety.set_timer(t)
++    self._feed_inputs()
++    for dec in (30, 8, HYUNDAI_FCA11_LONG_RATE_STEP + 1):
++      self.assertFalse(self._tx(self._brake_cmd(dec)), f"reopen at {dec} after a passive frame must be refused")
++    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)))
++    _, last, refusals = self._stream(t + self.PERIOD_MS * 1000, 200, start_dec=HYUNDAI_FCA11_LONG_RATE_STEP)
++    self.assertEqual((30, []), (last, refusals))
++
++  def test_f3_churn_alternating_passive_never_exceeds_onset(self):
++    """F3: alternating passive / actuating frames can never climb: each reopen is capped at RATE_STEP again."""
++    self._rearm()
+     self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
++    t = 1000000
++    for _ in range(20):
++      t += self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self._feed_inputs()
++      self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP + 1)))
++      self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)))
++      self.assertTrue(self._tx(self._fca11()))
++
++  def test_f3_stale_stream_restarts_the_onset(self):
++    """F3 (stale variant, 0035): brake at 30, then the host goes SILENT past TX_STALE. hyundai_fwd_hook has handed
++    FCA11 back to the camera (the ESC sees the camera's idle frame = 0), so a reopen at 30 would be a 0 -> 30 step at
++    the ESC: it is REFUSED and the reopen restarts at RATE_STEP. At exactly TX_STALE the stream is still ours (the
++    fwd hook still blocks the camera), so the reference is kept and holding 30 is accepted."""
++    for gap_us, held_ok in ((HYUNDAI_FCA11_LONG_TX_STALE_US, True), (HYUNDAI_FCA11_LONG_TX_STALE_US + 1, False),
++                            (2000000, False)):
++      with self.subTest(gap_us=gap_us):
++        self._rearm()
++        self._open_window()
++        t, last, refusals = self._stream(1000000, 500)
++        self.assertEqual((30, []), (last, refusals))
++        self.safety.set_timer(t + gap_us)
++        self._feed_inputs()
++        self.assertEqual(not held_ok, self.safety.safety_fwd_hook(2, 0x38D) == 0)   # camera forwarded iff stale
++        self.assertEqual(held_ok, self._tx(self._brake_cmd(30)))
++        if not held_ok:
++          self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP + 1)))
++          self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)))
++
++  def test_f4_overrides_still_fire_10s_into_a_continuous_episode(self):
++    """F4: at t = 10 000 ms into a continuous, accepted stream every independent gate still refuses on the SAME
++    frame: brake press, cruise-cancel, heartbeat loss, stale inputs, any wheel <= 9 km/h, gear != D. None of them is
++    keyed to episode state (the old budget was the only thing that 'did something' at 2.5 s)."""
++    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    faults = {
++      "brake_press": lambda: self._rx(self._user_brake_msg(True)),
++      "cruise_cancel": lambda: self._rx(self._button_msg(Buttons.CANCEL)),
++      "heartbeat_loss": lambda: self.safety.set_heartbeat_engaged(False),
++      "controls_lost": lambda: self.safety.set_controls_allowed(False),
++      "wheel_fl_at_floor": lambda: self._rx(self._wheel_msg(lo, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW)),
++      "wheel_rr_below_floor": lambda: self._rx(self._wheel_msg(self.IN_WINDOW_RAW, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW,
++                                                               lo - 1)),
++      "gear_n": lambda: self._rx(self._gear_msg(6)),
++      "gear_r": lambda: self._rx(self._gear_msg(7)),
++      "gas_press": lambda: self._rx(self._interceptor_user_gas(0x1000)),
++    }
++    for name, fault in faults.items():
++      with self.subTest(fault=name):
++        self._rearm()
++        self._open_window()
++        t, last, refusals = self._stream(1000000, 10000)
++        self.assertEqual((30, []), (last, refusals), "the stream must be live and accepted at 10 s")
++        t += self.PERIOD_MS * 1000
++        self.safety.set_timer(t)
++        self._feed_inputs()
++        fault()
++        self.assertFalse(self._tx(self._brake_cmd(30)), f"{name} must refuse at 10 s")
++        self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)), f"{name}: any level refused")
++    # stale inputs at 10 s: each input individually stops arriving for > 100 ms
++    feeds = {"brake": lambda: self._rx(self._user_brake_msg(False)), "gas": lambda: self._rx(self._user_gas_msg(0)),
++             "gear": lambda: self._rx(self._gear_msg(5)), "speed": lambda: self._rx(self._wheel_msg(self.IN_WINDOW_RAW))}
++    for stale in feeds:
++      with self.subTest(stale=stale):
++        self._rearm()
++        self._open_window()
++        t, last, refusals = self._stream(1000000, 10000)
++        self.assertEqual((30, []), (last, refusals))
++        for k in range(1, 7):                                   # 6 more host frames (120 ms) with `stale` withheld
++          self.safety.set_timer(t + k * self.PERIOD_MS * 1000)
++          for name, f in feeds.items():
++            if name != stale:
++              f()
++          self._rx(self._interceptor_user_gas(0))
++          ok = self._tx(self._brake_cmd(30))
++          if k * self.PERIOD_MS > 100:
++            self.assertFalse(ok, f"stale {stale} at +{k * self.PERIOD_MS} ms must refuse")
++          else:
++            self.assertTrue(ok, f"{stale} still fresh at +{k * self.PERIOD_MS} ms")
+ 
+-  def test_passive_frame_between_episodes_rearms_the_budget(self):
+-    """G7 fix, panda side: the SAME two brakes, but with the passive 0x38D the car layer now sends on
+-    each release. The passive frame ends episode 1 and starts the cooldown; episode 2 opens after it,
+-    so each brake gets its own full 2.5 s budget (this is the G7 pairing with fca11_long.py)."""
++  def test_f4_stop_termination_at_the_speed_floor(self):
++    """F4/R3: a long episode decelerating through the 9 km/h gate: accepted down to raw 289, REFUSED from the first
++    frame whose slowest wheel is <= 288, and the camera owns the ESC again within TX_STALE of the last accepted
++    frame. Nothing actuates at or below the floor, however long the episode has been running."""
++    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
+     self._rearm()
+     self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))                 # episode 1
+-    t1 = 1000000 + int(1.0e6)
+-    self.safety.set_timer(t1)
+-    self.assertTrue(self._tx(self._fca11()))                     # G7: passive release on the edge
+-    # the cooldown runs from the passive frame; a NEW actuation just past it opens episode 2 fresh
+-    t2 = t1 + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2
+-    self.safety.set_timer(t2)
+-    self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))                # episode 2, its own budget
+-    # the full 2.5 s of episode 2 is now allowed (the budget restarted, it did not continue)
+-    self.safety.set_timer(t2 + HYUNDAI_FCA11_LONG_MAX_ACT_US - 1)
+-    self._open_window()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))
+-    self.safety.set_timer(t2 + HYUNDAI_FCA11_LONG_MAX_ACT_US + 1)
++    t, _, refusals = self._stream(1000000, 15000)
++    self.assertEqual([], refusals)
++    speed = lo + 10
++    last_ok_t = None
++    while speed >= lo - 10:
++      t += self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self._feed_inputs(speed_raw=speed)
++      ok = self._tx(self._brake_cmd(30))
++      self.assertEqual(speed > lo, ok, f"speed raw {speed}")
++      if ok:
++        last_ok_t = t
++      speed -= 1
++    self.safety.set_timer(last_ok_t + HYUNDAI_FCA11_LONG_TX_STALE_US + 1)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D), "camera forwarded again within TX_STALE")
++
++  def test_f5_regression_cap_slew_release_passive(self):
++    """F5: 31 refused; +4 per frame enforced (+5 refused); immediate release accepted; passive frames are always
++    accepted (mid-episode, after a refusal, while disengaged, at any time)."""
++    self._rearm()
+     self._open_window()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
++    t, last, _ = self._stream(1000000, 300)
++    self.assertEqual(30, last)
++    self.assertFalse(self._tx(self._brake_cmd(31)))
++    self.assertTrue(self._tx(self._brake_cmd(2)))                 # immediate release
++    self.assertFalse(self._tx(self._brake_cmd(2 + HYUNDAI_FCA11_LONG_RATE_STEP + 1)))
++    self.assertTrue(self._tx(self._brake_cmd(2 + HYUNDAI_FCA11_LONG_RATE_STEP)))
++    self.assertTrue(self._tx(self._fca11()))                       # passive mid-stream
++    self.assertFalse(self._tx(self._brake_cmd(31)))
++    self.assertTrue(self._tx(self._fca11()))                       # passive after a refusal
++    self._engage(False, False)
++    self.assertTrue(self._tx(self._fca11()))                       # passive while disengaged
++    self.safety.set_timer(t + 60000000)
++    self.assertTrue(self._tx(self._fca11()))                       # passive 60 s later, inputs stale
++
++  def test_f6_camera_owns_mid_episode_with_a_wedged_host(self):
++    """F6 (starvation gate): a host that looks WEDGED (keeps streaming 30 LSB every 20 ms, heartbeat fine, controls
++    allowed, inputs fresh) is cut the moment the stock camera requests FCA11 mid-episode (10 s in): every host frame
++    (actuating AND passive) is refused, and the camera's own 0x38D is forwarded to the ESC from that frame on."""
++    for field, val in (("CF_VSM_Warn", 2), ("CR_VSM_DecCmd", 0.10), ("FCA_CmdAct", 1), ("CF_VSM_Prefill", 1)):
++      with self.subTest(field=field):
++        self._rearm()
++        self._open_window()
++        self._rx(self._cam_fca11())
++        t, last, refusals = self._stream(1000000, 10000)
++        self.assertEqual((30, []), (last, refusals))
++        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))   # our stream owns the ESC
++        self._rx(self._cam_fca11(**{field: val}))                    # the camera's own request
++        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++        for k in range(1, 251):                                      # 5 s more of the wedged host
++          self.safety.set_timer(t + k * self.PERIOD_MS * 1000)
++          self._feed_inputs()
++          self.assertFalse(self._tx(self._brake_cmd(30)))
++          self.assertFalse(self._tx(self._fca11()))
++          self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++
++  def test_f0_no_budget_or_cooldown_in_the_header(self):
++    """F0: the budget/cooldown mechanism is gone from the safety header, not merely raised."""
++    with open(HYUNDAI_H) as f:
++      src = f.read()
++    for name in ("HYUNDAI_FCA11_LONG_MAX_ACT_US", "HYUNDAI_FCA11_LONG_COOLDOWN_US", "hyundai_fca11_long_act_active",
++                 "hyundai_fca11_long_ts_act"):
++      self.assertNotIn(name, src)
+ 
+   # *** latched cut ***
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index d0655f2..56deb4c 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -50,8 +50,11 @@ GATE + SAFETY
+ * Every production veto still applies on every frame (see ``Fca11LongBrake.update``): the cal
+   episode is opened ONLY when ``fca11_ok()`` is True (engaged + heartbeat via the panda, gear D,
+   speed floor, camera not owning, driver-cut latches clear, pedal not faulted) and it is dropped
+-  the instant any of them fires, exactly like a planner ask. The budget/cooldown mirror is
+-  untouched, so cal never commands a frame the panda would refuse.
++  the instant any of them fires, exactly like a planner ask.
++* HOLD BOUND (0035): the panda has NO actuation-duration budget any more, so the TOOL bounds its own
++  holds where the bound belongs: a rep whose ``hold_s`` exceeds ``CAL_MAX_HOLD_S`` (10 s) is REFUSED
++  (never armed), and ``Fca11LongBrake`` runs an independent WATCHDOG that drops any scripted ask held
++  longer than ``CAL_WATCHDOG_FRAMES`` and forces the production release (passive close frame).
+ * Release goes through the PRODUCTION release path unchanged (the fade, the passive frame) so the
+   release tests fit the shipped shaping.
+ * GAS NEUTRALIZATION: while a cal hold is active the planner sees the car slowing and asks for
+@@ -68,7 +71,7 @@ DRIVER CONSENT -- "TAP TO FIRE" (patch 0033)
+ A rep is a real, 2.2 s scripted brake on a live road. The reference-model review ranked
+ DRIVER-CONSENT-PER-REP the #1 mitigation for the rear-approach risk: it converts an uninitiated
+ robot brake into a driver-INITIATED one. Consent is ADDITIVE and never weakens any existing veto
+-(the production gates, the 0031 budget mirror, the 0032 blind-spot veto): it can only ADD a pending
++(the production gates, the 0035 hold cap, the 0032 blind-spot veto): it can only ADD a pending
+ state and a tap requirement, never remove one.
+ 
+ ``conditions.consent_mode`` (or a top-level ``consent`` object) selects the policy:
+@@ -84,7 +87,7 @@ When a rep is DUE and every condition passes and consent is required for it, the
+ actuate: it PARKS the rep (``pending``) and writes ``/data/fca11-cal/pending.json`` for the UI to show
+ a prompt. The owner taps; the UI writes ``/data/fca11-cal/consent.json`` = {rep_id, ts, accept}. The
+ sequencer consumes that file and, ONLY if it is FRESH (<= 2 s), bound to THIS rep_id, and accepted,
+-RE-VERIFIES every condition (and the budget) at the instant of the tap and then fires. Anything else
++RE-VERIFIES every condition (and the hold cap) at the instant of the tap and then fires. Anything else
+ -- absent, malformed, stale, mismatched, non-accepted -- NEVER actuates. A parked rep EXPIRES after
+ ``consent.timeout_s`` (default 8 s) if untouched and is retried later; an explicit dismiss (accept =
+ false) is honoured for the rest of the session. The pending file is ADVISORY (it only drives the
+@@ -108,14 +111,16 @@ CAL_MAX_LSB = 30           # HYUNDAI_FCA11_LONG_MAX_DEC: the PANDA gate (persona
+ CAL_MIN_LSB = 2            # FCA11_DEC_ACTIVE_FLOOR: an episode never commands 0
+ CAL_RATE_STEP_LSB = 4      # HYUNDAI_FCA11_LONG_RATE_STEP: +LSB per SENT frame ceiling
+ 
+-# --- 0031: the panda actuation-budget / cooldown mirror constants, DUPLICATED from fca11_long.py
+-# (same no-import-cycle rationale as CAL_MAX_LSB above; the unit tests PIN them against the shipped
+-# fca11_long values). The sequencer gates rep ARMING on this mirror so it never starts a rep the
+-# panda will refuse for budget/cooldown reasons -- a refused rep still counts as `ok` in progress.
+-CAL_BUDGET_FRAMES = 250           # == fca11_long.FCA11_BUDGET_FRAMES   (2.5 s @ 100 Hz)
+-CAL_COOLDOWN_FRAMES = 300         # == fca11_long.FCA11_COOLDOWN_FRAMES (3.0 s @ 100 Hz)
+-CAL_COOLDOWN_MARGIN_FRAMES = 2    # == fca11_long.FCA11_COOLDOWN_MARGIN_FRAMES
+-CAL_HOLD_MARGIN_FRAMES = 10       # extra slack on top of a rep's hold (quantisation/ordering)
++# --- 0035: TOOL-SIDE hold bound. 0031's arming predicate only existed to fit a rep inside the panda's
++# 2.5 s budget; that budget is deleted (0035), so arming is budget-free and the bound lives HERE:
++#   * CAL_MAX_HOLD_S: a rep whose hold exceeds it is REFUSED (never armed, never prompted). The shipped
++#     matrix holds 2.2 s; 10 s leaves room for longer reps without letting a plan typo hold a brake.
++#   * CAL_WATCHDOG_FRAMES: Fca11LongBrake drops a scripted ask that has been up longer than this
++#     (independent of the sequencer's own hold arithmetic) and forces the production release (passive
++#     close frame). 20 frames (0.2 s) of slack over the cap: it can never cut a legal hold.
++CAL_MAX_HOLD_S = 10.0
++CAL_WATCHDOG_MARGIN_FRAMES = 20
++CAL_WATCHDOG_FRAMES = int(round(CAL_MAX_HOLD_S * 100.0)) + CAL_WATCHDOG_MARGIN_FRAMES
+ 
+ # --- 0032: the blind-spot veto hold-off. A rep is a 2.2 s scripted brake hold on a live road; the
+ # rear quarter radars (LCA11 CF_Lca_IndLeft/IndRight -> carState.leftBlindspot/rightBlindspot) can
+@@ -150,8 +155,8 @@ DEFAULT_TURN_LAT_MAX = 0.5         # m/s^2: |lateral accel| above this = not nea
+ DEFAULT_STRAIGHT_MIN_S = 2.0       # the straight condition must hold this long
+ DEFAULT_BAND_TOL_KPH = 5.0         # band window half-width
+ DEFAULT_BAND_STABLE_S = 5.0        # the band must be held this long before a rep may start
+-DEFAULT_HOLD_S = 2.2               # hold length (budget 2.5 s minus margin)
+-DEFAULT_RECOVERY_S = 3.5           # >= the panda's 3 s cooldown + margin, before the next rep
++DEFAULT_HOLD_S = 2.2               # hold length (the shipped matrix; <= CAL_MAX_HOLD_S)
++DEFAULT_RECOVERY_S = 3.5           # release -> next rep gap (band recovery; no panda cooldown since 0035)
+ # 0032 blind-spot veto: FAIL-CLOSED DEFAULT ON. An old plan that predates 0032 therefore still gets
+ # the veto (one-way information; absence of the key must not silently disable a safety addition).
+ DEFAULT_BLINDSPOT_VETO = True      # skip a rep while either rear-quarter blind-spot bit is set
+@@ -251,36 +256,14 @@ def consent_opts(cond: dict, obj: dict) -> dict:
+   }
+ 
+ 
+-def _fca11_budget_predicate(hold_s: float, in_budget: bool, budget_start: int, budget_end: int,
+-                            frame: int) -> tuple[bool, str]:
+-  """THE 0031 ARMED-ONLY-IF-PROVABLY-FULL PREDICATE. ``m`` are the car layer's panda budget mirror
+-  values ``(in_budget, budget_start, budget_end)`` and ``frame`` is the 100 Hz controller frame.
+-
+-  Returns ``(can_arm, reason)``. A rep may be armed ONLY when the mirror PROVABLY has room for the
+-  whole hold (the release/passive frame needs no budget). If the answer is not an unambiguous yes
+-  (e.g. the mirror has not been published yet) the caller must NOT arm.
+-
+-  Semantics (mirror of ``fca11_long.Fca11LongBrake.update``):
+-    in_budget True   -> inside a continuous actuation episode opened at ``budget_start``; the panda
+-                        allows ``FCA11_BUDGET_FRAMES`` frames from there.
+-    in_budget False  -> not in an episode; ``budget_end >= 0`` is the frame the closing passive frame
+-                        was EMITTED, and a new actuation is refused until the cooldown has run.
+-  """
+-  need = int(round(float(hold_s) * 100.0)) + CAL_HOLD_MARGIN_FRAMES
+-  if in_budget:
+-    if budget_end >= 0:
+-      return False, "budget_mirror_inconsistent"          # can't be both in-episode and ended
+-    remaining = (int(budget_start) + CAL_BUDGET_FRAMES) - int(frame)
+-    if remaining < need:
+-      return False, f"budget_low(remaining={remaining},need={need})"
+-    return True, f"budget_room(remaining={remaining},need={need})"
+-  if budget_end >= 0:
+-    # cooldown: the panda refuses a new actuation until
+-    #   frame - budget_end > CAL_COOLDOWN_FRAMES + CAL_COOLDOWN_MARGIN_FRAMES
+-    if (int(frame) - int(budget_end)) <= (CAL_COOLDOWN_FRAMES + CAL_COOLDOWN_MARGIN_FRAMES):
+-      return False, f"cooldown(frame={int(frame)},end={int(budget_end)})"
+-    return True, "budget_full"
+-  return True, "budget_room(fresh_episode)"
++def hold_ok(hold_s) -> tuple[bool, str]:
++  """0035 TOOL-SIDE HOLD BOUND (replaces the 0031 budget predicate). A rep may be armed only if its
++  hold is a positive, finite number of seconds no longer than ``CAL_MAX_HOLD_S``. Anything else is
++  refused -- never armed, never prompted -- with the reason surfaced in ``status()``."""
++  h = _to_float(hold_s, None)
++  if h is None or not (0.0 < h <= CAL_MAX_HOLD_S):
++    return False, f"hold_over_cap(hold_s={hold_s},cap={CAL_MAX_HOLD_S})"
++  return True, ""
+ 
+ 
+ def plan_id(obj: dict) -> str:
+@@ -394,7 +377,7 @@ class CalSequencer:
+   Reads ``plan.json`` + ``progress.json``; decides which rep is due NOW (engaged + band stable + feet
+   off + no lead + near-straight + no rear-quarter blind spot + not expired + drive cap not hit);
+   commands the level (the brake's ``update`` consumes ``level_lsb``/``active_actuation``); on the hold
+-  elapsing it releases and, after the cooldown + band recovery, records the rep and moves on. Progress
++  elapsing it releases and, after the recovery gap + band recovery, records the rep and moves on. Progress
+   keys on ``plan_id`` so a new plan revision resets completion; a completed rep is never re-run.
+   """
+ 
+@@ -425,7 +408,6 @@ class CalSequencer:
+     self._session_reps = 0
+     self._active: CalRep | None = None
+     self._hold_frames = 0
+-    self._rep_saw_budget = False   # 0031: the armed rep has seen a live (in-budget) episode
+     self._on_start = -1          # frame the current rep's actuation opened on
+     self._release_frame = -1     # frame braking last went False
+     self._last_outcome = ""
+@@ -436,18 +418,9 @@ class CalSequencer:
+     self._yaw_hist: list[tuple[int, float]] = []
+     self._block_reason = "no_plan"
+     self._last_act_frame = -1
+-    # ---- 0031: the panda budget/cooldown mirror published by Fca11LongBrake.update ----
+-    # The car layer already mirrors the panda's 2.5 s budget / 3 s cooldown (``_in_budget``,
+-    # ``_budget_start``, ``_budget_end`` in fca11_long.py). 0031 surfaces that mirror here so the
+-    # sequencer gates ARMING on it: never start a rep whose hold+release would run past the
+-    # remaining budget, and never start one while the cooldown is running.
+-    # Default = a FRESH episode: at process start the panda has just ``hyundai_init``'d
+-    # (act_active false, no cooldown), and ``update`` publishes this frame's exact values before
+-    # every ``tick`` in production. ``_budget_published`` records whether a real mirror has been
+-    # seen (diagnostics only).
+-    self._budget_mirror: dict = {"in_budget": False, "budget_start": 0, "budget_end": -1}
+-    self._budget_published = False
+-    self._last_budget_reason = ""
++    # ---- 0035: tool-side hold bound diagnostics (the 0031 budget mirror is gone) ----
++    self._last_hold_reason = ""      # why the last over-cap rep was refused
++    self._watchdog_skip: set[str] = set()   # reps the watchdog aborted this session (never re-armed)
+     # ---- 0032: blind-spot veto hold-off ------------------------------------------------
+     # ``_blindspot_last_set`` is the frame of the most recent SET sample in EITHER rear quarter;
+     # the veto is held for ``blindspot_holdoff_s`` after it. -1 means "no set sample this session".
+@@ -499,22 +472,22 @@ class CalSequencer:
+     self._consent_reason = ""
+     self._consent_skip = set()
+     self._consent_rerprompt_after = {}
+-
+-  # ------------------------------------------------------------------ 0031 budget gate
+-  def set_budget_mirror(self, in_budget: bool, budget_start: int, budget_end: int) -> None:
+-    """Publish the car layer's panda budget/cooldown mirror (fca11_long ``_in_budget`` /
+-    ``_budget_start`` / ``_budget_end``) for the arming gate below. Called by
+-    ``Fca11LongBrake.update`` every frame, before ``tick``."""
+-    self._budget_mirror = {"in_budget": bool(in_budget), "budget_start": int(budget_start),
+-                           "budget_end": int(budget_end)}
+-    self._budget_published = True
+-
+-  def budget_can_arm(self, hold_s: float, frame: int) -> tuple[bool, str]:
+-    """THE 0031 PREDICATE. True only when the panda's budget/cooldown mirror provably has room
+-    for a ``hold_s`` rep (as ``_fca11_budget_predicate``), so the sequencer never arms a rep the
+-    panda will refuse."""
+-    m = self._budget_mirror
+-    return _fca11_budget_predicate(hold_s, m["in_budget"], m["budget_start"], m["budget_end"], frame)
++    self._watchdog_skip = set()
++
++  # ------------------------------------------------------------------ 0035 watchdog
++  def watchdog_abort(self, frame: int) -> None:
++    """0035: called by ``Fca11LongBrake`` when its independent watchdog finds a scripted ask held past
++    ``CAL_WATCHDOG_FRAMES``. Drop the ask NOW (the brake's production release path emits the passive
++    close frame), record the rep as ``watchdog`` (NOT ok, so it is not counted done), and never re-arm
++    it this session. A trip means the sequencer's own hold arithmetic failed -- it must be loud."""
++    rep = self._active
++    self._active = None
++    self.active_actuation = False
++    self.level_lsb = 0
++    self._block_reason = "watchdog"
++    if rep is not None:
++      self._watchdog_skip.add(rep.id)
++      self._complete(rep, "watchdog", frame - self._on_start)
+ 
+   # ------------------------------------------------------------------ gate
+   def _reload_plan(self, now_wall: float, frame: int) -> None:
+@@ -766,7 +739,7 @@ class CalSequencer:
+     True for fire / False for dismiss -- so the STEERING WHEEL and the TOUCH path share ONE channel, ONE
+     schema and ONE set of rules. This is a SECOND WRITER of the one 0033 channel, never a second channel:
+     the sequencer consumes the file on its next tick and applies the SAME freshness window, the SAME
+-    rep/plan/seq binding and the SAME re-verification (0032 blind-spot veto + 0031 budget) as for a tap.
++    rep/plan/seq binding and the SAME re-verification (0032 blind-spot veto + 0035 hold cap) as for a tap.
+ 
+     Returns the gesture name when it resolved a parked rep, else ``"consumed"`` (nothing was parked, so
+     the gesture is dropped and NOTHING is written -- a double-tap with no rep is completely inert)."""
+@@ -782,7 +755,6 @@ class CalSequencer:
+     """Arm ``rep``: command its level NOW (the brake enters on the panda-rate ramp, a clean step).
+     Shared by the autonomous pick path and the 0033 accepted-tap path, so the two never drift."""
+     self._active = rep
+-    self._rep_saw_budget = False
+     self.level_lsb = rep.level_lsb
+     self.active_actuation = True
+     self._on_start = frame
+@@ -824,7 +796,7 @@ class CalSequencer:
+ 
+   def _tick_pending(self, CC, CS, frame: int) -> None:
+     """0033: resolve a parked pending rep. FIRE only on a fresh, rep+plan+seq-bound, accepted tap
+-    whose conditions+budget STILL hold at the instant of the tap; otherwise DROP (expire / dismiss /
++    whose conditions (+ the hold cap) STILL hold at the instant of the tap; otherwise DROP (expire / dismiss /
+     lapse / refuse). Called only while ``self._pending is not None``, and NEVER lets a malformed file
+     take the 100 Hz car loop down (fail-closed)."""
+     pending = self._pending
+@@ -852,10 +824,10 @@ class CalSequencer:
+           return
+         self._consent_reason = why              # absent / stale / mismatched -> keep waiting
+         return
+-      can, bwhy = self.budget_can_arm(pending.hold_s, frame)
++      can, hwhy = hold_ok(pending.hold_s)
+       if not can:
+-        self._drop_pending("budget_at_tap")     # never fire a rep the panda would refuse for budget
+-        self._consent_reason = bwhy
++        self._drop_pending("hold_over_cap")     # never fire a rep whose hold exceeds the tool cap
++        self._consent_reason = hwhy
+         return
+       # FIRE: arm exactly like the autonomous START path (shared helper -> no drift).
+       rep = pending
+@@ -958,20 +930,23 @@ class CalSequencer:
+       if not self._conditions_ok(CC, CS)[0]:
+         self._block_reason = self._conditions_ok(CC, CS)[1]
+         return
+-      # remaining budget (0031): never arm a rep the panda will refuse for budget/cooldown
++      # 0035: arming is BUDGET-FREE (the panda has no duration budget). The only duration gate is the
++      # tool-side hold cap: a rep whose hold exceeds CAL_MAX_HOLD_S is refused, never armed.
+       pick = None
+-      blocked_by_budget = False
++      blocked_by_hold = False
+       for rep in self._enabled_reps():
+         if self._is_complete(rep):
+           continue
+         if rep.id in self._consent_skip:          # 0033: dismissed this session -> never re-prompt
+           continue
+-        if not self._band_ready(rep.band_kph):
++        if rep.id in self._watchdog_skip:         # 0035: the watchdog aborted it this session
+           continue
+-        can, why = self.budget_can_arm(rep.hold_s, frame)
++        can, why = hold_ok(rep.hold_s)
+         if not can:
+-          blocked_by_budget = True
+-          self._last_budget_reason = why
++          blocked_by_hold = True
++          self._last_hold_reason = why
++          continue
++        if not self._band_ready(rep.band_kph):
+           continue
+         # 0033: a rep that requires consent is PARKED (published for the UI), never armed. A rep whose
+         # prompt just expired waits out its re-prompt hold-off so it is not asked on every tick.
+@@ -985,7 +960,7 @@ class CalSequencer:
+         pick = rep
+         break
+       if pick is None:
+-        self._block_reason = "budget_block" if blocked_by_budget else "band_not_ready"
++        self._block_reason = "hold_over_cap" if blocked_by_hold else "band_not_ready"
+         return
+       # START the rep: command the level NOW. The brake enters on the panda-rate ramp (a clean step).
+       self._start_rep(pick, frame, now_wall, consent=False)
+@@ -1006,7 +981,7 @@ class CalSequencer:
+     if not cond_ok:
+       # a condition lapsed mid-rep (a lead closed, entered a turn, disengaged, or -- 0032 -- a rear
+       # quarter blind-spot bit went set). Abandon the rep; the brake's own fca11_ok/fade path releases
+-      # the episode. No record: the rep is simply retried when conditions return (reps are <= 2.2 s, so
++      # the episode. No record: the rep is simply retried when conditions return (reps are short, so
+       # the cost is negligible and the log stays clean). 0032 surfaces the veto reason so the operator
+       # can see WHY reps are being skipped.
+       self._active = None
+@@ -1014,23 +989,7 @@ class CalSequencer:
+       self.level_lsb = 0
+       self._block_reason = "blindspot" if cond_why == "blindspot" else "conditions_lapsed"
+       return
+-    # 0031: an armed rep must not spend its whole hold delivering nothing. The arming gate can still
+-    # be one frame stale (the release that starts a cooldown happens AFTER the publish on its frame),
+-    # so re-check here. A rep that has NEVER seen a live episode since it was armed (the mirror says
+-    # we still cannot arm) is commanding frames the panda refuses -- abort it. Once the rep's own (or
+-    # a production) episode has opened, `_rep_saw_budget` latches and the hold proceeds normally.
+-    m = self._budget_mirror
+-    if not m["in_budget"] and not self._rep_saw_budget:
+-      can, why = self.budget_can_arm(self._active.hold_s, frame)
+-      if not can:
+-        self._last_budget_reason = why
+-        self._active = None
+-        self.active_actuation = False
+-        self.level_lsb = 0
+-        self._block_reason = "budget_abort"
+-        return
+-    elif m["in_budget"]:
+-      self._rep_saw_budget = True
++    # 0035: the 0031 mid-hold budget abort is gone with the budget (there is no cooldown to arm into).
+     if (frame - self._on_start) < int(round(self._active.hold_s * 100.0)):
+       # an optional MID-HOLD STEP-DOWN (the partial-release test): drop the command to level2 once
+       # switch_at_s of the hold has elapsed. A downward step is emitted immediately.
+@@ -1072,8 +1031,8 @@ class CalSequencer:
+       "session_reps": self._session_reps,
+       "active_rep": self._active.id if self._active is not None else None,
+       "phases": list(self._phase_enabled),
+-      "budget_mirror": self._budget_mirror,
+-      "budget_reason": self._last_budget_reason,
++      "max_hold_s": CAL_MAX_HOLD_S,
++      "hold_reason": self._last_hold_reason,
+       # 0032: blind-spot veto diagnostics. ``blindspot_veto`` is the configured flag; ``is_vetoing``
+       # reports whether the veto is HELD right now (a set sample inside the hold-off window).
+       "blindspot_veto": bool(self.opts.get("blindspot_veto", DEFAULT_BLINDSPOT_VETO)),
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 299b0ba..90b27bc 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -24,29 +24,26 @@ Design (see car-features/fca11-long-integration.md for the full picture):
+     (0), the alive counter (+1, continuing the camera's sequence) and the CRC8-J1850 checksum;
+   - panda (bit 256, patch 0014) independently polices every frame: controls_allowed AND
+     heartbeat_engaged, gear D, no pedal, fresh inputs, every wheel above 9 km/h, DecCmd <= 0.30 g,
+-    rate-limited growth, a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera
+-    hand-back. Nothing here can make the car brake if the panda rules say no;
++    rate-limited growth (every (re)opened episode restarts at +RATE_STEP), and an immediate camera
++    hand-back. There is NO actuation-duration budget and NO cooldown (0035): a brake runs until the
++    planner releases it or a gate (floor, driver, camera, stale) ends it. Nothing here can make the
++    car brake if the panda rules say no;
+   - the COMMANDED decel cap is personality-indexed (relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g, the
+     max) so the driver's feel dial owns the braking strength too. Every tier is <= the panda's 0.30 g gate
+     (which is personality-agnostic), so this is a python-only change;
+   - no auto-resume after a CUT (driver brake/gas, gear != D, pedal fault, camera request): braking
+     stays off until the next deliberate pause/resume engagement, per the owner's model.
+   - G7 (N1): on every braking true -> false transition ONE passive mirror frame goes out - all brake
+-    fields 0, Warn 0, the camera's own idle shape. It is the ONLY thing besides budget expiry that
+-    ends the panda's FCA11-long actuation episode (``safety/modes/hyundai.h`` 970-973). Without it
+-    ``act_active`` stays latched across separate brakes, the 2.5 s budget keeps running and the panda
+-    then refuses actuation for a 3 s cooldown - which is why the car layer used to be silently cut
+-    to ~half its intended brake time. The same 2.5 s / 3 s budget is mirrored in Python so ``braking``
+-    (and therefore the gas hard-zero and the alerts) matches what the panda will really accept.
++    fields 0, Warn 0, the camera's own idle shape: the clean hand-back that ends the episode at the
++    panda (an accepted passive frame drops the panda's rate-limit reference to 0, so the next episode
++    restarts its onset ramp). 0035 deleted the 2.5 s budget / 3 s cooldown mirror that used to live
++    here, together with the budget-edge stop-commanding it drove.
+   - G8 (R7 frame contract): the mirror is made a strict subset of what the panda accepts, frame by frame.
+     (R7-A) the rate-limit reference (``_dec_last_sent``) advances only on frames actually SENT: the panda
+     allows +RATE_STEP over the last ACCEPTED frame, and we only send on the 50 Hz slot, so advancing the
+     reference on every 100 Hz frame stepped the sent ramp +8 (twice the allowed rate) and the panda refused
+-    every actuating frame after the first. (R7-C) the cooldown clock is stamped when the passive frame is
+-    EMITTED (the panda starts its cooldown on the accepted passive frame, not on our release frame, which
+-    can be one frame earlier on an odd-frame release) plus a small conservative margin. (R7-D) the
+-    longActive-off exit owes the passive frame too: the panda's ``act_active`` survives a disengage (only
+-    ``hyundai_init`` clears it), so a mid-episode longActive drop must still close the episode.
++    every actuating frame after the first. (R7-D) the longActive-off exit owes the passive frame too, so a
++    mid-episode longActive drop still hands back cleanly.
+ 
+ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+   CF_VSM_Prefill (0,1), CF_VSM_HBACmd (1,2), CF_VSM_Warn (3,2), CF_VSM_BeltCmd (5,3),
+@@ -97,26 +94,12 @@ FCA11_ONSET_BYPASS_ACCEL = -1.2
+ FCA11_MIN_ON_S = FCA11_MIN_ON_FRAMES / 100.0
+ FCA11_ONSET_HOLD_S = FCA11_ONSET_HOLD_FRAMES / 100.0
+ 
+-# *** G7 (N1): passive release frame + the panda's actuation-budget mirror ***
+-# The panda's FCA11-long tx hook (safety/modes/hyundai.h:146-149, 939-975) caps a CONTINUOUS actuation
+-# episode at 2.5 s, then refuses new actuation for a 3 s cooldown of passive frames. An episode ends
+-# ONLY on an accepted passive 0x38D frame from the host (L970-973) or by budget expiry (L948-951).
+-# Before G7 the car layer sent NOTHING when not braking, so act_active stayed latched across separate
+-# brakes and the budget kept running - on the road only ~45-57 % of the intended brake time actuated
+-# (round-5 N1). G7 mirrors the same 2.5 s / 3 s state machine here so `braking` (and hence the gas
+-# hard-zero and the alerts) matches what the panda will really accept: the car layer deliberately
+-# ends an episode at the budget edge (with its passive frame) rather than keep commanding frames the
+-# panda refuses inside the cooldown.
+-# Controller frames are 100 Hz, so the budget/cooldown are counted in frames; the panda times both
+-# from the same microsecond clock, and the +-1-frame quantisation is sub-20 ms either side.
+-FCA11_BUDGET_FRAMES = 250    # 2.5 s at 100 Hz: == HYUNDAI_FCA11_LONG_MAX_ACT_US (safety/modes/hyundai.h:148)
+-FCA11_COOLDOWN_FRAMES = 300  # 3.0 s at 100 Hz: == HYUNDAI_FCA11_LONG_COOLDOWN_US (safety/modes/hyundai.h:149)
+-# *** G8 (R7-C): the cooldown is counted from the ACCEPTED PASSIVE frame, not from the release ***
+-# The panda starts its cooldown clock on the accepted passive 0x38D (hyundai.h:970-973), which goes out on
+-# the 50 Hz slot one frame later than the release on an odd-frame release. This margin keeps the Python
+-# mirror a STRICT SUBSET of what the panda allows (a couple of frames of slack rather than an exact copy),
+-# so the car layer never commands a frame the panda would refuse at the cooldown edge.
+-FCA11_COOLDOWN_MARGIN_FRAMES = 2
++# *** G7 (N1): passive release frame ***
++# On every braking true -> false edge ONE passive 0x38D goes out (the camera's idle shape). It is the clean
++# hand-back, and an ACCEPTED passive frame drops the panda's rate-limit reference to 0 (safety/modes/hyundai.h,
++# the 0035 onset rule), so the next episode restarts at +RATE_STEP - exactly what this layer does too
++# (`_dec_last_sent` resets on release). 0035: there is NO actuation-duration budget / cooldown any more, in the
++# panda or here, so nothing in this module may end a brake or hold one off on a clock.
+ 
+ # planner-side speed floor (km/h). 3 km/h above the panda's 9 km/h backstop so the panda floor is
+ # never the thing that ends a brake; below this the planner requests coast-only (the PID limits in
+@@ -282,8 +265,8 @@ class Fca11LongBrake:
+ 
+   ``braking`` is True only while an ACTUATING frame is being sent; on the true -> false edge the
+   class emits exactly one PASSIVE mirror frame (the camera's idle shape: all brake fields 0, Warn 0)
+-  to close the panda's FCA11-long episode. The panda's 2.5 s budget / 3 s cooldown is mirrored here so
+-  the class stops commanding at the budget edge instead of being silently refused in the cooldown.
++  to close the panda's FCA11-long episode. There is no duration budget: an episode runs as long as the
++  planner (or a cal hold) asks and every gate holds.
+   """
+ 
+   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None):
+@@ -308,23 +291,23 @@ class Fca11LongBrake:
+     # 0030 (D2-iii): echo-confirmation of the passive close frame. The panda only CLOSES its FCA11-long episode on an
+     # ACCEPTED passive 0x38D (hyundai.h:1027-1030); if the close frame was REFUSED (engage/disengage edge), the
+     # episode never closes. The car layer sees the pandad echo of every 0x38D it sends (src 128 = sent, 192 = REJECTED)
+-    # and can re-owe a refused close frame instead of starting the cooldown on a frame that never landed. Inert until
++    # and can re-owe a refused close frame instead of treating a frame that never landed as a hand-back. Inert until
+     # the car layer feeds it via observe_echo (a no-op otherwise, so shipping it unwired is safe).
+     self._pending_echo: bytes | None = None   # the last passive frame we emitted, awaiting its echo
+     self._pending_echo_frame = -1              # controller frame at which it was emitted
+     self._echo_rejected = False               # that frame came back 192 (never closed the episode)
+-    self._echo_wired = False                  # observe_echo has been called -> the car layer owns the cooldown stamp
++    self._echo_wired = False                  # observe_echo has been called
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+     self._sent_this_episode = False
+     # ---- G5 anti-flap state ----
+     self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
+     self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
+-    # ---- G7 panda actuation-budget mirror + passive release edge ----
+-    self._budget_start = 0             # controller frame at which the current ACTUATION episode opened
+-    self._in_budget = False            # inside a continuous actuation episode (== the panda's act_active)
+-    self._budget_end = -1              # frame at which the episode ended (cooldown runs from here)
++    # ---- G7 passive release edge ----
+     self._release_pending = False      # a passive frame is owed (the braking true -> false edge)
++    # ---- 0035: tool-side CAL watchdog (the panda no longer bounds a hold's duration) ----
++    self._cal_frames = 0               # consecutive frames the cal sequencer has asked for a hold
++    self.cal_watchdog_trips = 0        # diagnostics: how often the watchdog had to force a release
+     # ---- 0029 CAL command mode (patch: 0029-hyundai-fca11-cal-command-mode) ----
+     # A file-gated, autonomous sequencer that can replace the SOURCE of the decel command (the planner
+     # ask) with an exact scripted level, WHILE every production gate stays on. Subordinate to the
+@@ -380,30 +363,36 @@ class Fca11LongBrake:
+ 
+     ``echoes`` is the pandad echo of every host 0x38D we sent this CAN tick: an iterable of (src, dat) with
+     src 128 = accepted / forwarded by the panda TX hook, src 192 = REJECTED by it. The panda CLOSES its
+-    FCA11-long episode ONLY on an ACCEPTED passive 0x38D (safety/modes/hyundai.h:1027-1030); a refused close
+-    frame leaves ``act_active`` latched, so the NEXT brake hits budget-expiry on frame 1 + a 3 s cooldown (the
+-    860-frame stale defect). Until the echo for OUR close frame comes back accepted we must not treat the
+-    episode as closed, and if it comes back REFUSED we must RE-OWE the close frame and retry - never start the
+-    cooldown on a frame that never landed.
++    FCA11-long episode (drops its rate reference to 0) ONLY on an ACCEPTED passive 0x38D. If it comes back
++    REFUSED we RE-OWE the close frame and retry, so the hand-back is never assumed on a frame that never
++    landed. (0035: there is no cooldown to stamp any more; the echo only drives the re-owe.)
+ 
+     Called once per controller frame from create_gas_command. Inert (and byte-identical to the shipped
+     behaviour) until the first call, which is what sets ``_echo_wired``.
+     """
+     self._echo_wired = True
+-    if not echoes or self._pending_echo is None:
++    if not echoes:
++      return
++    # 0035: a REFUSED ACTUATING frame while we are still braking restarts the ramp. The panda's onset rule resets its
++    # rate reference to 0 once our stream has been stale > TX_STALE (the camera has re-owned the ESC), and a refused
++    # frame does not refresh the stream - so if a host/USB hiccup ever leaves a gap, continuing at the old level would
++    # be refused on EVERY frame until the planner released (a silent loss of the rest of the brake). Dropping our own
++    # reference to 0 makes the next frame RATE_STEP, which the panda accepts, and the ramp climbs back in ~150 ms.
++    # It can only ever LOWER the command.
++    if self.braking and any(int(src) == 192 and len(dat) == 8 and dat[1] != 0 for src, dat in echoes):
++      self._dec_last_sent = 0
++    if self._pending_echo is None:
+       return
+     pending = self._pending_echo
+     for src, dat in echoes:
+       if bytes(dat) != pending:
+         continue
+-      if int(src) == 192:
+-        # the close frame was REFUSED: the panda episode is STILL OPEN. Re-owe it (a later send slot retries) and
+-        # do NOT start the cooldown - the panda has not started its own either.
++      if int(src) == 192 and not self.braking:
++        # the close frame was REFUSED: the panda episode is STILL OPEN. Re-owe it (a later send slot retries).
++        # 0035: never while braking again - re-owing then would force the live brake off for a slot (a silent
++        # mid-brake truncation); the new episode's own release will owe its own close frame.
+         self._echo_rejected = True
+         self._release_pending = True
+-      else:
+-        # accepted: the panda closed the episode and started its cooldown at THIS emission frame.
+-        self._budget_end = self._pending_echo_frame
+       self._pending_echo = None
+       return
+ 
+@@ -412,8 +401,8 @@ class Fca11LongBrake:
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+ 
+     This is the clean release / hand-back frame the panda accepts while ``controls_allowed`` AND
+-    ``heartbeat_engaged`` (safety/modes/hyundai.h:903-931, 963-973); it is what ENDS an actuation
+-    episode and starts the cooldown clock. Only sent on the FCA11_SEND_EVERY slot, same 50 Hz stream
++    ``heartbeat_engaged`` (safety/modes/hyundai.h); it is what ENDS an actuation episode (the panda's
++    rate reference drops to 0). Only sent on the FCA11_SEND_EVERY slot, same 50 Hz stream
+     as the actuating frames, and only when a fresh camera frame is in hand (never a hardcoded frame -
+     the mirror is always sourced from the latest bus-2 0x38D).
+     """
+@@ -433,10 +422,9 @@ class Fca11LongBrake:
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+       self._on_frames = 0
+-      # G7: likewise no budget/cooldown state survives a disable (a re-arm is a clean panda episode too).
+-      self._in_budget = False
+-      self._budget_end = -1
++      # G7: likewise no owed close frame survives a disable (a re-arm is a clean panda episode too).
+       self._release_pending = False
++      self._cal_frames = 0
+       # G9b: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
+       self._driver_cut = False
+       self._hard_cut = False
+@@ -490,16 +478,13 @@ class Fca11LongBrake:
+     self.low_speed_alert = self._alert(CS)
+ 
+     if not CC.longActive:
+-      # R7-D: the panda's ``act_active`` survives a disengage (only ``hyundai_init`` clears it), so a
+-      # mid-episode longActive drop must still close the FCA11 episode with a passive frame. We cannot
+-      # send it here (longActive is off), so we OWE it: the first longActive frame back emits it before any
+-      # new actuation (the cooldown mirror holds braking off until it has gone out). An episode that never
+-      # opened owes nothing, and the panda's episode state is re-armed by ``hyundai_init`` on the next
+-      # onroad regardless, so nothing latent survives offroad.
+-      if self.braking or self._in_budget:
++      # R7-D: a mid-episode longActive drop must still close the FCA11 episode with a passive frame. We cannot
++      # send it here (longActive is off), so we OWE it: the first longActive send slot back emits it before any
++      # new actuation. An episode that never opened owes nothing.
++      if self.braking:
+         self._release_pending = True
+-      self._in_budget = False
+       self.braking = False
++      self._cal_frames = 0
+       self._dec_last_sent = 0
+       # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
+       self._ask_frames = 0
+@@ -518,17 +503,25 @@ class Fca11LongBrake:
+     # the first dec_cmd frame (Fable's gas-neutralization timing item). cal_on is LATCHED between
+     # ticks; it can only ever be true while the last tick commanded a hold AND a gate still holds.
+     if self.cal_seq is not None and frame % FCA11_SEND_EVERY == 0:
+-      # 0031: publish the panda budget/cooldown mirror BEFORE ticking, so the sequencer's ARMING
+-      # gate sees this frame's exact state. `_in_budget` == the panda's act_active; `_budget_start`
+-      # is the frame the current episode opened; `_budget_end` is the frame the closing passive
+-      # frame was emitted (the cooldown clock). The sequencer will not start a rep whose hold +
+-      # release would exceed the remaining budget, nor while the cooldown is running -- a rep the
+-      # panda refuses still lands in progress.json as outcome=ok, which is what we are fixing.
+-      self.cal_seq.set_budget_mirror(self._in_budget, self._budget_start, self._budget_end)
++      # 0035: no budget mirror is published any more (the panda has no duration budget); the sequencer
++      # arms on its own conditions and bounds the hold itself (CAL_MAX_HOLD_S + the watchdog below).
+       self.cal_seq.tick(CC, CS, frame)
+     # cal_on is the scripted ASK, gated by `ok` exactly like a planner ask: a production veto (camera
+     # owns, gear out of D, below floor, pedal fault, driver-cut latch) suppresses it on the SAME frame.
+-    cal_on = bool(self.cal_seq is not None and self.cal_seq.active_actuation and ok)
++    cal_ask = bool(self.cal_seq is not None and self.cal_seq.active_actuation)
++    # ---- 0035 tool-side CAL WATCHDOG -------------------------------------------------------------
++    # The panda's 2.5 s budget used to be the hard backstop on a scripted hold. It is gone, so the TOOL
++    # bounds itself, independently of the sequencer's own hold arithmetic: a cal ask that stays up longer
++    # than CAL_MAX_HOLD_S + the watchdog margin is a sequencer fault -> drop the ask this frame, tell the
++    # sequencer to abort the rep (outcome "watchdog"), and let the production release path emit the
++    # passive close frame. Bounds ONLY the scripted ask - a planner ask is never silenced by this.
++    self._cal_frames = self._cal_frames + 1 if cal_ask else 0
++    if cal_ask and self._cal_frames > cal_mode.CAL_WATCHDOG_FRAMES:
++      self.cal_watchdog_trips += 1
++      self.cal_seq.watchdog_abort(frame)
++      cal_ask = False
++      self._cal_frames = 0
++    cal_on = bool(cal_ask and ok)
+     self._cal_active = False   # re-latched below iff THIS frame commands a scripted hold
+ 
+     # ---- G5 anti-flap decision ----------------------------------------------------------------
+@@ -552,29 +545,15 @@ class Fca11LongBrake:
+     holding = bool(self.braking and ok and
+                    (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+     want_brake = bool(onset or holding or cal_on)
+-
+-    # ---- G7 panda actuation-budget mirror -------------------------------------------------------
+-    # Mirror of safety/modes/hyundai.h:944-961. `self._in_budget` == the panda's act_active.
+-    #   * while in an episode, a CONTINUOUS actuation runs at most FCA11_BUDGET_FRAMES (2.5 s); at the
+-    #     budget edge the panda ENDS the episode and REFUSES that frame -> we must stop commanding
+-    #     (not merely be cut): end here, release below with the passive frame, start the cooldown.
+-    #   * after an episode ends (budget or release), a NEW actuation is refused for
+-    #     FCA11_COOLDOWN_FRAMES (3 s) of passive frames -> we must not re-command inside it.
+-    # A frame we would command inside the cooldown is a frame the panda refuses; refusing it here is
+-    # what keeps `braking`/gas-zero/alerts honest. Safety-only paths (`ok` false, longActive off,
+-    # camera owns, CUT) are evaluated BEFORE this and are untouched by the budget mirror.
+-    cooldown_active = self._release_pending or (
+-      (not self._in_budget) and self._budget_end >= 0 and
+-      (frame - self._budget_end) <= FCA11_COOLDOWN_FRAMES + FCA11_COOLDOWN_MARGIN_FRAMES)
+-    if want_brake and self._in_budget and (frame - self._budget_start) > FCA11_BUDGET_FRAMES:
+-      # budget spent: the panda would refuse this very frame and end the episode here
+-      self._in_budget = False
+-      self._budget_end = frame
+-      want_brake = False
+-    elif want_brake and cooldown_active:
+-      # still inside the passive cooldown: a new actuation is refused by the panda, so do not ask
++    # 0035: the G7 budget-edge stop and the 3 s cooldown hold-off that used to sit here are DELETED with the
++    # panda's budget/cooldown. The only things that end a brake are the planner/cal release above and the `ok`
++    # gates (driver, gear, floor, camera, pedal, staleness). The one remaining hold-off is the close-frame
++    # ORDERING: a passive frame still owed from the previous episode goes out first, so a re-brake waits at most
++    # ONE 50 Hz send slot (<= 20 ms). It cannot wedge: the owed frame is emitted on the next send slot whenever a
++    # fresh camera frame exists (and without one `ok` is False anyway), and observe_echo never re-owes a close
++    # frame while braking.
++    if want_brake and self._release_pending:
+       want_brake = False
+-    # ---------------------------------------------------------------------------------------------
+ 
+     if want_brake:
+       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
+@@ -619,12 +598,6 @@ class Fca11LongBrake:
+         self._dec_last_sent = dec_cmd
+       self.braking = True
+       self._sent_this_episode = True
+-      if not self._in_budget:
+-        # first accepted actuation of a new episode: open the budget clock (the panda starts it on the
+-        # first accepted actuating frame, hyundai.h:967-969).
+-        self._in_budget = True
+-        self._budget_start = frame
+-        self._budget_end = -1
+     else:
+       # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
+       # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
+@@ -634,30 +607,18 @@ class Fca11LongBrake:
+       self._dec_last_sent = 0
+       self._sent_this_episode = False
+       if was_braking:
+-        # braking true -> false edge: end the panda episode, owe a passive frame. The cooldown clock
+-        # starts when the passive frame is ACCEPTED by the panda, so it is stamped at emission below
+-        # (R7-C), not here at the release frame.
+-        if self._in_budget:
+-          self._in_budget = False
++        # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+         self._release_pending = True
+       if self._release_pending:
+         sends += self._passive_frame(CS, frame)
+         if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
+           self._release_pending = False
+           if self._echo_wired:
+-            # 0030 (D2-iii): do NOT start the cooldown on EMISSION. Record the frame we just put on the wire and
+-            # wait for the pandad echo (observe_echo): accepted (src 128) stamps _budget_end; refused (src 192)
+-            # RE-OWES the close frame, so the episode is retried instead of the cooldown starting on a frame that
+-            # never landed (the 860-frame stale act_active defect).
++            # 0030 (D2-iii): record the frame we just put on the wire and wait for the pandad echo (observe_echo):
++            # refused (src 192) RE-OWES the close frame so the hand-back is retried.
+             self._pending_echo = bytes(sends[-1].dat)
+             self._pending_echo_frame = frame
+             self._echo_rejected = False
+-          else:
+-            # R7-C: the panda starts its cooldown on the ACCEPTED passive frame (hyundai.h:970-973), which is THIS
+-            # emission frame - not the (possibly odd) release frame. Stamping it here, plus the conservative margin
+-            # in cooldown_active, keeps the mirror a strict subset of the panda. (Echo-unwired fallback: the shipped
+-            # behaviour, byte-for-byte, so this patch is inert until the car layer wires observe_echo.)
+-            self._budget_end = frame
+ 
+     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+     self._on_frames = self._on_frames + 1 if want_brake else 0
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index dcd70fd..bed703f 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -298,7 +298,7 @@ class GasInterceptorCarController:
+     # Freshness reference for the mirrored camera frame: the same now_nanos CarInterface.apply received (replay-safe).
+     CS.fca11_now_nanos = now_nanos
+     # 0030 (D2-iii): feed the pandad echo of our own 0x38D frames (collected in CarInterface.update) so the class can
+-    # confirm the passive close frame was ACCEPTED before it starts the cooldown; a refused close frame is re-owed.
++    # confirm the passive close frame was ACCEPTED (the clean hand-back); a refused close frame is re-owed.
+     self.fca11_brake.observe_echo(getattr(CS, "fca11_echoes", None))
+     # 0034: STEERING-WHEEL consent. The CarState phase recognised a double-press on this frame's cruise
+     # buttons and (if it was a consent gesture for the rep parked on a PREVIOUS frame) dropped its taps
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 68e4cf9..6012c28 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -356,12 +356,10 @@ class TestController(unittest.TestCase):
+     b.update(self._cc(-2.0, engaged=False), _CS(cam=_cam()), 6)
+     b.update(self._cc(-2.0, engaged=True), _CS(cam=_cam()), 8)
+     self.assertFalse(b.blocked_until_resume)
+-    # G7/G8: the cut also ENDED the actuation episode, and G8 stamps the cooldown on the ACCEPTED passive
+-    # frame (frame 2 here - an even release), plus the conservative margin. So the panda's 3 s passive
+-    # cooldown must elapse before a new actuation is accepted, and the first such frame must be on the
+-    # 50 Hz send slot (an even frame) to actually emit.
+-    f = 2 + fl.FCA11_COOLDOWN_FRAMES + fl.FCA11_COOLDOWN_MARGIN_FRAMES + 2
+-    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f))
++    # 0035: the cut ENDED the episode with its passive frame (frame 2); there is NO cooldown, so the very
++    # next send slot after the resume brakes again.
++    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 10))
++    self.assertTrue(b.braking)
+ 
+   def test_passive_release_frame_on_every_episode_end(self):
+     """G7 (N1): every braking episode must end with exactly ONE passive 0x38D (the panda needs it to
+@@ -396,26 +394,77 @@ class TestController(unittest.TestCase):
+       for x in b2.update(self._cc(-2.0), _CS(cam=_cam()), f):
+         self.assertGreaterEqual(fl._get_bits(x.dat, 8, 8), 1)
+ 
+-  def test_budget_mirror_ends_episode_and_holds_cooldown(self):
+-    """G7: the panda's 2.5 s/3 s budget is mirrored, so the car layer stops commanding at the budget
+-    edge (instead of being silently refused) and does not re-command inside the cooldown."""
++  # *** 0035 (F7): no duration budget, no cooldown in the car layer ***
++
++  def _withheld(self, b, frames, accel=-2.0, start=0, cs=None):
++    """Drive a sustained ask for `frames` controller frames; return (withheld, sent) where `withheld` counts the
++    frames on which the class was NOT braking, or (on a 50 Hz send slot) did not emit an ACTUATING 0x38D, while
++    every gate held - i.e. the frames the car layer withheld by itself."""
++    withheld, sent = 0, 0
++    for f in range(start, start + frames):
++      out = b.update(self._cc(accel), cs or _CS(cam=_cam()), f)
++      act = [x for x in out if fl._get_bits(x.dat, 8, 8) > 0]
++      sent += len(act)
++      if not b.braking or (f % fl.FCA11_SEND_EVERY == 0 and not act):
++        withheld += 1
++    return withheld, sent
++
++  def test_f7_continuous_braking_is_never_withheld(self):
++    """F7: a sustained hard ask brakes for 30 s (3000 frames, 12x the old 2.5 s budget) with ZERO withheld frames
++    and an actuating frame on every 50 Hz slot. RED on 0034: the budget mirror stopped commanding at frame 251
++    and held braking off for the following 3 s."""
+     b = self._brake(self._cp_sp())
+-    # a sustained hard ask brakes through the whole 2.5 s budget ...
+-    for f in range(0, fl.FCA11_BUDGET_FRAMES + 1):
+-      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+-      self.assertTrue(b.braking, f)
+-    # ... the car layer ends the episode one frame past the budget (the panda would refuse that frame)
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), fl.FCA11_BUDGET_FRAMES + 1)
++    withheld, sent = self._withheld(b, 3000)
++    self.assertEqual(0, withheld)
++    self.assertEqual(1500, sent)
++
++  def test_f7_multi_episode_profiles_are_never_withheld(self):
++    """F7: back-to-back episodes, each longer than the old budget, separated by gaps all SHORTER than the old 3 s
++    cooldown: every frame of every episode brakes (0 withheld), and every episode ends with exactly one passive
++    close frame. RED on 0034 (the budget edge + cooldown)."""
++    b = self._brake(self._cp_sp())
++    f = 0
++    total_withheld = 0
++    for gap in (4, 50, 150, 298):
++      withheld, _ = self._withheld(b, 400, start=f)
++      total_withheld += withheld
++      f += 400
++      # release: ask rises above -0.30 -> the episode ends on this frame (min-on long elapsed)
++      got = []
++      for g in range(f, f + gap):
++        got += b.update(self._cc(0.0), _CS(cam=_cam()), g)
++        self.assertFalse(b.braking, g)
++      self.assertEqual(1, len([x for x in got if fl._get_bits(x.dat, 8, 8) == 0]), f"close frame, gap {gap}")
++      f += gap
++    withheld, _ = self._withheld(b, 400, start=f)
++    self.assertEqual(0, total_withheld + withheld)
++
++  def test_f7_close_frame_ordering_holds_a_rebrake_at_most_one_slot(self):
++    """F7: the ONE remaining car-layer hold-off is the close-frame ordering. Release on an ODD frame (no send slot),
++    re-ask on the very next frame: the owed passive frame goes out first on the even slot and the re-brake starts on
++    the next frame - at most one 20 ms send slot, never a clock."""
++    b = self._brake(self._cp_sp())
++    self._withheld(b, 101)                                  # brake through frame 100
++    self.assertEqual([], b.update(self._cc(0.0), _CS(cam=_cam()), 101))   # odd release: nothing sent yet
+     self.assertFalse(b.braking)
+-    # ... it does not re-command inside the 3 s cooldown (which G8 starts at the ACCEPTED passive frame -
+-    # an odd release here, so the passive goes out one frame later and the margin applies) ...
+-    for f in range(fl.FCA11_BUDGET_FRAMES + 2, fl.FCA11_BUDGET_FRAMES + 2 + fl.FCA11_COOLDOWN_FRAMES):
+-      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+-      self.assertFalse(b.braking, f)
+-    # ... and a fresh ask past the cooldown opens a NEW episode.
+-    f = fl.FCA11_BUDGET_FRAMES + 2 + fl.FCA11_COOLDOWN_FRAMES + fl.FCA11_COOLDOWN_MARGIN_FRAMES + 1
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+-    self.assertTrue(b.braking)
++    out = b.update(self._cc(-2.0), _CS(cam=_cam()), 102)   # re-ask on the next (even) slot
++    self.assertEqual([0], [fl._get_bits(x.dat, 8, 8) for x in out], "the close frame goes out first")
++    withheld, _ = self._withheld(b, 200, start=103)
++    self.assertEqual(0, withheld, "and the re-brake is never withheld after it")
++
++  def test_f7_no_budget_or_cooldown_reference_remains(self):
++    """F7: the mirror is gone, not just bypassed: no constant, no state, no published mirror."""
++    for name in ("FCA11_BUDGET_FRAMES", "FCA11_COOLDOWN_FRAMES", "FCA11_COOLDOWN_MARGIN_FRAMES"):
++      self.assertFalse(hasattr(fl, name), name)
++    b = self._brake(self._cp_sp())
++    for attr in ("_in_budget", "_budget_start", "_budget_end"):
++      self.assertFalse(hasattr(b, attr), attr)
++    for mod in (fl, cm):
++      with open(mod.__file__) as f:
++        src = f.read()
++      for token in ("FCA11_BUDGET_FRAMES", "FCA11_COOLDOWN_FRAMES", "CAL_BUDGET_FRAMES", "CAL_COOLDOWN_FRAMES",
++                    "_in_budget", "_budget_end", "set_budget_mirror", "budget_can_arm", "_fca11_budget_predicate"):
++        self.assertNotIn(token, src, (mod.__name__, token))
+ 
+   def test_off_path_emits_no_passive_frame(self):
+     """G7: the OFF path (fca11Brake False -> enabled False) is inert: no mirror frame of any kind."""
+@@ -459,8 +508,8 @@ class TestG8FrameContract(unittest.TestCase):
+ 
+   R7-A: the rate reference advances only on frames actually SENT, so every sent frame grows <= +RATE_STEP
+         over the previous sent frame (what the panda's hyundai.h:940-941 rate limit checks).
+-  R7-C: the cooldown is counted from the ACCEPTED passive frame, not the release frame (hyundai.h:970-973),
+-        with a conservative margin, so the first re-brake after the cooldown is accepted.
++  R7-C (0035): the passive close frame goes out on the first send slot after an odd release, and a re-brake right
++        after it is accepted at once (there is no cooldown any more).
+   R7-D: the longActive-off exit owes the passive frame too (the panda's act_active survives a disengage).
+   """
+ 
+@@ -497,12 +546,10 @@ class TestG8FrameContract(unittest.TestCase):
+     self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0], "first sent frame is capped at RATE_STEP")
+     self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE], decs[-1])
+ 
+-  def test_r7c_cooldown_stamped_at_passive_emission(self):
+-    """R7-C: the cooldown clock starts at the ACCEPTED passive frame (odd release -> one frame later)."""
++  def test_r7c_passive_on_next_slot_then_immediate_rebrake(self):
++    """R7-C (0035): odd release -> the passive goes out one frame later on the 50 Hz slot; the very next send slot
++    may brake again (no cooldown, no margin)."""
+     b = self._brake()
+-    # keep the hard ask until one frame past the 0.6 s min-on, then release ON AN ODD frame (61):
+-    # an odd release emits nothing, so the passive goes out one frame later (62) and the cooldown is
+-    # stamped THERE - not at the release frame.
+     for f in range(0, 61):
+       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+     self.assertTrue(b.braking)
+@@ -510,20 +557,13 @@ class TestG8FrameContract(unittest.TestCase):
+     s_rel = b.update(self._cc(-0.2), _CS(cam=_cam()), f_rel)
+     self.assertFalse(b.braking, "min-on elapsed, ask above release -> releases on the odd frame")
+     self.assertEqual([], s_rel, "odd release frame emits nothing (passive is on the 50 Hz slot)")
+-    # the passive goes out on the next (even) frame; the cooldown is stamped THERE, not at f_rel
+     f_pas = f_rel + 1
+     s_pas = b.update(self._cc(-0.2), _CS(cam=_cam()), f_pas)
+-    passive = [x for x in s_pas if fl._get_bits(x.dat, 8, 8) == 0]
+-    self.assertEqual(1, len(passive), "the passive frame goes out on the next send slot")
+-    self.assertEqual(f_pas, b._budget_end, "cooldown origin must be the passive emission frame")
+-    # the first frame past the cooldown + margin on a send slot is accepted (braking), the one before is not
+-    first = f_pas + fl.FCA11_COOLDOWN_FRAMES + fl.FCA11_COOLDOWN_MARGIN_FRAMES + 1
+-    if first % 2 == 1:
+-      first += 1
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), first - 2)
+-    self.assertFalse(b.braking, "still inside the cooldown + margin")
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), first)
+-    self.assertTrue(b.braking, "first re-brake past the cooldown must be accepted")
++    self.assertEqual(1, len([x for x in s_pas if fl._get_bits(x.dat, 8, 8) == 0]), "passive on the next send slot")
++    s_new = b.update(self._cc(-2.0), _CS(cam=_cam()), f_pas + 2)
++    self.assertTrue(b.braking, "re-brake on the next send slot is commanded (0035: no cooldown)")
++    self.assertEqual([fl.HYUNDAI_FCA11_LONG_RATE_STEP], [fl._get_bits(x.dat, 8, 8) for x in s_new],
++                     "and restarts at the onset step, exactly what the panda's onset rule allows")
+ 
+   def test_r7d_longactive_off_owes_and_emits_the_passive_frame(self):
+     """R7-D: a mid-episode longActive drop must still close the episode with a passive frame."""
+@@ -1135,7 +1175,7 @@ class TestCalModeActuation(unittest.TestCase):
+ 
+   def test_cal_release_uses_the_production_fade_and_passive_frame(self):
+     """When the sequencer drops the hold, the episode ends through the PRODUCTION path: a passive
+-    frame, not a mid-episode 0, and the panda budget/cooldown mirror stays in charge."""
++    frame, not a mid-episode 0."""
+     with tempfile.TemporaryDirectory() as d:
+       b = self._mk(d)
+       _write_plan(d, _cal_plan([(60, 20, 0.5)]))   # a 0.5 s hold
+@@ -1408,6 +1448,100 @@ class TestCalModeActuation(unittest.TestCase):
+       self.assertGreater(i10, i20)
+       self.assertEqual(1, sum(1 for dd in decs if dd == 0), "one episode -> one passive frame")
+ 
++  # *** 0035 (F8): budget-free arming + the tool-side hold cap + watchdog ***
++
++  def _run(self, b, cc, cs, frames, start=0):
++    """Step update(); return per-frame (frame, braking, [sent decs], cal_active)."""
++    out = []
++    for f in range(start, start + frames):
++      decs = [fl._get_bits(x.dat, 8, 8) for x in b.update(cc, cs, f)]
++      out.append((f, b.braking, decs, b._cal_active))
++    return out
++
++  def test_f8_arming_is_budget_free_right_after_a_long_planner_brake(self):
++    """F8: a planner brake LONGER than the old 2.5 s budget closes, and a due cal rep arms as soon as its own
++    conditions hold (band stable 0.5 s) - not after a 3 s cooldown. RED on 0034: the planner brake was clipped at
++    frame 251 and the 0031 predicate held the rep off until the cooldown (+margin) had run."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      cc.actuators.accel = -2.0
++      trace = self._run(b, cc, cs, 400)                  # 4 s planner brake, never clipped
++      self.assertTrue(all(t[1] for t in trace[1:]), "planner brake must not be clipped at 2.5 s")
++      cc.actuators.accel = 0.0
++      self._run(b, cc, cs, 2, start=400)                 # release + passive close
++      _write_plan(d, _cal_plan([(60, 20, 1.0)]))
++      started = next((f for f, _, _, cal in self._run(b, cc, cs, 300, start=402) if cal), None)
++      self.assertIsNotNone(started, "the rep must arm")
++      self.assertLess(started - 402, 120, f"armed {started - 402} frames after the close: no 3 s cooldown")
++
++  def test_f8_hold_at_the_tool_cap_completes_untruncated(self):
++    """F8: a rep held for exactly CAL_MAX_HOLD_S (10 s, 4x the old budget) brakes continuously for the whole
++    hold - no gap, no watchdog trip - then closes with one passive frame and is recorded ok."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, cm.CAL_MAX_HOLD_S)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      trace = self._run(b, cc, cs, 2400)
++      on = [t[0] for t in trace if t[1]]
++      self.assertTrue(on, "the rep must actuate")
++      self.assertEqual(list(range(on[0], on[-1] + 1)), on, "one contiguous episode, never a gap")
++      self.assertGreaterEqual(len(on), int(cm.CAL_MAX_HOLD_S * 100), "held for the whole 10 s")
++      self.assertEqual(0, b.cal_watchdog_trips)
++      self.assertEqual(1, sum(1 for t in trace for x in t[2] if x == 0), "one passive close frame")
++      prog = json.load(open(os.path.join(d, "progress.json")))
++      self.assertEqual("ok", prog["reps"]["r0"]["outcome"])
++
++  def test_f8_over_cap_hold_is_refused(self):
++    """F8: a rep whose hold exceeds CAL_MAX_HOLD_S is never armed (no actuation at all), with the reason surfaced;
++    a legal rep in the same plan still runs."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, cm.CAL_MAX_HOLD_S + 0.5)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      trace = self._run(b, cc, cs, 800)
++      self.assertFalse(any(t[1] for t in trace), "an over-cap rep must never actuate")
++      self.assertEqual("hold_over_cap", b.cal_seq._block_reason)
++      self.assertIn("hold_over_cap", b.cal_seq.status()["hold_reason"])
++      for bad in (0.0, -1.0, "x", None):
++        self.assertFalse(cm.hold_ok(bad)[0], bad)
++      self.assertTrue(cm.hold_ok(cm.CAL_MAX_HOLD_S)[0])
++
++  def test_f8_watchdog_forces_the_close_when_the_sequencer_overruns(self):
++    """F8: the brake's independent watchdog bounds a scripted hold even if the SEQUENCER's own hold arithmetic
++    fails (simulated: the active rep's hold is corrupted to 100 s mid-hold). At CAL_WATCHDOG_FRAMES the ask is
++    dropped, the production release emits one passive close frame, the rep is recorded 'watchdog' (not ok) and is
++    not re-armed this session."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, 5.0)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      f = 0
++      while not b._cal_active and f < 400:
++        b.update(cc, cs, f)
++        f += 1
++      self.assertTrue(b._cal_active)
++      b.cal_seq._active.hold_s = 100.0                    # the sequencer fault
++      trace = self._run(b, cc, cs, 2000, start=f)
++      on = [t[0] for t in trace if t[1]]
++      self.assertEqual(1, b.cal_watchdog_trips)
++      self.assertLessEqual(len(on) + 1, cm.CAL_WATCHDOG_FRAMES + 1, "the watchdog bounds the hold")
++      self.assertGreater(len(on), int(cm.CAL_MAX_HOLD_S * 100), "but never before the tool cap")
++      self.assertEqual(1, sum(1 for t in trace for x in t[2] if x == 0), "one passive close frame")
++      self.assertEqual("watchdog", json.load(open(os.path.join(d, "progress.json")))["reps"]["r0"]["outcome"])
++      self.assertFalse(trace[-1][1], "and it is not re-armed this session")
++
+   def test_lead_condition_skips_the_high_level_rep(self):
+     """A high-level rep (>= 20 LSB) is skipped while a lead is close; the sequencer waits."""
+     with tempfile.TemporaryDirectory() as d:
+@@ -1502,12 +1636,9 @@ class Test0030CameraLatchWithoutLongActive(unittest.TestCase):
+ 
+ 
+ class Test0030EchoConfirmedClose(unittest.TestCase):
+-  """0030 (D2-iii): the car layer must stamp ``_budget_end`` only on an ECHO-CONFIRMED accepted passive close frame,
+-  and RE-OWE the close frame when the panda REFUSED it (src 192). The panda closes its FCA11-long episode ONLY on an
+-  ACCEPTED passive 0x38D (safety/modes/hyundai.h:1027-1030); a refused close frame leaves act_active latched, so the
+-  next brake hits budget-expiry on frame 1 + the 3 s cooldown (the 860-frame stale defect, drive 14f). FALSIFIABLE
+-  CONTRAST: on the deployed 29-patch tree the refused-close test FAILS (the old code stamped _budget_end at EMISSION,
+-  with no echo) - observe_echo() does not even exist."""
++  """0030 (D2-iii): the car layer RE-OWES the close frame when the panda REFUSED it (src 192): the panda only ends
++  the episode on an ACCEPTED passive 0x38D. (0035: there is no cooldown stamp any more; the echo only drives the
++  re-owe.) FALSIFIABLE CONTRAST: on the deployed 29-patch tree observe_echo() does not even exist."""
+ 
+   def _brake(self):
+     cp_sp = structs.CarParamsSP()
+@@ -1543,40 +1674,68 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
+     b.observe_echo([])                                     # wire the echo path (as create_gas_command does each frame)
+     f_emit, dat = self._emit_close(b)
+     self.assertEqual(dat, b._pending_echo, "the emitted close frame must be recorded for echo confirmation")
+-    self.assertEqual(-1, b._budget_end, "no cooldown may start until the echo confirms the close")
+     self.assertFalse(b._release_pending)
+-    # the panda REFUSED it (engage/disengage edge): re-owe and do NOT start the cooldown
++    # the panda REFUSED it (engage/disengage edge): re-owe
+     b.observe_echo([(192, dat)])
+     self.assertTrue(b._release_pending, "a refused close frame must be re-owed")
+-    self.assertEqual(-1, b._budget_end)
+     self.assertIsNone(b._pending_echo)
+     # the re-owed close frame goes out on the NEXT send slot
+     s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 2)
+     p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
+     self.assertEqual(1, len(p), "the re-owed passive frame must be re-emitted")
+ 
+-  def test_wired_accepted_close_stamps_the_cooldown_at_the_emission_frame(self):
++  def test_wired_accepted_close_then_immediate_rebrake(self):
++    """0035: an accepted close needs nothing more, and the next brake is commanded on the very next frame."""
+     b = self._brake()
+     b.observe_echo([])
+     f_emit, dat = self._emit_close(b)
+     b.observe_echo([(128, dat)])                          # accepted by the panda TX hook
+-    self.assertEqual(f_emit, b._budget_end, "the cooldown starts at the ACCEPTED close frame, not at emission blindly")
+     self.assertFalse(b._release_pending)
+     self.assertIsNone(b._pending_echo)
+-    # inside the cooldown a new actuation is not commanded; past it, it is
+-    for f in range(f_emit + 1, f_emit + 1 + fl.FCA11_COOLDOWN_FRAMES):
++    for f in range(f_emit + 1, f_emit + 400):
+       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+-      self.assertFalse(b.braking, f)
+-    f_new = f_emit + 1 + fl.FCA11_COOLDOWN_FRAMES + fl.FCA11_COOLDOWN_MARGIN_FRAMES + 1
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), f_new)
++      self.assertTrue(b.braking, f)
++
++  def test_refused_close_echo_arriving_after_a_rebrake_never_cuts_it(self):
++    """0035: a REFUSED-close echo that lands after the next brake has already started must NOT re-owe the close
++    frame (that would force the live brake off for a slot - a silent truncation)."""
++    b = self._brake()
++    b.observe_echo([])
++    f_emit, dat = self._emit_close(b)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), f_emit + 2)
++    self.assertTrue(b.braking)
++    b.observe_echo([(192, dat)])                           # late refusal of the OLD close frame
++    self.assertFalse(b._release_pending)
++    for f in range(f_emit + 3, f_emit + 200):
++      b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++      self.assertTrue(b.braking, f)
++
++  def test_refused_actuating_echo_restarts_the_ramp(self):
++    """0035: if the panda REFUSES an actuating frame mid-brake (e.g. its onset rule after a >100 ms stream gap), the
++    next frame restarts at RATE_STEP instead of repeating the refused level forever (which would keep the stream
++    stale and lose the rest of the brake). Passive/accepted echoes do not touch the ramp."""
++    b = self._brake()
++    b.observe_echo([])
++    sent = []
++    for f in range(0, 40):
++      sent += [bytes(x.dat) for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE)]
++    self.assertEqual(30, sent[-1][1])
++    b.observe_echo([(128, sent[-1])])                     # accepted: no change
++    s = b.update(self._cc(-2.0), _CS(cam=_cam()), 40, fl.PERSONALITY_AGGRESSIVE)
++    self.assertEqual([30], [x.dat[1] for x in s])
++    b.observe_echo([(192, bytes(s[0].dat))])              # refused actuating frame
++    decs = []
++    for f in range(41, 60):
++      decs += [x.dat[1] for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE)]
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0], "the ramp restarts at the onset step")
++    self.assertEqual(30, decs[-1], "and climbs back to the ask")
+     self.assertTrue(b.braking)
+ 
+-  def test_unwired_falls_back_to_the_shipped_r7c_behaviour(self):
+-    """Guard: without an observe_echo call the class must behave EXACTLY as the deployed 29-patch tree (stamp at
+-    emission). This is what makes the patch inert until the car layer wires the echo."""
++  def test_unwired_emits_the_close_and_records_no_echo(self):
++    """Guard: without an observe_echo call the close frame is still emitted once and nothing waits on an echo."""
+     b = self._brake()
+     f_emit, dat = self._emit_close(b)
+-    self.assertEqual(f_emit, b._budget_end)              # R7-C, unchanged
++    self.assertFalse(b._release_pending)
+     self.assertIsNone(b._pending_echo)
+ 
+   def test_wired_retries_until_an_echo_is_accepted(self):
+@@ -1585,20 +1744,19 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
+     f_emit, dat = self._emit_close(b)
+     b.observe_echo([(192, dat)])                         # refused
+     self.assertTrue(b._release_pending)
+-    # re-emit and refuse again: still owed, still no cooldown stamped
++    # re-emit and refuse again: still owed
+     s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 2)
+     p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
+     self.assertEqual(1, len(p))
+     b.observe_echo([(192, bytes(p[0].dat))])
+     self.assertTrue(b._release_pending)
+-    self.assertEqual(-1, b._budget_end)
+     # finally accepted
+     s = b.update(self._cc(-0.2), _CS(cam=_cam()), f_emit + 4)
+     p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
+     self.assertEqual(1, len(p))
+     b.observe_echo([(128, bytes(p[0].dat))])
+     self.assertFalse(b._release_pending)
+-    self.assertEqual(f_emit + 4, b._budget_end)
++    self.assertIsNone(b._pending_echo)
+ 
+ 
+ class TestEchoCollectionShape(unittest.TestCase):
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index bfa70de..bbff85e 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -30,7 +30,8 @@ class HyundaiSafetyFlagsSP:
+   # (needs GAS_INTERCEPTOR; armed by _initialize_hyundai_gas_interceptor from the HyundaiFca11Brake param).
+   # Panda (bit 256): actuating FCA11 only while controls_allowed AND heartbeat_engaged, gear D, no pedal, fresh
+   # inputs, every wheel above 9 km/h (no ceiling), DecCmd <= 30 (0.30 g), rate-limited growth (+0.04 g/camera
+-  # period), a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera hand-back. C mirror:
++  # period, every (re)opened episode restarting at +0.04 g), NO duration budget / cooldown (0035), and an immediate
++  # camera hand-back. C mirror:
+   # HYUNDAI_PARAM_SP_FCA11_LONG.
+   FCA11_LONG = 256
+   # TEST-ONLY, NOT FOR ROAD USE: parked LKAS11 (0x340) steering-torque sweep, armed only by the steer-test runner with
+diff --git a/opendbc/sunnypilot/car/hyundai/wheel_consent.py b/opendbc/sunnypilot/car/hyundai/wheel_consent.py
+index 9770bd9..955ee48 100644
+--- a/opendbc/sunnypilot/car/hyundai/wheel_consent.py
++++ b/opendbc/sunnypilot/car/hyundai/wheel_consent.py
+@@ -63,7 +63,7 @@ FAIL-CLOSED
+ -----------
+ This module only DETECTS; the authority stays entirely in cal_mode.CalSequencer. The written consent file
+ is bound to the rep_id + plan_id + prompt seq of the parked rep, must be <= CONSENT_FRESHNESS_S (2 s)
+-fresh, and the sequencer RE-VERIFIES every condition (incl. the 0032 blind-spot veto) and the 0031 budget
++fresh, and the sequencer RE-VERIFIES every condition (incl. the 0032 blind-spot veto) and the 0035 hold cap
+ at the instant it consumes it. A detector bug can at worst fail to prompt, or fire a rep the sequencer
+ would have parked anyway -- it can never actuate without the sequencer's own re-verification. The
+ detector itself writes nothing and holds no actuation state.
+-- 
+2.54.0 (Apple Git-157)
+

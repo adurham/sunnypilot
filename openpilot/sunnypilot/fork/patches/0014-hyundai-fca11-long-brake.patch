@@ -1,0 +1,1937 @@
+From 285ffe274bafddf020300faba6c3b78a7bf36927 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Mon, 5 Oct 2026 20:06:14 -0500
+Subject: [PATCH] =?UTF-8?q?hyundai:=20FCA11=20LONG=20braking=20=E2=80=94?=
+ =?UTF-8?q?=20finish=20car=20layer,=20safety=20tests,=20fix=20RX/hook/cool?=
+ =?UTF-8?q?down=20bugs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completes the 799a0a71 checkpoint: the panda C compiled only with the pedal-fault
+declaration moved above hyundai_common_init; the FCA11-long window's cooldown
+check no longer fires from a phantom ts_act_end=0 on a fresh arm; carstate_ext
+produces the CS inputs the controller reads; get_pid_accel_limits override;
+capnp fca11Brake field; alert + UI + params key (sp repo). Safety suite: 4439
+passed / 780 skipped / 0 failed (Fca11Long class 289 passed, 16 skipped).
+---
+ opendbc/can/parser.py                         |   7 +
+ opendbc/car/hyundai/carcontroller.py          |   6 +-
+ opendbc/car/hyundai/carstate.py               |   5 +
+ opendbc/car/hyundai/interface.py              |  17 +-
+ opendbc/car/structs.py                        |   1 +
+ opendbc/safety/modes/hyundai.h                | 310 +++++++++++++++-
+ opendbc/safety/modes/hyundai_canfd.h          |   1 +
+ opendbc/safety/modes/hyundai_common.h         |  28 ++
+ opendbc/safety/tests/common.py                |   2 +-
+ opendbc/safety/tests/test_hyundai.py          | 349 +++++++++++++++++-
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  15 +
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  | 291 +++++++++++++++
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  22 +-
+ .../car/hyundai/tests/test_fca11_long.py      | 324 ++++++++++++++++
+ .../car/hyundai/tests/test_gas_interceptor.py | 139 +++++++
+ opendbc/sunnypilot/car/hyundai/values.py      |  17 +
+ opendbc/sunnypilot/car/interfaces.py          |  12 +
+ 17 files changed, 1539 insertions(+), 7 deletions(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/fca11_long.py
+ create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+
+diff --git a/opendbc/can/parser.py b/opendbc/can/parser.py
+index 7290ffad..ab40728e 100644
+--- a/opendbc/can/parser.py
++++ b/opendbc/can/parser.py
+@@ -152,6 +152,10 @@ class CANParser:
+     self.can_invalid_cnt: int = CAN_INVALID_CNT
+     self.last_nonempty_nanos: int = 0
+     self._last_update_nanos: int = 0
++    # fork: opt-in raw-frame capture (hyundai FCA11 long braking mirrors the camera's 0x38D byte-for-byte, so the
++    # car layer needs the raw bytes, not just the decoded signals). Empty = no cost in the hot loop.
++    self.capture_addrs: set[int] = set()
++    self.captured: dict[int, tuple[int, bytes]] = {}
+ 
+   def _add_message(self, name_or_addr: str | int, freq: int | None = None) -> None:
+     if isinstance(name_or_addr, numbers.Number):
+@@ -230,6 +234,9 @@ class CANParser:
+         if src != self.bus:
+           continue
+         bus_empty = False
++        if self.capture_addrs and address in self.capture_addrs:
++          # fork: keep the newest raw frame for the mirrored-address consumers (FCA11 long braking)
++          self.captured[address] = (t, bytes(dat))
+         state = self.message_states.get(address)
+         if state is None or len(dat) > 64:
+           continue
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index a8d7cbad..eb56cffa 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -107,6 +107,10 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     stopping = actuators.longControlState == LongCtrlState.stopping
+     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
+ 
++    # fork: FCA11 long braking low-speed hand-over alert gate — a lead is present and still closing. Read by
++    # Fca11LongBrake._alert (via CS) to warn the driver below floor+margin, before the planner runs out of authority.
++    CS.fca11_lead_closing = bool(CC_SP.leadOne.status) and float(CC_SP.leadOne.vRel) < -0.5
++
+     can_sends = []
+ 
+     # *** common hyundai stuff ***
+@@ -141,7 +145,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+                                             stopping, hud_control, actuators, CS, CC))
+ 
+       # comma pedal (no-op unless CP_SP.enableGasInterceptor)
+-      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame))
++      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame, now_nanos))
+       # engagement state the pause/resume button is judged against on the next CarState update (carstate_ext.py)
+       CS.pedal_long_engaged = CC.enabled
+ 
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index b1d524ec..27d00fbf 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -12,6 +12,7 @@ from opendbc.car.interfaces import CarStateBase
+ from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+ from opendbc.sunnypilot.car.hyundai.escc import EsccCarStateBase
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC, get_interceptor_ids
++from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+ from opendbc.sunnypilot.car.hyundai.mads import MadsCarState
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+@@ -352,4 +353,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+       # pedal's rate so a dead pedal times out -> canValid=False (CarInterfaceBase ANDs every parser).
+       # Only the active ID dialect's sensor (0x201 GAS_SENSOR or remapped 0x701 GAS_SENSOR_R) is subscribed.
+       parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [(get_interceptor_ids(CP_SP).sensor_msg, 50)], 0)
++    if CP_SP.fca11Brake:
++      # fork: production FCA11 long braking mirrors the camera's byte-exact 0x38D, so the bus-2 parser must keep the
++      # freshest RAW frame (not just decoded signals). Opt-in; empty set = zero cost in the hot loop.
++      parsers[Bus.cam].capture_addrs.add(FCA11_ADDR)
+     return parsers
+diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
+index 9bb780c6..3d6019b5 100644
+--- a/opendbc/car/hyundai/interface.py
++++ b/opendbc/car/hyundai/interface.py
+@@ -2,7 +2,8 @@ from opendbc.car import Bus, get_safety_config, structs, uds
+ from opendbc.car.hyundai.hyundaicanfd import CanBus
+ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+ from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
+-from opendbc.car.interfaces import CarInterfaceBase
++from opendbc.car.interfaces import CarInterfaceBase, ACCEL_MAX, ACCEL_MIN
++from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.disable_ecu import disable_ecu
+ from opendbc.car.hyundai.carcontroller import CarController
+ from opendbc.car.hyundai.carstate import CarState
+@@ -27,6 +28,20 @@ class CarInterface(CarInterfaceBase):
+ 
+   DRIVABLE_GEARS = (structs.CarState.GearShifter.sport, structs.CarState.GearShifter.manumatic)
+ 
++  @staticmethod
++  def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
++    # fork: FCA11 longitudinal braking (HyundaiFca11Brake). Above the planner's 12 km/h floor the PID may ask for brake
++    # (down to -FCA11_A_MAX_MSS2 = 0.30 g * 0.67 gain + margin); below it the plan is coast-only (+0.0 floor) so the
++    # controller never sends FCA11 near the panda's 9 km/h backstop. With the toggle OFF this returns exactly today's
++    # (-3.5, +2.0) bounds, so pedal-only behavior is byte-for-byte unchanged (the pedal law ignores negative accel).
++    if CP_SP.fca11Brake:
++      from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_BRAKE_MIN_KPH, FCA11_A_MAX_MSS2
++      if current_speed * CV.MS_TO_KPH > FCA11_BRAKE_MIN_KPH:
++        return -FCA11_A_MAX_MSS2, ACCEL_MAX
++      return 0.0, ACCEL_MAX
++    return ACCEL_MIN, ACCEL_MAX
++
++
+   @staticmethod
+   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
+     ret.brand = "hyundai"
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 61657042..b5f7cd50 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -62,6 +62,7 @@ class CarParamsSP:
+   pcmCruiseSpeed: bool = auto_field()
+   intelligentCruiseButtonManagementAvailable: bool = auto_field()
+   enableGasInterceptor: bool = auto_field()
++  fca11Brake: bool = auto_field()  # fork: production FCA11 longitudinal braking (HyundaiFca11Brake, default OFF)
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index e078369b..44be5d81 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -123,6 +123,144 @@ static bool hyundai_legacy = false;
+ #define HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK \
+   {.msg = {{0x367, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+ 
++// ******************** PRODUCTION FCA11 longitudinal braking (HYUNDAI_PARAM_SP_FCA11_LONG, bit 256) ********************
++// Rides ON TOP of the gas interceptor (pedal-long), with openpilot ENGAGED. Proven on the car (roll-20261005T232357Z):
++// variant B (CF_VSM_Warn=3, FCA_CmdAct=1, CF_VSM_DecCmdAct=0, CR_VSM_DecCmd=g*100, Prefill=1) braked through the ESC
++// at ~31 km/h, 0.74/1.28/2.03 m/s^2 for 0.10/0.20/0.30 g (~2/3 of the command, linear); no response below ~8-10 km/h.
++// Unlike the TEST bits this mode requires controls_allowed AND the openpilot heartbeat engaged, keeps the pedal
++// active, and never bounds the speed from above (production braking must work at any D speed).
++
++// max raw CR_VSM_DecCmd (0.01 g/LSB). Measured: 0.30 g -> 2.03 m/s^2 delivered (69%), ~= COMFORT_BRAKE. The car layer
++// requests with a 0.67 gain correction, so a -2.0 m/s^2 accel ask maps to 0.30 g here. Must equal
++// HYUNDAI_FCA11_LONG_MAX_DEC in opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
++#define HYUNDAI_FCA11_LONG_MAX_DEC 30
++// speed floor, raw WHL_SPD11 units (0.03125 km/h/LSB): 9 km/h. The car never responded below ~8-10 km/h and camera FCA
++// is documented inert below 10 km/h on this car, so braking there is wasted frames; the car layer's planner floor is
++// 12 km/h (this floor is the backstop, never the limiter). NO ceiling: production braking must work at highway speed
++// (the 35 km/h test ceiling was a runner safety artifact, not an ESC property). Must equal
++// HYUNDAI_FCA11_LONG_MIN_SPEED_KPH in values.py (unit tests pin the boundary).
++#define HYUNDAI_FCA11_LONG_MIN_SPEED 288U   // 9 km/h
++// decel RATE limit per camera period (20 ms): a frame's CR_VSM_DecCmd may exceed the last accepted one by at most
++// 0.04 g -> 2.0 g/s of ramp, 0 -> 0.30 g in 150 ms. Release (smaller decel) is immediate, like the pedal slew.
++#define HYUNDAI_FCA11_LONG_RATE_STEP 4
++// continuous-actuation budget and cooldown: after this long actuating, a passive frame is REQUIRED for the cooldown
++// before the budget re-arms (a real lead-brake event is 2-3 s; the driver alert has long since fired by then).
++#define HYUNDAI_FCA11_LONG_MAX_ACT_US 2500000U   // 2.5 s
++#define HYUNDAI_FCA11_LONG_COOLDOWN_US 3000000U  // 3 s of passive frames after the budget is spent
++// freshness of every window input (wheels/gear/brake/gas), and the stale-TX hand-back, as the rolling test
++#define HYUNDAI_FCA11_LONG_RX_MAX_AGE_US 100000U
++#define HYUNDAI_FCA11_LONG_TX_STALE_US 100000U
++#define HYUNDAI_FCA11_LONG_GEAR_D 5U  // LVR12 CF_Lvr_Gear: 5 = D (same decode as the rolling window)
++
++// Per-arm state. Reset by every hyundai_init (each ignition / re-arm starts clean, un-cut, with no evidence yet).
++enum {
++  HYUNDAI_LONG_SEEN_SPEED = 1,
++  HYUNDAI_LONG_SEEN_GEAR = 2,
++  HYUNDAI_LONG_SEEN_BRAKE = 4,
++  HYUNDAI_LONG_SEEN_GAS = 8,
++  HYUNDAI_LONG_SEEN_ALL = 15,
++};
++static bool hyundai_fca11_long_cut;         // LATCHED: no further actuation until the next init
++static uint32_t hyundai_fca11_long_seen;    // HYUNDAI_LONG_SEEN_* bits
++static bool hyundai_fca11_long_gear_d;
++static uint32_t hyundai_fca11_long_speed_min;  // raw, slowest wheel
++static uint32_t hyundai_fca11_long_ts_speed;
++static uint32_t hyundai_fca11_long_ts_gear;
++static uint32_t hyundai_fca11_long_ts_brake;
++static uint32_t hyundai_fca11_long_ts_gas;
++static bool hyundai_fca11_long_camera_owns;   // LATCHED: camera requested actuation -> camera FCA11 forwarded, our TX blocked
++static bool hyundai_fca11_long_tx_seen;       // panda has transmitted an accepted 0x38D since this arm
++static uint32_t hyundai_fca11_long_ts_tx;     // ... last one at
++static bool hyundai_fca11_long_act_active;    // inside a continuous actuation episode
++static uint32_t hyundai_fca11_long_ts_act;    // ... which started at
++static uint32_t hyundai_fca11_long_ts_act_end;// ... which ended at (cooldown runs from here)
++static int hyundai_fca11_long_dec_last;       // last ACCEPTED CR_VSM_DecCmd (rate-limit reference; -1 = none this arm)
++
++static void hyundai_fca11_long_reset(void) {
++  hyundai_fca11_long_cut = false;
++  hyundai_fca11_long_seen = 0U;
++  hyundai_fca11_long_gear_d = false;
++  hyundai_fca11_long_speed_min = 0U;
++  hyundai_fca11_long_ts_speed = 0U;
++  hyundai_fca11_long_ts_gear = 0U;
++  hyundai_fca11_long_ts_brake = 0U;
++  hyundai_fca11_long_ts_gas = 0U;
++  hyundai_fca11_long_camera_owns = false;
++  hyundai_fca11_long_tx_seen = false;
++  hyundai_fca11_long_ts_tx = 0U;
++  hyundai_fca11_long_act_active = false;
++  hyundai_fca11_long_ts_act = 0U;
++  hyundai_fca11_long_ts_act_end = 0U;
++  hyundai_fca11_long_dec_last = -1;
++}
++
++// Called at the END of hyundai_rx_hook for valid, RX-checked frames. Records the window inputs and LATCHES the cut on:
++// driver brake, driver gas, gear != D, pedal fault, or a real camera FCA11 request (which also hands FCA11 back).
++// A cut never clears inside the armed session (re-arm = the next init).
++static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
++  uint32_t ts = microsecond_timer_get();
++  if ((msg->bus == 2U) && (msg->addr == 0x38DU)) {
++    // the camera's OWN request: any actuation or warning field -> it is a real event, the camera gets FCA11 back for
++    // the rest of this arm (latched; fwd hook stops blocking, tx hook rejects every 0x38D)
++    bool cam_act = (msg->data[1] != 0U) || ((msg->data[0] & 0x1FU) != 0U) || GET_BIT(msg, 20U) || GET_BIT(msg, 21U) ||
++                   GET_BIT(msg, 31U);
++    if (cam_act) {
++      hyundai_fca11_long_camera_owns = true;
++      hyundai_fca11_long_cut = true;
++    }
++  }
++  if (msg->bus == 0U) {
++    if (msg->addr == 0x386U) {
++      uint32_t fl = GET_BYTES(msg, 0, 2) & 0x3FFFU;
++      uint32_t fr = GET_BYTES(msg, 2, 2) & 0x3FFFU;
++      uint32_t rl = GET_BYTES(msg, 4, 2) & 0x3FFFU;
++      uint32_t rr = GET_BYTES(msg, 6, 2) & 0x3FFFU;
++      hyundai_fca11_long_speed_min = SAFETY_MIN(SAFETY_MIN(fl, fr), SAFETY_MIN(rl, rr));
++      hyundai_fca11_long_ts_speed = ts;
++      hyundai_fca11_long_seen |= HYUNDAI_LONG_SEEN_SPEED;
++    }
++    if (msg->addr == 0x367U) {
++      hyundai_fca11_long_gear_d = (msg->data[4] & 0xFU) == HYUNDAI_FCA11_LONG_GEAR_D;  // CF_Lvr_Gear 32|4
++      hyundai_fca11_long_ts_gear = ts;
++      hyundai_fca11_long_seen |= HYUNDAI_LONG_SEEN_GEAR;
++    }
++    if (msg->addr == 0x394U) {
++      hyundai_fca11_long_ts_brake = ts;
++      hyundai_fca11_long_seen |= HYUNDAI_LONG_SEEN_BRAKE;
++    }
++    if (msg->addr == 0x260U) {
++      hyundai_fca11_long_ts_gas = ts;
++      hyundai_fca11_long_seen |= HYUNDAI_LONG_SEEN_GAS;
++    }
++  }
++
++  bool cut = brake_pressed || gas_pressed || hyundai_interceptor_pedal_fault;
++  if ((hyundai_fca11_long_seen & HYUNDAI_LONG_SEEN_GEAR) != 0U) {
++    cut |= !hyundai_fca11_long_gear_d;
++  }
++  if (cut) {
++    hyundai_fca11_long_cut = true;
++  }
++}
++
++static bool hyundai_fca11_long_fresh(uint32_t ts, uint32_t ts_last) {
++  return safety_get_ts_elapsed(ts, ts_last) <= HYUNDAI_FCA11_LONG_RX_MAX_AGE_US;
++}
++
++// The window, evaluated for every actuating FCA11 frame in the long mode. The cut inputs are re-checked here (not
++// only via the latch) so a frame can never race the latch. NOTE: the speed FLOOR is deliberately NOT a cut and NOT
++// part of ok - the car layer stops asking below its own (higher) floor; if a frame still arrives below the panda
++// floor it is rejected by the tx hook's own floor check, not by the latch, so re-entering the window when the car
++// speeds back up needs no re-arm.
++static bool hyundai_fca11_long_window_ok(void) {
++  uint32_t ts = microsecond_timer_get();
++  bool ok = (hyundai_fca11_long_seen == (uint32_t)HYUNDAI_LONG_SEEN_ALL);
++  ok = ok && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_speed) && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_gear) &&
++       hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_brake) && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_gas);
++  ok = ok && !hyundai_fca11_long_cut && hyundai_fca11_long_gear_d && !brake_pressed && !gas_pressed;
++  return ok;
++}
++
+ // Per-arm rolling-test state. Reset by every hyundai_init (each 0xdc re-arms clean, un-cut, with no evidence yet).
+ enum {
+   HYUNDAI_ROLL_SEEN_SPEED = 1,
+@@ -226,6 +364,15 @@ static bool hyundai_fwd_hook(int bus_num, int addr) {
+     block = hyundai_fca11_roll_tx_seen && !hyundai_fca11_roll_camera_owns &&
+             (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_fca11_roll_ts_tx) <= HYUNDAI_FCA11_ROLL_TX_STALE_US);
+   }
++  if (hyundai_fca11_long && (bus_num == 2) && (addr == 0x38D)) {
++    // same dynamic-blocking model as the rolling test: while openpilot is braking it MIRRORS the camera's 0x38D on bus 0
++    // (only the brake fields overridden), so the camera's own copy must not also reach the ESC (two FCA11 sources); the
++    // block exists ONLY while panda transmitted an accepted 0x38D recently (<= TX_STALE) and the camera has not made its
++    // own request. Host death / stale stream / a real camera request -> the camera's FCA11 forwards again within one
++    // camera period (~20 ms), the same fail-open the test mode proved on the car.
++    block = hyundai_fca11_long_tx_seen && !hyundai_fca11_long_camera_owns &&
++            (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_fca11_long_ts_tx) <= HYUNDAI_FCA11_LONG_TX_STALE_US);
++  }
+   return block;
+ }
+ 
+@@ -424,6 +571,17 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+       int gas_interceptor = hyundai_get_interceptor_gas(msg);
+       gas_pressed = gas_interceptor > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD;
+       gas_interceptor_prev = gas_interceptor;
++      // FCA11 long (bit 256): a pedal FAULT means openpilot throttle authority is gone (passthrough), so the ESC brake
++      // must not mix with a throttle we do not control. LIVE from the pedal's STATE nibble; any observed fault then
++      // LATCHES the long cut (hyundai_fca11_long_rx) until the next init - a pedal fault event is rare and serious,
++      // and re-arm-by-ignition is the fail-closed choice. BOOT states do NOT cut: 4 = STARTUP (first ~1 s after
++      // pedal power-up) and 5 = TIMEOUT (powered, no valid command yet) are present at EVERY ignition before card
++      // starts commanding, so latching on them would disable the feature for the whole drive. 1 = BAD_CHECKSUM,
++      // 2 = SEND, 3 = SCE, 6 = INVALID (unknown, treated as a fault) do cut. While a fault is latched the pedal
++      // passes the driver's pedal straight through and 0x701 still reports the driver's raw ADC, so gas_pressed
++      // stays truthful - this cut is belt-and-braces on top of the gas_pressed window check.
++      uint8_t pedal_state = (uint8_t)((msg->data[4] >> 4) & 0xFU);
++      hyundai_interceptor_pedal_fault = (pedal_state != 0U) && (pedal_state != 4U) && (pedal_state != 5U);
+     } else {
+     }
+ 
+@@ -481,6 +639,10 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+     hyundai_fca11_rolling_rx(msg);
+   }
+ 
++  if (hyundai_fca11_long) {
++    hyundai_fca11_long_rx(msg);
++  }
++
+   hyundai_common_reset_acc_main_on_mismatches();
+ }
+ 
+@@ -497,7 +659,79 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+     bool FCA_CmdAct = GET_BIT(msg, 20U);
+     bool CF_VSM_DecCmdAct = GET_BIT(msg, 31U);
+ 
+-    if (!hyundai_fca11_brake_test) {
++    if (hyundai_fca11_long) {
++      // PRODUCTION FCA11 long braking (bit 256, on top of the gas interceptor). Openpilot is ENGAGED: every frame
++      // (actuating or passive) requires controls_allowed AND the openpilot heartbeat engaged, on top of the
++      // window/cap/rate/budget rules. Allowed shapes:
++      //   * ACTUATING: the car layer's mirror of the camera frame (variant B) with CR_VSM_DecCmd 1..30 (0.01 g/LSB),
++      //     CF_VSM_Prefill (bit 0), CF_VSM_Warn = 3 (bits 3-4), FCA_CmdAct (bit 20), CF_VSM_DecCmdAct = 0;
++      //   * PASSIVE: the camera's own idle shape (all brake fields 0, Warn = 0) - the clean release/hand-back frame,
++      //     byte-identical to what the ESC sees from the camera every idle frame.
++      // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2), FCA_StopReq (bit 21), CF_VSM_DecCmdAct,
++      // Warn 1/2 (never a shape this car answered), Warn 3 on a passive frame (a warning we have no reason to send),
++      // any ACTUATION outside the window / after a cut / below the floor / during the cooldown / while the camera
++      // owns FCA11.
++      int CF_VSM_HBACmd = (msg->data[0] >> 1) & 0x3U;
++      bool CF_VSM_Prefill = GET_BIT(msg, 0U);
++      int CF_VSM_Warn = (msg->data[0] >> 3) & 0x3U;
++      bool FCA_StopReq = GET_BIT(msg, 21U);
++      bool actuation = (CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct || CF_VSM_Prefill;
++
++      bool violation = (CR_VSM_DecCmd > HYUNDAI_FCA11_LONG_MAX_DEC);
++      violation |= (CF_VSM_HBACmd != 0);
++      violation |= FCA_StopReq;
++      violation |= CF_VSM_DecCmdAct;           // variant B: FCA_CmdAct carries the command, not DecCmdAct
++      violation |= actuation ? (CF_VSM_Warn != 3) : (CF_VSM_Warn != 0);
++      violation |= hyundai_fca11_long_camera_owns;
++      violation |= !controls_allowed || !heartbeat_engaged;
++      violation |= actuation && !hyundai_fca11_long_window_ok();
++      violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
++
++      uint32_t ts = microsecond_timer_get();
++      if (actuation && !violation) {
++        // rate limit on decel growth: at most +0.04 g above the last ACCEPTED frame (release is immediate, and an
++        // accepted smaller value RESETS the reference down, so the next ramp starts from the released level)
++        int dec_ref = (hyundai_fca11_long_dec_last < 0) ? 0 : hyundai_fca11_long_dec_last;
++        violation |= (CR_VSM_DecCmd > (dec_ref + HYUNDAI_FCA11_LONG_RATE_STEP));
++      }
++      if (actuation && !violation) {
++        // episode budget: a continuous actuation runs at most MAX_ACT_US, then a COOLDOWN_US gap of passive frames
++        // is required before the budget re-arms. Budget spent -> the episode ENDS here (the cooldown starts) and
++        // this frame is refused, so the state can never wedge in "episode over budget" refusing everything forever.
++        if (hyundai_fca11_long_act_active) {
++          if (safety_get_ts_elapsed(ts, hyundai_fca11_long_ts_act) > HYUNDAI_FCA11_LONG_MAX_ACT_US) {
++            hyundai_fca11_long_act_active = false;
++            hyundai_fca11_long_ts_act_end = ts;
++            violation = true;
++          } else {
++          }
++        } else if (hyundai_fca11_long_ts_act_end != 0U) {
++          // still inside the passive cooldown? then a NEW actuation is refused
++          if (safety_get_ts_elapsed(ts, hyundai_fca11_long_ts_act_end) <= HYUNDAI_FCA11_LONG_COOLDOWN_US) {
++            violation = true;
++          } else {
++          }
++        } else {
++        }
++      }
++      if (!violation) {
++        hyundai_fca11_long_tx_seen = true;
++        hyundai_fca11_long_ts_tx = ts;
++        hyundai_fca11_long_dec_last = CR_VSM_DecCmd;
++        if (actuation && !hyundai_fca11_long_act_active) {
++          hyundai_fca11_long_act_active = true;
++          hyundai_fca11_long_ts_act = ts;
++        } else if (!actuation && hyundai_fca11_long_act_active) {
++          // a passive frame ends the episode and starts the cooldown clock
++          hyundai_fca11_long_act_active = false;
++          hyundai_fca11_long_ts_act_end = ts;
++        } else {
++        }
++      }
++      if (violation) {
++        tx = false;
++      }
++    } else if (!hyundai_fca11_brake_test) {
+       if ((CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct) {
+         tx = false;
+       }
+@@ -691,9 +925,28 @@ static safety_config hyundai_init(uint16_t param) {
+     {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
+   };
+ 
++  // PRODUCTION FCA11 long braking (bit 256): the FULL pedal TX list (LKAS11 + LFAHDA with check_relay, which is correct
++  // in production because openpilot REPLACES the camera's steering messages) + the active pedal command + FCA11 with
++  // DYNAMIC camera blocking (hyundai_fwd_hook) and check_relay: 0x38D never appears on bus 0 from the car (route logs),
++  // so the relay check only trips on a real harness fault. Two dialect variants, exactly like the pedal lists.
++  static const CanMsg HYUNDAI_FCA11_LONG_TX_MSGS[] = {
++    {0x340, 0, 8, .check_relay = true},   // LKAS11 Bus 0
++    {0x485, 0, 4, .check_relay = true},   // LFAHDA_MFC Bus 0
++    {0x200, 0, 6, .check_relay = false},  // GAS_COMMAND Bus 0 (comma pedal)
++    {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
++  };
++
++  static const CanMsg HYUNDAI_FCA11_LONG_REMAPPED_TX_MSGS[] = {
++    {0x340, 0, 8, .check_relay = true},   // LKAS11 Bus 0
++    {0x485, 0, 4, .check_relay = true},   // LFAHDA_MFC Bus 0
++    {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
++    {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
++  };
++
+   hyundai_common_init(param);
+   hyundai_legacy = false;
+   hyundai_fca11_rolling_reset();
++  hyundai_fca11_long_reset();
+ 
+   safety_config ret;
+   if (hyundai_longitudinal) {
+@@ -843,6 +1096,38 @@ static safety_config hyundai_init(uint16_t param) {
+       HYUNDAI_LDA_BUTTON_ADDR_CHECK
+     };
+ 
++    // PRODUCTION FCA11 long (bit 256): the pedal's RX check + gear (LVR12, the D gate) + the camera's own FCA11
++    // (bus 2; lag-policed and the source of the camera-request hand-back latch). Both pedal dialects.
++    static RxCheck hyundai_non_scc_fca11_long_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_CAMERA_ADDR_CHECK
++    };
++
++    static RxCheck hyundai_non_scc_fca11_long_lda_button_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_CAMERA_ADDR_CHECK
++      HYUNDAI_LDA_BUTTON_ADDR_CHECK
++    };
++
++    static RxCheck hyundai_non_scc_fca11_long_remapped_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_REMAPPED_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_CAMERA_ADDR_CHECK
++    };
++
++    static RxCheck hyundai_non_scc_fca11_long_remapped_lda_button_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_GAS_INTERCEPTOR_REMAPPED_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_FCA11_ROLL_CAMERA_ADDR_CHECK
++      HYUNDAI_LDA_BUTTON_ADDR_CHECK
++    };
++
+     SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
+     if (hyundai_fca11_brake_test) {  // hyundai_common_init: non-SCC ICE only, never with any openpilot longitudinal
+       SET_TX_MSGS(HYUNDAI_FCA11_TEST_TX_MSGS, ret);
+@@ -859,6 +1144,28 @@ static safety_config hyundai_init(uint16_t param) {
+       } else {
+         SET_RX_CHECKS(hyundai_non_scc_addr_checks, ret);
+       }
++    } else if (hyundai_fca11_long) {  // implies hyundai_gas_interceptor (hyundai_common_init); never with the test bits
++      // PRODUCTION FCA11 long: the pedal TX list + FCA11 (dynamic camera blocking); RX adds gear (LVR12) and the
++      // camera's own FCA11 (bus 2) so the window inputs are policed for lag/validity and a camera request latches
++      // the hand-back, exactly like the rolling test. The pedal sensor check stays (whichever dialect is active).
++      if (hyundai_gas_interceptor_remapped) {
++        SET_TX_MSGS(HYUNDAI_FCA11_LONG_REMAPPED_TX_MSGS, ret);
++      } else {
++        SET_TX_MSGS(HYUNDAI_FCA11_LONG_TX_MSGS, ret);
++      }
++      if (hyundai_has_lda_button) {
++        if (hyundai_gas_interceptor_remapped) {
++          SET_RX_CHECKS(hyundai_non_scc_fca11_long_remapped_lda_button_addr_checks, ret);
++        } else {
++          SET_RX_CHECKS(hyundai_non_scc_fca11_long_lda_button_addr_checks, ret);
++        }
++      } else {
++        if (hyundai_gas_interceptor_remapped) {
++          SET_RX_CHECKS(hyundai_non_scc_fca11_long_remapped_addr_checks, ret);
++        } else {
++          SET_RX_CHECKS(hyundai_non_scc_fca11_long_addr_checks, ret);
++        }
++      }
+     } else if (hyundai_gas_interceptor_remapped) {  // implies hyundai_gas_interceptor (hyundai_common_init)
+       // remapped pedal IDs: TX 0x700 / RX 0x701, mutually exclusive with the standard set below
+       SET_TX_MSGS(HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS, ret);
+@@ -927,6 +1234,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+   hyundai_gas_interceptor_remapped = false;
+   hyundai_fca11_brake_test = false;
+   hyundai_fca11_rolling_test = false;
++  hyundai_fca11_long = false;
+   hyundai_camera_scc = false;
+   return BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
+ }
+diff --git a/opendbc/safety/modes/hyundai_canfd.h b/opendbc/safety/modes/hyundai_canfd.h
+index d5379bda..bb68d623 100644
+--- a/opendbc/safety/modes/hyundai_canfd.h
++++ b/opendbc/safety/modes/hyundai_canfd.h
+@@ -276,6 +276,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+   hyundai_gas_interceptor_remapped = false;
+   hyundai_fca11_brake_test = false;  // FCA11 brake test is CAN (non-SCC) only
+   hyundai_fca11_rolling_test = false;
++  hyundai_fca11_long = false;  // FCA11 long braking is CAN (non-SCC ICE + pedal) only
+ 
+   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
+   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index 41ac9f40..9ed2bee5 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -26,6 +26,7 @@ enum {
+   HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED = 32,  // pedal on remapped IDs: cmd 0x700 / sensor 0x701 (needs GAS_INTERCEPTOR)
+   HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64,  // TEST-ONLY: parked FCA11 (0x38D) brake-injection research, see hyundai.h
+   HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST = 128,  // TEST-ONLY: extends 64 to a low-speed rolling window (needs 64), see hyundai.h
++  HYUNDAI_PARAM_SP_FCA11_LONG = 256,  // PRODUCTION (toggle-gated): FCA11 decel on top of the gas interceptor, see hyundai.h
+ };
+ 
+ // common state
+@@ -91,6 +92,14 @@ bool hyundai_fca11_brake_test = false;
+ extern bool hyundai_fca11_rolling_test;
+ bool hyundai_fca11_rolling_test = false;
+ 
++// PRODUCTION FCA11 longitudinal braking (HYUNDAI_PARAM_SP_FCA11_LONG, bit 256), a fork feature armed by CarParamsSP
++// from the HyundaiFca11Brake param (default OFF). Unlike the TEST bits (64/128), this rides ON TOP of the gas
++// interceptor (pedal-long): the pedal TX/RX path stays fully active and openpilot is ENGAGED (controls_allowed +
++// heartbeat_engaged) while it sends FCA11 decel. All rules and per-arm state: hyundai.h (hyundai_fca11_long_*).
++// Never set on CAN-FD / legacy; never together with the test bits (64/128) or SCC-replacement longitudinal.
++extern bool hyundai_fca11_long;
++bool hyundai_fca11_long = false;
++
+ // Gas interceptor only: factory (conventional) cruise MAIN armed, EMS16 CRUISE_LAMP_M. The factory cruise can only engage
+ // while MAIN is armed, and openpilot never sends CLU11 in this mode (no CANCEL to fight it), so pedal-long is locked out
+ // while it is armed: controls_allowed is cleared and no button may grant it (fail closed, never two speed controllers).
+@@ -324,6 +333,15 @@ static bool acc_main_on_prev;
+ static bool acc_main_on_tx;
+ static uint32_t acc_main_on_mismatches;
+ 
++// Gas interceptor: called on every RX message (hyundai_rx_hook), so a brake press is caught even when it falls
++// between two CLU11 samples. Brake during a pause/resume press (or its release debounce) cancels that resume.
++// FCA11 long (bit 256) ALSO uses this: a pedal fault means the pedal is in passthrough (driver's pedal straight
++// to the ECU) and openpilot throttle authority is gone, so panda latches the FCA11 long cut (hyundai.h) - mixing
++// an ESC brake with a throttle we no longer control is the two-controllers case. Defined BEFORE hyundai_common_init
++// (which clears it) and before hyundai_rx_hook reads it.
++extern bool hyundai_interceptor_pedal_fault;
++bool hyundai_interceptor_pedal_fault = false;
++
+ void hyundai_common_init(uint16_t param) {
+   const uint16_t HYUNDAI_PARAM_EV_GAS = 1;
+   const uint16_t HYUNDAI_PARAM_HYBRID_GAS = 2;
+@@ -353,6 +371,7 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_pause_armed = false;
+   hyundai_pause_released_cnt = HYUNDAI_PAUSE_RELEASE_SAMPLES;
+   hyundai_fc_cancel_reset();
++  hyundai_interceptor_pedal_fault = false;
+   acc_main_on_prev = false;
+   acc_main_on_tx = false;
+   acc_main_on_mismatches = 0U;
+@@ -382,6 +401,14 @@ void hyundai_common_init(uint16_t param) {
+   }
+   // rolling extension: only on top of an armed bit 64 (so non-SCC ICE, no openpilot longitudinal, no pedal)
+   hyundai_fca11_rolling_test = hyundai_fca11_brake_test && GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST);
++
++  // PRODUCTION FCA11 long braking (bit 256) rides ON TOP of the gas interceptor: it needs the pedal active
++  // (non-SCC ICE, no SCC-replacement longitudinal) and is mutually exclusive with the TEST bits (64/128), which
++  // take over FCA11 for runner-driven research with openpilot disengaged. While armed, panda polices FCA11 decel
++  // with its own window/cap/rate/budget rules (hyundai.h) IN ADDITION to the pedal checks; nothing about the pedal
++  // path changes.
++  hyundai_fca11_long = hyundai_gas_interceptor && !hyundai_fca11_brake_test &&
++                       GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_FCA11_LONG);
+ }
+ 
+ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+@@ -409,6 +436,7 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+ 
+ // Gas interceptor: called on every RX message (hyundai_rx_hook), so a brake press is caught even when it falls
+ // between two CLU11 samples. Brake during a pause/resume press (or its release debounce) cancels that resume.
++// FCA11 long (bit 256) also reads hyundai_interceptor_pedal_fault (defined above, before hyundai_common_init).
+ static void hyundai_gas_interceptor_pedal_check(void) {
+   if (brake_pressed) {
+     hyundai_pause_armed = false;
+diff --git a/opendbc/safety/tests/common.py b/opendbc/safety/tests/common.py
+index 68d61c08..ebb8d348 100644
+--- a/opendbc/safety/tests/common.py
++++ b/opendbc/safety/tests/common.py
+@@ -1024,7 +1024,7 @@ class SafetyTest(SafetyTestBase):
+             # (FCA11 brake test shares FCA11 0x38D with HKG longitudinal; both police its content in hyundai_tx_hook)
+             base_tests = {'TestHyundaiLongitudinalSafety', 'TestHyundaiLongitudinalSafetyCameraSCC', 'TestHyundaiSafetyFCEVLong',
+                           'TestHyundaiLongitudinalESCCSafety', 'TestHyundaiNonSCCFCA11BrakeTestSafety',
+-                          'TestHyundaiNonSCCFCA11RollingTestSafety'}
++                          'TestHyundaiNonSCCFCA11RollingTestSafety', 'TestHyundaiFca11LongSafety'}
+             if any(attr.startswith(test) for test in base_tests) and any(current_test.startswith(test) for test in base_tests):
+               continue
+             volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 306f727e..49cc501b 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -21,13 +21,27 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
+                                                          MAX_INTERCEPTOR_GAS, REMAPPED_IDS, STANDARD_IDS
+ 
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC, HYUNDAI_FCA11_ROLL_MAX_DEC, \
+-  HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH, HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH
++  HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH, HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH, HYUNDAI_FCA11_LONG_MAX_DEC, \
++  HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, HYUNDAI_FCA11_LONG_RATE_STEP
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+ 
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+ GAS_ON = 0.1
+ 
+ HYUNDAI_COMMON_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai_common.h")
++HYUNDAI_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai.h")
++
++# C-only FCA11-long constants (seconds), read straight from the header so the safety tests pin them
++HYUNDAI_FCA11_LONG_MAX_ACT_US = 2500000
++HYUNDAI_FCA11_LONG_COOLDOWN_US = 3000000
++HYUNDAI_FCA11_LONG_TX_STALE_US = 100000
++
++
++def _c_define(path: str, name: str) -> int:
++  with open(path) as f:
++    m = re.search(rf"#define\s+{name}\s+(\d+)U?", f.read())
++  assert m is not None, f"{name} not found in {path}"
++  return int(m.group(1))
+ 
+ 
+ def fc_cancel_episode(safety, rx, ems16, clu_raw, brake_msg, period_us=19800, n=150):
+@@ -2512,6 +2526,339 @@ class TestHyundaiNonSCCFCA11RollingTestSafety(TestHyundaiNonSCCFCA11BrakeTestSaf
+     dat[4] = 0x80
+     return libsafety_py.make_CANPacket(addr, 0, bytes(dat))
+ 
++@parameterized_class(LDA_BUTTON)
++class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
++  """
++    PRODUCTION FCA11 long braking (bit 256, HyundaiFca11Brake). Rides ON TOP of the comma pedal with openpilot
++    ENGAGED (controls_allowed AND heartbeat_engaged): TX = the pedal list + FCA11 (dynamic camera blocking), the
++    pedal path stays fully active. Actuating FCA11 is legal only inside the window (gear D, no pedal, every wheel
++    above 9 km/h raw 288, fresh inputs, no cut), capped at 0.30 g, rate-limited, on a 2.5 s budget / 3 s cooldown,
++    camera request hands back the same frame. A cut LATCHES until the next init.
++  """
++  # pedal list + FCA11 (check_relay, dynamic blocking via hyundai_fwd_hook). NO CLU11: the pedal TX list has none.
++  TX_MSGS = [[0x340, 0], [0x485, 0], [0x200, 0], [0x38D, 0]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x340, 0x485, 0x38D)}
++  # openpilot steers in this production mode (LKAS11/LFAHDA in the TX list), so the camera's copies stay blocked.
++  # 0x38D is NOT listed: its blocking is dynamic (hyundai_fwd_hook) and tested explicitly below.
++  FWD_BLACKLISTED_ADDRS = {2: [0x340, 0x485]}
++  DEC_CAP = HYUNDAI_FCA11_LONG_MAX_DEC
++  RAW_PER_KPH = 32
++  IN_WINDOW_RAW = 20 * 32  # 20 km/h
++  cnt_lvr = 0
++
++  @classmethod
++  def setUpClass(cls):
++    if cls.__name__ == "TestHyundaiFca11LongSafety":
++      cls.safety = None
++      raise unittest.SkipTest
++
++  def setUp(self):
++    super().setUp()
++
++  def _pedal_sp(self) -> int:
++    return super()._pedal_sp() | HyundaiSafetyFlagsSP.FCA11_LONG
++
++  def _engage(self, controls=True, heartbeat=True):
++    self.safety.set_controls_allowed(controls)
++    self.safety.set_heartbeat_engaged(heartbeat)
++
++  def _gear_msg(self, gear):
++    return self.packer.make_can_msg_safety("LVR12", 0, {"CF_Lvr_Gear": gear})
++
++  def _wheel_msg(self, fl, fr=None, rl=None, rr=None):
++    vals = {"FL": fl, "FR": fl if fr is None else fr, "RL": fl if rl is None else rl, "RR": fl if rr is None else rr}
++    values = {"WHL_SPD_%s" % k: v * 0.03125 for k, v in vals.items()}
++    values["WHL_SPD_AliveCounter_LSB"] = (self.cnt_speed % 16) & 0x3
++    values["WHL_SPD_AliveCounter_MSB"] = (self.cnt_speed % 16) >> 2
++    self.__class__.cnt_speed += 1
++    return self.packer.make_can_msg_safety("WHL_SPD11", 0, values, fix_checksum=checksum)
++
++  def _open_window(self, speed_raw=None):
++    # a complete window implies the production gate: openpilot engaged (controls_allowed + heartbeat)
++    self._engage(True, True)
++    self.assertTrue(self._rx(self._user_brake_msg(False)))
++    # gas freshness in the C window is keyed on EMS16 (0x260); the pedal sensor (0x201) sets gas_pressed, not ts_gas
++    self.assertTrue(self._rx(self._user_gas_msg(0)))
++    self.assertTrue(self._rx(self._interceptor_user_gas(0)))
++    self.assertTrue(self._rx(self._gear_msg(5)))
++    self.assertTrue(self._rx(self._wheel_msg(self.IN_WINDOW_RAW if speed_raw is None else speed_raw)))
++
++  def _rearm(self, sp=None):
++    self.safety.set_current_safety_param_sp(self._pedal_sp() if sp is None else sp)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self.safety.set_timer(1000000)
++    self._engage(True, True)
++
++  def _fca11(self, dec=0, prefill=0, hba=0, cmd_act=0, dec_cmd_act=0, stop_req=0, warn=0, bus=0):
++    values = {"CR_VSM_DecCmd": (dec + 0.25) * 0.01 if dec else 0, "CF_VSM_Prefill": prefill, "CF_VSM_HBACmd": hba,
++              "FCA_CmdAct": cmd_act, "CF_VSM_DecCmdAct": dec_cmd_act, "FCA_StopReq": stop_req, "FCA_Status": 2,
++              "CF_VSM_Warn": warn}
++    return self.packer.make_can_msg_safety("FCA11", bus, values)
++
++  def _brake_cmd(self, dec):
++    # variant B: Prefill + Warn 3 + CmdAct, DecCmdAct 0
++    return self._fca11(dec=dec, prefill=1, warn=3, cmd_act=1, dec_cmd_act=0)
++
++  def _cam_fca11(self, **kw):
++    values = {"FCA_Status": 2}
++    values.update(kw)
++    return self.packer.make_can_msg_safety("FCA11", 2, values)
++
++  def _rx_all_but_pedal(self):
++    # FCA11_LONG adds the gear (LVR12) and camera (0x38D bus 2) RX checks; feed them so the pedal stays the only
++    # missing required stream the inherited pedal-health tests probe.
++    super()._rx_all_but_pedal()
++    self._rx(self._gear_msg(5))
++    self._rx(self._cam_fca11())
++
++  def _tx_brake(self, target, steps=12):
++    """Send a decel ramp accepted by the rate limiter, ending exactly on `target`; returns the last verdict."""
++    dec = 0
++    last = True
++    for _ in range(steps):
++      dec = min(target, dec + HYUNDAI_FCA11_LONG_RATE_STEP)
++      last = self._tx(self._brake_cmd(dec))
++      if dec >= target:
++        break
++    return last
++
++  # *** window: controls_allowed AND heartbeat_engaged ***
++
++  def test_needs_controls_and_heartbeat(self):
++    for controls, heartbeat in ((False, False), (True, False), (False, True)):
++      with self.subTest(controls=controls, heartbeat=heartbeat):
++        self._rearm()
++        self._open_window()
++        self._engage(controls, heartbeat)
++        self.assertFalse(self._tx(self._brake_cmd(1)))
++        self.assertFalse(self._tx(self._fca11()))  # the passive shape is gated too (panda never needs to send it)
++    self._rearm()
++    self._open_window()
++    self._engage(True, True)
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.assertTrue(self._tx(self._fca11()))
++
++  def test_floor_and_no_ceiling(self):
++    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    for raw, ok in ((lo, False), (lo + 1, True), (raw_hi := 200 * self.RAW_PER_KPH, True)):
++      with self.subTest(raw=raw):
++        self._rearm()
++        self._open_window(raw)
++        self.assertEqual(ok, self._tx(self._brake_cmd(1)))
++
++  def test_each_wheel_policed(self):
++    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    for i in range(4):
++      for bad in (lo, lo - 1):
++        with self.subTest(wheel=i, bad=bad):
++          self._rearm()
++          self._open_window()
++          w = [self.IN_WINDOW_RAW] * 4
++          w[i] = bad
++          self._rx(self._wheel_msg(*w))
++          self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  def test_needs_every_input_seen(self):
++    feeds = {"brake": lambda: self._rx(self._user_brake_msg(False)), "gas": lambda: self._rx(self._user_gas_msg(0)),
++             "gear": lambda: self._rx(self._gear_msg(5)), "speed": lambda: self._rx(self._wheel_msg(self.IN_WINDOW_RAW))}
++    for missing in feeds:
++      with self.subTest(missing=missing):
++        self._rearm()
++        self.safety.set_timer(50000)
++        for name, f in feeds.items():
++          if name != missing:
++            f()
++        self.assertFalse(self._tx(self._brake_cmd(1)))
++        self.assertTrue(self._tx(self._fca11()))
++
++  def test_stale_input_blocks(self):
++    feeds = {"brake": lambda: self._rx(self._user_brake_msg(False)), "gas": lambda: self._rx(self._user_gas_msg(0)),
++             "gear": lambda: self._rx(self._gear_msg(5)), "speed": lambda: self._rx(self._wheel_msg(self.IN_WINDOW_RAW))}
++    for stale in feeds:
++      with self.subTest(stale=stale):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._brake_cmd(1)))
++        self.safety.set_timer(1000000 + 100001)  # just past 100 ms
++        for name, f in feeds.items():
++          if name != stale:
++            f()
++        self.assertFalse(self._tx(self._brake_cmd(1)))
++        feeds[stale]()
++        self.assertTrue(self._tx(self._brake_cmd(1)))
++    self._rearm()
++    self._open_window()
++    self.safety.set_timer(1000000 + 100000)  # exactly 100 ms is fresh
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  def test_gear_gate(self):
++    for gear in (0, 4, 6, 7, 8, 12):
++      with self.subTest(gear=gear):
++        self._rearm()
++        self._open_window()
++        self._rx(self._gear_msg(gear))
++        self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  # *** cap / shapes ***
++
++  def test_c_python_cap_match(self):
++    self._open_window()
++    self.assertTrue(self._tx_brake(self.DEC_CAP))
++    self.assertFalse(self._tx(self._brake_cmd(self.DEC_CAP + 1)))
++
++  def test_cap_python_mirror(self):
++    # the C constant must equal the Python one (values.py is the C mirror's source of truth)
++    self.assertEqual(self.DEC_CAP, HYUNDAI_FCA11_LONG_MAX_DEC)
++
++  def test_hba_stopreq_dec_cmd_act_blocked(self):
++    self._open_window()
++    for hba in (1, 2, 3):
++      self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, hba=hba, cmd_act=1)))
++    self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, cmd_act=1, stop_req=1)))
++    self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, cmd_act=1, dec_cmd_act=1)))  # variant B: DecCmdAct stays 0
++
++  def test_warn_shape_policed(self):
++    self._open_window()
++    # actuating frames must carry Warn 3; passive frames must carry Warn 0
++    self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=0, cmd_act=1)))
++    self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=1, cmd_act=1)))
++    self.assertTrue(self._tx(self._fca11(prefill=1, warn=3)))          # prefill-only: an actuation bit, Warn 3
++    self.assertFalse(self._tx(self._fca11(warn=3)))                    # Warn 3 with no actuation at all: rejected
++
++  # *** rate limit ***
++
++  def test_rate_ramp(self):
++    self._open_window()
++    step = HYUNDAI_FCA11_LONG_RATE_STEP
++    # first frame of an episode is capped at RATE_STEP from zero
++    self.assertFalse(self._tx(self._brake_cmd(step + 1)))
++    self.assertTrue(self._tx(self._brake_cmd(step)))
++    # growth above last accepted + step is rejected, and does not move the reference
++    self.assertFalse(self._tx(self._brake_cmd(step * 2 + 1)))
++    self.assertTrue(self._tx(self._brake_cmd(step * 2)))
++    # release is immediate and resets the reference down
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.assertTrue(self._tx(self._brake_cmd(1 + step)))
++    self.assertFalse(self._tx(self._brake_cmd(1 + step * 2 + 1)))
++
++  # *** budget / cooldown ***
++
++  def test_budget_and_cooldown(self):
++    self._rearm()  # fixes the clock at 1e6 so the budget arithmetic is absolute
++    self._open_window()
++    # 2.5 s of continuous actuation is allowed (same dec value: no rate growth, episode stays open)
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US - 1)
++    self._open_window()  # inputs must be fresh again after the 2.5 s jump
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    # past the budget: refused, episode ends, cooldown starts
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + 1)
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # a passive frame during the cooldown is fine (camera keeps its idle shape / hand-back)
++    self.assertTrue(self._tx(self._fca11()))
++    # still inside the cooldown: any NEW actuation is refused
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + HYUNDAI_FCA11_LONG_COOLDOWN_US - 1)
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # cooldown over: re-armed (budget was spent at +2.5 s+1, so 3 s later is +5.5 s+1; strictly past it)
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_MAX_ACT_US + HYUNDAI_FCA11_LONG_COOLDOWN_US + 2)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  # *** latched cut ***
++
++  def _assert_cut_latched(self):
++    # after a cut, actuation is refused until re-arm; the passive 0x38D verdict depends on the cut type (a driver
++    # brake drops controls_allowed -> everything refused; a pedal fault does not), so only the brake is asserted here.
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  def test_cut_on_driver_brake(self):
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self._rx(self._user_brake_msg(True))
++    self._assert_cut_latched()
++
++  def test_cut_on_driver_gas(self):
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    # above HYUNDAI_GAS_INTERCEPTOR_THRESHOLD: the pedal sensor latches gas_pressed
++    self._rx(self._interceptor_user_gas(0x1000))
++    self._assert_cut_latched()
++
++  def test_cut_on_gear_not_d(self):
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self._rx(self._gear_msg(4))
++    self._assert_cut_latched()
++
++  def test_cut_on_pedal_fault(self):
++    # STATE 1 BAD_CHECKSUM / 3 SCE / 6 INVALID latch; 4 STARTUP / 5 TIMEOUT (boot states) do not
++    for fault in (1, 3, 6):
++      with self.subTest(fault=fault):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._brake_cmd(1)))
++        self._rx(self._interceptor_user_gas(0, state=fault))
++        self._assert_cut_latched()
++    for boot in (4, 5):
++      with self.subTest(boot=boot):
++        self._rearm()
++        self._open_window()
++        self._rx(self._interceptor_user_gas(0, state=boot))
++        # boot states do not latch and do not block the window by themselves
++        self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  # *** camera hand-back ***
++
++  def test_camera_request_blocks_and_unblocks_fwd(self):
++    self._rx(self._cam_fca11())  # camera idle
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    # panda transmitted -> the camera's copy is blocked while our stream is fresh
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    # a real camera request (Warn) hands FCA11 back the same frame, un-blocks the camera, and blocks our TX
++    self._rx(self._cam_fca11(CF_VSM_Warn=2))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  def test_camera_handback_on_stale_tx(self):
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    # panda TX stream goes stale -> the camera forwards again
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_TX_STALE_US + 1)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++
++  # *** not armed: byte-for-byte pedal behavior ***
++
++  def test_without_bit_is_pedal_only(self):
++    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self._engage(True, True)
++    self._open_window()
++    # no FCA11 of any kind, camera forwarded untouched, pedal command still transmittable
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self.assertFalse(self._tx(self._fca11()))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(0.1)))
++
++  def test_ignored_on_canfd_and_legacy(self):
++    for mode in (CarParams.SafetyModel.hyundaiLegacy, CarParams.SafetyModel.hyundaiCanfd):
++      with self.subTest(mode=mode):
++        self.safety.set_current_safety_param_sp(self._pedal_sp())
++        self.safety.set_safety_hooks(mode, 0)
++        self._engage(True, True)
++        self.assertFalse(self._tx(self._brake_cmd(1)))
++
++
+ @parameterized_class(ALL_NON_SCC_HEV_EV_COMBOS)
+ class TestHyundaiNonSCCSafety_HEV_EV(TestHyundaiSafety):
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 3156ab2b..f68e52a6 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -12,6 +12,7 @@ from opendbc.can.parser import CANParser
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+                                                          PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids
++from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PauseResumeTracker
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+@@ -32,6 +33,13 @@ class CarStateExt:
+     # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
+     self.interceptor_state = 0
+     self.pedal_fault_monitor = PedalFaultMonitor()
++    # fork: FCA11 long braking (HyundaiFca11Brake) inputs the controller reads off CS: the freshest raw bus-2 camera
++    # 0x38D frame (t_nanos, dat) for the byte-exact mirror, and the "now" the freshness check compares it against
++    # (written by the controller each frame, same pattern as pedal_long_engaged). fca11_lead_closing = a lead is
++    # closing (the low-speed hand-over alert gate), also written by the controller from CarControlSP.
++    self.fca11_cam_frame: tuple[int, bytes] | None = None
++    self.fca11_now_nanos: int = 0
++    self.fca11_lead_closing = False
+     # pause/resume button (gas interceptor only). pedal_long_engaged = CarControl.enabled, written by the CarController
+     # every frame (this CarState instance is the CS it receives), so it is the engagement state BEFORE a new press.
+     self.pause_resume = PauseResumeTracker()
+@@ -109,6 +117,13 @@ class CarStateExt:
+       if self.pedal_fault_monitor.escalated:
+         ret.accFaulted = True
+ 
++      # fork: FCA11 long braking — keep the freshest raw bus-2 camera 0x38D frame for the byte-exact mirror. The bus-2
++      # parser has capture_addrs={0x38D} when the toggle is on (get_can_parsers); empty set otherwise = no hot-loop cost.
++      if self.CP_SP.fca11Brake:
++        cap = can_parsers[Bus.cam].captured.get(FCA11_ADDR)
++        if cap is not None:
++          self.fca11_cam_frame = (cap[0], bytes(cap[1]))
++
+       # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
+       # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every
+       # ignition on routes 112-123), so arming MAIN locks pedal-long out: nonAdaptive -> wrongCruiseMode
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+new file mode 100644
+index 00000000..5bbb1cd9
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -0,0 +1,291 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Fork: FCA11 longitudinal BRAKING for Hyundai non-SCC ICE cars on the gas interceptor
++(param ``HyundaiFca11Brake``, default OFF, ``CP_SP.fca11Brake``). NOT A TEST MODE: this is the
++production feature built on the on-car-proven FCA11 path (roll-20261005T232357Z).
++
++Actuator facts this is built on (measured on the car, ~31 km/h, 0.6 s pulses):
++  - variant B frames (CF_VSM_Warn=3, FCA_CmdAct=1, CF_VSM_DecCmdAct=0, CR_VSM_DecCmd=g*100,
++    CF_VSM_Prefill=1) make the ESC brake: 0.74 / 1.28 / 2.03 m/s^2 extra decel for 0.10 / 0.20 /
++    0.30 g, ~2/3 of the command, linear.
++  - no response below ~8-10 km/h and at standstill; FCA_ACK rises during braking; the dash shows a
++    collision-braking notification with no chime.
++
++Design (see car-features/fca11-long-integration.md for the full picture):
++  - the PLANNER asks for accel as usual; when ``accel <= FCA11_BRAKE_ONSET_ACCEL`` and the window
++    is open the pedal command is hard-zeroed for that frame (gas and brake are never commanded
++    together) and one FCA11 mirror frame goes out at the camera's own rate;
++  - the frame MIRRORS the freshest bus-2 camera 0x38D (zero-gap takeover) and overrides ONLY the
++    brake fields: CR_VSM_DecCmd, CF_VSM_Prefill, CF_VSM_Warn (3), FCA_CmdAct, CF_VSM_DecCmdAct
++    (0), the alive counter (+1, continuing the camera's sequence) and the CRC8-J1850 checksum;
++  - panda (bit 256, patch 0014) independently polices every frame: controls_allowed AND
++    heartbeat_engaged, gear D, no pedal, fresh inputs, every wheel above 9 km/h, DecCmd <= 0.30 g,
++    rate-limited growth, a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera
++    hand-back. Nothing here can make the car brake if the panda rules say no;
++  - no auto-resume after a CUT (driver brake/gas, gear != D, pedal fault, camera request): braking
++    stays off until the next deliberate pause/resume engagement, per the owner's model.
++
++Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
++  CF_VSM_Prefill (0,1), CF_VSM_HBACmd (1,2), CF_VSM_Warn (3,2), CF_VSM_BeltCmd (5,3),
++  CR_VSM_DecCmd (8,8), PAINT1_Status (16,2), FCA_Status (18,2), FCA_CmdAct (20,1),
++  FCA_StopReq (21,1), FCA_DrvSetStatus (22,3), CF_VSM_DecCmdAct (31,1), FCA_Failinfo (32,3),
++  CR_FCA_Alive (35,4), FCA_RelativeVelocity (39,9), FCA_TimetoCollision (48,8),
++  CR_FCA_ChkSum (56,8).
++"""
++from dataclasses import dataclass
++
++from opendbc.car import structs
++from opendbc.car.hyundai.hyundaican import hyundai_checksum
++from opendbc.car.can_definitions import CanData
++from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_MIN_SPEED_KPH,
++                                                   HYUNDAI_FCA11_LONG_RATE_STEP)
++
++FCA11_ADDR = 0x38D
++FCA11_CAM_BUS = 2
++
++# accel request (m/s^2) at/below which the FCA11 brake engages. Coast (engine braking, ~0.3-0.5
++# m/s^2) covers everything above this; the first meaningful "slow down" ask is about -0.5 (which
++# delivers ~0.34 m/s^2 through the measured 2/3 gain). Between this and 0 the car coasts exactly
++# as it does today.
++FCA11_BRAKE_ONSET_ACCEL = -0.5
++
++# planner-side speed floor (km/h). 3 km/h above the panda's 9 km/h backstop so the panda floor is
++# never the thing that ends a brake; below this the planner requests coast-only (the PID limits in
++# the interface are floored at 0) and this module never sends.
++FCA11_BRAKE_MIN_KPH = 12.
++# low-speed HAND-OVER alert (warning only, never a disable): fires this many km/h above the floor
++# while a lead is still closing and openpilot long is engaged, so the driver takes the brake
++# before the planner runs out of FCA11 authority.
++FCA11_ALERT_MARGIN_KPH = 2.
++
++# PID accel bound the interface hands the planner above the floor: -0.30 g cap x the measured 0.67
++# gain (2.03 m/s^2) + margin. A -2.0 request commands 0.30 g raw (clamped) and delivers ~2.0 m/s^2.
++FCA11_A_MAX_MSS2 = 2.0
++
++# measured ESC gain: delivered decel / commanded decel = 0.67 (2.03 m/s^2 per 0.30 g; fit slope
++# 6.46 m/s^2 per g). The request INVERTS it, so a -2.0 m/s^2 accel ask commands 0.30 g.
++FCA11_BRAKE_GAIN = 0.67
++
++# camera-frame freshness for the mirror source (s): the camera sends ~50 Hz; anything older than
++# two periods means we do not know the ESC's last-seen state -> no send (never a hardcoded frame).
++FCA11_CAM_FRESH_S = 0.100
++
++# send rate divisor: controller frames are 100 Hz; every other frame = the camera's own 50 Hz.
++FCA11_SEND_EVERY = 2
++
++# camera-actuation detect on the freshest bus-2 frame (a real AEB/warning request -> hand back):
++# any of Prefill / Warn / CmdAct / StopReq / DecCmdAct or the HBA bits set.
++CAM_ACT_PREFILL_BIT = 0
++CAM_ACT_HBA_BITS = (1, 2)
++CAM_ACT_WARN_BITS = (3, 2)
++CAM_ACT_CMDACT_BIT = 20
++CAM_ACT_STOPREQ_BIT = 21
++CAM_ACT_DECCMDACT_BIT = 31
++
++
++def dec_cmd_from_accel(accel: float) -> int:
++  """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB), clamp [1, cap].
++
++  Zero for anything above the onset threshold (coast territory: not a brake request)."""
++  if accel > FCA11_BRAKE_ONSET_ACCEL:
++    return 0
++  dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81
++  return int(round(dec_g * 100))
++
++
++def clamp_dec_cmd(dec_cmd: int) -> int:
++  return max(1, min(HYUNDAI_FCA11_LONG_MAX_DEC, dec_cmd))
++
++
++@dataclass
++class Fca11MirrorFrame:
++  """The override fields for one mirrored FCA11 frame, before CRC/alive are applied."""
++  dec_cmd: int
++  prefill: bool
++  warn: int
++  cmd_act: bool
++  dec_cmd_act: bool
++
++
++def _get_bits(dat: bytes, start: int, length: int) -> int:
++  v = 0
++  for i in range(length):
++    pos = start + i
++    v |= ((dat[pos // 8] >> (pos % 8)) & 1) << i
++  return v
++
++
++def camera_requesting(dat: bytes) -> bool:
++  """True if a bus-2 camera FCA11 frame carries a real actuation/warning request (hand back)."""
++  if dat is None or len(dat) != 8:
++    return False
++  return (dat[1] != 0 or  # CR_VSM_DecCmd (byte 1): a commanded decel
++          _get_bits(dat, CAM_ACT_PREFILL_BIT, 1) != 0 or
++          _get_bits(dat, CAM_ACT_HBA_BITS[0], CAM_ACT_HBA_BITS[1]) != 0 or
++          _get_bits(dat, CAM_ACT_WARN_BITS[0], CAM_ACT_WARN_BITS[1]) != 0 or
++          _get_bits(dat, CAM_ACT_CMDACT_BIT, 1) != 0 or
++          _get_bits(dat, CAM_ACT_STOPREQ_BIT, 1) != 0 or
++          _get_bits(dat, CAM_ACT_DECCMDACT_BIT, 1) != 0)
++
++
++def build_fca11_frame(cam_dat: bytes, cam_alive: int, m: Fca11MirrorFrame) -> bytes:
++  """The camera's frame with ONLY the brake fields overridden + alive+1 + a fresh CRC.
++
++  ``cam_dat`` is the camera's raw 8-byte FCA11 frame; every other byte (FCA_Status, Failinfo,
++  DrvSetStatus, BeltCmd, RelativeVelocity, TimetoCollision, PAINT1, StopReq, HBA, and the
++  undefined bits this car always carries, e.g. byte4 bit7 = 1 in 10549/10549 logged frames) is
++  copied byte-for-byte, so the ESC only ever sees a shape it has already accepted - with a
++  different brake command in it.
++  """
++  if cam_dat is None or len(cam_dat) != 8:
++    raise ValueError(f"FCA11 mirror needs a fresh 8-byte camera frame, got {cam_dat!r}")
++  b = bytearray(cam_dat)
++
++  def clear(start: int, length: int) -> None:
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] &= (~(1 << (pos % 8))) & 0xFF
++
++  def setb(start: int, length: int, val: int) -> None:
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++
++  # override ONLY: Prefill, DecCmd, Warn, CmdAct, DecCmdAct, Alive. Everything else is mirrored.
++  clear(0, 1)      # CF_VSM_Prefill
++  clear(8, 8)      # CR_VSM_DecCmd
++  clear(3, 2)      # CF_VSM_Warn
++  clear(20, 1)     # FCA_CmdAct
++  clear(31, 1)     # CF_VSM_DecCmdAct
++  clear(35, 4)     # CR_FCA_Alive
++
++  setb(0, 1, 1 if m.prefill else 0)
++  setb(8, 8, int(m.dec_cmd) & 0xFF)
++  setb(3, 2, int(m.warn) & 0x3)
++  setb(20, 1, 1 if m.cmd_act else 0)
++  setb(31, 1, 1 if m.dec_cmd_act else 0)
++  setb(35, 4, int(cam_alive) & 0xF)
++
++  out = bytes(b[:7])
++  return out + bytes([hyundai_checksum(out)])
++
++
++class Fca11LongBrake:
++  """Owned by GasInterceptorCarController; steps once per 100 Hz controller frame.
++
++  Inert (``update`` returns [] and ``braking`` is False) unless ``CP_SP.fca11Brake`` is set. All
++  panda-facing state comes through ``CS`` attributes only (CarState writes them), so the class
++  works identically against the real card loop and a test double."""
++
++  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None):
++    self.CP = CP
++    self.CP_SP = CP_SP
++    self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
++    self.braking = False               # an FCA11 actuating frame was sent THIS frame
++    self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
++    self.low_speed_alert = False       # hand-over-before-the-floor warning (this frame)
++    self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
++    self._dec_last_sent = 0
++    self._sent_this_episode = False
++
++  # ---- window ----
++
++  def fca11_ok(self, CS) -> tuple[bool, str]:
++    """(ok, why-not) from the CarState-provided inputs. The panda re-polices everything anyway."""
++    if not self.enabled:
++      return False, "disabled"
++    if self.blocked_until_resume:
++      return False, "blocked_until_resume"
++    v_kph = float(CS.out.vEgo) * 3.6
++    if v_kph <= FCA11_BRAKE_MIN_KPH:
++      return False, "below_floor"
++    # pedal STATE 0 = NO_FAULT only. 4 STARTUP / 5 TIMEOUT are boot states the panda also accepts,
++    # but from openpilot's side a pedal that has never taken a command must not be mixed with a
++    # brake. 1 BAD_CHECKSUM / 2 SEND / 3 SCE / 6 INVALID are faults -> never brake.
++    state = int(getattr(CS, "interceptor_state", 0))
++    if state not in (0, 4, 5):
++      return False, "pedal_fault"
++    if CS.out.gearShifter != structs.CarState.GearShifter.drive:
++      return False, "gear_not_d"
++    cam = getattr(CS, "fca11_cam_frame", None)
++    now = getattr(CS, "fca11_now_nanos", None)
++    if cam is None or now is None:
++      return False, "no_camera_frame"
++    t_cam, dat = cam
++    if len(dat) != 8 or (now - t_cam) > FCA11_CAM_FRESH_S * 1e9:
++      return False, "stale_camera_frame"
++    if camera_requesting(dat):
++      return False, "camera_owns"
++    return True, ""
++
++  def _alert(self, CS) -> bool:
++    """Warning (never a disable): below floor+margin while a lead is still closing and long is on."""
++    if not self.enabled:
++      return False
++    v_kph = float(CS.out.vEgo) * 3.6
++    closing = bool(getattr(CS, "fca11_lead_closing", False))
++    return closing and FCA11_BRAKE_MIN_KPH < v_kph <= FCA11_BRAKE_MIN_KPH + FCA11_ALERT_MARGIN_KPH
++
++  def update(self, CC: structs.CarControl, CS, frame: int) -> list[CanData]:
++    sends: list[CanData] = []
++    if not self.enabled:
++      self.braking = False
++      self.low_speed_alert = False
++      return sends
++
++    # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
++    # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
++    engaged = bool(CC.enabled)
++    if engaged and not self._engaged_prev:
++      self.blocked_until_resume = False
++    self._engaged_prev = engaged
++
++    # latch the cut on what the car layer CAN observe (camera request, driver pedal, gear):
++    # braking stays off until the next deliberate re-engage, per the owner's no-auto-resume rule.
++    if CC.longActive and (bool(CS.out.brakePressed) or bool(CS.out.gasPressed) or
++                          CS.out.gearShifter != structs.CarState.GearShifter.drive):
++      self.blocked_until_resume = True
++    cam = getattr(CS, "fca11_cam_frame", None)
++    if CC.longActive and cam is not None and camera_requesting(cam[1]):
++      self.blocked_until_resume = True
++
++    self.low_speed_alert = self._alert(CS)
++
++    if not CC.longActive:
++      self.braking = False
++      self._dec_last_sent = 0
++      return sends
++
++    accel = float(CC.actuators.accel)
++    dec_cmd = dec_cmd_from_accel(accel)
++    ok, _why = self.fca11_ok(CS)
++    want_brake = dec_cmd >= 1 and ok
++
++    if want_brake:
++      dec_cmd = clamp_dec_cmd(dec_cmd)
++      # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
++      # camera period of growth; release is immediate. Reference = our last SENT frame.
++      dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++      dec_cmd = clamp_dec_cmd(dec_cmd)  # first frame of an episode: <= RATE_STEP, then ramps
++
++      t_cam, dat = cam
++      if frame % FCA11_SEND_EVERY == 0:
++        cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
++        m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++        out = build_fca11_frame(dat, (cam_alive + 1) & 0xF, m)
++        sends.append(CanData(FCA11_ADDR, out, 0))
++      self.braking = True
++      self._sent_this_episode = True
++      self._dec_last_sent = dec_cmd
++    else:
++      # not braking: the camera's own FCA11 keeps flowing (panda's dynamic block opens within one
++      # camera period of our last frame).
++      self.braking = False
++      self._dec_last_sent = 0
++      self._sent_this_episode = False
++
++    return sends
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 695b8f03..51c4a7c3 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -24,6 +24,7 @@ from opendbc.car import Bus, DT_CTRL, structs
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car import create_gas_interceptor_command
++from opendbc.sunnypilot.car.hyundai.fca11_long import Fca11LongBrake
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+ 
+ GAS_INTERCEPTOR_DBC = "hyundai_gas_interceptor_generated"
+@@ -222,8 +223,9 @@ class GasInterceptorCarController:
+     self.gas = 0.
+     self.interceptor_ids = get_interceptor_ids(CP_SP)
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
++    self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+ 
+-  def create_gas_command(self, CC: structs.CarControl, CS, frame: int) -> list[CanData]:
++  def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0) -> list[CanData]:
+     can_sends: list[CanData] = []
+     if not self.CP_SP.enableGasInterceptor:
+       return can_sends
+@@ -232,9 +234,24 @@ class GasInterceptorCarController:
+     # also clears any latched pedal fault (pedal firmware)
+     # (no low-speed cut: a pause/resume engagement may start from a standstill; LOW_SPEED_MAX_GAS limits the launch)
+     active = CC.longActive
++
++    # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
++    # command is hard-zeroed this frame (gas and brake are never commanded together) and the pedal stream keeps
++    # flowing (zero frames), which also keeps the pedal fault-clear path alive.
++    # Freshness reference for the mirrored camera frame: the same now_nanos CarInterface.apply received (replay-safe).
++    CS.fca11_now_nanos = now_nanos
++    brake_sends = self.fca11_brake.update(CC, CS, frame)
++
+     # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+-    self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas, CS.out.vEgo) if active else 0.
++    # While the FCA11 brake is active the pedal command is EXACTLY zero for this frame (hard zero, not the law's
++    # zero: the law would still add the hold feedforward at speed).
++    if active and not self.fca11_brake.braking:
++      self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo), self.gas, CS.out.vEgo)
++    elif self.fca11_brake.braking:
++      self.gas = 0.
++    else:
++      self.gas = 0.
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+     send_slot = frame % 2 == 0
+@@ -245,4 +262,5 @@ class GasInterceptorCarController:
+       can_sends.append(create_gas_interceptor_command(self.interceptor_packer, 0. if clear else self.gas, frame // 2,
+                                                      self.interceptor_ids.command_msg))
+ 
++    can_sends.extend(brake_sends)
+     return can_sends
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+new file mode 100644
+index 00000000..5043d6a6
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -0,0 +1,324 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++FCA11 long braking (HyundaiFca11Brake, default OFF) car-layer unit tests:
++  - the pure window / gain / mirror-frame logic (fca11_long.py);
++  - the mirror frame against bytes in the real camera layout (override fields only, alive+1, CRC, undefined bits kept);
++  - the capnp CarParamsSP field round-trip and the interface plumbing (toggle on/off + stale-libparams);
++  - the planner PID accel limits per speed (the interface override);
++  - the alert emission in car_specific (via the selfdrived path).
++"""
++import copy
++import unittest
++
++from opendbc.car import structs
++from opendbc.car.hyundai.hyundaican import hyundai_checksum
++from opendbc.car.car_helpers import interfaces
++from opendbc.car.hyundai.values import CAR
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.values import (HyundaiSafetyFlagsSP, HYUNDAI_FCA11_LONG_MAX_DEC,
++                                                   HYUNDAI_FCA11_LONG_MIN_SPEED_KPH)
++from opendbc.sunnypilot.car.interfaces import setup_interfaces
++
++CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++BASE_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8}
++STD = {0x201: 6}
++
++
++def _get_ci(param: bool | None, fca11: str | bytes | None = None):
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **STD}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  params_list: list = []
++  if param is not None:
++    params_list.append({"HyundaiGasInterceptor": param})
++  if fca11 is not None:
++    params_list.append({"HyundaiFca11Brake": fca11})
++  setup_interfaces(CarInterface, CP, CP_SP, params_list)
++  return CarInterface, CP, CP_SP
++
++
++def _real_camera_frame(dec=0, warn=0, alive=5, prefill=0, cmd_act=0, dec_cmd_act=0, hba=0, stop_req=0, undefined_high=True):
++  """A frame in the exact layout of the camera's 0x38D, including the always-set undefined byte4 bit7."""
++  b = bytearray(8)
++  def setb(start, length, val):
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++  setb(0, 1, prefill)
++  setb(1, 2, hba)
++  setb(3, 2, warn)
++  setb(8, 8, dec)
++  setb(18, 2, 2)          # FCA_Status
++  setb(20, 1, cmd_act)
++  setb(21, 1, stop_req)
++  setb(22, 3, 1)          # FCA_DrvSetStatus
++  setb(31, 1, dec_cmd_act)
++  setb(32, 3, 0)          # FCA_Failinfo
++  setb(35, 4, alive)
++  setb(39, 9, 255)        # FCA_RelativeVelocity
++  setb(48, 8, 254)        # FCA_TimetoCollision
++  if undefined_high:
++    b[4] |= 0x80          # byte4 bit7 = 1 (10549/10549 logged frames)
++  b[7] = hyundai_checksum(bytes(b[:7]))
++  return bytes(b)
++
++
++class TestPureLogic(unittest.TestCase):
++
++  def test_dec_cmd_from_accel_gain(self):
++    # inverse of the measured 0.67 gain; -0.5 is the onset, above it coasts
++    self.assertEqual(0, fl.dec_cmd_from_accel(0.0))
++    self.assertEqual(0, fl.dec_cmd_from_accel(-0.4))
++    self.assertEqual(0, fl.dec_cmd_from_accel(fl.FCA11_BRAKE_ONSET_ACCEL + 1e-6))
++    self.assertGreaterEqual(fl.dec_cmd_from_accel(fl.FCA11_BRAKE_ONSET_ACCEL), 1)
++    # -2.0 m/s^2 -> 0.30 g raw (clamped cap)
++    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.dec_cmd_from_accel(-2.0))
++    # monotone in magnitude
++    vals = [fl.dec_cmd_from_accel(-a) for a in (0.6, 0.8, 1.0, 1.5, 2.0)]
++    self.assertEqual(vals, sorted(vals))
++
++  def test_clamp_dec_cmd(self):
++    self.assertEqual(1, fl.clamp_dec_cmd(0))
++    self.assertEqual(1, fl.clamp_dec_cmd(-5))
++    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.clamp_dec_cmd(255))
++    self.assertEqual(7, fl.clamp_dec_cmd(7))
++
++  def test_constants_mirror_c(self):
++    # values.py mirrors the safety header; assert the planner floor is above the panda floor
++    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, 30)
++    self.assertEqual(HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, 9)
++    self.assertGreater(fl.FCA11_BRAKE_MIN_KPH, HYUNDAI_FCA11_LONG_MIN_SPEED_KPH)
++
++
++class TestMirrorFrame(unittest.TestCase):
++
++  def _fields(self, dat):
++    return {'prefill': fl._get_bits(dat, 0, 1), 'warn': fl._get_bits(dat, 3, 2), 'dec': fl._get_bits(dat, 8, 8),
++            'cmd_act': fl._get_bits(dat, 20, 1), 'dec_cmd_act': fl._get_bits(dat, 31, 1), 'alive': fl._get_bits(dat, 35, 4)}
++
++  def test_overrides_only_brake_fields_alive_crc(self):
++    cam = _real_camera_frame(dec=0, alive=5, undefined_high=True)
++    m = fl.Fca11MirrorFrame(dec_cmd=17, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++    out = fl.build_fca11_frame(cam, 6, m)
++    f = self._fields(out)
++    self.assertEqual(1, f['prefill'])
++    self.assertEqual(3, f['warn'])
++    self.assertEqual(17, f['dec'])
++    self.assertEqual(1, f['cmd_act'])
++    self.assertEqual(0, f['dec_cmd_act'])
++    self.assertEqual(6, f['alive'])
++    self.assertEqual(hyundai_checksum(out[:7]), out[7])
++    # bytes the override must never touch: byte 5 (RelVel low) and byte 6 (TimetoCollision) are byte-for-byte the
++    # camera's; the undefined byte4 bit7 is preserved. (Bytes 0/1/2/3/4 hold the overridden fields.)
++    self.assertEqual(cam[5], out[5])
++    self.assertEqual(cam[6], out[6])
++    self.assertEqual(cam[4] & 0x80, 0x80)          # undefined bit kept
++    self.assertEqual(out[4] & 0x80, 0x80)
++    self.assertEqual(cam[2] & 0x0C, out[2] & 0x0C)  # FCA_Status (bits 18-19) preserved
++
++  def test_alive_wraps_from_15(self):
++    m = fl.Fca11MirrorFrame(dec_cmd=1, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++    out = fl.build_fca11_frame(_real_camera_frame(alive=15), 0, m)
++    self.assertEqual(0, fl._get_bits(out, 35, 4))
++
++  def test_bad_frame_length_raises(self):
++    m = fl.Fca11MirrorFrame(dec_cmd=1, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++    with self.assertRaises(ValueError):
++      fl.build_fca11_frame(b"\x00\x01", 1, m)
++    with self.assertRaises(ValueError):
++      fl.build_fca11_frame(None, 1, m)
++
++  def test_camera_requesting(self):
++    self.assertFalse(fl.camera_requesting(_real_camera_frame()))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(warn=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(warn=2)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(dec=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(prefill=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(cmd_act=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(dec_cmd_act=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(hba=1)))
++    self.assertTrue(fl.camera_requesting(_real_camera_frame(stop_req=1)))
++    self.assertFalse(fl.camera_requesting(b""))
++
++
++class _CS:
++  """Minimal CarState double: the only attributes Fca11LongBrake reads."""
++  def __init__(self, v_ego=20.0, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
++               state=0, cam=None, now=0, lead_closing=False):
++    self.out = structs.CarState()
++    self.out.vEgo = v_ego
++    self.out.gearShifter = gear
++    self.out.brakePressed = brake
++    self.out.gasPressed = gas
++    self.interceptor_state = state
++    self.fca11_cam_frame = cam
++    self.fca11_now_nanos = now
++    self.fca11_lead_closing = lead_closing
++
++
++def _cam(v=0.0):
++  return (0, _real_camera_frame(alive=3))
++
++
++class TestController(unittest.TestCase):
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _brake(self, cp_sp):
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cp_sp(self, fca11=True, pedal=True):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = fca11
++    cp_sp.enableGasInterceptor = pedal
++    return cp_sp
++
++  def test_disabled_is_inert(self):
++    for fca11, pedal in ((False, True), (True, False), (False, False)):
++      b = self._brake(self._cp_sp(fca11, pedal))
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 0))
++      self.assertFalse(b.braking)
++
++  def test_brakes_on_request_and_hard_zero_intent(self):
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    self.assertTrue(b.braking)
++    # coast: no send
++    self.assertFalse(b.update(self._cc(-0.2), _CS(cam=_cam()), 0))
++    self.assertFalse(b.braking)
++
++  def test_no_send_below_floor(self):
++    b = self._brake(self._cp_sp())
++    sends = b.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_BRAKE_MIN_KPH / 3.6 - 0.01, cam=_cam()), 0)
++    self.assertEqual([], sends)
++    self.assertFalse(b.braking)
++
++  def test_no_send_without_fresh_camera(self):
++    b = self._brake(self._cp_sp())
++    # no camera frame at all
++    self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=None), 0))
++    # stale frame (age > 100 ms)
++    stale = (0, _real_camera_frame())
++    cs = _CS(cam=stale, now=int(0.2 * 1e9))
++    self.assertEqual([], b.update(self._cc(-2.0), cs, 0))
++
++  def test_send_rate_every_other_frame(self):
++    b = self._brake(self._cp_sp())
++    s0 = b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    s1 = b.update(self._cc(-2.0), _CS(cam=_cam()), 1)
++    self.assertEqual(1, len(s0))
++    self.assertEqual(0, len(s1))
++    self.assertEqual(0x38D, s0[0].address)
++    self.assertEqual(0, s0[0].src)
++
++  def test_rate_limit_growth(self):
++    b = self._brake(self._cp_sp())
++    sends = []
++    for f in range(0, 20, 2):
++      sends += b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++    decs = [fl._get_bits(s.dat, 8, 8) for s in sends]
++    self.assertEqual(decs, sorted(decs))
++    for a, c in zip(decs, decs[1:]):
++      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, decs[-1])
++
++  def test_blocked_until_resume_latch_on_cut(self):
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    # driver brake -> latch; no more braking even after the pedal/window clear
++    b.update(self._cc(-2.0), _CS(cam=_cam(), brake=True), 2)
++    self.assertTrue(b.blocked_until_resume)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 4)
++    self.assertFalse(b.braking)
++    # disengage -> re-engage clears it
++    b.update(self._cc(-2.0, engaged=False), _CS(cam=_cam()), 6)
++    b.update(self._cc(-2.0, engaged=True), _CS(cam=_cam()), 8)
++    self.assertFalse(b.blocked_until_resume)
++    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 10))
++
++  def test_camera_request_latches(self):
++    b = self._brake(self._cp_sp())
++    cam_req = (0, _real_camera_frame(warn=2))
++    b.update(self._cc(-2.0), _CS(cam=cam_req), 0)
++    self.assertTrue(b.blocked_until_resume)
++
++  def test_gear_gate(self):
++    b = self._brake(self._cp_sp())
++    sends = b.update(self._cc(-2.0), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 0)
++    self.assertEqual([], sends)
++    self.assertTrue(b.blocked_until_resume)
++
++  def test_pedal_fault_blocks(self):
++    for st in (1, 2, 3, 6):
++      b = self._brake(self._cp_sp())
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 0), st)
++    for st in (0, 4, 5):
++      b = self._brake(self._cp_sp())
++      self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 0), st)
++
++  def test_alert_gate(self):
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-0.2), _CS(v_ego=13.0 / 3.6, cam=_cam(), lead_closing=True), 0)
++    self.assertTrue(b.low_speed_alert)
++    b.update(self._cc(-0.2), _CS(v_ego=20.0 / 3.6, cam=_cam(), lead_closing=True), 0)
++    self.assertFalse(b.low_speed_alert)
++    b.update(self._cc(-0.2), _CS(v_ego=13.0 / 3.6, cam=_cam(), lead_closing=False), 0)
++    self.assertFalse(b.low_speed_alert)
++
++
++class TestInterfacePlumbing(unittest.TestCase):
++
++  def test_toggle_off_is_inert(self):
++    _, CP_ref, CP_SP_ref = _get_ci(True, None)
++    for val in (None, "0", "", "bogus", b"0"):
++      _, CP, CP_SP = _get_ci(True, val)
++      self.assertFalse(CP_SP.fca11Brake, val)
++      self.assertFalse(CP_SP.safetyParam & HyundaiSafetyFlagsSP.FCA11_LONG, val)
++      # everything else identical to the pedal-only baseline
++      self.assertEqual(CP_SP_ref.safetyParam, CP_SP.safetyParam, val)
++      self.assertEqual(CP_SP_ref.enableGasInterceptor, CP_SP.enableGasInterceptor)
++      self.assertEqual(CP.to_bytes(), CP_ref.to_bytes(), val)
++
++  def test_toggle_on_sets_flag_and_bit(self):
++    _, CP, CP_SP = _get_ci(True, "1")
++    self.assertTrue(CP_SP.fca11Brake)
++    self.assertTrue(CP_SP.safetyParam & HyundaiSafetyFlagsSP.FCA11_LONG)
++    # pedal bits untouched
++    self.assertTrue(CP_SP.safetyParam & HyundaiSafetyFlagsSP.GAS_INTERCEPTOR)
++
++  def test_toggle_on_without_pedal_is_ignored(self):
++    _, CP, CP_SP = _get_ci(None, "1")
++    self.assertFalse(CP_SP.fca11Brake)
++    self.assertFalse(CP_SP.safetyParam & HyundaiSafetyFlagsSP.FCA11_LONG)
++
++  def test_planner_pid_limits(self):
++    CarInterface = interfaces[CAR_UNDER_TEST]
++    _, CP, CP_SP = _get_ci(True, "1")
++    # above the floor: brake authority to -2.0; below: coast-only (+0.0)
++    lo, hi = CarInterface.get_pid_accel_limits(CP, CP_SP, 20.0, 20.0)
++    self.assertEqual(-fl.FCA11_A_MAX_MSS2, lo)
++    lo, hi = CarInterface.get_pid_accel_limits(CP, CP_SP, 3.0, 3.0)  # 10.8 km/h, below the 12 km/h floor
++    self.assertEqual(0.0, lo)
++    # toggle off: today's stock limits
++    _, CP2, CP_SP2 = _get_ci(True, "0")
++    self.assertEqual((-3.5, 2.0), CarInterface.get_pid_accel_limits(CP2, CP_SP2, 20.0, 20.0))
++
++  def test_capnp_field_present_default_off(self):
++    # the CarParamsSP struct carries the toggle and defaults OFF (the capnp field fca11Brake is regenerated by CI)
++    self.assertIn("fca11Brake", structs.CarParamsSP.__dataclass_fields__)
++    self.assertFalse(structs.CarParamsSP().fca11Brake)
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 3e6a9c70..10bb84e4 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -1086,3 +1086,142 @@ def _pedal_crc(msg):
+   dat = bytearray(dat)
+   dat[5] = crc8_pedal(dat[:5])
+   return addr, dat, bus
++
++
++# *** fork: FCA11 long braking (HyundaiFca11Brake) through the real CarController path ***
++
++def _get_ci_fca11(fca11: str | None, pedal=STD):
++  """CarInterface with the pedal armed and the FCA11 toggle as given (str or None)."""
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **pedal}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  params_list: list = [{"HyundaiGasInterceptor": True}]
++  if fca11 is not None:
++    params_list.append({"HyundaiFca11Brake": fca11})
++  setup_interfaces(CarInterface, CP, CP_SP, params_list)
++  return CarInterface, CP, CP_SP
++
++
++def _fca11_cam_frame(alive=5, warn=0):
++  from opendbc.sunnypilot.car.hyundai.fca11_long import build_fca11_frame, Fca11MirrorFrame  # noqa: F401
++  from opendbc.car.hyundai.hyundaican import hyundai_checksum
++  b = bytearray(8)
++  def setb(start, length, val):
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++  setb(3, 2, warn)
++  setb(18, 2, 2)      # FCA_Status
++  setb(22, 3, 1)      # FCA_DrvSetStatus
++  setb(35, 4, alive)
++  setb(39, 9, 255)
++  setb(48, 8, 254)
++  b[4] |= 0x80        # undefined byte4 bit7 (always 1 on this car)
++  b[7] = hyundai_checksum(bytes(b[:7]))
++  return bytes(b)
++
++
++class _Fca11CS:
++  """Minimal CarState double for GasInterceptorCarController.create_gas_command."""
++  def __init__(self, v_ego=20., cam=None, now=0, state=0, gear=None, brake=False, gas=False):
++    self.out = structs.CarState()
++    self.out.vEgo = v_ego
++    self.out.gearShifter = structs.CarState.GearShifter.drive if gear is None else gear
++    self.out.brakePressed = brake
++    self.out.gasPressed = gas
++    self.interceptor_state = state
++    self.fca11_cam_frame = cam
++    self.fca11_now_nanos = now
++    self.fca11_lead_closing = False
++    self.pedal_long_engaged = True
++    self.pedal_fault_monitor = gi.PedalFaultMonitor()
++
++  def __getattr__(self, name):
++    # anything the controller reads that isn't set above (is_metric, etc.)
++    if name == "is_metric":
++      return False
++    raise AttributeError(name)
++
++
++class TestFca11LongControllerIntegration:
++  """Hard-zeroed gas while braking + the 0x38D mirror frame on the wire, through create_gas_command."""
++
++  def _cc(self, accel, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = cc.latActive = cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc.as_reader()
++
++  def _ccr(self):
++    CarInterface, CP, CP_SP = _get_ci_fca11("1")
++    return CarInterface(CP, CP_SP), CP_SP
++
++  def test_toggle_off_never_sends_fca11_and_keeps_pedal(self):
++    CarInterface, CP, CP_SP = _get_ci_fca11("0")
++    CI = CarInterface(CP, CP_SP)
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame()))
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, 0)
++    assert not any(addr == 0x38D for addr, _dat, _src in sends)
++    # pedal still commanded at a positive accel (even frame = a send slot)
++    sends = CI.CC.create_gas_command(self._cc(1.0), cs, 2, 0)
++    assert any(addr == 0x200 for addr, _dat, _src in sends)
++
++  def test_braking_zeroes_gas_and_sends_mirror(self):
++    CI, CP_SP = self._ccr()
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame(alive=5)))
++    # first get the pedal commanding
++    for f in range(2, 120, 2):
++      CI.CC.create_gas_command(self._cc(1.5), cs, f, 0)
++    assert CI.CC.gas > 0.
++    # now brake: gas must be exactly zero THIS frame and a 0x38D must appear
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 120, 0)
++    assert CI.CC.gas == 0.
++    fca = [(a, d) for a, d, _ in sends if a == 0x38D]
++    assert len(fca) == 1
++    # pedal stream keeps flowing (a zero frame), no 0x38D duplicate
++    assert sum(1 for a, _ in [(a, d) for a, d, _ in sends] if a == 0x200) == 1
++
++  def test_no_mirror_without_fresh_camera(self):
++    CI, CP_SP = self._ccr()
++    cs = _Fca11CS(cam=None)
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, 0)
++    assert not any(addr == 0x38D for addr, _dat, _src in sends)
++    # fresh-at-capture frame but the controller's "now" is >100 ms later -> stale (now_nanos is the freshness reference)
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame()))
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, int(0.3 * 1e9))
++    assert not any(addr == 0x38D for addr, _dat, _src in sends)
++    # right at the freshness edge (100 ms) it still sends
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame()))
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, int(0.100 * 1e9))
++    assert any(addr == 0x38D for addr, _dat, _src in sends)
++
++  def test_camera_request_cuts_and_handback(self):
++    CI, CP_SP = self._ccr()
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame(warn=2)))  # the camera itself is braking
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, 0)
++    assert not any(addr == 0x38D for addr, _dat, _src in sends)
++    assert CI.CC.fca11_brake.blocked_until_resume
++
++  def test_mirror_frame_bytes(self):
++    CI, CP_SP = self._ccr()
++    cam = _fca11_cam_frame(alive=7)
++    cs = _Fca11CS(cam=(0, cam))
++    # drive send slots; the rate limiter ramps 4 -> 30 over ~7 frames
++    dats = []
++    for f in range(0, 32, 2):
++      sends = CI.CC.create_gas_command(self._cc(-2.0), cs, f, 0)
++      dats += [d for a, d, _ in sends if a == 0x38D]
++    dat = dats[-1]
++    from opendbc.sunnypilot.car.hyundai.fca11_long import _get_bits
++    from opendbc.car.hyundai.hyundaican import hyundai_checksum
++    assert _get_bits(dat, 0, 1) == 1          # Prefill
++    assert _get_bits(dat, 3, 2) == 3          # Warn 3
++    assert _get_bits(dat, 20, 1) == 1         # CmdAct
++    assert _get_bits(dat, 31, 1) == 0         # DecCmdAct stays 0
++    assert _get_bits(dat, 35, 4) == (7 + 1) & 0xF  # alive + 1, byte4 bits 3-6
++    assert dat[7] == hyundai_checksum(dat[:7])
++    assert _get_bits(dat, 8, 8) == 30         # -2.0 -> clamped 0.30 g raw once ramped
++    assert _get_bits(dats[0], 8, 8) == 4      # first frame is rate-limited to +0.04 g
++    assert dat[4] & 0x80                       # undefined byte4 bit7 preserved
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index ba892880..da41b080 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -26,6 +26,13 @@ class HyundaiSafetyFlagsSP:
+   # window: same decel cap, HBA/StopReq still blocked, actuation only in D with every wheel in (MIN, MAX] km/h, no pedal,
+   # fresh inputs, and a latching cut. C mirror: HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST. No car-layer code sets it.
+   FCA11_ROLLING_TEST = 128
++  # PRODUCTION (toggle-gated, default OFF): FCA11 longitudinal braking on top of the gas interceptor
++  # (needs GAS_INTERCEPTOR; armed by _initialize_hyundai_gas_interceptor from the HyundaiFca11Brake param).
++  # Panda (bit 256): actuating FCA11 only while controls_allowed AND heartbeat_engaged, gear D, no pedal, fresh
++  # inputs, every wheel above 9 km/h (no ceiling), DecCmd <= 30 (0.30 g), rate-limited growth (+0.04 g/camera
++  # period), a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera hand-back. C mirror:
++  # HYUNDAI_PARAM_SP_FCA11_LONG.
++  FCA11_LONG = 256
+ 
+ 
+ # Raw CR_VSM_DecCmd cap (0.01 g/LSB) for FCA11_BRAKE_TEST; must equal HYUNDAI_FCA11_TEST_MAX_DEC in safety/modes/hyundai.h
+@@ -37,6 +44,16 @@ HYUNDAI_FCA11_ROLL_MAX_DEC = 30
+ # safety/modes/hyundai.h (unit tests pin both boundaries)
+ HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH = 5
+ HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH = 35
++# *** PRODUCTION FCA11 long braking (FCA11_LONG) constants; unit tests pin them against safety/modes/hyundai.h ***
++# Raw CR_VSM_DecCmd cap: 0.30 g. Measured on the car (roll-20261005T232357Z): 0.30 g -> 2.03 m/s^2 delivered (~69%,
++# linear); ~COMFORT_BRAKE. Must equal HYUNDAI_FCA11_LONG_MAX_DEC.
++HYUNDAI_FCA11_LONG_MAX_DEC = 30
++# Speed floor (km/h, slowest wheel); must equal HYUNDAI_FCA11_LONG_MIN_SPEED (raw / 32). The car never responded below
++# ~8-10 km/h; the PLANNER floor (FCA11_BRAKE_MIN_KPH in gas_interceptor.py) is higher, so this is the backstop.
++# There is NO ceiling: production braking must work at any D speed.
++HYUNDAI_FCA11_LONG_MIN_SPEED_KPH = 9
++# Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
++HYUNDAI_FCA11_LONG_RATE_STEP = 4
+ 
+ 
+ class HyundaiFlagsSP(IntFlag):
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index 7d5a7f55..6c243ac5 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -121,6 +121,18 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   CP.minEnableSpeed = -1.
+   CP.longitudinalActuatorDelay = 0.5  # TBD-BENCH: pedal -> ECU torque request -> DCT, unmeasured
+ 
++  # fork: production FCA11 longitudinal braking (HyundaiFca11Brake, PERSISTENT BOOL, default "0" = OFF). Rides ON TOP of
++  # the pedal: same car layer already proven on-car (roll-20261005T232357Z). Armed ONLY with the explicit param + the
++  # pedal feature armed; leaves safetyParam bit 256 (FCA11_LONG) clear otherwise, so the panda TX path is byte-for-byte
++  # today's. A NEW key can be unreadable on a stale libparams (missing key -> get() returns None): treat anything but a
++  # clean "1" as OFF (never raise, never default ON).
++  fca11_raw = params_dict.get("HyundaiFca11Brake")
++  if isinstance(fca11_raw, bytes):
++    fca11_raw = fca11_raw.decode(errors="ignore")
++  if str(fca11_raw or "0").strip() == "1":
++    CP_SP.fca11Brake = True
++    CP_SP.safetyParam |= HyundaiSafetyFlagsSP.FCA11_LONG
++
+ 
+ def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
+   """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
+-- 
+2.55.0
+

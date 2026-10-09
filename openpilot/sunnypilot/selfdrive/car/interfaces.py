@@ -8,8 +8,9 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -80,11 +81,13 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     params.remove("IntelligentCruiseButtonManagement")
 
   if not CP.openpilotLongitudinalControl and CP_SP.pcmCruiseSpeed:
+    # fork #30: these are the owner's stored cruise preferences. Keep them when longitudinal is
+    # only transiently unavailable (pedal interceptor disarmed for an ignition); the consumers
+    # are already gated on longitudinal being active, so nothing reads them while unavailable.
     cloudlog.warning("openpilot Longitudinal Control and ICBM not available, cleaning up params")
-    params.remove("DynamicExperimentalControl")
-    params.remove("CustomAccIncrementsEnabled")
-    params.remove("SmartCruiseControlVision")
-    params.remove("SmartCruiseControlMap")
+    for key in ("DynamicExperimentalControl", "CustomAccIncrementsEnabled",
+                "SmartCruiseControlVision", "SmartCruiseControlMap"):
+      remove_unless_preserved(params, key)
 
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
@@ -129,4 +132,28 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "ToyotaStopAndGoHack",
   ])
 
-  return [{k: params.get(k, return_default=True)} for k in keys]
+  params_list = [{k: params.get(k, return_default=True)} for k in keys]
+
+  # fork: comma pedal opt-in. The key lives in params_keys.h, i.e. inside the compiled libparams; an overlay deploy that
+  # ships this Python without rebuilding libparams would raise UnknownKeyName here and take down card (and lateral) with
+  # it. Read defensively so a stale libparams just leaves the feature off.
+  try:
+    params_list.append({"HyundaiGasInterceptor": params.get("HyundaiGasInterceptor", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasInterceptor param unknown to libparams (not rebuilt?); gas interceptor stays disabled")
+
+  # fork: optional pedal CAN ID dialect override (auto/standard/remapped). Same stale-libparams hazard; missing -> "auto"
+  # (opendbc treats an absent key as auto, i.e. whichever pedal dialect the fingerprint saw, standard preferred).
+  try:
+    params_list.append({"HyundaiGasInterceptorIDSet": params.get("HyundaiGasInterceptorIDSet", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasInterceptorIDSet param unknown to libparams (not rebuilt?); using auto pedal ID detection")
+
+  # fork: FCA11 longitudinal braking opt-in. Same stale-libparams hazard as the pedal keys; a missing key just leaves the
+  # feature off (opendbc treats anything but a clean "1" as OFF and never defaults it ON).
+  try:
+    params_list.append({"HyundaiFca11Brake": params.get("HyundaiFca11Brake", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11Brake param unknown to libparams (not rebuilt?); FCA11 braking stays disabled")
+
+  return params_list

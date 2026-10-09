@@ -10,7 +10,10 @@ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarContr
 from opendbc.car.interfaces import CarStateBase
 
 from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
+from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_MSG
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarStateBase
+from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, GAS_INTERCEPTOR_DBC, get_interceptor_ids
+from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarState
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
@@ -77,6 +80,16 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     # Main button also can trigger an engagement on these cars
     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
 
+  def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
+    # gas interceptor: the pause/resume button is the ONLY on switch for openpilot longitudinal. It engages only through
+    # the explicit resumeCruise event that PauseResumeTracker emits for a deliberate, debounced driver press (never from a
+    # timer or a pedal release). The up/down arrows (accelCruise / decelCruise) only change the set speed
+    # (selfdrive/car/cruise.py) and never engage. Panda mirrors this: only the pause/resume release grants controls
+    # (hyundai_gas_interceptor_pause_button_check, safety/modes/hyundai_common.h).
+    if self.CP_SP.enableGasInterceptor:
+      return any(b.type == ButtonType.resumeCruise and not b.pressed for b in buttonEvents)
+    return super().update_button_enable(buttonEvents)
+
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -102,6 +115,12 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       cp.vl["WHL_SPD11"]["WHL_SPD_RR"],
     )
     ret.standstill = cp.vl["WHL_SPD11"]["WHL_SPD_FL"] <= STANDSTILL_THRESHOLD and cp.vl["WHL_SPD11"]["WHL_SPD_RR"] <= STANDSTILL_THRESHOLD
+    # 0040: the SLOWEST wheel speed in km/h (min of the four WHL_SPD11), the same observable the panda's deleted speed
+    # floor watched. The FCA11 episode logger stores it so a drive's logs can answer "what did the ESC do below
+    # 12 km/h / at standstill". Cheap (a min of four floats); inert unless FCA11-long is armed.
+    if self.CP_SP.fca11Brake:
+      self.fca11_wheel_min_kph = min(cp.vl["WHL_SPD11"]["WHL_SPD_FL"], cp.vl["WHL_SPD11"]["WHL_SPD_FR"],
+                                     cp.vl["WHL_SPD11"]["WHL_SPD_RL"], cp.vl["WHL_SPD11"]["WHL_SPD_RR"])
 
     self.cluster_speed_counter += 1
     if self.cluster_speed_counter > CLUSTER_SAMPLE_RATE:
@@ -332,7 +351,22 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     if CP.flags & HyundaiFlags.CANFD:
       return self.get_can_parsers_canfd(CP)
 
-    return {
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
+    parsers = {
+      # fork (adurham): drive-mode decode. CLU13 CF_Clu_DriveMode (0x50C) is the CN7's drive mode. It is 10 Hz on
+      # C-CAN and only changes on a cluster button press, so it is subscribed at its own 10 Hz (the debounce
+      # reads frames per tick; nothing polls it at 100 Hz). CANParser builds message_states ONLY from this
+      # `messages` list, so before this subscription CLU13 was never decoded: CarStateSP.driveMode stayed 0,
+      # making DriveModePersonality inert AND killing the N/N-Custom longitudinal block (patch 0021).
+      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [(DRIVE_MODE_MSG, 10)], 0),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
+    if CP_SP.enableGasInterceptor:
+      # comma pedal on bus 0, own DBC (0x200/0x201 collide with EMS20 in hyundai_can). Explicitly subscribed at the
+      # pedal's rate so a dead pedal times out -> canValid=False (CarInterfaceBase ANDs every parser).
+      # Only the active ID dialect's sensor (0x201 GAS_SENSOR or remapped 0x701 GAS_SENSOR_R) is subscribed.
+      parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [(get_interceptor_ids(CP_SP).sensor_msg, 50)], 0)
+    if CP_SP.fca11Brake:
+      # fork: production FCA11 long braking mirrors the camera's byte-exact 0x38D, so the bus-2 parser must keep the
+      # freshest RAW frame (not just decoded signals). Opt-in; empty set = zero cost in the hot loop.
+      parsers[Bus.cam].capture_addrs.add(FCA11_ADDR)
+    return parsers

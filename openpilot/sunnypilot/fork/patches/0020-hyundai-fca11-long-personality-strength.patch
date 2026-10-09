@@ -1,0 +1,313 @@
+From 49d8f6871cf708e17804667a31c252a7a05223be Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 17:18:58 -0500
+Subject: [PATCH] hyundai: FCA11-long personality-indexed braking strength
+ (relaxed 0.12 / standard 0.20 / aggressive 0.30 g)
+
+The driver's LongitudinalPersonality (already the feel dial for the pedal launch ceiling / A_CRUISE_MAX / interceptor
+cap via CarControlSP.personality) now owns the FCA11-long COMMANDED decel cap too:
+- fca11_long.py: PERSONALITY_MAX_DEC tier table (relaxed 12 / standard 20 / aggressive 30 raw = 0.12/0.20/0.30 g);
+  clamp_dec_cmd(dec_cmd, personality) and Fca11LongBrake.update(..., personality) index the cap; unknown -> standard.
+  Standard's 20 is the new default (a bare call / sim / legacy caller gets the middle, never the strongest).
+- gas_interceptor.py: create_gas_command threads its personality arg into fca11_brake.update.
+- Every tier <= the panda gate HYUNDAI_FCA11_LONG_MAX_DEC (30, personality-agnostic): python-only, no safety change.
+- Tests: test_fca11_long.py TestPersonalityStrength (per-tier cap + emitted frame + OFF-inert + fallback + gate
+  invariant) and test_gas_interceptor.py wire-path; two pre-existing personality-independent pins updated.
+
+No panda/opendbc safety files touched (firmware 00e086b9 valid); no resume/stop change; toggle-OFF byte-for-byte inert.
+---
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  |  47 ++++++-
+ .../sunnypilot/car/hyundai/gas_interceptor.py |   2 +-
+ .../car/hyundai/tests/test_fca11_long.py      | 132 ++++++++++++++++--
+ .../car/hyundai/tests/test_gas_interceptor.py |  14 +-
+ 4 files changed, 178 insertions(+), 17 deletions(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 5bbb1cd9..8d0805e7 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -26,6 +26,9 @@ Design (see car-features/fca11-long-integration.md for the full picture):
+     heartbeat_engaged, gear D, no pedal, fresh inputs, every wheel above 9 km/h, DecCmd <= 0.30 g,
+     rate-limited growth, a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera
+     hand-back. Nothing here can make the car brake if the panda rules say no;
++  - the COMMANDED decel cap is personality-indexed (relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g, the
++    max) so the driver's feel dial owns the braking strength too. Every tier is <= the panda's 0.30 g gate
++    (which is personality-agnostic), so this is a python-only change;
+   - no auto-resume after a CUT (driver brake/gas, gear != D, pedal fault, camera request): braking
+     stays off until the next deliberate pause/resume engagement, per the owner's model.
+ 
+@@ -86,6 +89,39 @@ CAM_ACT_CMDACT_BIT = 20
+ CAM_ACT_STOPREQ_BIT = 21
+ CAM_ACT_DECCMDACT_BIT = 31
+ 
++# *** personality-indexed decel cap (adurham fork) ***
++# The driver's LongitudinalPersonality is the feel dial for FCA11-long braking STRENGTH (the commanded decel cap), the
++# same lever the pedal law / launch ceiling / A_CRUISE_MAX read. Personality is cereal log.LongitudinalPersonality
++# (0 = aggressive, 1 = standard, 2 = relaxed) and reaches here raw via CarControlSP.personality. Raw CR_VSM_DecCmd cap
++# per tier (0.01 g/LSB, delivered decel ~= 0.67 x command):
++#   relaxed    12 = 0.12 g  (~0.79 m/s^2 delivered)
++#   standard   20 = 0.20 g  (~1.31 m/s^2 delivered)
++#   aggressive 30 = 0.30 g  (== HYUNDAI_FCA11_LONG_MAX_DEC: today's cap, the max)
++# Every tier is <= the PANDA firmware gate (HYUNDAI_FCA11_LONG_MAX_DEC, safety/modes/hyundai.h), which is
++# personality-AGNOSTIC (it only rejects CR_VSM_DecCmd > 30). Indexing the cap python-side is therefore a strict subset of
++# the firmware allow-window: NO safety/firmware change is needed and deployed firmware 00e086b9 stays valid. An unknown
++# / out-of-range personality falls back to STANDARD (the middle, never the strongest).
++PERSONALITY_AGGRESSIVE = 0
++PERSONALITY_STANDARD = 1
++PERSONALITY_RELAXED = 2
++PERSONALITY_MAX_DEC = {
++  PERSONALITY_RELAXED: 12,
++  PERSONALITY_STANDARD: 20,
++  PERSONALITY_AGGRESSIVE: HYUNDAI_FCA11_LONG_MAX_DEC,
++}
++
++
++def personality_max_dec(personality) -> int:
++  """Raw CR_VSM_DecCmd cap for a LongitudinalPersonality raw value. Unknown / missing -> STANDARD (never the strongest).
++
++  Mirrors the pedal law's normalization (``int(getattr(p, 'raw', p))``) so a capnp _DynamicEnum, a bare int, or junk
++  all resolve the same way. The result is always <= HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate)."""
++  try:
++    pid = int(getattr(personality, 'raw', personality))
++  except (TypeError, ValueError):
++    pid = PERSONALITY_STANDARD
++  return PERSONALITY_MAX_DEC.get(pid, PERSONALITY_MAX_DEC[PERSONALITY_STANDARD])
++
+ 
+ def dec_cmd_from_accel(accel: float) -> int:
+   """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB), clamp [1, cap].
+@@ -97,8 +133,9 @@ def dec_cmd_from_accel(accel: float) -> int:
+   return int(round(dec_g * 100))
+ 
+ 
+-def clamp_dec_cmd(dec_cmd: int) -> int:
+-  return max(1, min(HYUNDAI_FCA11_LONG_MAX_DEC, dec_cmd))
++def clamp_dec_cmd(dec_cmd: int, personality=PERSONALITY_STANDARD) -> int:
++  """Clamp a raw CR_VSM_DecCmd to the personality's tier cap (>= 1). Standard reproduces the pre-personality cap."""
++  return max(1, min(personality_max_dec(personality), dec_cmd))
+ 
+ 
+ @dataclass
+@@ -230,7 +267,7 @@ class Fca11LongBrake:
+     closing = bool(getattr(CS, "fca11_lead_closing", False))
+     return closing and FCA11_BRAKE_MIN_KPH < v_kph <= FCA11_BRAKE_MIN_KPH + FCA11_ALERT_MARGIN_KPH
+ 
+-  def update(self, CC: structs.CarControl, CS, frame: int) -> list[CanData]:
++  def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     sends: list[CanData] = []
+     if not self.enabled:
+       self.braking = False
+@@ -266,11 +303,11 @@ class Fca11LongBrake:
+     want_brake = dec_cmd >= 1 and ok
+ 
+     if want_brake:
+-      dec_cmd = clamp_dec_cmd(dec_cmd)
++      dec_cmd = clamp_dec_cmd(dec_cmd, personality)
+       # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
+       # camera period of growth; release is immediate. Reference = our last SENT frame.
+       dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+-      dec_cmd = clamp_dec_cmd(dec_cmd)  # first frame of an episode: <= RATE_STEP, then ramps
++      dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
+ 
+       t_cam, dat = cam
+       if frame % FCA11_SEND_EVERY == 0:
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 57fad029..e106b4d2 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -292,7 +292,7 @@ class GasInterceptorCarController:
+     # flowing (zero frames), which also keeps the pedal fault-clear path alive.
+     # Freshness reference for the mirrored camera frame: the same now_nanos CarInterface.apply received (replay-safe).
+     CS.fca11_now_nanos = now_nanos
+-    brake_sends = self.fca11_brake.update(CC, CS, frame)
++    brake_sends = self.fca11_brake.update(CC, CS, frame, personality)
+ 
+     # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 5043d6a6..8191f6af 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -84,10 +84,14 @@ class TestPureLogic(unittest.TestCase):
+     self.assertEqual(vals, sorted(vals))
+ 
+   def test_clamp_dec_cmd(self):
++    # default personality is STANDARD (cap 20); the tier cap is applied, floored at 1
+     self.assertEqual(1, fl.clamp_dec_cmd(0))
+     self.assertEqual(1, fl.clamp_dec_cmd(-5))
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.clamp_dec_cmd(255))
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_STANDARD], fl.clamp_dec_cmd(255))
+     self.assertEqual(7, fl.clamp_dec_cmd(7))
++    # explicit tiers
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE], fl.clamp_dec_cmd(255, fl.PERSONALITY_AGGRESSIVE))
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_RELAXED], fl.clamp_dec_cmd(255, fl.PERSONALITY_RELAXED))
+ 
+   def test_constants_mirror_c(self):
+     # values.py mirrors the safety header; assert the planner floor is above the panda floor
+@@ -223,15 +227,19 @@ class TestController(unittest.TestCase):
+     self.assertEqual(0, s0[0].src)
+ 
+   def test_rate_limit_growth(self):
+-    b = self._brake(self._cp_sp())
+-    sends = []
+-    for f in range(0, 20, 2):
+-      sends += b.update(self._cc(-2.0), _CS(cam=_cam()), f)
+-    decs = [fl._get_bits(s.dat, 8, 8) for s in sends]
+-    self.assertEqual(decs, sorted(decs))
+-    for a, c in zip(decs, decs[1:]):
+-      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, decs[-1])
++    # growth is capped at RATE_STEP per camera period and finally lands on the PERSONALITY's tier cap
++    for p, cap in ((fl.PERSONALITY_AGGRESSIVE, fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE]),
++                   (fl.PERSONALITY_STANDARD, fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_STANDARD]),
++                   (fl.PERSONALITY_RELAXED, fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_RELAXED])):
++      b = self._brake(self._cp_sp())
++      sends = []
++      for f in range(0, 20, 2):
++        sends += b.update(self._cc(-2.0), _CS(cam=_cam()), f, p)
++      decs = [fl._get_bits(s.dat, 8, 8) for s in sends]
++      self.assertEqual(decs, sorted(decs))
++      for a, c in zip(decs, decs[1:]):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++      self.assertEqual(cap, decs[-1], p)
+ 
+   def test_blocked_until_resume_latch_on_cut(self):
+     b = self._brake(self._cp_sp())
+@@ -277,6 +285,110 @@ class TestController(unittest.TestCase):
+     self.assertFalse(b.low_speed_alert)
+ 
+ 
++class TestPersonalityStrength(unittest.TestCase):
++  """Personality-indexed FCA11-long decel cap: relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g (today's cap, max).
++
++  Personality is cereal log.LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed). The cap is a strict
++  subset of the panda firmware gate (HYUNDAI_FCA11_LONG_MAX_DEC), which is personality-agnostic -> no firmware change.
++  """
++
++  RE = fl.PERSONALITY_RELAXED
++  ST = fl.PERSONALITY_STANDARD
++  AG = fl.PERSONALITY_AGGRESSIVE
++
++  def test_tier_table_is_g(self):
++    # raw CR_VSM_DecCmd is 0.01 g/LSB
++    self.assertEqual(0.12, fl.PERSONALITY_MAX_DEC[self.RE] / 100)
++    self.assertEqual(0.20, fl.PERSONALITY_MAX_DEC[self.ST] / 100)
++    self.assertEqual(0.30, fl.PERSONALITY_MAX_DEC[self.AG] / 100)
++
++  def test_every_tier_within_firmware_gate(self):
++    # invariant: the whole table must fit the panda's personality-agnostic gate (else firmware would reject frames)
++    self.assertLessEqual(max(fl.PERSONALITY_MAX_DEC.values()), HYUNDAI_FCA11_LONG_MAX_DEC)
++    for p in (self.RE, self.ST, self.AG):
++      self.assertLessEqual(fl.personality_max_dec(p), HYUNDAI_FCA11_LONG_MAX_DEC)
++
++  def test_ordering_and_aggressive_is_legacy(self):
++    self.assertLess(fl.personality_max_dec(self.RE), fl.personality_max_dec(self.ST))
++    self.assertLess(fl.personality_max_dec(self.ST), fl.personality_max_dec(self.AG))
++    # aggressive == the pre-personality cap (regression anchor); standard is the middle
++    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.personality_max_dec(self.AG))
++    self.assertEqual(20, fl.personality_max_dec(self.ST))
++
++  def test_unknown_and_junk_fall_back_to_standard(self):
++    for bad in (3, 7, -1, 99, 255, None, 'bogus', b'1'):
++      self.assertEqual(fl.PERSONALITY_MAX_DEC[self.ST], fl.personality_max_dec(bad), bad)
++    # a capnp _DynamicEnum-like object carrying .raw is accepted
++    class _E:
++      raw = 0  # aggressive
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[self.AG], fl.personality_max_dec(_E()))
++
++  def test_clamp_at_each_tier(self):
++    for p, cap in ((self.RE, 12), (self.ST, 20), (self.AG, 30)):
++      self.assertEqual(cap, fl.clamp_dec_cmd(255, p), p)   # requests above the cap clamp down
++      self.assertEqual(cap, fl.clamp_dec_cmd(cap, p), p)   # at the cap stays
++      self.assertEqual(7, fl.clamp_dec_cmd(7, p), p)       # below the cap untouched
++      self.assertEqual(1, fl.clamp_dec_cmd(0, p), p)       # raw floor
++      self.assertEqual(1, fl.clamp_dec_cmd(-5, p), p)
++
++  def test_default_personality_is_standard(self):
++    # a direct call with no personality (sim / any caller that forgets) is STANDARD, never aggressive
++    self.assertEqual(fl.clamp_dec_cmd(255), fl.clamp_dec_cmd(255, self.ST))
++    self.assertEqual(20, fl.clamp_dec_cmd(255))
++
++  def test_scale_then_clamp_each_tier(self):
++    # the same -2.0 m/s^2 ask maps through the gain inverse to a raw cap per tier (the strength scaling felt)
++    for p, cap in ((self.RE, 12), (self.ST, 20), (self.AG, 30)):
++      self.assertEqual(cap, fl.clamp_dec_cmd(fl.dec_cmd_from_accel(-2.0), p), p)
++    # a -0.6 m/s^2 ask is a small raw value below every tier cap: identical for all three
++    small = fl.dec_cmd_from_accel(-0.6)
++    self.assertLess(small, 12)
++    for p in (self.RE, self.ST, self.AG):
++      self.assertEqual(small, fl.clamp_dec_cmd(small, p), p)
++
++  # ---- controller level: the emitted CR_VSM_DecCmd lands on the tier cap ----
++
++  def _emit(self, personality, accel=-2.0, frames=40):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    cc = structs.CarControl()
++    cc.enabled = cc.longActive = True
++    cc.actuators.accel = accel
++    sends = []
++    for f in range(0, frames, 2):
++      sends += b.update(cc, _CS(cam=_cam()), f, personality)
++    return [fl._get_bits(s.dat, 8, 8) for s in sends]
++
++  def test_emitted_frame_cap_per_tier(self):
++    for p, cap in ((self.RE, 12), (self.ST, 20), (self.AG, 30)):
++      decs = self._emit(p)
++      self.assertTrue(decs, p)
++      self.assertEqual(cap, max(decs), p)              # a strong request lands exactly on the tier cap
++      self.assertLessEqual(max(decs), HYUNDAI_FCA11_LONG_MAX_DEC, p)
++
++  def test_strong_request_scales_by_personality(self):
++    caps = {p: max(self._emit(p)) for p in (self.RE, self.ST, self.AG)}
++    self.assertLess(caps[self.RE], caps[self.ST])
++    self.assertLess(caps[self.ST], caps[self.AG])
++
++  def test_off_inert_every_personality(self):
++    # toggle OFF must be byte-for-byte inert for any personality value (incl. out-of-range) and the kwarg-omitted path
++    for p in (self.RE, self.ST, self.AG, 255):
++      cp_sp = structs.CarParamsSP()
++      cp_sp.fca11Brake = False
++      cp_sp.enableGasInterceptor = True
++      b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = -2.0
++      self.assertEqual([], b.update(cc, _CS(cam=_cam()), 0, p), p)
++      self.assertFalse(b.braking, p)
++      self.assertEqual(0, b._dec_last_sent, p)         # no state mutation
++      self.assertEqual([], b.update(cc, _CS(cam=_cam()), 2), p)  # kwarg omitted -> default standard, still inert
++
++
+ class TestInterfacePlumbing(unittest.TestCase):
+ 
+   def test_toggle_off_is_inert(self):
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 10bb84e4..798ee12d 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -1222,6 +1222,18 @@ class TestFca11LongControllerIntegration:
+     assert _get_bits(dat, 31, 1) == 0         # DecCmdAct stays 0
+     assert _get_bits(dat, 35, 4) == (7 + 1) & 0xF  # alive + 1, byte4 bits 3-6
+     assert dat[7] == hyundai_checksum(dat[:7])
+-    assert _get_bits(dat, 8, 8) == 30         # -2.0 -> clamped 0.30 g raw once ramped
++    assert _get_bits(dat, 8, 8) == 20         # -2.0 -> clamped 0.20 g raw (STANDARD default) once ramped
+     assert _get_bits(dats[0], 8, 8) == 4      # first frame is rate-limited to +0.04 g
+     assert dat[4] & 0x80                       # undefined byte4 bit7 preserved
++
++  def test_personality_reaches_gas_command(self):
++    # the create_gas_command personality arg must reach Fca11LongBrake: the emitted cap is the tier cap
++    from opendbc.sunnypilot.car.hyundai.fca11_long import _get_bits, PERSONALITY_MAX_DEC
++    for p, cap in ((2, 12), (1, 20), (0, 30)):
++      CI, CP_SP = self._ccr()
++      cs = _Fca11CS(cam=(0, _fca11_cam_frame()))
++      dats = []
++      for f in range(0, 32, 2):
++        sends = CI.CC.create_gas_command(self._cc(-2.0), cs, f, 0, p)
++        dats += [d for a, d, _ in sends if a == 0x38D]
++      assert _get_bits(dats[-1], 8, 8) == cap == PERSONALITY_MAX_DEC[p], (p, cap)
+-- 
+2.55.0
+

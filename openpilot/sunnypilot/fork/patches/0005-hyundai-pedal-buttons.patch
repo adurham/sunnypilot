@@ -1,0 +1,1089 @@
+From 705ec793a7d785e27b090188a3a0d7a8c162a9e9 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sat, 3 Oct 2026 17:24:34 -0500
+Subject: [PATCH] hyundai: gas interceptor: zero CLU11 TX (factory cruise MAIN
+ lockout) + pause/resume re-engage, no auto-resume
+
+Root cause of the pedal FAULT_SCE onsets on routes 11c/123: our CLU11 (0x4F1) CANCEL frames collide with the
+cluster's own CLU11 on bus 0. The panda can't intercept the buttons (cluster, ECM and panda share bus 0), so the
+factory cruise is locked out instead: it can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M), and
+pedal-long now refuses to run while MAIN is armed (car: nonAdaptive -> wrongCruiseMode; panda:
+hyundai_factory_main_on clears controls and blocks every grant). openpilot sends ZERO CLU11 in this mode (removed
+from the car controller and from the panda TX allowlist).
+
+Pause/resume (CF_Clu_CruiseSwState 4): disengages while engaged (as before). While disengaged, a deliberate press
+re-engages via resumeCruise (v_cruise restored by VCruiseHelper.initialize_v_cruise), only if brake and gas were
+released for the whole press and the 60 ms release debounce. Panda mirrors it sample for sample. SET/RES pressed
+with the brake down (incl. held across the brake release) can't engage. No auto-resume: nothing but a driver
+button edge grants controls_allowed or buttonEnable.
+---
+ opendbc/car/hyundai/carcontroller.py          |  17 +-
+ opendbc/car/hyundai/carstate.py               |  11 +
+ opendbc/safety/modes/hyundai.h                |  33 +-
+ opendbc/safety/modes/hyundai_common.h         |  88 ++++-
+ opendbc/safety/tests/test_hyundai.py          | 230 ++++++++++++-
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  43 +++
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  23 --
+ .../sunnypilot/car/hyundai/pause_resume.py    |  81 +++++
+ .../car/hyundai/tests/test_gas_interceptor.py | 314 +++++++++++++++---
+ 9 files changed, 755 insertions(+), 85 deletions(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/pause_resume.py
+
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index f4dcaf14..a8d7cbad 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -9,7 +9,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParam
+ from opendbc.car.interfaces import CarControllerBase
+ 
+ from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
+-from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController, cancel_burst_active
++from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController
+ from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
+ from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
+ from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
+@@ -142,6 +142,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+ 
+       # comma pedal (no-op unless CP_SP.enableGasInterceptor)
+       can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame))
++      # engagement state the pause/resume button is judged against on the next CarState update (carstate_ext.py)
++      CS.pedal_long_engaged = CC.enabled
+ 
+     # Intelligent Cruise Button Management
+     can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN))
+@@ -168,14 +170,13 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+                                               self.lkas_icon))
+ 
+     # Button messages
+-    # With the gas interceptor, SET/RES also engages the factory (non-adaptive) cruise, which would hold speed while
+-    # openpilot wants to coast: controlsd requests cancel whenever it is on (pcmCruise=False), so keep cancelling it.
+-    if not self.CP.openpilotLongitudinalControl or self.CP_SP.enableGasInterceptor:
++    # Gas interceptor: openpilotLongitudinalControl=True, so NO CLU11 is ever sent (not in the panda TX allowlist either).
++    # Our CLU11 shares 0x4F1 with the cluster's own 50 Hz CLU11 and the colliding frames latched pedal FAULT_SCE (routes
++    # 11c, 123). The factory cruise is locked out via its MAIN lamp instead (carstate_ext.py), so nothing needs cancelling.
++    if not self.CP.openpilotLongitudinalControl:
+       if self.cancel_counter > CANCEL_BUTTON_DELAY_FRAMES:
+-        # gas interceptor: bursts with pauses, not every frame (CLU11 collisions with the cluster latch pedal faults)
+-        if not self.CP_SP.enableGasInterceptor or cancel_burst_active(self.cancel_counter - CANCEL_BUTTON_DELAY_FRAMES - 1):
+-          can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
+-      elif CC.cruiseControl.resume and not self.CP_SP.enableGasInterceptor:
++        can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
++      elif CC.cruiseControl.resume:
+         # send resume at a max freq of 10Hz
+         if (self.frame - self.last_button_frame) * DT_CTRL > 0.1:
+           # send 25 messages at a time to increases the likelihood of resume being accepted
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index c9cc086b..0676875e 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -78,6 +78,17 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+     # Main button also can trigger an engagement on these cars
+     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
+ 
++  def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
++    # gas interceptor: the pause/resume button re-engages too, but only through the explicit resumeCruise event that
++    # PauseResumeTracker emits for a deliberate, debounced driver press (never from a timer or a pedal release)
++    # SET/RES only count if the brake was released for the whole press (setres_engage_blocked, carstate_ext.py)
++    if self.CP_SP.enableGasInterceptor:
++      if any(b.type == ButtonType.resumeCruise and not b.pressed for b in buttonEvents):
++        return True
++      if self.setres_engage_blocked:
++        return False
++    return super().update_button_enable(buttonEvents)
++
+   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
+     cp = can_parsers[Bus.pt]
+     cp_cam = can_parsers[Bus.cam]
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 2422393a..f8bffd1c 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -295,12 +295,29 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+     }
+ 
+     if ((msg->addr == 0x260U) && hyundai_non_scc && !hyundai_ev_gas_signal && !hyundai_hybrid_gas_signal) {
+-      acc_main_on = GET_BIT(msg, 25U);
++      if (hyundai_gas_interceptor) {
++        // CRUISE_LAMP_M = factory cruise MAIN armed. Pedal-long does not use it as its main switch. Instead it is a
++        // lockout: the factory cruise can only engage while armed, and openpilot never cancels it in this mode.
++        hyundai_factory_main_on = GET_BIT(msg, 25U);
++        // factory cruise active (CRUISE_LAMP_S, implies MAIN armed): also a lockout, belt and braces
++        if (hyundai_factory_main_on || GET_BIT(msg, 26U)) {
++          controls_allowed = false;
++        }
++        // openpilot reports cruiseState.available = True in this mode (carstate_ext.py); mirror it so the MADS acc_main
++        // edges (lateral request / exit) agree between panda and openpilot. Arming MAIN never affects lateral.
++        acc_main_on = true;
++      } else {
++        acc_main_on = GET_BIT(msg, 25U);
++      }
+       bool cruise_engaged = GET_BIT(msg, 26U);
+       hyundai_common_cruise_state_check(cruise_engaged);
+     }
+   }
+ 
++  if (hyundai_gas_interceptor) {
++    hyundai_gas_interceptor_pedal_check();
++  }
++
+   hyundai_common_reset_acc_main_on_mismatches();
+ }
+ 
+@@ -405,7 +422,7 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+   }
+ 
+   // BUTTONS: used for resume spamming and cruise cancellation
+-  // (also policed with the gas interceptor: openpilot only sends CANCEL there, to stop the factory conventional cruise)
++  // (gas interceptor: CLU11 is not in the TX allowlist at all; same-ID frames collide with the cluster's own CLU11)
+   if ((msg->addr == 0x4F1U) && !hyundai_longitudinal) {
+     int button = msg->data[0] & 0x7U;
+ 
+@@ -440,15 +457,21 @@ static safety_config hyundai_init(uint16_t param) {
+     HYUNDAI_LONG_COMMON_TX_MSGS(0)
+   };
+ 
+-  // base TX + the pedal command only: no SCC/FCA/radar-UDS actuation messages
++  // LKAS11 + LFAHDA_MFC + the pedal command only: no SCC/FCA/radar-UDS actuation messages, and NO CLU11 (0x4F1).
++  // A CLU11 from us shares the ID with the cluster's own 50 Hz CLU11, so the two can win arbitration together and then
++  // bit-error in the data field; every such error frame can latch the pedal's FAULT_SCE (routes 11c and 123: all
++  // commanded SCE onsets 3-17 ms after one of our CLU11 frames). The factory cruise is locked out via its MAIN lamp
++  // instead (hyundai_factory_main_on), so there is nothing to cancel.
+   static const CanMsg HYUNDAI_GAS_INTERCEPTOR_TX_MSGS[] = {
+-    HYUNDAI_COMMON_TX_MSGS(0)
++    {0x340, 0, 8, .check_relay = true},   // LKAS11 Bus 0
++    {0x485, 0, 4, .check_relay = true},   // LFAHDA_MFC Bus 0
+     {0x200, 0, 6, .check_relay = false},  // GAS_COMMAND Bus 0 (comma pedal)
+   };
+ 
+   // same, remapped pedal IDs: GAS_COMMAND_R on 0x700 INSTEAD OF 0x200 (never both)
+   static const CanMsg HYUNDAI_GAS_INTERCEPTOR_REMAPPED_TX_MSGS[] = {
+-    HYUNDAI_COMMON_TX_MSGS(0)
++    {0x340, 0, 8, .check_relay = true},   // LKAS11 Bus 0
++    {0x485, 0, 4, .check_relay = true},   // LFAHDA_MFC Bus 0
+     {0x700, 0, 6, .check_relay = false},  // GAS_COMMAND_R Bus 0 (comma pedal, remapped IDs)
+   };
+ 
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index 4013819f..30b73e68 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -84,6 +84,23 @@ bool hyundai_gas_interceptor_remapped = false;
+ extern bool hyundai_fca11_brake_test;
+ bool hyundai_fca11_brake_test = false;
+ 
++// Gas interceptor only: factory (conventional) cruise MAIN armed, EMS16 CRUISE_LAMP_M. The factory cruise can only engage
++// while MAIN is armed, and openpilot never sends CLU11 in this mode (no CANCEL to fight it), so pedal-long is locked out
++// while it is armed: controls_allowed is cleared and no button may grant it (fail closed, never two speed controllers).
++extern bool hyundai_factory_main_on;
++bool hyundai_factory_main_on = false;
++
++// Gas interceptor only: the steering-wheel pause/resume button (CLU11 CF_Clu_CruiseSwState 4, "CANCEL" in the DBC).
++// A press while longitudinal is engaged disengages (as before). A press while disengaged re-engages, but ONLY when the
++// press started with brake and gas released, neither was pressed at any time during the press, and the button was then
++// released for HYUNDAI_PAUSE_RELEASE_SAMPLES consecutive NONE samples (debounce: a one-frame bounce inside a disengage
++// press must never turn it into a resume). Nothing else re-grants controls: no timer, brake release or speed recovery.
++// MUST equal PAUSE_RELEASE_SAMPLES in opendbc/sunnypilot/car/hyundai/pause_resume.py (a unit test enforces this).
++#define HYUNDAI_PAUSE_RELEASE_SAMPLES 3U  // CLU11 is 50 Hz: 60 ms
++static bool hyundai_setres_brake_seen;       // gas interceptor: brake was pressed during the current SET/RES press
++static bool hyundai_pause_armed;             // the current/last press will resume on its debounced release
++static uint8_t hyundai_pause_released_cnt;   // consecutive NONE samples since the button was last 4
++
+ static uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
+ 
+ static bool main_button_prev;
+@@ -116,6 +133,10 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
+ 
+   main_button_prev = false;
++  hyundai_factory_main_on = false;
++  hyundai_pause_armed = false;
++  hyundai_setres_brake_seen = false;
++  hyundai_pause_released_cnt = HYUNDAI_PAUSE_RELEASE_SAMPLES;
+   acc_main_on_prev = false;
+   acc_main_on_tx = false;
+   acc_main_on_mismatches = 0U;
+@@ -161,13 +182,55 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+     }
+     cruise_engaged_prev = cruise_engaged;
+   } else if (hyundai_gas_interceptor) {
+-    // Pressing SET/RES on a non-SCC car also engages the factory (non-adaptive) cruise, which would hold speed while
+-    // openpilot coasts. Track its state only so openpilot may send CANCEL (hyundai_tx_hook); never grants controls.
++    // The factory (non-adaptive) cruise never grants controls here; it is locked out via its MAIN lamp instead
++    // (hyundai_factory_main_on, hyundai.h). Tracked for visibility only: openpilot sends no CLU11 in this mode.
+     cruise_engaged_prev = cruise_engaged;
+   } else {
+   }
+ }
+ 
++// Gas interceptor: called on every RX message (hyundai_rx_hook), so a brake/gas press is caught even when it falls
++// between two CLU11 samples. Brake or gas during a pause/resume press (or its release debounce) cancels that resume,
++// and brake during a SET/RES press makes that press unable to engage.
++static void hyundai_gas_interceptor_pedal_check(void) {
++  if (brake_pressed || gas_pressed) {
++    hyundai_pause_armed = false;
++  }
++  bool setres_active = (cruise_button_prev == HYUNDAI_BTN_SET) || (cruise_button_prev == HYUNDAI_BTN_RESUME);
++  if (setres_active && brake_pressed) {
++    hyundai_setres_brake_seen = true;
++  }
++}
++
++// pause/resume button state machine, gas interceptor only. Must run BEFORE the CANCEL-held clear below: a new press
++// samples whether longitudinal was engaged at the moment the press began.
++static void hyundai_gas_interceptor_pause_button_check(const int cruise_button) {
++  bool pedal_pressed = brake_pressed || gas_pressed;
++  if (cruise_button == HYUNDAI_BTN_CANCEL) {
++    if (hyundai_pause_released_cnt >= HYUNDAI_PAUSE_RELEASE_SAMPLES) {
++      // new press (not a bounce of the previous one): resume press only if disengaged with no pedal pressed
++      hyundai_pause_armed = !controls_allowed && !pedal_pressed && !hyundai_factory_main_on;
++    }
++    hyundai_pause_released_cnt = 0U;
++  } else if (cruise_button != HYUNDAI_BTN_NONE) {
++    // rolled onto another cruise button: the pause press is abandoned (that button follows its own rules)
++    hyundai_pause_armed = false;
++    hyundai_pause_released_cnt = HYUNDAI_PAUSE_RELEASE_SAMPLES;
++  } else if (hyundai_pause_released_cnt < HYUNDAI_PAUSE_RELEASE_SAMPLES) {
++    hyundai_pause_released_cnt += 1U;
++    if (hyundai_pause_armed && !pedal_pressed && !hyundai_factory_main_on &&
++        (hyundai_pause_released_cnt == HYUNDAI_PAUSE_RELEASE_SAMPLES)) {
++      controls_allowed = true;
++      hyundai_pause_armed = false;
++    }
++  } else {
++  }
++  // brake or gas at any time during the press or its release debounce cancels the resume
++  if (pedal_pressed) {
++    hyundai_pause_armed = false;
++  }
++}
++
+ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool main_button) {
+   if ((cruise_button == HYUNDAI_BTN_RESUME) || (cruise_button == HYUNDAI_BTN_SET) || (cruise_button == HYUNDAI_BTN_CANCEL) || main_button) {
+     hyundai_last_button_interaction = 0U;
+@@ -176,10 +239,29 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
+   }
+ 
+   if (hyundai_longitudinal || hyundai_gas_interceptor) {
++    if (hyundai_gas_interceptor) {
++      hyundai_gas_interceptor_pause_button_check(cruise_button);
++    }
++
+     // enter controls on falling edge of resume or set
++    // (gas interceptor: never while the factory cruise MAIN is armed, see hyundai_factory_main_on)
+     bool set = (cruise_button != HYUNDAI_BTN_SET) && (cruise_button_prev == HYUNDAI_BTN_SET);
+     bool res = (cruise_button != HYUNDAI_BTN_RESUME) && (cruise_button_prev == HYUNDAI_BTN_RESUME);
+-    if (set || res) {
++    bool setres_blocked = false;
++    if (hyundai_gas_interceptor) {
++      // a SET/RES press only engages if the brake was released for the WHOLE press (a press held across the brake
++      // release, or released while braking at standstill, does not count) and the factory cruise MAIN is off
++      bool setres_held = (cruise_button == HYUNDAI_BTN_SET) || (cruise_button == HYUNDAI_BTN_RESUME);
++      bool setres_prev = (cruise_button_prev == HYUNDAI_BTN_SET) || (cruise_button_prev == HYUNDAI_BTN_RESUME);
++      if (setres_held && !setres_prev) {
++        hyundai_setres_brake_seen = false;  // new press
++      }
++      if ((setres_held || setres_prev) && brake_pressed) {
++        hyundai_setres_brake_seen = true;
++      }
++      setres_blocked = hyundai_factory_main_on || hyundai_setres_brake_seen;
++    }
++    if ((set || res) && !setres_blocked) {
+       controls_allowed = true;
+     }
+ 
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index e88f75e3..e7e9b606 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -682,6 +682,43 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+       return addr, dat, bus
+     return self.pedal_packer.make_can_msg_safety(ids.sensor_msg, 0, values, fix_checksum=fix_checksum)
+ 
++  # *** EMS16 in pedal mode: factory cruise MAIN (CRUISE_LAMP_M) is a lockout, not openpilot's main switch ***
++
++  def _ems16(self, main=False, active=False, gas=0):
++    values = {"CF_Ems_AclAct": gas, "CRUISE_LAMP_M": main, "CRUISE_LAMP_S": active, "AliveCounter": self.cnt_gas % 4}
++    self.__class__.cnt_gas += 1
++    return self.packer.make_can_msg_safety("EMS16", 0, values, fix_checksum=checksum)
++
++  def _user_gas_msg(self, gas: float, controls_allowed: bool = True):
++    # factory cruise MAIN off (the normal pedal-long state); EMS16 gas is ignored in this mode anyway
++    return self._ems16(gas=gas)
++
++  def _pcm_status_msg(self, enable):
++    # factory cruise active implies its MAIN is armed
++    return self._ems16(main=enable, active=enable)
++
++  def _acc_state_msg(self, enable):
++    # factory cruise MAIN armed. Pedal-long: acc_main_on (openpilot's cruiseState.available) is always True; MAIN armed
++    # is a longitudinal lockout only
++    return self._ems16(main=enable)
++
++  def test_enable_control_allowed_with_mads_button_and_disable_with_main_cruise(self):
++    # pedal-long: arming / disarming the factory MAIN never touches lateral (MADS), only longitudinal (lockout)
++    try:
++      self._lkas_button_msg(False)
++    except NotImplementedError as err:
++      raise unittest.SkipTest("no LDA button on this variant") from err
++    for enable_mads in (True, False):
++      with self.subTest(enable_mads=enable_mads):
++        self.safety.set_mads_params(enable_mads, False, False)
++        self._rx(self._lkas_button_msg(True))
++        self._rx(self._lkas_button_msg(False))
++        self.assertEqual(enable_mads, self.safety.get_controls_allowed_lateral())
++        for main in (True, False, True):
++          self._rx(self._acc_state_msg(main))
++          self.assertTrue(self.safety.get_acc_main_on())
++          self.assertEqual(enable_mads, self.safety.get_controls_allowed_lateral())
++
+   # *** CAN ID dialect: exactly one of standard (0x200/0x201) / remapped (0x700/0x701) is active ***
+ 
+   def test_pedal_messages_use_dialect_addrs(self):
+@@ -750,17 +787,173 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+     self._rx(self._pcm_status_msg(True))
+     # SET is still held: no falling edge yet, and the factory cruise rising edge must not grant
+     self.assertFalse(self.safety.get_controls_allowed())
+-    # but it is tracked so openpilot may cancel the factory cruise
+-    self.assertTrue(self.safety.get_cruise_engaged_prev())
++    self._rx(self._button_msg(Buttons.NONE))
++    # SET falling edge while the factory cruise is on (MAIN armed): locked out
++    self.assertFalse(self.safety.get_controls_allowed())
+ 
+   def test_factory_cruise_off_keeps_controls(self):
+-    # openpilot cancels the factory cruise on purpose; that must not drop pedal-long
+     self.safety.set_controls_allowed(True)
+     self._rx(self._pcm_status_msg(False))
+     self.assertTrue(self.safety.get_controls_allowed())
+ 
++  def test_button_sends(self):
++    # root-cause fix for the pedal SCE faults (routes 11c/123): openpilot may NEVER send CLU11 (0x4F1) in pedal mode,
++    # in any state: it collides with the cluster's own CLU11 on the same ID
++    for controls_allowed in (False, True):
++      for cruise_on in (False, True):
++        self.safety.set_controls_allowed(controls_allowed)
++        self._rx(self._pcm_status_msg(cruise_on))
++        self.safety.set_controls_allowed(controls_allowed)
++        for btn in range(8):
++          self.assertFalse(self._tx(self._button_msg(btn)), f"{btn=} {controls_allowed=} {cruise_on=}")
++
++  def test_factory_main_lockout(self):
++    # factory cruise MAIN armed: pedal-long disengages and SET / RES / pause-resume can't engage
++    self.safety.set_controls_allowed(True)
++    self._rx(self._acc_state_msg(True))  # MAIN armed
++    self.assertFalse(self.safety.get_controls_allowed())
++    self.assertTrue(self.safety.get_acc_main_on())  # lateral main unaffected
++    for btn in (Buttons.SET, Buttons.RESUME, Buttons.CANCEL):
++      self._press(btn)
++      self._release()
++      self.assertFalse(self.safety.get_controls_allowed(), btn)
++    # MAIN off again: buttons work
++    self._rx(self._acc_state_msg(False))
++    self.assertTrue(self.safety.get_acc_main_on())
++    self._press(Buttons.SET)
++    self._release(1)
++    self.assertTrue(self.safety.get_controls_allowed())
++
+   def test_set_resume_buttons(self):
+-    HyundaiLongitudinalBase.test_set_resume_buttons(self)
++    # HyundaiLongitudinalBase.test_set_resume_buttons, with the pause/resume (4) release debounce flushed between cases
++    for btn_prev in range(8):
++      for btn_cur in range(8):
++        for _ in range(5):
++          self._rx(self._button_msg(Buttons.NONE))
++        self.safety.set_controls_allowed(0)
++        for _ in range(10):
++          self._rx(self._button_msg(btn_prev))
++          self.assertFalse(self.safety.get_controls_allowed())
++        should_enable = btn_cur != btn_prev and btn_cur != Buttons.CANCEL and btn_prev in (Buttons.RESUME, Buttons.SET)
++        self._rx(self._button_msg(btn_cur))
++        self.assertEqual(should_enable, self.safety.get_controls_allowed(), f"{btn_prev=} {btn_cur=}")
++
++  # *** pause/resume button (CF_Clu_CruiseSwState 4) and NO auto-resume ***
++
++  def _press(self, btn, n=5):
++    for _ in range(n):
++      self._rx(self._button_msg(btn))
++
++  def _release(self, n=5):
++    for _ in range(n):
++      self._rx(self._button_msg(Buttons.NONE))
++
++  def _engage_then_brake(self):
++    self._rx(self._user_brake_msg(False))
++    self._rx(self._speed_msg(500))
++    self._release()
++    self._press(Buttons.SET)
++    self._release(1)
++    self.assertTrue(self.safety.get_controls_allowed())
++    self._rx(self._user_brake_msg(True))
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_brake_then_no_auto_resume(self):
++    # brake disengages, and NOTHING but a driver button press re-engages: not releasing the brake, not time,
++    # not speed recovering, not the button samples that keep streaming
++    self._engage_then_brake()
++    self._rx(self._user_brake_msg(False))
++    for i in range(1000):  # 20 s of CLU11 at 50 Hz with brake/speed traffic, no button
++      self._rx(self._button_msg(Buttons.NONE))
++      if i % 2 == 0:
++        self._rx(self._user_brake_msg(False))
++        self._rx(self._speed_msg(500 + i))
++        self._rx(self._interceptor_user_gas(0))
++      self.assertFalse(self.safety.get_controls_allowed(), i)
++
++  def test_pause_button_resumes_after_brake(self):
++    self._engage_then_brake()
++    self._rx(self._user_brake_msg(False))
++    self._release()
++    self._press(Buttons.CANCEL)
++    self.assertFalse(self.safety.get_controls_allowed())  # nothing while held
++    self._release(2)
++    self.assertFalse(self.safety.get_controls_allowed())  # debounce: not yet
++    self._release(1)
++    self.assertTrue(self.safety.get_controls_allowed())  # exactly on the 3rd released sample
++
++  def test_pause_button_disengages_when_engaged(self):
++    self.safety.set_controls_allowed(True)
++    self._release()
++    self._press(Buttons.CANCEL, 1)
++    self.assertFalse(self.safety.get_controls_allowed())
++    self._press(Buttons.CANCEL)
++    self._release(20)
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_pause_button_bounce_stays_disengaged(self):
++    # engaged press with 1-2 sample bounces inside it must not turn into a resume
++    for bounce in (1, 2):
++      self.safety.set_controls_allowed(True)
++      self._release()
++      self._press(Buttons.CANCEL, 3)
++      self._release(bounce)
++      self._press(Buttons.CANCEL, 3)
++      self._release(20)
++      self.assertFalse(self.safety.get_controls_allowed(), bounce)
++
++  def test_pause_button_while_brake_held(self):
++    self._engage_then_brake()
++    self._release()
++    self._press(Buttons.CANCEL)
++    self._release()
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_pause_button_held_across_brake_release(self):
++    self._engage_then_brake()
++    self._release()
++    self._press(Buttons.CANCEL)       # press starts with the brake down
++    self._rx(self._user_brake_msg(False))
++    self._press(Buttons.CANCEL)       # still held after the brake release
++    self._release(20)
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_pause_button_brake_during_press(self):
++    self._engage_then_brake()
++    self._rx(self._user_brake_msg(False))
++    self._release()
++    self._press(Buttons.CANCEL)
++    self._rx(self._user_brake_msg(True))
++    self._rx(self._user_brake_msg(False))
++    self._release(20)
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_pause_button_gas_pressed(self):
++    self._engage_then_brake()
++    self._rx(self._user_brake_msg(False))
++    self._release()
++    for phase in ("start", "during"):
++      self._rx(self._interceptor_user_gas(0x1000 if phase == "start" else 0))
++      self._press(Buttons.CANCEL)
++      if phase == "during":
++        self._rx(self._interceptor_user_gas(0x1000))
++      self._rx(self._interceptor_user_gas(0))
++      self._release(20)
++      self.assertFalse(self.safety.get_controls_allowed(), phase)
++
++  def test_set_held_across_brake_release(self):
++    for btn in (Buttons.SET, Buttons.RESUME):
++      self._engage_then_brake()
++      self._release()
++      self._press(btn)                  # pressed while braking
++      self._rx(self._user_brake_msg(False))
++      self._press(btn)
++      self._release(20)
++      self.assertFalse(self.safety.get_controls_allowed(), btn)
++      # a fresh press after the release still works
++      self._press(btn)
++      self._release(1)
++      self.assertTrue(self.safety.get_controls_allowed(), btn)
+ 
+   def test_cancel_button(self):
+     HyundaiLongitudinalBase.test_cancel_button(self)
+@@ -1050,6 +1243,35 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+       self.assertFalse(self._tx(common.make_msg(0, 0x700, 6)))
+       self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
+ 
++  def test_test_bit_overrides_pedal_buttons(self):
++    # integration (0002 v2 + 0005): with BOTH bits set, none of the pedal-mode button changes leak into test mode.
++    # The factory MAIN lamp is not a lockout here, CLU11 cancel-only stays transmittable (the pedal list has no CLU11),
++    # and the pause/resume re-engage state machine is inert.
++    for dialect in (0, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED):
++      with self.subTest(dialect=dialect):
++        self.safety.set_current_safety_param_sp(self._test_sp() | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | dialect)
++        self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++        self.safety.init_tests()
++        # stock non-SCC MAIN semantics (pedal mode would force acc_main_on = true)
++        self._rx(self._acc_state_msg(False))
++        self.assertFalse(self.safety.get_acc_main_on())
++        self._rx(self._acc_state_msg(True))
++        self.assertTrue(self.safety.get_acc_main_on())
++        # CLU11: cancel only, while the factory cruise is on
++        self._rx(self._pcm_status_msg(True))
++        self.safety.set_controls_allowed(False)
++        self.assertTrue(self._tx(self._button_msg(Buttons.CANCEL)))
++        for btn in (Buttons.RESUME, Buttons.SET):
++          self.assertFalse(self._tx(self._button_msg(btn)), btn)
++        # pause/resume press + debounced release while disengaged: no grant
++        self._rx(self._pcm_status_msg(False))
++        self.safety.set_controls_allowed(False)
++        for btn in [Buttons.NONE] * 5 + [Buttons.CANCEL] * 5 + [Buttons.NONE] * 5:
++          self._rx(self._button_msg(btn))
++        self.assertFalse(self.safety.get_controls_allowed())
++        # the test brake path itself is unchanged
++        self.assertTrue(self._tx(self._brake_cmd(1)))
++
+   # *** mode gating: honored only when armed (bit + non-SCC ICE + no hyundai_longitudinal) ***
+ 
+   def _assert_not_armed(self):
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index d6db93a0..2cd301bf 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -12,8 +12,11 @@ from opendbc.can.parser import CANParser
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+                                                          PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids
++from opendbc.sunnypilot.car.hyundai.pause_resume import PauseResumeTracker
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
++ButtonType = structs.CarState.ButtonEvent.Type
++
+ 
+ class CarStateExt:
+   def __init__(self, CP, CP_SP):
+@@ -25,6 +28,15 @@ class CarStateExt:
+     # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
+     self.interceptor_state = 0
+     self.pedal_fault_monitor = PedalFaultMonitor()
++    # pause/resume button (gas interceptor only). pedal_long_engaged = CarControl.enabled, written by the CarController
++    # every frame (this CarState instance is the CS it receives), so it is the engagement state BEFORE a new press.
++    self.pause_resume = PauseResumeTracker()
++    self.pedal_long_engaged = False
++    # SET/RES (CF_Clu_CruiseSwState 2/1) pressed while the brake was down at any point of the press: that press can't
++    # engage. Mirror of hyundai_setres_brake_seen (safety/modes/hyundai_common.h).
++    self.setres_brake_seen = False
++    self.setres_prev = 0
++    self.setres_engage_blocked = False
+ 
+   def update_speed_limit(self, cp, cp_cam) -> float:
+     speed_limit = 0
+@@ -93,6 +105,37 @@ class CarStateExt:
+       if self.pedal_fault_monitor.escalated:
+         ret.accFaulted = True
+ 
++      # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
++      # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every
++      # ignition on routes 112-123), so arming MAIN locks pedal-long out: nonAdaptive -> wrongCruiseMode
++      # ("Adaptive Cruise Disabled": disengages longitudinal, blocks engagement). MADS strips wrongCruiseMode from its own
++      # state machine, so lateral is unaffected. Pedal-long availability no longer follows the MAIN lamp (always True;
++      # panda acc_main_on mirrors this). Panda enforces the lockout independently (hyundai_factory_main_on, hyundai.h).
++      factory_main = bool(cp.vl["EMS16"]["CRUISE_LAMP_M"])
++      ret.cruiseState.available = True
++      ret.cruiseState.nonAdaptive = factory_main or ret.cruiseState.enabled
++
++      # pause/resume (CF_Clu_CruiseSwState 4): replaces the plain cancel mapping. See pause_resume.py.
++      pause_events = self.pause_resume.update(cp.vl_all["CLU11"]["CF_Clu_CruiseSwState"], self.pedal_long_engaged,
++                                              ret.brakePressed, ret.gasPressed, factory_main)
++      # rebuild by value: ret is a capnp builder, re-assigning its own list elements would corrupt them
++      kept = [structs.CarState.ButtonEvent(pressed=bool(be.pressed), type=be.type.raw) for be in ret.buttonEvents
++              if be.type != ButtonType.cancel]
++      ret.buttonEvents = kept + pause_events
++
++      for b in cp.vl_all["CLU11"]["CF_Clu_CruiseSwState"]:
++        held, prev = b in (1, 2), self.setres_prev in (1, 2)
++        if held and not prev:
++          self.setres_brake_seen = False
++        if (held or prev) and ret.brakePressed:
++          self.setres_brake_seen = True
++        self.setres_prev = b
++      if self.setres_prev in (1, 2) and ret.brakePressed:
++        self.setres_brake_seen = True
++      # a SET/RES release that rolls straight onto pause/resume (4) does not engage: panda grants on the SET/RES edge
++      # but the held CANCEL clears it on the same sample (hyundai_common_cruise_buttons_check)
++      self.setres_engage_blocked = self.setres_brake_seen or factory_main or self.setres_prev == 4
++
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
+ 
+   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index b05ac9c2..fe35ba13 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -165,29 +165,6 @@ class PedalFaultMonitor:
+     return send_clear
+ 
+ 
+-# *** bursted CLU11 CANCEL (gas interceptor mode only) ***
+-# Our CANCEL CLU11 (0x4F1) shares the ID with the cluster's own 50 Hz CLU11. Sent every 10 ms frame, the two collide
+-# (panda bit1Errors/bus-offs, 100 % inside cancel streams on route 11c) and every error frame can latch the pedal's
+-# FAULT_SCE. Send short bursts with pauses instead: CANCEL_BURST_FRAMES frames, then a pause that rotates through
+-# CANCEL_PAUSE_FRAMES (150/200/250 ms: a fixed period could phase-lock with the cluster's 20 ms schedule).
+-CANCEL_BURST_FRAMES = 5
+-CANCEL_PAUSE_FRAMES = (15, 20, 25)
+-_CANCEL_CYCLE = tuple((CANCEL_BURST_FRAMES, p) for p in CANCEL_PAUSE_FRAMES)
+-CANCEL_CYCLE_FRAMES = sum(b + p for b, p in _CANCEL_CYCLE)
+-
+-
+-def cancel_burst_active(n: int) -> bool:
+-  """n = frames since the cancel button send became due (0 = first frame). True -> send CANCEL on this frame."""
+-  k = n % CANCEL_CYCLE_FRAMES
+-  for burst, pause in _CANCEL_CYCLE:
+-    if k < burst:
+-      return True
+-    k -= burst + pause
+-    if k < 0:
+-      return False
+-  return False  # unreachable
+-
+-
+ class GasInterceptorCarController:
+   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict):
+     self.CP = CP
+diff --git a/opendbc/sunnypilot/car/hyundai/pause_resume.py b/opendbc/sunnypilot/car/hyundai/pause_resume.py
+new file mode 100644
+index 00000000..cad79f38
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/pause_resume.py
+@@ -0,0 +1,81 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Steering-wheel pause/resume button for Hyundai gas-interceptor (pedal) longitudinal.
++
++On this car the button the driver calls "pause/resume" sends CLU11 CF_Clu_CruiseSwState = 4 (named CANCEL in the DBC).
++Route 11c: four presses of it with the factory cruise off all made the factory cruise resume ~40 ms later, so for the
++car it is a toggle and not a plain cancel. openpilot used to treat it only as cancel, which is why it could not
++re-engage pedal-long after a brake press.
++
++Mirror of hyundai_gas_interceptor_pause_button_check() in opendbc/safety/modes/hyundai_common.h. The two MUST stay in
++lockstep: if they diverge, the panda refuses (controlsMismatch) or openpilot refuses (heartbeat clears panda
++controls), and both outcomes fail safe.
++
++  * Press while engaged: emits `cancel`, which disengages (unchanged).
++  * Press while disengaged: emits `resumeCruise` (pressed + released in the same frame) only if ALL of these hold:
++      - the press started with brake and gas released and the factory cruise MAIN off;
++      - neither pedal was pressed at any sample during the press or its release debounce;
++      - the button then stayed released for PAUSE_RELEASE_SAMPLES consecutive samples.
++    openpilot's buttonEnable (CarState.update_button_enable) is the only consumer, so the engage source is always a
++    deliberate driver press. Nothing else produces resumeCruise: no timer, no brake release, no speed recovery.
++  * Bounce: a release shorter than PAUSE_RELEASE_SAMPLES does not start a new press. So a press that began while
++    engaged (a disengage) can never be re-interpreted as a resume.
++"""
++from opendbc.car import structs
++
++ButtonType = structs.CarState.ButtonEvent.Type
++
++PAUSE_BUTTON = 4  # CF_Clu_CruiseSwState (Buttons.CANCEL)
++NO_BUTTON = 0
++# MUST equal HYUNDAI_PAUSE_RELEASE_SAMPLES in opendbc/safety/modes/hyundai_common.h. CLU11 is 50 Hz: 3 samples = 60 ms.
++PAUSE_RELEASE_SAMPLES = 3
++
++
++class PauseResumeTracker:
++  def __init__(self):
++    self.armed = False                      # current/last press resumes on its debounced release
++    self.cancel_press = False               # current/last press is a disengage (cancel) press
++    self.released_cnt = PAUSE_RELEASE_SAMPLES
++
++  def update(self, samples, engaged: bool, brake: bool, gas: bool, factory_main: bool) -> list[structs.CarState.ButtonEvent]:
++    """samples: every CF_Clu_CruiseSwState value received since the last call (CLU11 is 50 Hz, CarState 100 Hz).
++    engaged: openpilot longitudinal engaged (CarControl.enabled from the previous frame, i.e. before this press).
++    Returns the button events for this frame: cancel and/or resumeCruise."""
++    events: list[structs.CarState.ButtonEvent] = []
++    pedal = brake or gas
++    for b in samples:
++      if b == PAUSE_BUTTON:
++        if self.released_cnt >= PAUSE_RELEASE_SAMPLES:
++          # a new press: is it a resume or a disengage?
++          self.armed = not engaged and not pedal and not factory_main
++          self.cancel_press = not self.armed
++          if self.cancel_press:
++            events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.cancel))
++        self.released_cnt = 0
++      elif b != NO_BUTTON:
++        # rolled onto another cruise button: abandon the pause press (that button follows its own rules)
++        self._finish_cancel(events)
++        self.armed = False
++        self.released_cnt = PAUSE_RELEASE_SAMPLES
++      elif self.released_cnt < PAUSE_RELEASE_SAMPLES:
++        self.released_cnt += 1
++        if self.released_cnt == PAUSE_RELEASE_SAMPLES:
++          self._finish_cancel(events)
++          if self.armed and not pedal and not factory_main:
++            events.append(structs.CarState.ButtonEvent(pressed=True, type=ButtonType.resumeCruise))
++            events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.resumeCruise))
++          self.armed = False
++      if pedal:
++        self.armed = False  # brake or gas at any time during the press / release debounce cancels the resume
++    if pedal:
++      self.armed = False  # also on frames with no new CLU11 sample (CarState runs at 100 Hz, CLU11 at 50 Hz)
++    return events
++
++  def _finish_cancel(self, events: list) -> None:
++    if self.cancel_press:
++      events.append(structs.CarState.ButtonEvent(pressed=False, type=ButtonType.cancel))
++      self.cancel_press = False
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index a8c6c497..b6f2e0a5 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -20,6 +20,7 @@ from opendbc.car.car_helpers import interfaces
+ from opendbc.car.hyundai.values import CAR
+ from opendbc.sunnypilot.car import crc8_pedal, create_gas_interceptor_command
+ from opendbc.sunnypilot.car.hyundai import gas_interceptor as gi
++from opendbc.sunnypilot.car.hyundai import pause_resume as pr
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
+ from opendbc.sunnypilot.car.interfaces import setup_interfaces
+ 
+@@ -560,56 +561,285 @@ class TestPedalFaultClearEndToEnd:
+     assert not CI.CS.pedal_fault_monitor.escalated and not CI.CS.pedal_fault_monitor.clear_frames
+ 
+ 
+-class TestCancelBursts:
+-  def _cancel_frames(self, pedal: dict | None, n: int = 400) -> list[int]:
++class TestNoClu11InPedalMode:
++  """Root-cause fix for the pedal SCE faults: openpilot never transmits CLU11 (0x4F1) in gas-interceptor mode. Our CLU11
++  shares the ID with the cluster's own 50 Hz CLU11; on routes 11c and 123 every commanded SCE onset followed one of our
++  CLU11 frames by 3-17 ms. The factory cruise is locked out through its MAIN lamp instead (TestFactoryMainLockout)."""
++  def _sends(self, pedal: dict | None, n: int = 400) -> list[tuple[int, list]]:
+     fp = BASE_FINGERPRINT if pedal is None else {**BASE_FINGERPRINT, **pedal}
+     CarInterface, CP, CP_SP = _get_ci(fp, None if pedal is None else True)
+     CI = CarInterface(CP, CP_SP)
++    out = []
++    for i in range(n):
++      CC = structs.CarControl()
++      # every combination openpilot could ask for, incl. cancel + resume requests and both engagement states
++      CC.cruiseControl.cancel = (i // 50) % 2 == 0
++      CC.cruiseControl.resume = (i // 25) % 2 == 0
++      CC.enabled = CC.latActive = CC.longActive = (i // 100) % 2 == 0
++      CI.update([])
++      CI.CS.out.vEgo = 25.
++      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
++      out.append((i, sends))
++    return out
++
++  @pytest.mark.parametrize("pedal", [STD, REM], ids=["standard", "remapped"])
++  def test_zero_clu11_frames(self, pedal):
++    sent = [i for i, sends in self._sends(pedal) if any(a == 0x4F1 for a, _, _ in sends)]
++    assert sent == []
++
++  def test_non_interceptor_cancel_unchanged(self):
++    # stock (pcmCruise) cars keep sending CANCEL after the 10-frame delay
++    CarInterface, CP, CP_SP = _get_ci(BASE_FINGERPRINT, None)
++    CI = CarInterface(CP, CP_SP)
+     CC = structs.CarControl()
+     CC.cruiseControl.cancel = True
+     frames = []
+-    for i in range(n):
++    for i in range(100):
+       CI.update([])
+       _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i)
+       if any(a == 0x4F1 for a, _, _ in sends):
+         frames.append(i)
+-    return frames
+-
+-  def test_burst_pattern(self):
+-    pat = [gi.cancel_burst_active(n) for n in range(gi.CANCEL_CYCLE_FRAMES * 2)]
+-    assert sum(pat) == 2 * gi.CANCEL_BURST_FRAMES * len(gi.CANCEL_PAUSE_FRAMES)
+-    assert pat[:5] == [True] * 5 and not any(pat[5:20]) and all(pat[20:25]) and not any(pat[25:45]) and all(pat[45:50])
+-    assert gi.CANCEL_CYCLE_FRAMES == 75 and not any(pat[50:75]) and all(pat[75:80])
+-    # pauses within the specified 150-250 ms
+-    assert all(15 <= p <= 25 for p in gi.CANCEL_PAUSE_FRAMES) and 3 <= gi.CANCEL_BURST_FRAMES <= 5
+-
+-  def test_interceptor_cancel_bursted(self):
+-    frames = self._cancel_frames(REM)
+-    # same 10-frame delay as before, then bursts of 5 consecutive frames with 150/200/250 ms pauses
+-    assert frames[0] == 10
+-    bursts = []
+-    for f in frames:
+-      if bursts and f == bursts[-1][-1] + 1:
+-        bursts[-1].append(f)
+-      else:
+-        bursts.append([f])
+-    assert all(len(b) == gi.CANCEL_BURST_FRAMES for b in bursts[:-1])
+-    gaps = [b[0] - a[-1] - 1 for a, b in zip(bursts, bursts[1:], strict=False)]
+-    assert gaps[:6] == [15, 20, 25, 15, 20, 25]
+-    assert len(frames) < 0.25 * 390  # duty 20 % vs 100 % before
+-
+-  def test_cancel_stops_immediately(self):
+-    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
+-    CI = CarInterface(CP, CP_SP)
+-    CC = structs.CarControl()
+-    for i in range(60):
+-      CC.cruiseControl.cancel = i < 30
+-      CI.update([])
+-      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i)
+-      if i >= 30:
+-        assert not any(a == 0x4F1 for a, _, _ in sends)
+-
+-  def test_non_interceptor_cancel_unchanged(self):
+-    # stock (pcmCruise) cars keep the continuous stream after the delay
+-    frames = self._cancel_frames(None, 100)
+     assert frames == list(range(10, 100))
++
++
++# *** CarState through the real CarInterface.update path: factory-cruise lockout + pause/resume button ***
++
++PK = CANPacker("hyundai_can_generated")
++
++
++class _Car:
++  """Drives CarInterface.update with EMS16 / TCS13 / CLU11 / pedal sensor frames. One step = one 50 Hz CLU11 sample
++  = two 100 Hz CarState updates (CLU11 rides on the first)."""
++  def __init__(self):
++    CarInterface, self.CP, self.CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    self.CI = CarInterface(self.CP, self.CP_SP)
++    self.t = 0
++    self.i = 0
++    self.engaged = False
++
++  def step(self, btn=0, brake=False, gas=False, main=False, active=False):
++    rets = []
++    for sub in range(2):
++      self.t += int(DT_CTRL * 1e9)
++      frames = [PK.make_can_msg("EMS16", 0, {"CRUISE_LAMP_M": main, "CRUISE_LAMP_S": active, "AliveCounter": self.i % 4}),
++                PK.make_can_msg("TCS13", 0, {"DriverOverride": 2 if brake else 0, "AliveCounterTCS": self.i % 8}),
++                _sensor_frame(gi.REMAPPED_IDS, 2000 if gas else 0, self.i) + (0,)]
++      if sub == 0:
++        frames.append(PK.make_can_msg("CLU11", 0, {"CF_Clu_CruiseSwState": btn}))
++      self.i += 1
++      # what the CarController stored on the previous frame (CarControl.enabled): the state before this sample
++      self.CI.CS.pedal_long_engaged = self.engaged
++      ret, _ = self.CI.update([(self.t, [(a, d, b) for a, d, b in frames])])
++      rets.append(ret)
++    return rets
++
++  def run(self, n, **kw):
++    out = []
++    for _ in range(n):
++      out += self.step(**kw)
++    return out
++
++
++def _types(rets, attr="buttonEvents"):
++  return [(str(b.type), b.pressed) for r in rets for b in getattr(r, attr)]
++
++
++def _enables(rets):
++  return sum(r.buttonEnable for r in rets)
++
++
++class TestFactoryMainLockout:
++  def test_main_armed_is_non_adaptive_lockout(self):
++    # available stays True (MADS lateral never follows the factory MAIN); MAIN armed -> nonAdaptive -> wrongCruiseMode
++    car = _Car()
++    rets = car.run(5)[2:]
++    assert all(r.cruiseState.available and not r.cruiseState.nonAdaptive for r in rets)
++    rets = car.run(5, main=True)[1:]
++    assert all(r.cruiseState.available and r.cruiseState.nonAdaptive for r in rets)
++    rets = car.run(5, main=True, active=True)[1:]
++    assert all(r.cruiseState.nonAdaptive and r.cruiseState.enabled for r in rets)
++    rets = car.run(5)[1:]
++    assert all(r.cruiseState.available and not r.cruiseState.nonAdaptive for r in rets)
++
++  def test_no_engage_while_main_armed(self):
++    car = _Car()
++    car.run(5, main=True)
++    for btn in (1, 2, 4):
++      rets = car.run(5, btn=btn, main=True) + car.run(10, main=True)
++      assert _enables(rets) == 0, btn
++
++  def test_no_pedal_car_keeps_main_semantics(self):
++    # feature off: cruiseState.available stays = CRUISE_LAMP_M (stock non-SCC behaviour)
++    CarInterface, CP, CP_SP = _get_ci(BASE_FINGERPRINT, None)
++    CI = CarInterface(CP, CP_SP)
++    t = 0
++    for main in (True, False, True):
++      for _ in range(3):
++        t += 10_000_000
++        ret, _ = CI.update([(t, [PK.make_can_msg("EMS16", 0, {"CRUISE_LAMP_M": main})])])
++      assert ret.cruiseState.available == main
++
++
++class TestPauseResumeButton:
++  def _disengaged_after_brake(self):
++    car = _Car()
++    car.run(10)
++    car.engaged = True
++    car.run(5, brake=True)  # brake: openpilot disengages (pedalPressed); panda clears controls_allowed
++    car.engaged = False
++    return car
++
++  def test_constant_matches_panda(self):
++    assert pr.PAUSE_RELEASE_SAMPLES == _c_define(HYUNDAI_COMMON_H, "HYUNDAI_PAUSE_RELEASE_SAMPLES")
++
++  def test_no_auto_resume_after_brake(self):
++    # brake released, then 20 s of normal driving without a button press: never an engage request
++    car = self._disengaged_after_brake()
++    rets = car.run(1000)
++    assert _enables(rets) == 0
++    assert not any(t[0] == "resumeCruise" for t in _types(rets))
++
++  def test_resume_after_brake(self):
++    car = self._disengaged_after_brake()
++    car.run(5)
++    held = car.run(5, btn=4)
++    assert _enables(held) == 0 and _types(held) == []  # no cancel, nothing while held
++    rel = car.run(5)
++    # exactly one engage request, on the 3rd released CLU11 sample, carried by resumeCruise
++    assert _enables(rel) == 1 and rel[2 * (pr.PAUSE_RELEASE_SAMPLES - 1)].buttonEnable
++    assert _types(rel) == [("resumeCruise", True), ("resumeCruise", False)]
++
++  def test_press_while_engaged_disengages(self):
++    car = _Car()
++    car.run(10)
++    car.engaged = True
++    rets = car.run(5, btn=4)
++    assert _types(rets) == [("cancel", True)]
++    car.engaged = False  # openpilot disengaged on buttonCancel
++    rets = car.run(10)
++    assert _types(rets) == [("cancel", False)] and _enables(rets) == 0
++
++  @pytest.mark.parametrize("bounce", [1, 2])
++  def test_bounce_in_disengage_press_never_resumes(self, bounce):
++    car = _Car()
++    car.run(10)
++    car.engaged = True
++    rets = car.run(3, btn=4)
++    car.engaged = False
++    rets += car.run(bounce) + car.run(3, btn=4) + car.run(20)
++    assert _enables(rets) == 0 and not any(t[0] == "resumeCruise" for t in _types(rets))
++
++  def test_press_while_brake_held(self):
++    car = self._disengaged_after_brake()
++    rets = car.run(5, btn=4, brake=True) + car.run(20, brake=True)
++    assert _enables(rets) == 0
++
++  def test_press_held_across_brake_release(self):
++    car = self._disengaged_after_brake()
++    rets = car.run(5, btn=4, brake=True) + car.run(5, btn=4) + car.run(20)
++    assert _enables(rets) == 0
++
++  def test_brake_tap_during_press(self):
++    car = self._disengaged_after_brake()
++    car.run(5)
++    rets = car.run(3, btn=4) + car.run(1, btn=4, brake=True) + car.run(3, btn=4) + car.run(20)
++    assert _enables(rets) == 0
++
++  def test_gas_pressed(self):
++    car = self._disengaged_after_brake()
++    car.run(5)
++    rets = car.run(5, btn=4, gas=True) + car.run(20)
++    rets += car.run(3, btn=4) + car.run(1, btn=4, gas=True) + car.run(20)
++    assert _enables(rets) == 0
++
++  @pytest.mark.parametrize("btn", [1, 2], ids=["RES", "SET"])
++  def test_setres_held_across_brake_release(self, btn):
++    car = self._disengaged_after_brake()
++    rets = car.run(5, btn=btn, brake=True) + car.run(5, btn=btn) + car.run(20)
++    assert _enables(rets) == 0
++    # a fresh press afterwards engages normally
++    rets = car.run(5, btn=btn) + car.run(3)
++    assert _enables(rets) == 1
++
++  def test_inert_without_interceptor(self):
++    # feature off: CF_Clu_CruiseSwState 4 stays a plain cancel, never resumeCruise
++    CarInterface, CP, CP_SP = _get_ci(BASE_FINGERPRINT, None)
++    CI = CarInterface(CP, CP_SP)
++    t, types = 0, []
++    for btn in [0] * 5 + [4] * 5 + [0] * 10:
++      t += 10_000_000
++      ret, _ = CI.update([(t, [PK.make_can_msg("CLU11", 0, {"CF_Clu_CruiseSwState": btn})])])
++      types += [str(b.type) for b in ret.buttonEvents]
++      assert not ret.buttonEnable
++    assert types == ["cancel", "cancel"]
++
++
++class TestPandaLockstep:
++  """Randomized: the car-side tracker (CarState buttonEnable) and panda safety (controls_allowed grants) must agree on
++  every engagement, sample for sample. Either one granting alone would be a divergence."""
++  @pytest.mark.parametrize("seed", range(6))
++  def test_grants_agree(self, seed):
++    from opendbc.car.structs import CarParams
++    from opendbc.safety.tests.libsafety import libsafety_py
++    from opendbc.safety.tests.common import CANPackerSafety
++    rng = np.random.default_rng(seed)
++    safety = libsafety_py.libsafety
++    safety.set_current_safety_param_sp(int(HyundaiSafetyFlagsSP.NON_SCC | PEDAL_SP))
++    safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    safety.init_tests()
++    spk = CANPackerSafety("hyundai_can_generated")
++    ppk = CANPackerSafety(gi.GAS_INTERCEPTOR_DBC)
++
++    def prx(name, vals, packer=spk, fix=None):
++      assert safety.safety_rx_hook(packer.make_can_msg_safety(name, 0, vals, fix_checksum=fix))
++
++    car = _Car()
++    btn, brake, gas, main = 0, False, False, False
++    grants_panda, grants_car, trace = [], [], []
++    for k in range(3000):
++      if rng.random() < 0.15:
++        btn = int(rng.choice([0, 0, 0, 1, 2, 4, 4]))
++      brake = bool(rng.random() < 0.06) if rng.random() < 0.3 else brake
++      gas = bool(rng.random() < 0.04) if rng.random() < 0.3 else gas
++      main = bool(rng.random() < 0.3) if rng.random() < 0.01 else main
++      # panda: same signals, pedal/brake/EMS16 before the CLU11 sample (as CarState sees them in the same update)
++      before = safety.get_controls_allowed()
++      safety.set_controls_allowed(car.engaged)
++      prx("WHL_SPD11", {"WHL_SPD_FL": 15., "WHL_SPD_RR": 15., "WHL_SPD_AliveCounter_LSB": k % 4,
++                        "WHL_SPD_AliveCounter_MSB": (k % 16) >> 2}, fix=_hyundai_checksum)
++      prx("TCS13", {"DriverOverride": 2 if brake else 0, "AliveCounterTCS": k % 8}, fix=_hyundai_checksum)
++      prx("EMS16", {"CRUISE_LAMP_M": main, "AliveCounter": k % 4}, fix=_hyundai_checksum)
++      prx(gi.REMAPPED_IDS.sensor_msg, {"INTERCEPTOR_GAS": 2000 if gas else 0, "INTERCEPTOR_GAS2": 2000 if gas else 0,
++                                       "PEDAL_COUNTER": k & 0xF}, packer=ppk, fix=_pedal_crc)
++      mid = safety.get_controls_allowed()
++      safety.safety_rx_hook(spk.make_can_msg_safety("CLU11", 0, {"CF_Clu_CruiseSwState": btn, "CF_Clu_AliveCnt1": k % 16}))
++      after = safety.get_controls_allowed()
++      if after and not mid:
++        grants_panda.append(k)
++      was_engaged = car.engaged
++      rets = car.step(btn=btn, brake=brake, gas=gas, main=main)
++      # an engage request only counts while disengaged (re-pressing SET while engaged is a set-speed change)
++      if any(r.buttonEnable for r in rets) and not was_engaged:
++        grants_car.append(k)
++      trace.append((k, btn, brake, gas, main, was_engaged, mid, after))
++      # openpilot follows its own engage requests; brake disengages (pedalPressed), cancel/MAIN disengage
++      if any(r.buttonEnable for r in rets) and not brake and not main:
++        car.engaged = True
++      if brake or main or any(str(b.type) == "cancel" and b.pressed for r in rets for b in r.buttonEvents):
++        car.engaged = False
++      del before
++    assert len(grants_car) > 10, "fuzz never exercised an engagement"
++    first = next((k for k in sorted(set(grants_panda) ^ set(grants_car))), None)
++    assert grants_panda == grants_car, "\n".join(str(t) for t in trace if first is not None and first - 25 <= t[0] <= first)
++
++
++def _hyundai_checksum(msg):
++  from opendbc.safety.tests.test_hyundai import checksum
++  return checksum(msg)
++
++
++def _pedal_crc(msg):
++  addr, dat, bus = msg
++  dat = bytearray(dat)
++  dat[5] = crc8_pedal(dat[:5])
++  return addr, dat, bus
+-- 
+2.55.0
+

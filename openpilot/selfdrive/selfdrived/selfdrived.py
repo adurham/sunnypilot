@@ -28,6 +28,8 @@ from openpilot.common.hardware import HARDWARE
 
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
+from openpilot.sunnypilot.fork.cruise_prefs import experimental_active, remove_unless_preserved
+from openpilot.sunnypilot.fork import drive_mode_personality as dmp
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
@@ -108,7 +110,7 @@ class SelfdriveD(CruiseHelper):
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'deviceMotion', 'lateralDelay',
                                    'managerState', 'vehicleParameters', 'radarState', 'lateralTorqueParameters',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark',
-                                   'lateralManeuverPlan', 'modelDataV2SP', 'longitudinalPlanSP'] + \
+                                   'lateralManeuverPlan', 'modelDataV2SP', 'longitudinalPlanSP', 'carStateSP'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
                                   ignore_alive=ignore, ignore_avg_freq=ignore,
                                   ignore_valid=ignore, frequency=int(1/DT_CTRL))
@@ -124,7 +126,10 @@ class SelfdriveD(CruiseHelper):
     if not self.CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
     if not self.CP.openpilotLongitudinalControl:
-      self.params.remove("ExperimentalMode")
+      # fork #30: this is the owner's stored ExperimentalMode. Keep it when longitudinal is only
+      # transiently unavailable; selfdrived gates the runtime use on openpilotLongitudinalControl
+      # (see params_thread), so it stays inert while unavailable.
+      remove_unless_preserved(self.params, "ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
     self.AM = AlertManager()
@@ -148,6 +153,10 @@ class SelfdriveD(CruiseHelper):
       max(log.LongitudinalPersonality.schema.enumerants.values()),
       self.params
     )
+    # fork (adurham): drive-mode-follows-personality. OFF (default) = inert = today's behaviour.
+    # drive_mode_result is the last mapped action, so the personality is (re)written only on a CHANGE.
+    self.drive_mode_personality = dmp.read_enabled(self.params)
+    self.drive_mode_result = dmp.UNKNOWN
     self.recalibrating_seen = False
     self.dm_lockout_set = False
     self.dm_uncertain_alerted = False
@@ -278,8 +287,16 @@ class SelfdriveD(CruiseHelper):
       car_events = self.car_events.update(CS, self.CS_prev, self.sm['carControl']).to_msg()
       self.events.add_from_msg(car_events)
 
-      car_events_sp = self.car_events_sp.update(CS, self.events).to_msg()
+      car_events_sp = self.car_events_sp.update(CS, self.sm['carStateSP'], self.events, self.sm['carControl'].longActive).to_msg()
       self.events_sp.add_from_msg(car_events_sp)
+
+      # fork (adurham): drive-mode-follows-personality. Param OFF -> inert. ON:
+      #   * NORMAL/ECO/SPORT on a mode CHANGE -> write self.personality live + the param (gap-button rail);
+      #   * N / N-Custom -> block openpilot LONGITUDINAL. The block rides the same rail as the factory-cruise
+      #     lockout: MADS strips EventName.driveModePersonalityBlock (mads.py), so lateral-only is untouched;
+      #   * UNKNOWN / absent -> do nothing (never force a personality, never block).
+      if self.drive_mode_personality:
+        dmp.step(self, self.events, self.sm['carStateSP'].driveMode)
 
       if self.CP.notCar:
         # wait for everything to init first
@@ -666,8 +683,9 @@ class SelfdriveD(CruiseHelper):
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
-      self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      self.experimental_mode = experimental_active(self.params, self.CP.openpilotLongitudinalControl)
       self.personality = self.params.get("LongitudinalPersonality", return_default=True)
+      self.drive_mode_personality = dmp.read_enabled(self.params)
 
       self.mads.read_params()
       time.sleep(0.1)

@@ -208,6 +208,14 @@ enum class EventName_b8007ed8a646b5e6: uint16_t {
   E2E_CHIME,
   LANE_CHANGE_ROAD_EDGE,
   BIG_MODEL_READY,
+  PEDAL_FACTORY_CRUISE_LOCKOUT,
+  PEDAL_BELOW_ENGAGE_SPEED,
+  FCA11_BRAKE_LOW_SPEED_D_E_P_R_E_C_A_T_E_D,
+  DRIVE_MODE_PERSONALITY_LOCKOUT,
+  FCA11_UNAVAILABLE,
+  FCA11_SUPERVISE_STOP,
+  FCA11_STOP_COMPLETE,
+  FCA11_BRAKE_NOW,
 };
 CAPNP_DECLARE_ENUM(EventName, b8007ed8a646b5e6);
 CAPNP_DECLARE_SCHEMA(80ae746ee2596b11);
@@ -240,6 +248,14 @@ CAPNP_DECLARE_SCHEMA(d8f4f047edce3c71);
 CAPNP_DECLARE_SCHEMA(9e62278160b7df26);
 CAPNP_DECLARE_SCHEMA(b86e6369214c01c8);
 CAPNP_DECLARE_SCHEMA(f416ec09499d9d19);
+CAPNP_DECLARE_SCHEMA(bdd296f3895125d8);
+enum class RoadType_bdd296f3895125d8: uint16_t {
+  UNKNOWN,
+  INTERSTATE,
+  HIGHWAY,
+  URBAN,
+};
+CAPNP_DECLARE_ENUM(RoadType, bdd296f3895125d8);
 CAPNP_DECLARE_SCHEMA(a1680744031fdb2d);
 CAPNP_DECLARE_SCHEMA(b73df234a23b0cc2);
 enum class TurnDirection_b73df234a23b0cc2: uint16_t {
@@ -711,7 +727,7 @@ struct CarControlSP {
 
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(a5cd762cd951a455, 0, 5)
+    CAPNP_DECLARE_STRUCT_HEADER(a5cd762cd951a455, 1, 5)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -819,6 +835,8 @@ struct LiveMapDataSP {
   class Reader;
   class Builder;
   class Pipeline;
+  typedef ::capnp::schemas::RoadType_bdd296f3895125d8 RoadType;
+
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(f416ec09499d9d19, 2, 1)
@@ -3406,6 +3424,10 @@ public:
 
   inline bool getEnableGasInterceptor() const;
 
+  inline bool getFca11Brake() const;
+
+  inline bool getFca11AffineGain() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -3455,6 +3477,12 @@ public:
 
   inline bool getEnableGasInterceptor();
   inline void setEnableGasInterceptor(bool value);
+
+  inline bool getFca11Brake();
+  inline void setFca11Brake(bool value);
+
+  inline bool getFca11AffineGain();
+  inline void setFca11AffineGain(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -3693,6 +3721,8 @@ public:
   inline bool hasIntelligentCruiseButtonManagement() const;
   inline  ::cereal::IntelligentCruiseButtonManagement::Reader getIntelligentCruiseButtonManagement() const;
 
+  inline  ::uint8_t getPersonality() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -3755,6 +3785,9 @@ public:
   inline  ::cereal::IntelligentCruiseButtonManagement::Builder initIntelligentCruiseButtonManagement();
   inline void adoptIntelligentCruiseButtonManagement(::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement>&& value);
   inline ::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement> disownIntelligentCruiseButtonManagement();
+
+  inline  ::uint8_t getPersonality();
+  inline void setPersonality( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -4378,6 +4411,16 @@ public:
 
   inline float getSpeedLimit() const;
 
+  inline  ::uint8_t getDriveMode() const;
+
+  inline bool getFca11Unavailable() const;
+
+  inline bool getSuperviseStop() const;
+
+  inline bool getStopComplete() const;
+
+  inline bool getBrakeNow() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4408,6 +4451,21 @@ public:
 
   inline float getSpeedLimit();
   inline void setSpeedLimit(float value);
+
+  inline  ::uint8_t getDriveMode();
+  inline void setDriveMode( ::uint8_t value);
+
+  inline bool getFca11Unavailable();
+  inline void setFca11Unavailable(bool value);
+
+  inline bool getSuperviseStop();
+  inline void setSuperviseStop(bool value);
+
+  inline bool getStopComplete();
+  inline void setStopComplete(bool value);
+
+  inline bool getBrakeNow();
+  inline void setBrakeNow(bool value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -4465,6 +4523,8 @@ public:
   inline bool hasRoadName() const;
   inline  ::capnp::Text::Reader getRoadName() const;
 
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4514,6 +4574,9 @@ public:
   inline  ::capnp::Text::Builder initRoadName(unsigned int size);
   inline void adoptRoadName(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownRoadName();
+
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType();
+  inline void setRoadType( ::cereal::LiveMapDataSP::RoadType value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -7770,6 +7833,34 @@ inline void CarParamsSP::Builder::setEnableGasInterceptor(bool value) {
       ::capnp::bounded<50>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool CarParamsSP::Reader::getFca11Brake() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11Brake() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11Brake(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11AffineGain() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11AffineGain() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11AffineGain(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool CarParamsSP::NeuralNetworkLateralControl::Reader::hasModel() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -8079,6 +8170,20 @@ inline void CarControlSP::Builder::adoptIntelligentCruiseButtonManagement(
 inline ::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement> CarControlSP::Builder::disownIntelligentCruiseButtonManagement() {
   return ::capnp::_::PointerHelpers< ::cereal::IntelligentCruiseButtonManagement>::disown(_builder.getPointerField(
       ::capnp::bounded<4>() * ::capnp::POINTERS));
+}
+
+inline  ::uint8_t CarControlSP::Reader::getPersonality() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarControlSP::Builder::getPersonality() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void CarControlSP::Builder::setPersonality( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
 inline bool CarControlSP::Param::Reader::hasKey() const {
@@ -8807,6 +8912,76 @@ inline void CarStateSP::Builder::setSpeedLimit(float value) {
       ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
+inline  ::uint8_t CarStateSP::Reader::getDriveMode() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getDriveMode() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setDriveMode( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getFca11Unavailable() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getFca11Unavailable() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFca11Unavailable(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getSuperviseStop() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getSuperviseStop() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setSuperviseStop(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getStopComplete() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getStopComplete() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setStopComplete(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getBrakeNow() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getBrakeNow() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setBrakeNow(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool LiveMapDataSP::Reader::getSpeedLimitValid() const {
   return _reader.getDataField<bool>(
       ::capnp::bounded<0>() * ::capnp::ELEMENTS);
@@ -8909,6 +9084,20 @@ inline void LiveMapDataSP::Builder::adoptRoadName(
 inline ::capnp::Orphan< ::capnp::Text> LiveMapDataSP::Builder::disownRoadName() {
   return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Reader::getRoadType() const {
+  return _reader.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Builder::getRoadType() {
+  return _builder.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LiveMapDataSP::Builder::setRoadType( ::cereal::LiveMapDataSP::RoadType value) {
+  _builder.setDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
 }
 
 inline  ::cereal::ModelDataV2SP::TurnDirection ModelDataV2SP::Reader::getLaneTurnDirection() const {

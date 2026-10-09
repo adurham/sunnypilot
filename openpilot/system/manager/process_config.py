@@ -71,6 +71,27 @@ def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
+def offload_mode_any(started, params, CP: car.CarParams) -> bool:
+  """Enable the device-side offload processes only when OffloadMode opts in (WS-D).
+
+  OffloadMode is user-gated and absent by default, so ``params.get`` may raise
+  UnknownKeyName; any failure is treated as "disabled". When OffloadMode is not
+  shadow/drive, the offload bridge and offloadd never start, keeping the stock
+  onroad path unchanged.
+  """
+  try:
+    mode = params.get("OffloadMode")
+  except Exception:
+    return False
+  if mode is None:
+    return False
+  if isinstance(mode, bytes):
+    try:
+      mode = mode.decode()
+    except UnicodeDecodeError:
+      return False
+  return str(mode).strip().lower() in ("shadow", "drive")
+
 def sunnylink_ready_shim(started, params, CP: car.CarParams) -> bool:
   """Shim for sunnylink_ready to match the process manager signature."""
   return sunnylink_ready(params)
@@ -158,6 +179,13 @@ procs = [
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
   PythonProcess("webrtcd", "openpilot.system.webrtc.webrtcd", or_(livestream, notcar)),
   PythonProcess("joystick", "openpilot.tools.joystick.joystick_control", and_(joystick, iscar)),
+
+  # offload (WS-D) — gated on OffloadMode in {shadow, drive}; absent by default -> never starts.
+  # onroad-only (iscar) so it never collides with the offroad `bridge` debug proc binding the
+  # same ZMQ ports. The bridge binds tcp://*:<port> (all interfaces; the binary has no bind-ip
+  # flag — see device/README.md). offroad/shadow bench runs are started manually.
+  NativeProcess("offload_bridge", "openpilot/cereal/messaging", ["./bridge"], and_(iscar, offload_mode_any)),
+  PythonProcess("offloadd", "openpilot.offload.device.offloadd", and_(iscar, offload_mode_any)),
 
   # sunnylink <3
   DaemonProcess("manage_sunnylinkd", "openpilot.sunnypilot.sunnylink.athena.manage_sunnylinkd", "SunnylinkdPid"),

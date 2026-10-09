@@ -354,6 +354,14 @@ struct OnroadEventSP @0xda96579883444c35 {
     e2eChime @23;
     laneChangeRoadEdge @24;
     bigModelReady @25;
+    pedalFactoryCruiseLockout @26;  # fork: Hyundai gas interceptor, factory cruise MAIN armed (alert only)
+    pedalBelowEngageSpeed @27;  # fork: Hyundai gas interceptor, SET/RES below minEnableSpeed refused (alert only)
+    fca11BrakeLowSpeedDEPRECATED @28;  # fork (0040): RETIRED ordinal, was "FCA11: Take Over Below 12 km/h" (that floor is gone); kept so old logs decode, no alert defined
+    driveModePersonalityLockout @29;  # fork: drive mode N/N-Custom blocks openpilot longitudinal (alert only)
+    fca11Unavailable @30;  # fork (0030): FCA11-long is handed back to the camera for the rest of this ignition
+    fca11SuperviseStop @31;  # fork (0040): steady YELLOW "supervise stop" while braking below 15 km/h (warning only)
+    fca11StopComplete @32;  # fork (0040): steady YELLOW "stop complete - hold brake pedal" while holding at a stop (hand-off, NOT a cap)
+    fca11BrakeNow @33;  # fork (0040): persistent RED "BRAKE NOW" - ESC non-response or hold lost; clears only on driver brake
   }
 }
 
@@ -363,6 +371,8 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pcmCruiseSpeed @3 :Bool;
   intelligentCruiseButtonManagementAvailable @4 :Bool;
   enableGasInterceptor @5 :Bool;
+  fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
+  fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
@@ -383,6 +393,11 @@ struct CarControlSP @0xa5cd762cd951a455 {
   leadOne @2 :LeadData;
   leadTwo @3 :LeadData;
   intelligentCruiseButtonManagement @4 :IntelligentCruiseButtonManagement;
+  # fork: raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed; cereal
+  # log.LongitudinalPersonality) so car-brand controllers can scale driver-felt actuation by the feel dial (Hyundai
+  # pedal law: launch ceiling / pull gain / interceptor cap). 0 in capnp is aggressive, so the opendbc mirror defaults
+  # to standard and the producer always writes it; consumers clamp anything unknown to standard.
+  personality @5 :UInt8;
 
   struct Param {
     key @0 :Text;
@@ -447,6 +462,12 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  driveMode @1 :UInt8;  # fork: raw CLU13 CF_Clu_DriveMode (1 normal/2 eco/3 sport/6 N custom/7 N), 0 unknown
+  fca11Unavailable @2 :Bool;  # fork (0030): FCA11-long braking is unavailable for the rest of this ignition
+  # fork (0040): the three FCA11 braking alerts (see onroad EventNameSP fca11SuperviseStop/StopComplete/BrakeNow).
+  superviseStop @3 :Bool;  # steady YELLOW: braking below 15 km/h ("supervise stop")
+  stopComplete @4 :Bool;  # steady YELLOW: at/near a stop while holding ("stop complete - hold brake pedal")
+  brakeNow @5 :Bool;  # persistent RED: ESC non-response or hold lost ("BRAKE NOW"); clears only on driver brake
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
@@ -456,6 +477,14 @@ struct LiveMapDataSP @0xf416ec09499d9d19 {
   speedLimitAhead @3 :Float32;
   speedLimitAheadDistance @4 :Float32;
   roadName @5 :Text;
+  roadType @6 :RoadType;
+
+  enum RoadType {
+    unknown @0;
+    interstate @1;
+    highway @2;
+    urban @3;
+  }
 }
 
 struct ModelDataV2SP @0xa1680744031fdb2d {

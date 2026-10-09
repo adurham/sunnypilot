@@ -1,0 +1,28 @@
+diff --git a/tinygrad/runtime/ops_metal.py b/tinygrad/runtime/ops_metal.py
+index 770162c0c..03e2316bd 100644
+--- a/tinygrad/runtime/ops_metal.py
++++ b/tinygrad/runtime/ops_metal.py
+@@ -156,8 +156,21 @@ class MetalBuffer:
+ 
+ class MetalAllocator(Allocator[MetalDevice]):
+   def _alloc(self, size:int, options) -> BufferStorage:
+-    ret = metal.MTLBuffer(options.external_ptr) if options.external_ptr else \
+-      self.dev.sysdevice.newBufferWithLength_options(size, metal.MTLResourceStorageModeShared)
++    # OFFLOAD fork fix (2026-10-07): external_ptr from Tensor.from_blob is a RAW HOST ADDRESS,
++    # not an existing MTLBuffer object. metal.MTLBuffer(options.external_ptr) fabricated a Spec
++    # whose .contents()/.release() message-sent to a bogus pointer -> SIGSEGV (objc.py:33).
++    # Upstream keeps this signature on purpose (its METAL path expects a device-owned MTLBuffer),
++    # so the fix is fork-local. Wrap the caller's memory ZERO-COPY via newBufferWithBytesNoCopy —
++    # aliasing must be preserved (from_blob contract: writes to the source must be visible to the
++    # tensor; the frame pipeline caches tensors per buffer address, so a copy would freeze frames).
++    if options.external_ptr is not None:
++      ret = objc.msg("newBufferWithBytesNoCopy:length:options:deallocator:", metal.MTLBuffer,
++                     [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, objc.id_], retain=True)(
++                       self.dev.sysdevice, ctypes.c_void_p(options.external_ptr), size, metal.MTLResourceStorageModeShared, None)
++      setattr(ret, "retain", False) # released explicitly in _free(); deallocator=None so caller memory is NOT freed
++      if ret.value is None: raise MemoryError(f"Metal can't wrap external ptr {hex(options.external_ptr)} ({size=})")
++      return BufferStorage(MetalBuffer(ret, size), None, MMIOInterface(addr, size) if (addr:=ret.contents()) is not None else None)
++    ret = self.dev.sysdevice.newBufferWithLength_options(size, metal.MTLResourceStorageModeShared)
+     setattr(ret, "retain", False) # Buffer is explicitly released in _free()
+     if ret.value is None: raise MemoryError(f"Metal OOM while allocating {size=}")
+     return BufferStorage(MetalBuffer(ret, size), None, MMIOInterface(addr, size) if (addr:=ret.contents()) is not None else None)

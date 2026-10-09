@@ -1374,6 +1374,7 @@ BO_ 1292 CLU13: 8 CLU
  SG_ CF_Clu_SWL_Stat : 36|3@1+ (1.0,0.0) [0.0|7.0] ""  ACU,EMS
  SG_ CF_Clu_ActiveEcoSW : 39|1@1+ (1.0,0.0) [0.0|1.0] ""  DATC,EMS,TCU
  SG_ CF_Clu_EcoDriveInf : 40|3@1+ (1.0,0.0) [0.0|7.0] ""  CUBIS,EMS,IAP,IBOX
+ SG_ CF_Clu_DriveMode : 44|4@1+ (1.0,0.0) [0.0|15.0] ""  XXX
  SG_ CF_Clu_IsaMainSW : 43|1@1+ (1.0,0.0) [0.0|1.0] ""  EMS
  SG_ CF_Clu_LdwsLkasSW : 56|1@1+ (1.0,0.0) [0.0|1.0] ""  LDWS_LKAS
  SG_ CF_Clu_AltLStatus : 59|1@1+ (1.0,0.0) [0.0|1.0] ""  BCM,DATC,EMS
@@ -1679,9 +1680,13 @@ CM_ 512 "Contains signal with gear shifter. Used by fuel cell hydrogen-powered (
 CM_ SG_ 871 CF_Lvr_IsgState "Idle Stop and Go";
 CM_ SG_ 1056 SCCInfoDisplay "Goes to 1 for a second while transitioning from Cruise Control to No Message";
 CM_ SG_ 1348 SpeedLim_Nav_Clu "Speed limit displayed on Nav, Cluster and HUD";
+CM_ SG_ 1292 CF_Clu_DriveMode "Current drive mode: 1 Normal, 2 Eco, 3 Sport, 6 N Custom, 7 N. Bits 44-47 were undefined; decode from route 00000147 (car-features/0x4a0-decode.md).";
+CM_ SG_ 1292 CF_Clu_EcoDriveInf "On CN7 (Elantra N) this low nibble carries the N Custom slot (0 not N Custom, 1 slot 1, 2 slot 2) when CF_Clu_DriveMode=6.";
+CM_ SG_ 897 CF_Mdps_CurrMode "MDPS steering mode: 0 Normal, 1 Sport, 3 N. Corroborates the CLU13 drive mode; NOT an alive counter (that is CF_Mdps_AliveCnt).";
 
 VAL_ 274 CUR_GR 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D" 7 "D" 8 "D" 14 "R" 0 "P";
 VAL_ 512 HYDROGEN_GEAR_SHIFTER 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";
+VAL_ 897 CF_Mdps_CurrMode 0 "Normal" 1 "Sport" 3 "N";
 VAL_ 871 CF_Lvr_IsgState 0 "enabled" 1 "activated" 2 "unknown" 3 "disabled";
 VAL_ 871 CF_Lvr_Gear 12 "T" 4 "S" 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";
 VAL_ 882 Elect_Gear_Shifter 4 "S" 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";

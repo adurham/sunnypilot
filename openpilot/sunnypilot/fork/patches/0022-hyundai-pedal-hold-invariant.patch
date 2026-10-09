@@ -1,0 +1,44 @@
+From f10b32438660d3610ec73b34859756cda2e68b00 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 01:30:00 -0500
+Subject: [PATCH] hyundai: gas-interceptor HOLD feedforward is
+ personality-invariant
+
+get_hold_command no longer multiplies the hold feedforward by personality_scale: the
+hold term is the one pedal-law component that must be physics (road-load / aero+rolling
+resistance against a zero integral term, LongControl ki=0), so scaling it by personality
+was an uncorrected steady-state bias (aggressive tracked above its plan, relaxed below).
+The pull gain (PEDAL_SCALE) and the per-tier launch ceilings keep their personality
+spread; only the hold becomes tier-neutral. personality is retained in the signature for
+call compatibility.
+
+Round-3 G3, validated on the G1-fixed harness: standard bit-identical to the shipped
+stack (max|dv|=0); relaxed s11 on-ramp t->22 m/s 18.80 -> 16.45 s; both non-standard tiers
+move in the intended direction. Python-only, no opendbc/safety and no panda change.
+---
+ opendbc/sunnypilot/car/hyundai/gas_interceptor.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index e106b4d2..d3ff7a81 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -186,8 +186,13 @@ def get_pedal_scale(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+ 
+ 
+ def get_hold_command(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+-  """Pedal fraction that holds speed on flat ground (accel request 0), scaled by personality."""
+-  return personality_scale(personality) * float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
++  """Pedal fraction that holds speed on flat ground (accel request 0). This is a PHYSICS feedforward
++  (road-load / aero+rolling resistance), not a feel dial: it replaces a zero integral term (LongControl
++  ki=0), so any personality scaling of it is an uncorrected bias - aggressive would track above its own
++  plan, relaxed below. Personality-invariant since G3; `personality` is kept in the signature for call
++  compatibility but no longer scales the hold. (personality_scale still applies to the pull gain and the
++  per-tier launch ceilings, which ARE driver-felt.)"""
++  return float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
+ 
+ 
+ def get_pedal_rate_up(v_ego: float) -> float:
+-- 
+2.55.0
+

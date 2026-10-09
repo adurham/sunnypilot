@@ -145,6 +145,11 @@ void set_heartbeat_engaged_mads(bool c);
 void mads_heartbeat_engaged_check(void);
 void set_steering_disengage(bool c);
 int get_gas_interceptor_prev(void);
+
+int get_self_tx_count(void);
+void clear_self_tx(void);
+uint32_t get_self_tx(int i, CANPacket_t *out, int *bus, bool *skip_tx_hook);
+void set_heartbeat_engaged(bool c);
 """)
 
 class LibSafety:

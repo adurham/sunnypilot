@@ -1,0 +1,707 @@
+diff -ruN a/opendbc/car/structs.py b/opendbc/car/structs.py
+--- a/opendbc/car/structs.py	2026-10-09 03:10:58
++++ b/opendbc/car/structs.py	2026-10-09 03:10:58
+@@ -63,6 +63,10 @@
+   intelligentCruiseButtonManagementAvailable: bool = auto_field()
+   enableGasInterceptor: bool = auto_field()
+   fca11Brake: bool = auto_field()  # fork: production FCA11 longitudinal braking (HyundaiFca11Brake, default OFF)
++  # 0041: OPT-IN affine command law (HyundaiFca11AffineGain, default OFF). When ON the car layer inverts the fitted
++  # affine plant (extra = BITE + K*cmd_g, K~9.9 BITE~0.40) instead of the through-origin 0.67 gain, and the
++  # release-band floor drops from 8 to 4 LSB. OFF = byte-identical to 0040. Read once in Fca11LongBrake.__init__.
++  fca11AffineGain: bool = auto_field()
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff -ruN a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py	2026-10-09 03:10:58
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py	2026-10-09 03:10:58
+@@ -139,6 +139,17 @@
+ FCA11_NORESPONSE_MIN_LSB = 8
+ FCA11_HOLD_LOST_KPH = 2.
+ FCA11_STOP_KPH = 0.5  # the "at/near a full stop" band (log + stop-complete alert), matching the planner's stop semantics
++# 0041 (SHIP-BLOCKER gating fix): no_response is only meaningful on a REAL, SUSTAINED, MOVING brake. A car
++# HELD AT STANDSTILL has aEgo ~ 0, so the raw aEgo test tripped at every red light; a standstill hold is
++# hold_lost's job, not no_response's. So no_response runs ONLY while the car is moving above this, with a
++# real command (>= MIN_LSB) that has been held for the ESC lag (dead 0.14 + 2*tau 0.24 = 0.62 s) before the
++# 500 ms measurement timer may start. The command-stable gate resets whenever the command drops below 8 LSB.
++FCA11_NORESPONSE_MIN_KPH = 5.0
++FCA11_NORESPONSE_CMD_STABLE_S = 0.62
++# 0041 (latching): brake_now is still PERSISTENT (it survives frame-to-frame), but it SELF-HEALS once both
++# trigger conditions have been continuously false for this long, so a transient can never latch the red
++# alert on for a whole drive. (It also clears immediately on driver brake / disengage / gear != D / gas.)
++FCA11_BRAKE_NOW_CLEAR_S = 2.0
+ 
+ # 0040: per-episode logger. One compact JSON line per braking episode to /data/fca11-log/episodes.jsonl (see fca11_log
+ # for the schema, the fields and the reasoning). Inert (no accumulation, no I/O) unless enabled.
+@@ -181,6 +192,116 @@
+ # supersedes 0.67. Until that ships, 0.67 is what the car runs -- CHANGE NO VALUE WITHOUT THE REFIT.
+ FCA11_BRAKE_GAIN = 0.67
+ 
++# *** 0041: FCA11_AFFINE_GAIN — the OPT-IN affine command law (DEFAULT OFF), the Stage-1 refit ***
++#
++# The deployed 0.67 law inverts a THROUGH-THE-ORIGIN gain (delivered = 0.67 * commanded). The measured plant is
++# AFFINE: extra[m/s^2] = BITE + K * cmd_g, fitted on 17260 frames / 126 brake events from the owner's routes at
++# K = 9.9 (CI [9.43, 10.38]), BITE = 0.40 (CI [0.33, 0.48]). Two consequences the through-origin law gets wrong
++# at the same time: it UNDER-commands (~0.67 vs the true slope, ~1.5x low once BITE is accounted for), and the
++# 8 LSB episode floor OVER-delivers at the bottom (an 8 LSB command delivers ~1.19 m/s^2 where the planner wanted
++# ~0.06). See normal-braking/PLAN.md Stage 1 and stage3-floors/REPORT.md.
++#
++# When HyundaiFca11AffineGain is ON, the request inverts the AFFINE plant instead:
++#     dec_cmd_from_accel_affine(want, K, BITE): want_extra = -want (m/s^2, positive) -> cmd_LSB = (want_extra - BITE)/K in g.
++# It is clamped to [0, 30] here (the caller re-clamps to the personality tier cap as before) and the release-band
++# floor drops from 8 to 4 LSB ONLY WHILE MOVING: at/below the low-speed stop band the hold keeps the >= 8 LSB floor
++# (FCA11_AFFINE_HOLD_LSB), because a through-zero command that tapers honestly at speed must not weaken a physical
++# standstill hold. This hold/release floor is applied to the REQUEST, BEFORE the +RATE_STEP rate limiter, so the ramp
++# still governs the episode onset and the command can never exceed the panda's +RATE_STEP onset gate (see the fix note
++# on FCA11_AFFINE_STOP_BAND_KPH). The tier cap (20 std / 30 agg) and FCA11_A_MAX_MSS2 are UNCHANGED.
++#
++# THIS IS DEFERRED / OPT-IN. With the param absent AND no explicit env override, NOTHING here runs and the module is
++# byte-identical to 0040: the 0.67 law inverts exactly as before and the 8 LSB floor is untouched. The env FCA11_AFFINE
++# is an explicit test / A-B override that takes PRIORITY when set (see affine_gain_enabled). No value of
++# FCA11_BRAKE_GAIN or its doc block above is changed.
++FCA11_AFFINE_K = 9.9
++FCA11_AFFINE_BITE = 0.40
++FCA11_AFFINE_RELEASE_LSB = 4  # the release-band floor under the affine law (vs FCA11_NORESPONSE_MIN_LSB = 8 today)
++# 0041 hold floor: while the car is stopped or creeping (in the low-speed hold band) the affine ON path keeps the SAME
++# >= 8 LSB hold floor as the deployed 0.67 law. Reason: this is a DCT car that CREEPS at a stop and the sim cannot see
++# the ESC's behaviour at standstill, so a hold weaker than today's 8 LSB is an untested risk, not an improvement. (8 ==
++# FCA11_NORESPONSE_MIN_LSB by construction; pinned in the tests.)
++FCA11_AFFINE_HOLD_LSB = 8
++# The hold-band edge: v at/below which the affine path keeps FCA11_AFFINE_HOLD_LSB. Deliberately GENEROUS (3 km/h, above
++# the 0.5 km/h stop-complete band) and also true whenever CarState.standstill is set.
++FCA11_AFFINE_STOP_BAND_KPH = 3.0
++# THE FLOOR ABOVE IS A *REQUEST* FLOOR, APPLIED BEFORE THE +RATE_STEP RATE LIMITER (not after it). This is
++# load-bearing: the panda's onset rule allows only +RATE_STEP (4 LSB) over the last ACCEPTED frame, and that frame is
++# 0 at an episode open. A floor applied AFTER the limiter lifts the first SENT frame straight to 8 LSB, over the onset
++# gate, so the panda REFUSES every actuating frame (dec=8, last=0) and the brake never engages at low speed. Applied
++# to the REQUEST the limiter still governs the onset: request 8 -> min(8, 0+4)=4 (first frame, ACCEPTED) ->
++# min(8, 4+4)=8 (ACCEPTED) -> reaches the hold floor in ~40 ms. So these values can never exceed the panda gate.
++
++
++def dec_cmd_from_accel_affine(accel: float, K: float = FCA11_AFFINE_K, BITE: float = FCA11_AFFINE_BITE) -> int:
++  """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB) through the AFFINE plant, clamp [0, 30].
++
++  The inverse of ``extra = BITE + K * cmd_g``: a wanted extra decel of ``want_extra = -accel`` needs
++  ``cmd_g = (want_extra - BITE) / K``. Zero for anything above the onset threshold (coast territory) and for a
++  want at/below BITE (the plant's own bite already delivers more than asked). Unlike the 0.67 path this returns
++  0 (not 1) when nothing is asked, so it can taper honestly through zero; the caller applies the personality cap.
++  """
++  if accel > FCA11_BRAKE_ONSET_ACCEL:
++    return 0
++  want_extra = -accel
++  if want_extra <= BITE:
++    return 0
++  cmd_g = (want_extra - BITE) / K
++  return max(0, min(30, int(round(cmd_g * 100))))
++
++
++def _read_affine_gain_param(default: bool = False) -> bool:
++  """Read the opt-in ``HyundaiFca11AffineGain`` bool param. DEFAULT OFF; never raises.
++
++  Follows the fork's param-read pattern (0018): the key may be absent on a stale libparams (check_key raises
++  UnknownKeyName), or the Params library may be unavailable to the opendbc process -- anything but a clean truthy
++  read is False. Only used as a LAST-RESORT fallback; the primary path is CP_SP.fca11AffineGain (set by the
++  superproject's setup_interfaces). The env FCA11_AFFINE is handled one level up (an explicit override), not here.
++  """
++  try:
++    from openpilot.common.params import Params  # noqa: PLC0415  (lazy: opendbc must not hard-depend on openpilot)
++    key = "HyundaiFca11AffineGain"
++    p = Params()
++    try:
++      p.check_key(key)
++    except Exception:
++      return default  # unknown key on this libparams -> default (OFF)
++    return bool(p.get_bool(key, False))
++  except Exception:
++    return default
++
++
++def _affine_env_override() -> bool | None:
++  """The explicit FCA11_AFFINE env value as an A/B override, or None when it is unset / ambiguous.
++
++  Truthy ("1"/"true"/"yes"/"on") -> True, falsy ("0"/"false"/"no"/"off") -> False, anything else (unset, empty,
++  unrecognized) -> None. This is the sim's ONLY way to flip the affine law, so it must be an EXPLICIT override that
++  wins over the CP_SP field (which is always present, defaulting False) whenever it is set.
++  """
++  val = os.environ.get("FCA11_AFFINE", "").strip().lower()
++  if val in ("1", "true", "yes", "on"):
++    return True
++  if val in ("0", "false", "no", "off"):
++    return False
++  return None
++
++
++def affine_gain_enabled(CP_SP, default: bool = False) -> bool:
++  """The resolved opt-in state for the affine law: an explicit env override, else CP_SP.fca11AffineGain, else Params.
++
++  Reads ONCE at Fca11LongBrake.__init__ (never per frame). The env FCA11_AFFINE is a test / A-B override that takes
++  PRIORITY when explicitly set (1/true/yes/on -> ON, 0/false/no/off -> OFF) -- it is the sim's only way in, so it must
++  beat the always-present capnp field. When the env is unset the CP_SP field is authoritative (always present on a
++  real CarParamsSP), and only a build without the field falls through to the guarded Params key, then the default.
++  """
++  env = _affine_env_override()
++  if env is not None:
++    return env
++  field = getattr(CP_SP, "fca11AffineGain", None)
++  if field is not None:
++    return bool(field)
++  return _read_affine_gain_param(default)
++
+ # camera-frame freshness for the mirror source (s): the camera sends ~50 Hz; anything older than
+ # two periods means we do not know the ESC's last-seen state -> no send (never a hardcoded frame).
+ FCA11_CAM_FRESH_S = 0.100
+@@ -336,6 +457,9 @@
+     self.CP = CP
+     self.CP_SP = CP_SP
+     self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
++    # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
++    # frame. OFF -> the 0.67 through-origin law and the 8 LSB floor, byte-identical to 0040.
++    self.affine_gain = affine_gain_enabled(CP_SP)
+     self.braking = False               # an FCA11 actuating frame was sent THIS frame
+     self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
+     # G9b: split the cut the way the panda does. _driver_cut (brake/gas/gear != D) re-arms on the resume
+@@ -354,6 +478,11 @@
+     self.low_speed_alert = False       # alias of supervise_stop (kept so pre-0040 readers do not crash)
+     self._noresp_since: float | None = None
+     self._hold_lost_armed = False
++    # 0041 gating state: `_noresp_cmd_since` is the monotonic time the command has been continuously >= MIN_LSB
++    # (the ESC-lag "command stable" gate); `_brake_now_clear_since` is the time BOTH trigger conditions last went
++    # false (the 2 s self-heal timer, armed only while brake_now is up).
++    self._noresp_cmd_since: float | None = None
++    self._brake_now_clear_since: float | None = None
+     # 0040: per-episode logger (/data/fca11-log/episodes.jsonl). See fca11_log.py for the schema and reasoning.
+     self.log = fca11_log.EpisodeLogger()
+     self._last_why = ""                # this frame's fca11_ok reason (the episode-end reason when !ok)
+@@ -450,27 +579,88 @@
+     YELLOW "supervise stop"  - steady while we are commanding a brake below FCA11_SUPERVISE_KPH.
+     YELLOW "stop complete"   - steady while at/near a full stop and still holding (an explicit hand-off, NOT a cap:
+                                the command keeps flowing; this only tells the driver to put a foot on the brake).
+-    RED    "BRAKE NOW"       - persistent; ESC non-response (measured aEgo < 0.4x expected for 500 ms while commanding
+-                               >= 8 LSB) or hold lost (v > 2 km/h with no gas while holding). Clears ONLY on driver
+-                               brake. There is deliberately NO hold-duration alert.
++    RED    "BRAKE NOW"       - persistent; ESC non-response (measured aEgo < 0.4x expected for 500 ms while MOVING
++                               above FCA11_NORESPONSE_MIN_KPH and commanding >= 8 LSB, itself sustained for the ESC
++                               lag first) or hold lost (v > 2 km/h with no gas while we STILL command the stop hold).
++                               Persistence is frame-to-frame survival, not "never clears": it clears immediately on
++                               driver brake / gear != D / driver gas, and SELF-HEALS after both conditions have been
++                               continuously false for FCA11_BRAKE_NOW_CLEAR_S. There is deliberately NO hold-duration
++                               alert.
++
++    0041 FIX (ship-blocker): the 0040 tests for both triggers were too weak. 'no_response' fired at EVERY standstill
++    hold (aEgo ~ 0 at a red light, where delivering ~0 net decel is correct) and 'hold_lost' fired on openpilot's own
++    launches (the arm ignored whether we were still holding). Both are gated here: no_response requires MOVING above
++    5 km/h with a real, SUSTAINED command, and hold_lost disarms the instant we stop commanding the hold - so a
++    planner launch (planner releases braking -> self.braking False) can never arm it.
+     """
+     if not self.enabled:
+       self.supervise_stop = self.stop_complete = self.brake_now = False
+       self.low_speed_alert = False
+       self._noresp_since = None
++      self._noresp_cmd_since = None
+       self._hold_lost_armed = False
++      self._brake_now_clear_since = None
+       return
+     now_us = time.monotonic() * 1e6
+-    if bool(CS.out.brakePressed):
++    gas = bool(CS.out.gasPressed)
++    standstill = bool(getattr(CS.out, "standstill", False))
++    moving = bool(v_kph > FCA11_NORESPONSE_MIN_KPH and not standstill)
++    commanding = bool(dec_cmd >= FCA11_NORESPONSE_MIN_LSB)
++    holding_cmd = bool(self.braking and dec_cmd > 0)   # STILL commanding the hold this frame
++
++    # Hard clears: driver brake / gear != D / driver gas end the alert at once (never a latch). On a planner launch
++    # v > 0 is expected, so these two conditions are what take a standing brake_now down; the self-heal (c) covers
++    # the plain "condition went away" case.
++    if bool(CS.out.brakePressed) or CS.out.gearShifter != structs.CarState.GearShifter.drive or gas:
+       self.brake_now = False
+       self.brake_now_reason = ""
+       self._noresp_since = None
+       self._hold_lost_armed = False
+-    if not self.brake_now:
+-      # (a) ESC non-response: commanding real authority but the MEASURED decel is far under what we asked for.
+-      expected = dec_cmd * 0.01 * 9.81 * FCA11_BRAKE_GAIN
+-      aego = float(getattr(CS.out, "aEgo", 0.0) or 0.0)
+-      nonresp = bool(dec_cmd >= FCA11_NORESPONSE_MIN_LSB and aego > -(FCA11_NORESPONSE_FACTOR * expected))
++      self._brake_now_clear_since = None
++
++    # (a) ESC non-response: ONLY while MOVING above 5 km/h with a real command (>= 8 LSB) that has been SUSTAINED for
++    # at least the ESC lag (0.62 s) before the 500 ms measurement timer may run. At/below a stop this is not a fault
++    # (a held stop correctly delivers ~0 net decel) - that case is hold_lost's job. The command-stable gate resets
++    # whenever the command drops below 8 LSB, so the timer never spans a release/re-ask.
++    if commanding:
++      if self._noresp_cmd_since is None:
++        self._noresp_cmd_since = now_us
++    else:
++      self._noresp_cmd_since = None
++    expected = dec_cmd * 0.01 * 9.81 * FCA11_BRAKE_GAIN
++    aego = float(getattr(CS.out, "aEgo", 0.0) or 0.0)
++    nonresp = bool(moving and commanding and
++                   aego > -(FCA11_NORESPONSE_FACTOR * expected) and
++                   self._noresp_cmd_since is not None and
++                   (now_us - self._noresp_cmd_since) >= FCA11_NORESPONSE_CMD_STABLE_S * 1e6)
++
++    # (b) hold lost: ARM only while we are ACTIVELY COMMANDING a stop hold at/near a full stop; once armed it LATCHES
++    # (a hold established at a stop that then creeps is exactly the lost condition). DISARM the instant the hold is
++    # broken - we stop braking (a planner release / launch), the command drops below 8 LSB, gear != D, or the driver
++    # brakes/gases. Fires only while the hold is STILL commanded and the car moves anyway with no driver gas.
++    arm_now = bool(self.braking and dec_cmd > 0 and (v_kph <= FCA11_STOP_KPH or standstill))
++    if arm_now:
++      self._hold_lost_armed = True
++    elif (not self.braking or dec_cmd < FCA11_NORESPONSE_MIN_LSB or
++          CS.out.gearShifter != structs.CarState.GearShifter.drive or bool(CS.out.brakePressed) or gas):
++      self._hold_lost_armed = False
++    hold_lost = bool(self._hold_lost_armed and holding_cmd and v_kph > FCA11_HOLD_LOST_KPH and not gas)
++
++    if self.brake_now:
++      # (c) persistent: only the hard clears above or the 2 s self-heal may take it down. While either condition is
++      # true the latch stands; once BOTH have been continuously false for FCA11_BRAKE_NOW_CLEAR_S it self-heals.
++      if not nonresp and not hold_lost:
++        if self._brake_now_clear_since is None:
++          self._brake_now_clear_since = now_us
++        elif (now_us - self._brake_now_clear_since) >= FCA11_BRAKE_NOW_CLEAR_S * 1e6:
++          self.brake_now = False
++          self.brake_now_reason = ""
++          self._noresp_since = None
++          self._brake_now_clear_since = None
++      else:
++        self._brake_now_clear_since = None
++    else:
++      self._brake_now_clear_since = None
+       if nonresp:
+         if self._noresp_since is None:
+           self._noresp_since = now_us
+@@ -479,14 +669,12 @@
+           self.brake_now_reason = "no_response"
+       else:
+         self._noresp_since = None
+-      # (b) hold lost: a hold was established (at/near a stop, commanding) and the car is now moving with no gas.
+-      if self.braking and (v_kph <= FCA11_STOP_KPH or bool(CS.out.standstill)):
+-        self._hold_lost_armed = True
+-      if not self.brake_now and self._hold_lost_armed and v_kph > FCA11_HOLD_LOST_KPH and not CS.out.gasPressed:
++      if not self.brake_now and hold_lost:
+         self.brake_now = True
+         self.brake_now_reason = "hold_lost"
++
+     self.supervise_stop = bool(self.braking and v_kph <= FCA11_SUPERVISE_KPH)
+-    self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or bool(CS.out.standstill)))
++    self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or standstill))
+     self.low_speed_alert = self.supervise_stop   # alias
+ 
+   def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
+@@ -578,6 +766,9 @@
+       self.brake_now_reason = ""
+       self._noresp_since = None
+       self._hold_lost_armed = False
++      # 0041: and the gating timers, so a disable is a clean start.
++      self._noresp_cmd_since = None
++      self._brake_now_clear_since = None
+       self.log.flush(frame, "disabled", FCA11_STOP_KPH)
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+@@ -739,9 +930,31 @@
+       self._cal_active = bool(cal_on and ok)
+       # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+       # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+-      dec_cmd = dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL))
+-      # production tiering of the planner ask (unchanged when cal is off -> byte-identical).
+-      dec_cmd = clamp_dec_cmd(dec_cmd, personality)
++      # 0041: the OPT-IN affine law (self.affine_gain, DEFAULT OFF) replaces the through-origin inverse with the
++      # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040.
++      accel_ask = min(accel, FCA11_BRAKE_ONSET_ACCEL)
++      if self.affine_gain:
++        dec_cmd = dec_cmd_from_accel_affine(accel_ask)
++      else:
++        dec_cmd = dec_cmd_from_accel(accel_ask)
++      # production tiering of the planner ask (unchanged when cal is off -> byte-identical). 0041: under the affine
++      # law the command may legitimately taper to 0 (no honest request), so the floor is the honest level, not the
++      # fixed 1 the through-origin law uses; OFF keeps the 0040 clamp exactly (raw CR_VSM_DecCmd >= 1).
++      if self.affine_gain:
++        dec_cmd = min(dec_cmd, personality_max_dec(personality))
++      else:
++        dec_cmd = clamp_dec_cmd(dec_cmd, personality)
++      # 0041 (low-speed refusal fix): the affine hold/release floor is applied to the REQUEST here, BEFORE the
++      # +RATE_STEP rate limiter below -- NOT after it. Applied after, the floor lifted the FIRST frame of an episode
++      # straight to 8 LSB, over the panda's onset gate (the firmware allows only +RATE_STEP over the last ACCEPTED
++      # frame, which is 0 at an episode open), so panda refused EVERY actuating frame (dec=8 last=0) and the brake
++      # never engaged at low speed. Applied to the request, the limiter still governs the ONSET: request 8 ->
++      # min(8, 0+4) = 4 (first frame, ACCEPTED) -> min(8, 4+4) = 8 (ACCEPTED) -> 4 -> 8 in ~40 ms. The floor applies
++      # ONLY when the law commands > 0 (an honest taper to 0 stays 0) and never when cal sets the level itself.
++      if self.affine_gain and not cal_on and dec_cmd > 0:
++        in_hold_band = bool(v_kph_now <= FCA11_AFFINE_STOP_BAND_KPH or getattr(CS.out, "standstill", False))
++        dec_cmd = max(dec_cmd, FCA11_AFFINE_HOLD_LSB if in_hold_band else FCA11_AFFINE_RELEASE_LSB)
++        dec_cmd = min(dec_cmd, personality_max_dec(personality))
+       if cal_on:
+         # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
+         # planner. max() with the scripted level means: planner coasting -> the cal level (the
+@@ -760,7 +973,10 @@
+       dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+       if cal_on:
+         dec_cmd = max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, dec_cmd))  # <= panda gate (30)
+-      else:
++      elif not self.affine_gain:
++        # 0041: the affine ON path applies its hold/release floor to the REQUEST *before* this limiter (above), so the
++        # panda's onset gate still governs the ramp and there is nothing left to clamp for it here. OFF keeps the 0040
++        # clamp exactly.
+         dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
+ 
+       t_cam, dat = cam
+diff -ruN a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py	2026-10-09 03:10:58
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py	2026-10-09 03:10:58
+@@ -595,7 +595,9 @@
+ 
+   def test_brake_now_on_esc_non_response(self):
+     """0040: RED persistent BRAKE NOW when the MEASURED decel is < 0.4x expected for 500 ms while commanding >= 8 LSB;
+-    clears ONLY on driver brake; a genuinely delivered decel never trips it."""
++    clears ONLY on driver brake; a genuinely delivered decel never trips it. 0041: no_response is additionally gated
++    on MOVING > 5 km/h and a command SUSTAINED for the ESC lag (0.62 s), so the test pre-seeds BOTH the measurement
++    timer and the command-stable gate."""
+     import time as _t
+     # (a) a real delivered decel does NOT trip it, even after > 500 ms
+     b = self._brake(self._cp_sp())
+@@ -603,6 +605,7 @@
+     b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-1.0), 2)   # ramps >= 8 LSB
+     self.assertGreaterEqual(b._dec_last_sent, fl.FCA11_NORESPONSE_MIN_LSB)
+     b._noresp_since = _t.monotonic() - 1.0
++    b._noresp_cmd_since = _t.monotonic() - 1.0
+     b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-5.0), 4)   # measured decel >> expected
+     self.assertFalse(b.brake_now, "responding ESC: no alert")
+     # (b) non-response for > 500 ms while commanding >= 8 LSB -> RED
+@@ -612,13 +615,14 @@
+     self.assertTrue(b2.braking)
+     self.assertFalse(b2.brake_now, "under 500 ms of non-response: not yet")
+     b2._noresp_since = _t.monotonic() - 1.0
++    b2._noresp_cmd_since = _t.monotonic() - 1.0
+     b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 4)
+     self.assertTrue(b2.brake_now)
+     self.assertEqual("no_response", b2.brake_now_reason)
+-    # persistent: a good frame alone does NOT clear it
++    # persistent: a good frame alone does NOT clear it (within the 2 s self-heal window)
+     b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-5.0), 6)
+     self.assertTrue(b2.brake_now, "persistent: a good frame alone does not clear it")
+-    # clears ONLY on driver brake
++    # clears on driver brake
+     b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), brake=True), 8)
+     self.assertFalse(b2.brake_now)
+ 
+@@ -2051,6 +2055,320 @@
+     from opendbc.car.interfaces import collect_fca11_echoes
+     self.assertEqual([], collect_fca11_echoes([]))
+     self.assertEqual([], collect_fca11_echoes([(0, [])]))
++
++
++class Test0041AlertGating(unittest.TestCase):
++  """0041: the SHIP-BLOCKING BRAKE NOW false-positives. 'no_response' is MOVING-only with a command SUSTAINED for
++  the ESC lag, and 'hold_lost' disarms the instant we stop commanding the hold - so a held standstill and an
++  openpilot auto-launch are both quiet. These drive the REAL class with a mocked clock (the 500 ms / 0.62 s / 2 s
++  timers all read time.monotonic)."""
++
++  def setUp(self):
++    self._mono = time.monotonic
++    self.t = 1000.0
++    time.monotonic = lambda: self.t
++
++  def tearDown(self):
++    time.monotonic = self._mono
++
++  def _brake(self):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _tick(self, b, cc, cs, frame, dt=0.01):
++    self.t += dt
++    return b.update(cc, cs, frame)
++
++  def test_brake_now_does_not_fire_for_a_held_standstill(self):
++    """RED on 0040: a car HELD at standstill (aEgo ~ 0, ask -0.73 = the pass-1 median) trips 'no_response' in 0.51 s.
++    Under 0041 the motion gate (v > 5 km/h) makes it impossible - a delivered net decel of ~0 at a stop is CORRECT."""
++    b = self._brake()
++    cc = self._cc(-0.73)
++    cs = _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0)
++    for f in range(300):                       # 3 s of a standstill hold
++      self._tick(b, cc, cs, f)
++      self.assertFalse(b.brake_now, f"BRAKE NOW fired at a standstill hold @frame {f}")
++    self.assertTrue(b.braking)
++    self.assertTrue(b.stop_complete)
++
++  def test_brake_now_does_not_fire_on_openpilot_auto_launch(self):
++    """RED on 0040: after an FCA11 stop the planner LAUNCHES (ask -> positive, braking releases, v rises past 2 km/h
++    with NO driver gas) and 'hold_lost' fires 0.56 s in. Under 0041 the arm disarms the moment we stop commanding the
++    hold (the planner released), so the launch never raises it."""
++    b = self._brake()
++    # 1) a REAL stop hold (seconds long, as at a red light): armed, nothing fires
++    for f in range(300):
++      self._tick(b, self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=-2.0), f)
++    self.assertTrue(b.braking)
++    self.assertTrue(b._hold_lost_armed)
++    self.assertFalse(b.brake_now)
++    # 2) openpilot LAUNCHES: ask > 0 for the whole phase, the driver NEVER touches the gas
++    for f in range(300, 600):
++      self._tick(b, self._cc(1.0), _CS(v_ego=min(8.0, (f - 300) * 0.01), cam=_cam(), a_ego=1.0), f)
++      self.assertFalse(b.brake_now, f"BRAKE NOW fired on an openpilot launch @frame {f}")
++    self.assertFalse(b._hold_lost_armed, "the arm must disarm when we stop commanding the hold")
++
++  def test_brake_now_fires_true_positive_when_moving_and_unresponsive(self):
++    """TRUE POSITIVE: moving > 5 km/h, commanding >= 8 LSB, but the ESC delivers ~0 -> RED 'no_response'."""
++    b = self._brake()
++    cc = self._cc(-2.0)
++    cs = _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0)
++    for f in range(200):                      # ramp + 0.62 s command-stable + 0.5 s measurement
++      self._tick(b, cc, cs, f)
++      if b.brake_now:
++        break
++    self.assertTrue(b.brake_now, "a sustained unresponsive brake while moving must raise BRAKE NOW")
++    self.assertEqual("no_response", b.brake_now_reason)
++
++  def test_brake_now_requires_a_sustained_command(self):
++    """The command-stable gate: the 500 ms timer cannot even start until the command has held >= 8 LSB for the ESC
++    lag. A single frame that only ramps to RATE_STEP (4 < 8) never opens it."""
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 0)
++    self.assertLess(b._dec_last_sent, fl.FCA11_NORESPONSE_MIN_LSB)
++    self.assertIsNone(b._noresp_cmd_since, "a sub-8-LSB command must not open the command-stable gate")
++    self.assertFalse(b.brake_now)
++
++  def test_brake_now_self_heals_after_two_seconds(self):
++    """0041 latching: persistence is frame-to-frame survival, not forever. A transient clears 2 s after the trigger
++    goes away (and immediately on driver brake / gear != D / gas)."""
++    b = self._brake()
++    cc = self._cc(-2.0)
++    cs = _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0)
++    for f in range(200):
++      self._tick(b, cc, cs, f)
++      if b.brake_now:
++        break
++    self.assertTrue(b.brake_now)
++    good = _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-5.0)   # the ESC responds: condition false from here
++    self._tick(b, cc, good, 500)
++    self.assertTrue(b.brake_now, "not cleared instantly: it is persistent")
++    for f in range(501, 501 + 250):          # > 2 s of a continuously false condition
++      self._tick(b, cc, good, f)
++      if not b.brake_now:
++        break
++    self.assertFalse(b.brake_now, "self-heal must clear BRAKE NOW after 2 s")
++    self.assertEqual("", b.brake_now_reason)
++
++
++class Test0041AffineGain(unittest.TestCase):
++  """0041: the OPT-IN affine command law (HyundaiFca11AffineGain, DEFAULT OFF). OFF -> byte-identical to 0040 (the
++  0.67 through-origin law + the 8 LSB floor); ON -> the fitted K/BITE inverse with the 4 LSB release band floor WHILE
++  MOVING and the >= 8 LSB hold floor at/below the low-speed stop band. self.affine_gain is resolved ONCE at __init__.
++  The env FCA11_AFFINE is an explicit A/B override (wins when set); these tests clear it so the field-based cases are
++  deterministic regardless of the ambient environment."""
++
++  def setUp(self):
++    self._env_prev = os.environ.pop("FCA11_AFFINE", None)
++
++  def tearDown(self):
++    os.environ.pop("FCA11_AFFINE", None)
++    if self._env_prev is not None:
++      os.environ["FCA11_AFFINE"] = self._env_prev
++
++  def _brake(self, affine):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    cp_sp.fca11AffineGain = affine
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def test_default_off_and_constants(self):
++    self.assertFalse(self._brake(False).affine_gain, "the affine law must default OFF")
++    self.assertTrue(self._brake(True).affine_gain)
++    # the fitted constants (K CI [9.43, 10.38], BITE CI [0.33, 0.48]) and the 4 LSB release band floor
++    self.assertEqual(9.9, fl.FCA11_AFFINE_K)
++    self.assertEqual(0.40, fl.FCA11_AFFINE_BITE)
++    self.assertEqual(4, fl.FCA11_AFFINE_RELEASE_LSB)
++    self.assertLess(fl.FCA11_AFFINE_RELEASE_LSB, fl.FCA11_NORESPONSE_MIN_LSB, "affine releases below the 8 LSB floor")
++    # FIX (B): the affine ON path keeps the deployed hold floor in the low-speed band (== the 8 LSB floor by construction)
++    self.assertEqual(8, fl.FCA11_AFFINE_HOLD_LSB)
++    self.assertEqual(fl.FCA11_NORESPONSE_MIN_LSB, fl.FCA11_AFFINE_HOLD_LSB)
++    self.assertEqual(3.0, fl.FCA11_AFFINE_STOP_BAND_KPH)
++
++  def test_env_override_has_priority_over_the_field(self):
++    """0041 FIX (A): FCA11_AFFINE is an EXPLICIT A/B override that WINS over the always-present capnp field.
++    The field defaults to False but is ALWAYS present, so reading it FIRST (the old bug) shadowed the sim's only way
++    in and FCA11_AFFINE=1 was ignored. Order now: explicit env -> field -> guarded Params key -> default."""
++    cp_on = structs.CarParamsSP()
++    cp_on.fca11AffineGain = True
++    cp_off = structs.CarParamsSP()
++    cp_off.fca11AffineGain = False
++
++    # explicit truthy env -> ON even when the field is False (the defect: this used to return False)
++    for tok in ("1", "true", "TRUE", "yes", "on"):
++      try:
++        os.environ["FCA11_AFFINE"] = tok
++        self.assertTrue(fl.affine_gain_enabled(cp_off), tok)
++        self.assertTrue(fl.affine_gain_enabled(structs.CarParamsSP()), tok)
++      finally:
++        os.environ.pop("FCA11_AFFINE", None)
++    # explicit falsy env -> OFF even when the field is True
++    for tok in ("0", "false", "no", "off"):
++      try:
++        os.environ["FCA11_AFFINE"] = tok
++        self.assertFalse(fl.affine_gain_enabled(cp_on), tok)
++      finally:
++        os.environ.pop("FCA11_AFFINE", None)
++    # env UNSET -> the CP_SP field is authoritative
++    os.environ.pop("FCA11_AFFINE", None)
++    self.assertTrue(fl.affine_gain_enabled(cp_on))
++    self.assertFalse(fl.affine_gain_enabled(cp_off))
++    # env UNSET and the field ABSENT -> the guarded Params key / default (no Params service here -> default)
++    class _NoField:
++      pass
++    self.assertFalse(fl.affine_gain_enabled(_NoField(), default=False))
++    # an empty / unrecognized value is NOT an explicit override: fall through to the field
++    try:
++      os.environ["FCA11_AFFINE"] = ""
++      self.assertTrue(fl.affine_gain_enabled(cp_on))
++      os.environ["FCA11_AFFINE"] = "maybe"
++      self.assertFalse(fl.affine_gain_enabled(cp_off))
++    finally:
++      os.environ.pop("FCA11_AFFINE", None)
++
++  def test_env_override_flips_the_controller(self):
++    """End to end: with the field False, FCA11_AFFINE=1 must flip Fca11LongBrake.affine_gain ON (read once in __init__)."""
++    try:
++      os.environ["FCA11_AFFINE"] = "1"
++      cp_sp = structs.CarParamsSP()
++      cp_sp.fca11Brake = True
++      cp_sp.enableGasInterceptor = True
++      cp_sp.fca11AffineGain = False
++      self.assertTrue(fl.Fca11LongBrake(structs.CarParams(), cp_sp).affine_gain)
++    finally:
++      os.environ.pop("FCA11_AFFINE", None)
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), cp_sp).affine_gain)
++
++  def test_affine_law_inverts_the_affine_plant_and_tapering(self):
++    # want_extra = 0.8 -> (0.8 - 0.40) / 9.9 g = 0.04040 g -> 4 LSB  (vs the 0.67 law's 12 LSB)
++    self.assertEqual(4, fl.dec_cmd_from_accel_affine(-0.8))
++    self.assertEqual(12, fl.dec_cmd_from_accel(-0.8))
++    # a want at/below the plant's own BITE delivers more than asked -> command nothing; coast above onset -> 0
++    self.assertEqual(0, fl.dec_cmd_from_accel_affine(-0.40))
++    self.assertEqual(0, fl.dec_cmd_from_accel_affine(-0.30))
++    self.assertEqual(0, fl.dec_cmd_from_accel_affine(0.0))
++    self.assertEqual(0, fl.dec_cmd_from_accel_affine(fl.FCA11_BRAKE_ONSET_ACCEL + 1e-6))
++    # clamp to the panda gate (30) and monotone in magnitude
++    self.assertEqual(30, fl.dec_cmd_from_accel_affine(-4.0))
++    vals = [fl.dec_cmd_from_accel_affine(-a) for a in (0.5, 0.8, 1.0, 1.5, 2.0)]
++    self.assertEqual(vals, sorted(vals))
++
++  def test_affine_path_inert_when_off(self):
++    """OFF -> the emitted CR_VSM_DecCmd is EXACTLY the 0.67 law's (byte-identical to 0040)."""
++    b = self._brake(False)
++    decs = []
++    for f in range(0, 120, 2):
++      for s in b.update(self._cc(-0.8), _CS(cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    old = fl.dec_cmd_from_accel(-0.8)                       # 12
++    self.assertEqual(min(old, fl.HYUNDAI_FCA11_LONG_RATE_STEP), decs[0], "first sent frame is rate-limited")
++    self.assertEqual(old, max(decs), "OFF must command the 0.67 value, unchanged")
++
++  def test_affine_path_changed_when_on(self):
++    """ON -> the request inverts the AFFINE plant; a -0.8 ask commands 4 LSB while MOVING, not the 0.67 law's 12."""
++    b = self._brake(True)
++    decs = []
++    for f in range(0, 120, 2):
++      for s in b.update(self._cc(-0.8), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    self.assertTrue(decs)
++    self.assertEqual(4, max(decs), "the affine law commands 4 LSB for a -0.8 ask, not 12")
++    self.assertEqual(4, min(decs), "and it holds there (the honest level), never over-commanding")
++
++  def test_affine_on_keeps_the_hold_floor_at_standstill(self):
++    """FIX (B): at a standstill the affine ON path must NOT weaken the hold below today's 8 LSB. A DCT car creeps at a
++    stop and the sim cannot see the ESC, so the released 4 LSB floor is only legal WHILE MOVING.
++
++    FIX (low-speed refusal): the 8 LSB hold floor is a REQUEST floor applied BEFORE the +RATE_STEP rate limiter, so the
++    FIRST emitted actuating frame is the rate-limited onset step (4 LSB, <= RATE_STEP, which the panda ACCEPTS) and the
++    hold floor (8) is reached by the 2nd frame. The floor is never applied after the limiter (that lifted the first
++    frame straight to 8, over the panda's onset gate, so every frame was refused and the brake never engaged)."""
++    b = self._brake(True)
++    decs = []
++    for f in range(0, 120, 2):
++      for s in b.update(self._cc(-0.73), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0), f,
++                        fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    self.assertTrue(decs)
++    # onset obeys the panda's +RATE_STEP gate ...
++    self.assertLessEqual(decs[0], fl.HYUNDAI_FCA11_LONG_RATE_STEP,
++                         f"first standstill frame must be <= RATE_STEP so the panda accepts it, got {decs}")
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0])
++    # ... and the >= 8 LSB hold floor is reached by the 2nd emitted frame (4 -> 8 in one 20 ms camera period)
++    self.assertGreaterEqual(decs[1], fl.FCA11_AFFINE_HOLD_LSB, f"hold floor reached by frame 2, got {decs}")
++    self.assertEqual(8, max(decs))
++    # the ramp NEVER jumps: every consecutive SENT frame grows <= RATE_STEP (the panda's per-accepted-frame rule)
++    for a, c in zip(decs, decs[1:]):
++      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
++
++  def test_affine_on_standstill_first_frame_never_exceeds_the_panda_onset_gate(self):
++    """RED-on-the-bug regression: the OLD affine path applied the 8 LSB floor AFTER the +RATE_STEP limiter, so the
++    FIRST emitted actuating frame was 8 LSB -- over the panda's onset rule (only +RATE_STEP over the last ACCEPTED
++    frame, which is 0 at an episode open), so the panda refused EVERY frame (dec=8 last=0, 494 refusals observed) and
++    the brake never engaged. With the floor on the REQUEST the first frame is the rate-limited step (4), which the
++    panda accepts. Asserted on the emitted CR_VSM_DecCmd bytes, not on internals."""
++    for in_hold in (True, False):
++      cs = _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0) if in_hold else _CS(v_ego=20.0 / 3.6, cam=_cam())
++      b = self._brake(True)
++      decs = []
++      for f in range(0, 120, 2):
++        for s in b.update(self._cc(-0.73), cs, f, fl.PERSONALITY_AGGRESSIVE):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertTrue(decs)
++      self.assertLessEqual(decs[0], fl.HYUNDAI_FCA11_LONG_RATE_STEP,
++                           f"hold_band={in_hold}: first emitted frame must not exceed RATE_STEP, got {decs}")
++      # the floor the law wants is reached by the 2nd frame either way (hold 8 / release 4); a moving ask stays at 4
++      want = fl.FCA11_AFFINE_HOLD_LSB if in_hold else fl.FCA11_AFFINE_RELEASE_LSB
++      self.assertGreaterEqual(decs[1], min(want, fl.FCA11_AFFINE_RELEASE_LSB), (in_hold, decs))
++      self.assertEqual(want, max(decs), (in_hold, decs))
++      for a, c in zip(decs, decs[1:]):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (in_hold, a, c))
++
++  def test_affine_on_moving_modest_ask_commands_the_affine_result(self):
++    """FIX (B) contrast: an identical modest ask while MOVING (above the stop band) commands the honest affine result
++    (4 LSB), NOT the 8 LSB hold floor - the hold floor is scoped to the low-speed band only."""
++    b = self._brake(True)
++    decs = []
++    for f in range(0, 120, 2):
++      for s in b.update(self._cc(-0.8), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    self.assertEqual([4], sorted(set(decs)), f"moving affine ask is 4 LSB, got {decs}")
++
++  def test_affine_on_creep_stays_in_the_hold_band(self):
++    """FIX (B) band edge: v <= FCA11_AFFINE_STOP_BAND_KPH (3 km/h), or standstill, keeps the 8 LSB floor; just above it,
++    the honest affine level applies."""
++    b = self._brake(True)
++    decs = []
++    for f in range(0, 60, 2):
++      for s in b.update(self._cc(-0.73), _CS(v_ego=2.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    self.assertEqual(8, max(decs), "creeping (2 km/h <= 3) keeps the hold floor")
++    b2 = self._brake(True)
++    decs2 = []
++    for f in range(0, 60, 2):
++      for s in b2.update(self._cc(-0.73), _CS(v_ego=10.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs2.append(fl._get_bits(s.dat, 8, 8))
++    self.assertEqual(4, max(decs2), "above the band the affine level applies")
+ 
+ 
+ if __name__ == "__main__":

@@ -584,6 +584,14 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Adaptive Cruise Disabled"),
   },
 
+  EventName.driveModePersonalityBlock: {
+    # fork (adurham): the car is in N / N-Custom and DriveModePersonality is ON — openpilot longitudinal is
+    # unavailable (no new engage, immediate disengage). MADS strips this event so lateral-only is unaffected
+    # (the driver-facing message on a MADS car is the SP driveModePersonalityLockout event).
+    ET.USER_DISABLE: EngagementAlert(AudibleAlert.disengage),
+    ET.NO_ENTRY: NoEntryAlert("N Mode: Longitudinal Disabled"),
+  },
+
   EventName.steerTempUnavailable: {
     ET.SOFT_DISABLE: soft_disable_alert("Steering Assist Temporarily Unavailable"),
     ET.NO_ENTRY: NoEntryAlert("Steering Temporarily Unavailable"),
