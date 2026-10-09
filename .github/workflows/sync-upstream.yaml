@@ -570,6 +570,19 @@ jobs:
             esac
           done < "$RUNNER_TEMP/overlay.txt"
 
+      - name: Verify capnp/opendbc schema parity (card startup gate)
+        # Static, stdlib-only guard: every opendbc SP dataclass field must have a
+        # member in the matching struct in openpilot/cereal/custom.capnp.  Patch 0041
+        # shipped CarParamsSP.fca11AffineGain WITHOUT the custom.capnp member, so
+        # card's convert_to_capnp raised KjException at every ignition and card
+        # crash-looped (2026-10-09).  Runs before commit/push, so a tree that cannot
+        # start card can never reach `dev`.
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 openpilot/sunnypilot/fork/tests/check_capnp_parity.py --tree "$RUNNER_TEMP/prebuilt"
+
       - name: Build and install the panda H7 firmware
         # Cross-compiles the H7 app with the toolchain pinned in panda/pyproject.toml
         # (Arm GNU 13.2.1, delivered as a uv wheel), which is why a hosted ubuntu

@@ -372,6 +372,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   intelligentCruiseButtonManagementAvailable @4 :Bool;
   enableGasInterceptor @5 :Bool;
   fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
+  fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
