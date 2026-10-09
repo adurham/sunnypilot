@@ -1,0 +1,1122 @@
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index ec6dfee..4aaed29 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -115,6 +115,12 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+       cp.vl["WHL_SPD11"]["WHL_SPD_RR"],
+     )
+     ret.standstill = cp.vl["WHL_SPD11"]["WHL_SPD_FL"] <= STANDSTILL_THRESHOLD and cp.vl["WHL_SPD11"]["WHL_SPD_RR"] <= STANDSTILL_THRESHOLD
++    # 0040: the SLOWEST wheel speed in km/h (min of the four WHL_SPD11), the same observable the panda's deleted speed
++    # floor watched. The FCA11 episode logger stores it so a drive's logs can answer "what did the ESC do below
++    # 12 km/h / at standstill". Cheap (a min of four floats); inert unless FCA11-long is armed.
++    if self.CP_SP.fca11Brake:
++      self.fca11_wheel_min_kph = min(cp.vl["WHL_SPD11"]["WHL_SPD_FL"], cp.vl["WHL_SPD11"]["WHL_SPD_FR"],
++                                     cp.vl["WHL_SPD11"]["WHL_SPD_RL"], cp.vl["WHL_SPD11"]["WHL_SPD_RR"])
+ 
+     self.cluster_speed_counter += 1
+     if self.cluster_speed_counter > CLUSTER_SAMPLE_RATE:
+diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
+index 5852dc0..cf881e6 100644
+--- a/opendbc/car/hyundai/interface.py
++++ b/opendbc/car/hyundai/interface.py
+@@ -3,7 +3,6 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
+ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+ from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
+ from opendbc.car.interfaces import CarInterfaceBase, ACCEL_MAX, ACCEL_MIN
+-from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.disable_ecu import disable_ecu
+ from opendbc.car.hyundai.carcontroller import CarController
+ from opendbc.car.hyundai.carstate import CarState
+@@ -30,18 +29,16 @@ class CarInterface(CarInterfaceBase):
+ 
+   @staticmethod
+   def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
+-    # fork: FCA11 longitudinal braking (HyundaiFca11Brake). Above the planner's 12 km/h floor the PID may ask for brake
+-    # (down to -FCA11_A_MAX_MSS2); the "0.30 g" figure is the personality-agnostic PANDA cap, and the accel<->command
+-    # conversion uses FCA11_BRAKE_GAIN, whose value, meaning and provenance (three non-interchangeable estimates) are
+-    # documented in ONE place: the FCA11_BRAKE_GAIN block in sunnypilot/car/hyundai/fca11_long.py. Do not restate a
+-    # "correct" slope here. Below the floor the plan is coast-only (+0.0 floor) so the controller never sends FCA11
+-    # near the panda's 9 km/h backstop. With the toggle OFF this returns exactly today's (-3.5, +2.0) bounds, so
++    # fork: FCA11 longitudinal braking (HyundaiFca11Brake). 0040: the planner-side 12 km/h floor is DELETED - the PID
++    # may ask for brake (down to -FCA11_A_MAX_MSS2) at ANY speed, down to and through zero, so the car layer can guide
++    # the car to a complete stop and hold it. The "0.30 g" figure is the personality-agnostic PANDA cap, and the
++    # accel<->command conversion uses FCA11_BRAKE_GAIN, whose value, meaning and provenance (three non-interchangeable
++    # estimates) are documented in ONE place: the FCA11_BRAKE_GAIN block in sunnypilot/car/hyundai/fca11_long.py. Do not
++    # restate a "correct" slope here. With the toggle OFF this returns exactly today's (-3.5, +2.0) bounds, so
+     # pedal-only behavior is byte-for-byte unchanged (the pedal law ignores negative accel).
+     if CP_SP.fca11Brake:
+-      from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_BRAKE_MIN_KPH, FCA11_A_MAX_MSS2
+-      if current_speed * CV.MS_TO_KPH > FCA11_BRAKE_MIN_KPH:
+-        return -FCA11_A_MAX_MSS2, ACCEL_MAX
+-      return 0.0, ACCEL_MAX
++      from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_A_MAX_MSS2
++      return -FCA11_A_MAX_MSS2, ACCEL_MAX
+     return ACCEL_MIN, ACCEL_MAX
+ 
+ 
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 8a5c7b2..0957893 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -177,4 +177,13 @@ class CarStateSP:
+   # hyundai_fca11_long_cut (camera owns FCA11 / pedal fault) is set and only hyundai_init can clear it. The
+   # superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
+   # fails silently while openpilot keeps planning stops it cannot execute). Coupled with custom.capnp CarStateSP.
+-  fca11Unavailable: bool = auto_field()
+\ No newline at end of file
++  fca11Unavailable: bool = auto_field()
++  # 0040: the three owner-approved FCA11 braking alerts. Set by GasInterceptorCarController.create_gas_command (the
++  # same 1-frame pattern as fca11_unavailable) and read by the superproject (car_specific.py -> events.py). Coupled
++  # with custom.capnp CarStateSP.
++  #   superviseStop: steady YELLOW, braking below FCA11_SUPERVISE_KPH ("supervise stop").
++  #   stopComplete:  steady YELLOW at/near a full stop while still holding ("stop complete - hold brake pedal").
++  #   brakeNow:      persistent RED on ESC non-response or hold-lost; clears ONLY on driver brake ("BRAKE NOW").
++  superviseStop: bool = auto_field()
++  stopComplete: bool = auto_field()
++  brakeNow: bool = auto_field()
+\ No newline at end of file
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index ddf7d75..49b9e6f 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -134,20 +134,27 @@ static bool hyundai_legacy = false;
+ // requests with a 0.67 gain correction, so a -2.0 m/s^2 accel ask maps to 0.30 g here. Must equal
+ // HYUNDAI_FCA11_LONG_MAX_DEC in opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
+ #define HYUNDAI_FCA11_LONG_MAX_DEC 30
+-// speed floor, raw WHL_SPD11 units (0.03125 km/h/LSB): 9 km/h. The car never responded below ~8-10 km/h and camera FCA
+-// is documented inert below 10 km/h on this car, so braking there is wasted frames; the car layer's planner floor is
+-// 12 km/h (this floor is the backstop, never the limiter). NO ceiling: production braking must work at highway speed
+-// (the 35 km/h test ceiling was a runner safety artifact, not an ESC property). Must equal
+-// HYUNDAI_FCA11_LONG_MIN_SPEED_KPH in values.py (unit tests pin the boundary).
+-#define HYUNDAI_FCA11_LONG_MIN_SPEED 288U   // 9 km/h
++// 0040: the speed FLOOR is DELETED. It was OUR assumption (never measured): we believed the ESC was inert below
++// ~8-10 km/h, so we refused actuation there. A harvest of the owner's drives shows accepted production braking down
++// to a 12.7 km/h plateau with NOTHING lower ever sent (OUR floor stopped it before the ESC was ever asked), so the
++// belief was never tested. The owner's directive: treat FCA11 as a proper brake system, guide the car to a full stop,
++// hold it, and LOG what the ESC actually does below 12 km/h and at standstill instead of pre-empting it. There is no
++// lower speed bound on actuation any more, and no hold-duration cap. The bounds that REMAIN are: the 0.30 g cap
++// (HYUNDAI_FCA11_LONG_MAX_DEC), the +RATE_STEP/period ramp (HYUNDAI_FCA11_LONG_RATE_STEP), the driver-cut latches
++// (brake / gear != D), the camera-owns latch, the pedal-fault cut, the freshness checks, the gas per-frame window +
++// hold-off, and the HOST_HB liveness watchdog - which is the REPLACEMENT for the old floor's assumed purpose (bound a
++// live-but-wedged host), and is a liveness bound, never a floor. NO ceiling: production braking works at any D speed.
++//
+ // decel RATE limit per camera period (20 ms): a frame's CR_VSM_DecCmd may exceed the last accepted one by at most
+ // 0.04 g -> 2.0 g/s of ramp, 0 -> 0.30 g in 150 ms. Release (smaller decel) is immediate, like the pedal slew.
+ #define HYUNDAI_FCA11_LONG_RATE_STEP 4
+ // 0035: there is NO actuation-duration budget and NO cooldown. The old 2.5 s budget / 3 s cooldown sat AT the typical
+-// event length, so it clipped real stops mid-brake and then refused new braking for 3 s. A braking command is
+-// kinematically self-terminating (it drives the slowest wheel below HYUNDAI_FCA11_LONG_MIN_SPEED, where actuation is
+-// refused), and a live-but-wedged host is bounded by the cap, the rate limit, the stale-TX hand-back, the heartbeat,
+-// the driver-cut latch and the camera-owns hand-back. What the cooldown incidentally did - bound how often an episode
++// event length, so it clipped real stops mid-brake and then refused new braking for 3 s. 0040: a braking command is NO
++// LONGER kinematically self-terminating at any speed - the floor is gone, so it can now drive the car to a full stop
++// and hold it there (the owner's directive); the hold ends only when the PLANNER releases it or a gate ends it (driver
++// brake/gas, disengage, gear, camera, pedal fault, stale inputs, or the HOST_HB liveness watchdog). A live-but-wedged
++// host is bounded by the cap, the rate limit, the stale-TX hand-back, the heartbeat, the HOST_HB watchdog, the
++// driver-cut latch and the camera-owns hand-back. What the cooldown incidentally did - bound how often an episode
+ // can (re)open at a high level - is now done by the ONSET rule: the rate-limit reference restarts from 0 whenever the
+ // ESC is not currently seeing our command (no accepted frame this arm, the last accepted frame was PASSIVE, or our
+ // stream went stale and the camera's own FCA11 has been forwarded again), so every (re)opened episode starts at
+@@ -379,10 +386,10 @@ static bool hyundai_fca11_long_gas_holdoff_ok(uint32_t ts) {
+ 
+ // The window, evaluated for every actuating FCA11 frame in the long mode. The cut inputs are re-checked here (not
+ // only via the latch) so a frame can never race the latch. NOTE: the speed FLOOR is deliberately NOT a cut and NOT
+-// part of ok - the car layer stops asking below its own (higher) floor; if a frame still arrives below the panda
+-// floor it is rejected by the tx hook's own floor check, not by the latch, so re-entering the window when the car
+-// speeds back up needs no re-arm. 0038: `!gas_pressed` (per-frame, the driver's live pedal) plus the short
+-// elapsed-time hold-off are the ONLY gas barriers; there is no gas latch.
++// part of ok (it is still the SEEN_SPEED evidence the window needs). 0040: the floor is DELETED as a gate - the tx
++// hook no longer refuses on the slowest wheel, so actuation is legal at any speed, down to and through zero. 0038:
++// `!gas_pressed` (per-frame, the driver's live pedal) plus the short elapsed-time hold-off are the ONLY gas barriers;
++// there is no gas latch.
+ static bool hyundai_fca11_long_window_ok(void) {
+   uint32_t ts = microsecond_timer_get();
+   bool ok = (hyundai_fca11_long_seen == (uint32_t)HYUNDAI_LONG_SEEN_ALL);
+@@ -1059,8 +1066,9 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       //     byte-identical to what the ESC sees from the camera every idle frame.
+       // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2), FCA_StopReq (bit 21), CF_VSM_DecCmdAct,
+       // Warn 1/2 (never a shape this car answered), Warn 3 on a passive frame (a warning we have no reason to send),
+-      // any ACTUATION outside the window / after a cut / below the floor / while the camera owns FCA11 / from a host
+-      // that has gone silent past HOST_HB_TIMEOUT_US (0038 liveness watchdog).
++      // any ACTUATION outside the window / after a cut / while the camera owns FCA11 / from a host
++      // that has gone silent past HOST_HB_TIMEOUT_US (0038 liveness watchdog). 0040: there is NO speed floor any more
++      // (the deleted HYUNDAI_FCA11_LONG_MIN_SPEED); actuation is legal down to and through zero.
+       int CF_VSM_HBACmd = (msg->data[0] >> 1) & 0x3U;
+       bool CF_VSM_Prefill = GET_BIT(msg, 0U);
+       int CF_VSM_Warn = (msg->data[0] >> 3) & 0x3U;
+@@ -1089,7 +1097,9 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       // !camera_owns is checked before any state change.
+       violation |= actuation && (!controls_allowed || !heartbeat_engaged);
+       violation |= actuation && !hyundai_fca11_long_window_ok();
+-      violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
++      // 0040: the speed floor clause is DELETED. `hyundai_fca11_long_speed_min` is still tracked (the slowest-wheel
++      // observable, kept for parity with the SEEN_SPEED evidence the window requires) but it NO LONGER refuses
++      // actuation - the ESC is allowed to be asked to brake at any speed, down to and through zero.
+       // 0038: host-liveness watchdog. `host_hb_fresh` was sampled at the top of this hook (gap since the PREVIOUS
+       // host frame); a stale host may not command actuation. It self-clears on the next host frame (a few ms later),
+       // and it never gates a passive frame (the release path).
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 4e29598..4baac9e 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -22,7 +22,7 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
+ 
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC, HYUNDAI_FCA11_ROLL_MAX_DEC, \
+   HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH, HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH, HYUNDAI_FCA11_LONG_MAX_DEC, \
+-  HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, HYUNDAI_FCA11_LONG_RATE_STEP, HYUNDAI_LKAS_PARK_MAX_TORQUE, HYUNDAI_LKAS_PARK_RATE_UP, \
++  HYUNDAI_FCA11_LONG_RATE_STEP, HYUNDAI_LKAS_PARK_MAX_TORQUE, HYUNDAI_LKAS_PARK_RATE_UP, \
+   HYUNDAI_LKAS_PARK_RATE_DOWN, HYUNDAI_LKAS_PARK_MAX_ARM_S, HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW, HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG, \
+   HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+@@ -2688,24 +2688,101 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertTrue(self._tx(self._brake_cmd(1)))             # 0035: fresh episode at once, no cooldown
+ 
+   def test_floor_and_no_ceiling(self):
+-    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
+-    for raw, ok in ((lo, False), (lo + 1, True), (raw_hi := 200 * self.RAW_PER_KPH, True)):
++    # 0040: the speed floor is DELETED. Actuation is ACCEPTED at the old 9 km/h boundary, below it, at a crawl and at
++    # a full stop; there is still NO ceiling (200 km/h accepted). FALSIFIABLE CONTRAST: on the 39-patch tree `lo` and
++    # `lo - 1` are REFUSED (that was the floor); here everything is accepted.
++    lo = 9 * self.RAW_PER_KPH
++    for raw, ok in ((lo, True), (lo - 1, True), (1, True), (0, True), (raw_hi := 200 * self.RAW_PER_KPH, True)):
+       with self.subTest(raw=raw):
+         self._rearm()
+         self._open_window(raw)
+         self.assertEqual(ok, self._tx(self._brake_cmd(1)))
+ 
+   def test_each_wheel_policed(self):
+-    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    # 0040: there is no per-wheel speed floor any more. Each wheel independently may read ANY speed (including 0) and
++    # actuation is still accepted; freshness of the WHL_SPD11 stream is the only speed-related requirement (tested
++    # separately by test_stale_input_blocks). FALSIFIABLE CONTRAST: on the 39-patch tree every case below refuses.
++    lo = 9 * self.RAW_PER_KPH
+     for i in range(4):
+-      for bad in (lo, lo - 1):
+-        with self.subTest(wheel=i, bad=bad):
++      for raw in (0, 1, lo, lo - 1):
++        with self.subTest(wheel=i, raw=raw):
+           self._rearm()
+           self._open_window()
+           w = [self.IN_WINDOW_RAW] * 4
+-          w[i] = bad
++          w[i] = raw
+           self._rx(self._wheel_msg(*w))
+-          self.assertFalse(self._tx(self._brake_cmd(1)))
++          self.assertTrue(self._tx(self._brake_cmd(1)), f"wheel {i} raw {raw}")
++
++  # *** 0040: the speed FLOOR is removed; a full stop + hold is legal, and the ramp/cap are the only bounds ***
++
++  def test_floor_removed_now_sends_through_zero(self):
++    """0040 REQUIREMENT: an actuating frame at v_slowest == 0 is ACCEPTED (it was REFUSED before), and the whole
++    sub-9-km/h band is accepted. FALSIFIABLE CONTRAST: on the 39-patch tree every case here is refused (the floor);
++    the clean tree + this test file FAILS. The ramp and the 0.30 g cap still bound the frame; the HOST_HB watchdog,
++    the camera-owns / pedal-fault / brake / gear latches are all re-checked at v == 0 too."""
++    # raw 0 (a full stop) is now accepted, at every level up the ramp
++    self._rearm()
++    self._open_window(0)
++    self.assertTrue(self._tx(self._brake_cmd(1)), "raw 0: first ramp step accepted")
++    self.assertTrue(self._tx(self._brake_cmd(1 + HYUNDAI_FCA11_LONG_RATE_STEP)), "raw 0: ramp step accepted")
++    # the cap still bounds it even at a standstill: 31 refused, exactly RATE_STEP over the last accepted is fine
++    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_MAX_DEC + 1)), "the 0.30 g cap still bounds at v=0")
++    # a fresh arm holding at raw 0, held long: still accepted (no self-imposed stop termination / hold cap)
++    self._rearm()
++    self._open_window(0)
++    t, last, refusals = self._stream(1000000, 5000)
++    self.assertEqual((HYUNDAI_FCA11_LONG_MAX_DEC, []), (last, refusals), "a 5 s standstill hold is unimpeded")
++    # the whole sub-floor band (slowest wheel 0 .. 9 km/h) is accepted
++    for raw in (0, 1, 50, 9 * self.RAW_PER_KPH - 1, 9 * self.RAW_PER_KPH):
++      with self.subTest(raw=raw):
++        self._rearm()
++        self._open_window(raw)
++        self.assertTrue(self._tx(self._brake_cmd(1)), f"raw {raw} must be accepted (no floor)")
++
++  def test_floor_removed_still_refuses_on_watchdog_and_latches_at_zero(self):
++    """0040: removing the floor must NOT weaken the OTHER gates. At a full stop (raw 0) a stale host is still refused
++    by the HOST_HB watchdog, and the camera-owns / pedal-fault / gear != D / driver-brake latches still refuse."""
++    # stale host at raw 0: the liveness watchdog still refuses (the floor's replacement bound). Seed the host clock
++    # first (a benign host frame) so the watchdog measures a real gap.
++    self._rearm()
++    self._open_window(0)
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(0)), "benign host frame seeds the liveness clock")
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US + 100000)
++    self._feed_inputs(speed_raw=0)
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + stale host: still refused")
++    # driver brake at raw 0
++    self._rearm()
++    self._open_window(0)
++    self._rx(self._user_brake_msg(True))
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + driver brake: still refused")
++    # gear != D at raw 0
++    self._rearm()
++    self._open_window(0)
++    self._rx(self._gear_msg(4))
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + gear != D: still refused")
++    # pedal fault at raw 0
++    self._rearm()
++    self._open_window(0)
++    self._rx(self._interceptor_user_gas(0, state=1))
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + pedal fault: still refused")
++    # camera owns at raw 0
++    self._rearm()
++    self._open_window(0)
++    self._rx(self._cam_fca11(CF_VSM_Warn=2))
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + camera request: still refused")
++
++  def test_floor_constant_absent_from_the_header(self):
++    """0040: the floor MACRO is DELETED from safety/modes/hyundai.h (not merely unused). FALSIFIABLE CONTRAST: it is
++    present on the 39-patch tree, so this test fails there."""
++    h = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai.h")
++    with open(h) as f:
++      lines = f.readlines()
++    self.assertFalse(any(ln.strip().startswith("#define HYUNDAI_FCA11_LONG_MIN_SPEED") for ln in lines),
++                     "the floor macro must be gone from the header")
++    # ...and it is used in no CODE line (a comment referencing the deleted macro is fine and deliberate)
++    code = [ln.split("//", 1)[0] for ln in lines]
++    self.assertFalse(any("HYUNDAI_FCA11_LONG_MIN_SPEED" in ln for ln in code),
++                     "no live use of the deleted floor identifier")
+ 
+   def test_needs_every_input_seen(self):
+     feeds = {"brake": lambda: self._rx(self._user_brake_msg(False)), "gas": lambda: self._rx(self._user_gas_msg(0)),
+@@ -2942,17 +3019,14 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+ 
+   def test_f4_overrides_still_fire_10s_into_a_continuous_episode(self):
+     """F4: at t = 10 000 ms into a continuous, accepted stream every independent gate still refuses on the SAME
+-    frame: brake press, cruise-cancel, heartbeat loss, stale inputs, any wheel <= 9 km/h, gear != D. None of them is
+-    keyed to episode state (the old budget was the only thing that 'did something' at 2.5 s)."""
+-    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    frame: brake press, cruise-cancel, heartbeat loss, stale inputs, gear != D, gas press. None of them is keyed to
++    episode state (the old budget was the only thing that 'did something' at 2.5 s). 0040: the wheel-speed floor is
++    GONE, so a low wheel speed is NO LONGER one of these gates (see test_floor_and_no_ceiling)."""
+     faults = {
+       "brake_press": lambda: self._rx(self._user_brake_msg(True)),
+       "cruise_cancel": lambda: self._rx(self._button_msg(Buttons.CANCEL)),
+       "heartbeat_loss": lambda: self.safety.set_heartbeat_engaged(False),
+       "controls_lost": lambda: self.safety.set_controls_allowed(False),
+-      "wheel_fl_at_floor": lambda: self._rx(self._wheel_msg(lo, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW)),
+-      "wheel_rr_below_floor": lambda: self._rx(self._wheel_msg(self.IN_WINDOW_RAW, self.IN_WINDOW_RAW, self.IN_WINDOW_RAW,
+-                                                               lo - 1)),
+       "gear_n": lambda: self._rx(self._gear_msg(6)),
+       "gear_r": lambda: self._rx(self._gear_msg(7)),
+       "gas_press": lambda: self._rx(self._interceptor_user_gas(0x1000)),
+@@ -2991,27 +3065,31 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+             self.assertTrue(ok, f"{stale} still fresh at +{k * self.PERIOD_MS} ms")
+ 
+   def test_f4_stop_termination_at_the_speed_floor(self):
+-    """F4/R3: a long episode decelerating through the 9 km/h gate: accepted down to raw 289, REFUSED from the first
+-    frame whose slowest wheel is <= 288, and the camera owns the ESC again within TX_STALE of the last accepted
+-    frame. Nothing actuates at or below the floor, however long the episode has been running."""
+-    lo = HYUNDAI_FCA11_LONG_MIN_SPEED_KPH * self.RAW_PER_KPH
++    """0040: THE FLIP. RENAMED from "termination at the speed floor" - a long episode decelerating THROUGH the old
++    9 km/h boundary and all the way to a full stop is now ACCEPTED at EVERY frame (raw 289, 288, ... 0), and it stays
++    accepted at a standstill. FALSIFIABLE CONTRAST: on the 39-patch tree the first frame whose slowest wheel is <= 288
++    is REFUSED, and everything below it too (that was the floor)."""
+     self._rearm()
+     self._open_window()
+     t, _, refusals = self._stream(1000000, 15000)
+     self.assertEqual([], refusals)
+-    speed = lo + 10
+-    last_ok_t = None
+-    while speed >= lo - 10:
++    speed = 9 * self.RAW_PER_KPH + 10
++    n_ok = 0
++    while speed >= 0:
+       t += self.PERIOD_MS * 1000
+       self.safety.set_timer(t)
+       self._feed_inputs(speed_raw=speed)
+       ok = self._tx(self._brake_cmd(30))
+-      self.assertEqual(speed > lo, ok, f"speed raw {speed}")
+-      if ok:
+-        last_ok_t = t
++      self.assertTrue(ok, f"speed raw {speed} must be ACCEPTED (no floor)")
++      n_ok += 1
+       speed -= 1
+-    self.safety.set_timer(last_ok_t + HYUNDAI_FCA11_LONG_TX_STALE_US + 1)
+-    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D), "camera forwarded again within TX_STALE")
++    self.assertGreater(n_ok, 9 * self.RAW_PER_KPH)   # we did drive the whole range down to zero
++    # and at a full stop it is STILL accepted (no self-imposed stop termination), however long we hold
++    for _ in range(200):
++      t += self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self._feed_inputs(speed_raw=0)
++      self.assertTrue(self._tx(self._brake_cmd(30)), "a standstill hold must stay accepted")
+ 
+   def test_f5_regression_cap_slew_release_passive(self):
+     """F5: 31 refused; +4 per frame enforced (+5 refused); immediate release accepted; passive frames are always
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 64ffdd0..ee56755 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -51,6 +51,10 @@ class CarStateExt:
+     # 0030 (D1-b): the FCA11-long hand-back flag (camera owns / pedal fault), written by the controller each frame
+     # (same pattern as fca11_cal_active) and mirrored onto CarStateSP.fca11Unavailable for the superproject alert.
+     self.fca11_unavailable = False
++    # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
++    # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
++    # ESC do below 12 km/h / at standstill". None = not published this frame.
++    self.fca11_wheel_min_kph: float | None = None
+     # pause/resume button (gas interceptor only). pedal_long_engaged = CarControl.enabled, written by the CarController
+     # every frame (this CarState instance is the CS it receives), so it is the engagement state BEFORE a new press.
+     self.pause_resume = PauseResumeTracker()
+@@ -208,6 +212,12 @@ class CarStateExt:
+     # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
+     # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
+     ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
++    # 0040: the three FCA11 braking alerts (see structs.py CarStateSP). Only when the feature is armed, so the fields
++    # are exactly "this alert is up right now".
++    armed = bool(self.CP_SP.fca11Brake)
++    ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
++    ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
++    ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
+ 
+   # ------------------------------------------------------------------ 0034 wheel consent gesture
+   def register_wheel_brake(self, brake) -> None:
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_log.py b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+new file mode 100644
+index 0000000..0f6b211
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+@@ -0,0 +1,190 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++0040: PER-EPISODE FCA11 braking logger.
++
++WHY THIS EXISTS
++The owner removed the self-imposed speed floors (panda 9 km/h, car layer 12 km/h) precisely so the ESC can be asked
++to brake down to and through zero. We do NOT know whether the ESC accepts sub-12 km/h commands or holds at a full
++stop, because OUR floor stopped us from ever asking. This module records, per BRAKING EPISODE (one compact JSON line,
++never per-frame spam), exactly what we commanded and what the car/ESC did, so after a drive we can answer from the logs
++alone: "did the ESC accept sub-12 km/h commands, did it hold, and for how long".
++
++WHAT ONE RECORD HOLDS (see ``episode_record``)
++  * commanded DecCmd: min / max / last (raw CR_VSM_DecCmd LSB, 0.01 g/LSB), and the frame count.
++  * speed: vEgo-derived km/h at start / lowest / end, and the raw slowest-wheel km/h at start / lowest / end when the
++    car layer published it (``CS.fca11_wheel_min_kph``; the panda's own raw WHL_SPD11 observable, best-effort).
++  * stop/hold: whether a full stop was reached while FCA11 was still commanding, and how many frames / seconds it was
++    held at/near zero (v <= FCA11_STOP_KPH).
++  * delivered decel: min aEgo (m/s^2) over the final second of the episode - the physics that answers "did the ESC
++    actually brake".
++  * refusals: a histogram of OUR car-layer gate refusals by reason code, PLUS the count of frames the PANDA itself
++    refused (the pandad echo src==192 of an actuating 0x38D) - the firmware's own verdict, which is the ground truth.
++
++WHERE IT LANDS ON THE DEVICE
++``/data/fca11-log/episodes.jsonl`` (one JSON object per line, appended). Overridable with the ``FCA11_LOG_DIR``
++environment variable; ``FCA11_LOG_DIR=0`` disables the logger entirely (used by tests and by anyone who wants the
++feature byte-identical to pre-0040). The directory is created once at construction. The file is rotated to
++``episodes.jsonl.1`` past FCA11_LOG_MAX_BYTES so a long-running card cannot fill /data.
++
++REALTIME NOTE
++The write is a single, best-effort ``open(...,"a")`` + one ``write`` on the braking true -> false edge (the same
++cadence and the same try/except-OSError discipline as cal_mode.py's ``reps.jsonl``). It is NOT on the per-frame path.
++A log write must never take card down, so every failure is swallowed.
++"""
++import json
++import os
++import time
++
++FCA11_LOG_DIR = "/data/fca11-log"
++FCA11_LOG_EPISODES = "episodes.jsonl"
++FCA11_LOG_MAX_BYTES = 2 * 1024 * 1024  # rotate past 2 MB so /data cannot fill
++
++
++class EpisodeLogger:
++  """Accumulates one FCA11 braking episode and writes ONE JSON line when the episode ends.
++
++  Inert (no file I/O, no accumulation) when ``dir_path`` is falsy or ``FCA11_LOG_DIR=0``. Ticked only from the car
++  layer's FCA11 controller (opendbc/sunnypilot/car/hyundai/fca11_long.py), never from the panda.
++  """
++
++  def __init__(self, dir_path: str | None = None):
++    d = FCA11_LOG_DIR if dir_path is None else dir_path
++    d = os.environ.get("FCA11_LOG_DIR", d)
++    self.enabled = bool(d) and d != "0"
++    self.dir = d if self.enabled else None
++    self.path = os.path.join(self.dir, FCA11_LOG_EPISODES) if self.enabled else None
++    self._makedirs()
++    self.reset()
++
++  def _makedirs(self) -> None:
++    if not self.enabled:
++      return
++    try:
++      os.makedirs(self.dir, exist_ok=True)
++    except OSError:
++      self.enabled = False
++      self.dir = None
++      self.path = None
++
++  # ------------------------------------------------------------------ episode state
++  def reset(self) -> None:
++    self._open = False
++    self._t0 = 0.0
++    self._frames = 0
++    self._dec_min = 0
++    self._dec_max = 0
++    self._dec_last = 0
++    self._v_start = None
++    self._v_min = None
++    self._v_end = None
++    self._w_start = None
++    self._w_min = None
++    self._w_end = None
++    self._reached_stop = False
++    self._hold_frames = 0
++    self._aego_final = None
++    self._aego_final_frame = -10**9
++    self._refused: dict[str, int] = {}
++    self._panda_refused = 0
++
++  # ------------------------------------------------------------------ accumulation
++  def begin(self, frame: int, v_kph: float, wheel_kph: float | None) -> None:
++    self.reset()
++    self._open = True
++    self._t0 = time.time()
++    self._v_start = v_kph
++    self._v_min = v_kph
++    self._w_start = wheel_kph
++    self._w_min = wheel_kph
++    self._aego_final_frame = frame
++
++  def note_frame(self, frame: int, dec_cmd: int, v_kph: float, wheel_kph: float | None,
++                 aego: float | None, standstill: bool, stop_kph: float) -> None:
++    """One 100 Hz frame that the car layer COMMANDED an actuating FCA11 frame (dec_cmd >= 1)."""
++    if not self._open:
++      self.begin(frame, v_kph, wheel_kph)
++    self._frames += 1
++    self._dec_min = dec_cmd if self._dec_min == 0 else min(self._dec_min, dec_cmd)
++    self._dec_max = max(self._dec_max, dec_cmd)
++    self._dec_last = dec_cmd
++    self._v_min = v_kph if self._v_min is None else min(self._v_min, v_kph)
++    self._v_end = v_kph
++    if wheel_kph is not None:
++      self._w_min = wheel_kph if self._w_min is None else min(self._w_min, wheel_kph)
++      self._w_end = wheel_kph
++    if v_kph <= stop_kph or standstill:
++      self._reached_stop = True
++      self._hold_frames += 1
++    if aego is not None:
++      self._aego_final = float(aego) if self._aego_final is None else min(self._aego_final, float(aego))
++      self._aego_final_frame = frame
++
++  def note_refusal(self, why: str) -> None:
++    """A car-layer gate refused this frame (fca11_ok's reason code). Counted only while an episode is open."""
++    if self._open and why:
++      self._refused[why] = self._refused.get(why, 0) + 1
++
++  def note_panda_refusal(self, n: int = 1) -> None:
++    """The panda's own TX hook refused an actuating 0x38D we sent (pandad echo src==192). Ground truth."""
++    if self._open:
++      self._panda_refused += n
++
++  # ------------------------------------------------------------------ record + write
++  def episode_record(self, frame: int, reason: str, stop_kph: float) -> dict | None:
++    if not self._open or self._frames == 0:
++      return None
++    return {
++      "event": "episode",
++      "t": round(self._t0, 3),
++      "dur_s": round(max(0.0, time.time() - self._t0), 3),
++      "end_reason": reason,
++      "frames": self._frames,
++      "dec_cmd_min": self._dec_min,
++      "dec_cmd_max": self._dec_max,
++      "dec_cmd_last": self._dec_last,
++      "v_kph_start": _r(self._v_start),
++      "v_kph_min": _r(self._v_min),
++      "v_kph_end": _r(self._v_end),
++      "wheel_kph_start": _r(self._w_start),
++      "wheel_kph_min": _r(self._w_min),
++      "wheel_kph_end": _r(self._w_end),
++      "reached_stop": bool(self._reached_stop),
++      "hold_frames": self._hold_frames,
++      "hold_s": round(self._hold_frames / 100.0, 3),
++      "aego_min_mss2": _r(self._aego_final),
++      "refused": dict(sorted(self._refused.items())),
++      "refused_panda": self._panda_refused,
++      "stop_kph": stop_kph,
++      "frame": frame,
++    }
++
++  def flush(self, frame: int, reason: str, stop_kph: float) -> None:
++    rec = self.episode_record(frame, reason, stop_kph)
++    self.reset()
++    if rec is not None:
++      self._append(rec)
++
++  def _append(self, rec: dict) -> None:
++    if not self.enabled or self.path is None:
++      return
++    try:
++      self._rotate_if_needed()
++      with open(self.path, "a") as f:
++        f.write(json.dumps(rec, sort_keys=True) + "\n")
++    except OSError:
++      pass
++
++  def _rotate_if_needed(self) -> None:
++    try:
++      if os.path.getsize(self.path) > FCA11_LOG_MAX_BYTES:
++        os.replace(self.path, self.path + ".1")
++    except OSError:
++      pass  # no file yet, or no permission: the append below is the best effort that matters
++
++
++def _r(x):
++  return None if x is None else round(float(x), 3)
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index f886cf8..7a202ad 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -53,14 +53,15 @@ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+   CR_FCA_ChkSum (56,8).
+ """
+ import os
++import time
+ from dataclasses import dataclass
+ 
+ from opendbc.car import structs
+ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car.hyundai import cal_mode
+-from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_MIN_SPEED_KPH,
+-                                                   HYUNDAI_FCA11_LONG_RATE_STEP)
++from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP)
++from opendbc.sunnypilot.car.hyundai import fca11_log
+ 
+ FCA11_ADDR = 0x38D
+ FCA11_CAM_BUS = 2
+@@ -115,14 +116,33 @@ FCA11_ONSET_HOLD_S = FCA11_ONSET_HOLD_FRAMES / 100.0
+ GAS_HOLDOFF_FRAMES = 50
+ GAS_HOLDOFF_S = GAS_HOLDOFF_FRAMES / 100.0
+ 
+-# planner-side speed floor (km/h). 3 km/h above the panda's 9 km/h backstop so the panda floor is
+-# never the thing that ends a brake; below this the planner requests coast-only (the PID limits in
+-# the interface are floored at 0) and this module never sends.
+-FCA11_BRAKE_MIN_KPH = 12.
+-# low-speed HAND-OVER alert (warning only, never a disable): fires this many km/h above the floor
+-# while a lead is still closing and openpilot long is engaged, so the driver takes the brake
+-# before the planner runs out of FCA11 authority.
+-FCA11_ALERT_MARGIN_KPH = 2.
++# 0040: the planner-side speed floor is DELETED. It was 12 km/h, chosen to stay 3 km/h above the panda's (now also
++# deleted) 9 km/h backstop. Both floors were OUR assumption that the ESC is inert below ~8-10 km/h - a belief never
++# tested, because OUR floor stopped us from ever asking below 12.7 km/h. The owner's directive: treat FCA11 as a real
++# brake system, command through zero, and LOG what the ESC does. There is therefore NO speed gate here any more, and no
++# hold cap: below STOP_KPH the planner's standstill request keeps being commanded.
++#
++# The old "FCA11: Take Over Below 12 km/h" alert is now FALSE and is DELETED (see the superproject events.py /
++# car_specific.py for its removal). It is replaced by the three owner-approved alerts below.
++#
++# steady YELLOW "supervise stop": a stop is requested (we are braking) and the car is slow. Warning only.
++FCA11_SUPERVISE_KPH = 15.
++# steady YELLOW "stop complete - hold brake pedal": at/near a full stop while we keep holding. An explicit HAND-OFF,
++# NOT a cap - the command keeps flowing. "standstill" is CarState.standstill (all wheels <= 0.375 km/h).
++# RED persistent "BRAKE NOW": the ESC is not doing what we asked, or the hold was lost. Two triggers, both measured:
++#   * ESC non-response: delivered aEgo < FCA11_NORESPONSE_FACTOR x expected for FCA11_NORESPONSE_MS while commanding
++#     >= FCA11_NORESPONSE_MIN_LSB. aEgo is CS.out.aEgo (m/s^2, measured). expected = dec_cmd * 0.01 g * FCA11_BRAKE_GAIN.
++#   * hold lost: v > FCA11_HOLD_LOST_KPH with no gas while we were commanding a stop.
++# Clears ONLY on driver brake. There is deliberately NO hold-duration alert.
++FCA11_NORESPONSE_FACTOR = 0.4
++FCA11_NORESPONSE_MS = 500.
++FCA11_NORESPONSE_MIN_LSB = 8
++FCA11_HOLD_LOST_KPH = 2.
++FCA11_STOP_KPH = 0.5  # the "at/near a full stop" band (log + stop-complete alert), matching the planner's stop semantics
++
++# 0040: per-episode logger. One compact JSON line per braking episode to /data/fca11-log/episodes.jsonl (see fca11_log
++# for the schema, the fields and the reasoning). Inert (no accumulation, no I/O) unless enabled.
++FCA11_LOG_ENABLED = os.environ.get("FCA11_LOG_DIR", "") != "0"
+ 
+ # PID accel bound the interface hands the planner above the floor: 0.30 g cap x the measured
+ # delivered/commanded ratio (FCA11_BRAKE_GAIN) + margin. A -2.0 request commands 0.30 g raw
+@@ -324,7 +344,19 @@ class Fca11LongBrake:
+     self._driver_cut = False
+     self._hard_cut = False
+     self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+-    self.low_speed_alert = False       # hand-over-before-the-floor warning (this frame)
++    # 0040: the single low-speed hand-over alert (below the old 12 km/h floor) is DELETED - it is now false. Replaced
++    # by three owner-approved alerts (steady yellow / steady yellow / persistent red), all state read by the
++    # superproject from CarStateSP. low_speed_alert is kept as an alias of supervise_stop for any stale consumer.
++    self.supervise_stop = False        # YELLOW steady, slow + a stop requested
++    self.stop_complete = False         # YELLOW steady at standstill while holding (an explicit hand-off, NOT a cap)
++    self.brake_now = False             # RED persistent: ESC non-response or hold lost; clears ONLY on driver brake
++    self.brake_now_reason = ""         # "no_response" | "hold_lost"
++    self.low_speed_alert = False       # alias of supervise_stop (kept so pre-0040 readers do not crash)
++    self._noresp_since: float | None = None
++    self._hold_lost_armed = False
++    # 0040: per-episode logger (/data/fca11-log/episodes.jsonl). See fca11_log.py for the schema and reasoning.
++    self.log = fca11_log.EpisodeLogger()
++    self._last_why = ""                # this frame's fca11_ok reason (the episode-end reason when !ok)
+     # 0038: gas hold-off state. `_gas_release_frame` is the controller frame the pedal last read released (None =
+     # none yet this controller); the hold-off refuses actuation for GAS_HOLDOFF_FRAMES after it. No edge is needed to
+     # clear it (it just ages out), and gas is NOT part of _driver_cut any more.
+@@ -391,9 +423,8 @@ class Fca11LongBrake:
+       return False, "gas_pressed"
+     if not self._gas_holdoff_ok(frame):
+       return False, "gas_holdoff"
+-    v_kph = float(CS.out.vEgo) * 3.6
+-    if v_kph <= FCA11_BRAKE_MIN_KPH:
+-      return False, "below_floor"
++    # 0040: the speed floor ("below_floor") is DELETED. There is NO minimum speed to request FCA11 braking; the car
++    # layer commands through zero and holds at a stop. See the FCA11_SUPERVISE_KPH block above.
+     # pedal STATE 0 = NO_FAULT only. 4 STARTUP / 5 TIMEOUT are boot states the panda also accepts,
+     # but from openpilot's side a pedal that has never taken a command must not be mixed with a
+     # brake. 1 BAD_CHECKSUM / 2 SEND / 3 SCE / 6 INVALID are faults -> never brake.
+@@ -413,13 +444,69 @@ class Fca11LongBrake:
+       return False, "camera_owns"
+     return True, ""
+ 
+-  def _alert(self, CS) -> bool:
+-    """Warning (never a disable): below floor+margin while a lead is still closing and long is on."""
++  def _alerts(self, CS, frame: int, v_kph: float, dec_cmd: int) -> None:
++    """0040 three-alert state machine (drives CarStateSP.superviseStop / stopComplete / brakeNow).
++
++    YELLOW "supervise stop"  - steady while we are commanding a brake below FCA11_SUPERVISE_KPH.
++    YELLOW "stop complete"   - steady while at/near a full stop and still holding (an explicit hand-off, NOT a cap:
++                               the command keeps flowing; this only tells the driver to put a foot on the brake).
++    RED    "BRAKE NOW"       - persistent; ESC non-response (measured aEgo < 0.4x expected for 500 ms while commanding
++                               >= 8 LSB) or hold lost (v > 2 km/h with no gas while holding). Clears ONLY on driver
++                               brake. There is deliberately NO hold-duration alert.
++    """
+     if not self.enabled:
+-      return False
++      self.supervise_stop = self.stop_complete = self.brake_now = False
++      self.low_speed_alert = False
++      self._noresp_since = None
++      self._hold_lost_armed = False
++      return
++    now_us = time.monotonic() * 1e6
++    if bool(CS.out.brakePressed):
++      self.brake_now = False
++      self.brake_now_reason = ""
++      self._noresp_since = None
++      self._hold_lost_armed = False
++    if not self.brake_now:
++      # (a) ESC non-response: commanding real authority but the MEASURED decel is far under what we asked for.
++      expected = dec_cmd * 0.01 * 9.81 * FCA11_BRAKE_GAIN
++      aego = float(getattr(CS.out, "aEgo", 0.0) or 0.0)
++      nonresp = bool(dec_cmd >= FCA11_NORESPONSE_MIN_LSB and aego > -(FCA11_NORESPONSE_FACTOR * expected))
++      if nonresp:
++        if self._noresp_since is None:
++          self._noresp_since = now_us
++        elif (now_us - self._noresp_since) >= FCA11_NORESPONSE_MS * 1000.0:
++          self.brake_now = True
++          self.brake_now_reason = "no_response"
++      else:
++        self._noresp_since = None
++      # (b) hold lost: a hold was established (at/near a stop, commanding) and the car is now moving with no gas.
++      if self.braking and (v_kph <= FCA11_STOP_KPH or bool(CS.out.standstill)):
++        self._hold_lost_armed = True
++      if not self.brake_now and self._hold_lost_armed and v_kph > FCA11_HOLD_LOST_KPH and not CS.out.gasPressed:
++        self.brake_now = True
++        self.brake_now_reason = "hold_lost"
++    self.supervise_stop = bool(self.braking and v_kph <= FCA11_SUPERVISE_KPH)
++    self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or bool(CS.out.standstill)))
++    self.low_speed_alert = self.supervise_stop   # alias
++
++  def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
++    """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
++
++    An episode opens on the first commanded frame and closes on the braking true -> false edge, at which point ONE
++    compact JSON line is appended. Best-effort throughout: it must never affect control.
++    """
++    if not self.log.enabled:
++      return
+     v_kph = float(CS.out.vEgo) * 3.6
+-    closing = bool(getattr(CS, "fca11_lead_closing", False))
+-    return closing and FCA11_BRAKE_MIN_KPH < v_kph <= FCA11_BRAKE_MIN_KPH + FCA11_ALERT_MARGIN_KPH
++    wheel_kph = getattr(CS, "fca11_wheel_min_kph", None)
++    if dec_cmd >= 1:
++      if not self.braking:
++        self.log.begin(frame, v_kph, wheel_kph)
++      self.log.note_frame(frame, dec_cmd, v_kph, wheel_kph, getattr(CS.out, "aEgo", None),
++                          bool(CS.out.standstill), FCA11_STOP_KPH)
++    elif self.log._open:
++      reason = self._last_why if self._last_why not in ("", "disabled") else "release"
++      self.log.flush(frame, reason, FCA11_STOP_KPH)
+ 
+   def observe_echo(self, echoes) -> None:
+     """0030 (D2-iii): the car layer's half of the echo-confirmed close.
+@@ -444,6 +531,10 @@ class Fca11LongBrake:
+     # It can only ever LOWER the command.
+     if self.braking and any(int(src) == 192 and len(dat) == 8 and dat[1] != 0 for src, dat in echoes):
+       self._dec_last_sent = 0
++    # 0040: count the PANDA's own refusals of our ACTUATING frames (src 192 = the TX hook rejected it) for the
++    # episode log - the firmware's verdict is the ground truth on whether the ESC was ever asked.
++    if self.log.enabled and self.braking:
++      self.log.note_panda_refusal(sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0))
+     if self._pending_echo is None:
+       return
+     pending = self._pending_echo
+@@ -482,6 +573,12 @@ class Fca11LongBrake:
+     if not self.enabled:
+       self.braking = False
+       self.low_speed_alert = False
++      # 0040: the three alerts and the logger are all inert when the feature is off.
++      self.supervise_stop = self.stop_complete = self.brake_now = False
++      self.brake_now_reason = ""
++      self._noresp_since = None
++      self._hold_lost_armed = False
++      self.log.flush(frame, "disabled", FCA11_STOP_KPH)
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+       self._on_frames = 0
+@@ -550,7 +647,8 @@ class Fca11LongBrake:
+     # and is NOT re-armed, so while it is set FCA11-long braking is unavailable for the rest of this ignition.
+     self.fca11_unavailable = bool(self.enabled and self._hard_cut)
+ 
+-    self.low_speed_alert = self._alert(CS)
++    # 0040: this frame's speed (km/h); the alert state machine + logger both read it.
++    v_kph_now = float(CS.out.vEgo) * 3.6
+ 
+     if not CC.longActive:
+       # R7-D: a mid-episode longActive drop must still close the FCA11 episode with a passive frame. We cannot
+@@ -564,10 +662,13 @@ class Fca11LongBrake:
+       # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
+       self._ask_frames = 0
+       self._on_frames = 0
++      self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
++      self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+ 
+     accel = float(CC.actuators.accel)
+     ok, _why = self.fca11_ok(CS, frame)
++    self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
+ 
+     # ---- 0029 CAL: step the autonomous sequencer and set the scripted ask source -------------------
+     # The sequencer decides (off the plan file + progress) whether a scripted level is DUE now. It is
+@@ -630,6 +731,8 @@ class Fca11LongBrake:
+     if want_brake and self._release_pending:
+       want_brake = False
+ 
++    dec_cmd_now = 0   # 0040: the level COMMANDED this frame (0 = no actuating frame); feeds the alerts + logger
++
+     if want_brake:
+       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
+       # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
+@@ -673,6 +776,7 @@ class Fca11LongBrake:
+         self._dec_last_sent = dec_cmd
+       self.braking = True
+       self._sent_this_episode = True
++      dec_cmd_now = dec_cmd   # 0040: the level COMMANDED this frame (feeds the alerts + logger)
+     else:
+       # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
+       # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
+@@ -681,6 +785,7 @@ class Fca11LongBrake:
+       self.braking = False
+       self._dec_last_sent = 0
+       self._sent_this_episode = False
++      dec_cmd_now = 0   # 0040: no actuating frame this frame
+       if was_braking:
+         # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+         self._release_pending = True
+@@ -698,4 +803,8 @@ class Fca11LongBrake:
+     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+     self._on_frames = self._on_frames + 1 if want_brake else 0
+ 
++    # 0040: alert state (over this frame's braking) and the per-episode log (one line on the true -> false edge).
++    self._alerts(CS, frame, v_kph_now, dec_cmd_now)
++    self._log_tick(CS, frame, dec_cmd_now)
++
+     return sends
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 0e51b49..d87aac2 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -342,6 +342,10 @@ class GasInterceptorCarController:
+     # 0030 (D1-b): publish the FCA11-long hand-back so the CarState side can surface it (CarStateSP.fca11Unavailable);
+     # _hard_cut == the panda's fail-closed hyundai_fca11_long_cut (camera owns / pedal fault), NOT re-armed this ignition.
+     CS.fca11_unavailable = bool(self.fca11_brake.fca11_unavailable)
++    # 0040: publish the three FCA11 braking alerts (read by CarStateExt -> CarStateSP, then car_specific.py -> events.py).
++    CS.fca11_supervise_stop = bool(self.fca11_brake.supervise_stop)
++    CS.fca11_stop_complete = bool(self.fca11_brake.stop_complete)
++    CS.fca11_brake_now = bool(self.fca11_brake.brake_now)
+     # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
+     # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
+     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index ac9f88a..c4e2690 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -23,8 +23,7 @@ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.car_helpers import interfaces
+ from opendbc.car.hyundai.values import CAR
+ from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+-from opendbc.sunnypilot.car.hyundai.values import (HyundaiSafetyFlagsSP, HYUNDAI_FCA11_LONG_MAX_DEC,
+-                                                   HYUNDAI_FCA11_LONG_MIN_SPEED_KPH)
++from opendbc.sunnypilot.car.hyundai.values import (HyundaiSafetyFlagsSP, HYUNDAI_FCA11_LONG_MAX_DEC)
+ from opendbc.sunnypilot.car.interfaces import setup_interfaces
+ 
+ CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
+@@ -98,10 +97,20 @@ class TestPureLogic(unittest.TestCase):
+     self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_RELAXED], fl.clamp_dec_cmd(255, fl.PERSONALITY_RELAXED))
+ 
+   def test_constants_mirror_c(self):
+-    # values.py mirrors the safety header; assert the planner floor is above the panda floor
++    # 0040: the speed floors are DELETED (panda HYUNDAI_FCA11_LONG_MIN_SPEED and the car layer's
++    # HYUNDAI_FCA11_LONG_MIN_SPEED_KPH / FCA11_BRAKE_MIN_KPH). There is no speed gate left at either layer.
+     self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, 30)
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, 9)
+-    self.assertGreater(fl.FCA11_BRAKE_MIN_KPH, HYUNDAI_FCA11_LONG_MIN_SPEED_KPH)
++    for gone in ("FCA11_BRAKE_MIN_KPH", "FCA11_ALERT_MARGIN_KPH"):
++      self.assertFalse(hasattr(fl, gone), gone)
++    from opendbc.sunnypilot.car.hyundai import values as vals
++    self.assertFalse(hasattr(vals, "HYUNDAI_FCA11_LONG_MIN_SPEED_KPH"))
++    # the three owner-approved replacement alerts exist
++    self.assertEqual(fl.FCA11_SUPERVISE_KPH, 15.)
++    self.assertEqual(fl.FCA11_STOP_KPH, 0.5)
++    self.assertEqual(fl.FCA11_NORESPONSE_FACTOR, 0.4)
++    self.assertEqual(fl.FCA11_NORESPONSE_MS, 500.)
++    self.assertEqual(fl.FCA11_NORESPONSE_MIN_LSB, 8)
++    self.assertEqual(fl.FCA11_HOLD_LOST_KPH, 2.)
+ 
+ 
+ class TestMirrorFrame(unittest.TestCase):
+@@ -158,16 +167,19 @@ class TestMirrorFrame(unittest.TestCase):
+ class _CS:
+   """Minimal CarState double: the only attributes Fca11LongBrake reads."""
+   def __init__(self, v_ego=20.0, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
+-               state=0, cam=None, now=0, lead_closing=False):
++               state=0, cam=None, now=0, lead_closing=False, a_ego=0.0, standstill=False, wheel_min_kph=None):
+     self.out = structs.CarState()
+     self.out.vEgo = v_ego
+     self.out.gearShifter = gear
+     self.out.brakePressed = brake
+     self.out.gasPressed = gas
++    self.out.aEgo = a_ego
++    self.out.standstill = standstill
+     self.interceptor_state = state
+     self.fca11_cam_frame = cam
+     self.fca11_now_nanos = now
+     self.fca11_lead_closing = lead_closing
++    self.fca11_wheel_min_kph = wheel_min_kph
+     self.fca11_echoes = []
+ 
+ 
+@@ -245,12 +257,12 @@ class TestController(unittest.TestCase):
+     self.assertTrue(b.blocked_until_resume)
+     self.assertFalse(b.braking)
+     self.assertEqual([], sends)
+-    # (b) dropping below the speed floor releases immediately, even inside the min-on window.
++    # (b) 0040: the speed floor is GONE - dropping to a crawl no longer releases; the brake holds DOWN THROUGH ZERO.
+     b2 = self._brake(self._cp_sp())
+     b2.update(self._cc(-2.0), _CS(cam=_cam()), 0)
+     self.assertTrue(b2.braking)
+-    b2.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_BRAKE_MIN_KPH / 3.6 - 0.01, cam=_cam()), 1)
+-    self.assertFalse(b2.braking)
++    b2.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_STOP_KPH / 3.6, cam=_cam()), 1)
++    self.assertTrue(b2.braking, "0040: a crawl/standstill must KEEP braking (no floor)")
+     # (c) a stale camera frame releases immediately, even inside the min-on window.
+     b3 = self._brake(self._cp_sp())
+     b3.update(self._cc(-2.0), _CS(cam=_cam()), 0)
+@@ -306,10 +318,14 @@ class TestController(unittest.TestCase):
+       self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), 1, accel)
+ 
+   def test_no_send_below_floor(self):
++    # 0040: RENAMED BEHAVIOUR. There is no floor: a request at/near a standstill is now SERVED, not refused.
++    # (The falsifiable contrast test `test_floor_removed_now_sends_through_zero` asserts the full matrix; this keeps a
++    # single, direct assertion that the old "no send below the floor" path is gone.)
+     b = self._brake(self._cp_sp())
+-    sends = b.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_BRAKE_MIN_KPH / 3.6 - 0.01, cam=_cam()), 0)
+-    self.assertEqual([], sends)
+-    self.assertFalse(b.braking)
++    sends = b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam()), 0)
++    self.assertEqual(1, len(sends))
++    self.assertTrue(b.braking)
++    self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), 1)
+ 
+   def test_no_send_without_fresh_camera(self):
+     b = self._brake(self._cp_sp())
+@@ -529,13 +545,146 @@ class TestController(unittest.TestCase):
+       self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 0), st)
+ 
+   def test_alert_gate(self):
++    # 0040: the old below-12 hand-over alert is REPLACED by "supervise stop": steady while we are braking below
++    # FCA11_SUPERVISE_KPH (15 km/h). No lead gate any more (the floor it warned about is gone).
+     b = self._brake(self._cp_sp())
+-    b.update(self._cc(-0.2), _CS(v_ego=13.0 / 3.6, cam=_cam(), lead_closing=True), 0)
+-    self.assertTrue(b.low_speed_alert)
+-    b.update(self._cc(-0.2), _CS(v_ego=20.0 / 3.6, cam=_cam(), lead_closing=True), 0)
+-    self.assertFalse(b.low_speed_alert)
+-    b.update(self._cc(-0.2), _CS(v_ego=13.0 / 3.6, cam=_cam(), lead_closing=False), 0)
+-    self.assertFalse(b.low_speed_alert)
++    b.update(self._cc(-2.0), _CS(v_ego=13.0 / 3.6, cam=_cam()), 0)   # opens an episode at 13 km/h
++    self.assertTrue(b.braking)
++    self.assertTrue(b.supervise_stop)
++    self.assertTrue(b.low_speed_alert)                              # retained alias
++    b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam()), 1)
++    self.assertTrue(b.braking)
++    self.assertFalse(b.supervise_stop)
++    b.update(self._cc(-2.0), _CS(v_ego=13.0 / 3.6, cam=_cam()), 2)
++    self.assertTrue(b.supervise_stop)
++    # not braking -> no supervise alert even at a crawl (the alert is conditioned on a commanded brake)
++    b2 = self._brake(self._cp_sp())
++    b2.update(self._cc(0.5), _CS(v_ego=5.0 / 3.6, cam=_cam()), 0)
++    self.assertFalse(b2.braking)
++    self.assertFalse(b2.supervise_stop)
++
++  # *** 0040: stop-to-zero, no hold cap, the three alerts, and the per-episode logger ***
++
++  def test_commands_through_zero_and_holds_with_no_cap(self):
++    """0040 REQUIREMENT: below ~0.5 km/h the car layer keeps commanding the hold; it never drops to a passive frame
++    merely because the speed is low, and there is NO self-imposed hold cap. At a full stop the command keeps flowing
++    and stop_complete (the hand-off alert) is up."""
++    b = self._brake(self._cp_sp())
++    s = b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True), 0)
++    self.assertEqual(1, len(s), "a standstill request must still emit an actuating frame")
++    self.assertTrue(b.braking)
++    self.assertTrue(b.stop_complete)
++    self.assertGreaterEqual(fl._get_bits(s[0].dat, 8, 8), 1)
++    # 30 s of a standstill hold: the car layer withholds NOTHING (no hold cap)
++    withheld, sent = self._withheld(b, 3000, accel=-2.0,
++                                    cs=_CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=-2.0))
++    self.assertEqual(0, withheld, "no self-imposed hold cap: not one frame withheld in 30 s at a stop")
++    self.assertGreater(sent, 1000)
++
++  def test_stop_complete_only_at_a_stop_and_only_while_holding(self):
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(v_ego=10.0 / 3.6, cam=_cam()), 0)   # moving
++    self.assertFalse(b.stop_complete)
++    b.update(self._cc(-2.0), _CS(v_ego=0.2 / 3.6, cam=_cam()), 1)    # at a stop (<= 0.5 km/h)
++    self.assertTrue(b.braking)
++    self.assertTrue(b.stop_complete)
++    # standstill flag alone also counts (all wheels <= 0.375 km/h)
++    b2 = self._brake(self._cp_sp())
++    b2.update(self._cc(-2.0), _CS(v_ego=0.8 / 3.6, cam=_cam(), standstill=True), 0)
++    self.assertTrue(b2.stop_complete)
++
++  def test_brake_now_on_esc_non_response(self):
++    """0040: RED persistent BRAKE NOW when the MEASURED decel is < 0.4x expected for 500 ms while commanding >= 8 LSB;
++    clears ONLY on driver brake; a genuinely delivered decel never trips it."""
++    import time as _t
++    # (a) a real delivered decel does NOT trip it, even after > 500 ms
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-1.0), 0)
++    b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-1.0), 2)   # ramps >= 8 LSB
++    self.assertGreaterEqual(b._dec_last_sent, fl.FCA11_NORESPONSE_MIN_LSB)
++    b._noresp_since = _t.monotonic() - 1.0
++    b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-5.0), 4)   # measured decel >> expected
++    self.assertFalse(b.brake_now, "responding ESC: no alert")
++    # (b) non-response for > 500 ms while commanding >= 8 LSB -> RED
++    b2 = self._brake(self._cp_sp())
++    b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 0)
++    b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 2)
++    self.assertTrue(b2.braking)
++    self.assertFalse(b2.brake_now, "under 500 ms of non-response: not yet")
++    b2._noresp_since = _t.monotonic() - 1.0
++    b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 4)
++    self.assertTrue(b2.brake_now)
++    self.assertEqual("no_response", b2.brake_now_reason)
++    # persistent: a good frame alone does NOT clear it
++    b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-5.0), 6)
++    self.assertTrue(b2.brake_now, "persistent: a good frame alone does not clear it")
++    # clears ONLY on driver brake
++    b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), brake=True), 8)
++    self.assertFalse(b2.brake_now)
++
++  def test_brake_now_on_hold_lost(self):
++    """0040: RED persistent BRAKE NOW when the car moves (v > 2 km/h) with no gas while we are holding a stop."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=-2.0), 0)   # establish the hold
++    self.assertTrue(b.braking)
++    self.assertFalse(b.brake_now)
++    b.update(self._cc(-2.0), _CS(v_ego=3.0 / 3.6, cam=_cam(), a_ego=-2.0), 2)               # crept to 3 km/h, no gas
++    self.assertTrue(b.brake_now)
++    self.assertEqual("hold_lost", b.brake_now_reason)
++    b.update(self._cc(-2.0), _CS(v_ego=3.0 / 3.6, cam=_cam(), brake=True), 4)              # clears on driver brake
++    self.assertFalse(b.brake_now)
++
++  def test_episode_logger_writes_one_compact_record(self):
++    """0040: after a drive the log ALONE must answer 'did the ESC accept sub-12 km/h commands, did it hold, for how
++    long'. One compact JSON line per episode; the record carries the commanded DecCmd min/max/last, the slowest-wheel
++    speeds, reached_stop + hold_frames, the delivered aEgo, and the refusal histogram."""
++    import json
++    import tempfile
++    with tempfile.TemporaryDirectory() as d:
++      b = self._brake(self._cp_sp())
++      b.log = fl.fca11_log.EpisodeLogger(d)
++      b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=-1.0, wheel_min_kph=20.0), 0)
++      b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), a_ego=-2.0, standstill=True, wheel_min_kph=0.0), 2)
++      b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), brake=True, standstill=True), 4)   # ends the episode
++      path = os.path.join(d, "episodes.jsonl")
++      self.assertTrue(os.path.exists(path), "the episode log file must exist")
++      lines = open(path).read().strip().splitlines()
++      self.assertEqual(1, len(lines), "exactly one line per episode")
++      rec = json.loads(lines[0])
++      self.assertEqual("episode", rec["event"])
++      self.assertEqual(2, rec["frames"])
++      self.assertGreaterEqual(rec["dec_cmd_max"], 1)
++      self.assertLessEqual(rec["dec_cmd_max"], fl.HYUNDAI_FCA11_LONG_MAX_DEC)
++      self.assertEqual(20.0, rec["wheel_kph_start"])
++      self.assertEqual(0.0, rec["wheel_kph_min"])
++      self.assertTrue(rec["reached_stop"])
++      self.assertGreaterEqual(rec["hold_frames"], 1)
++      self.assertIn("refused", rec)
++      self.assertIn("refused_panda", rec)
++      self.assertEqual(0.5, rec["stop_kph"])
++      # the log is inert when disabled (an inert EpisodeLogger writes nothing)
++      b2 = self._brake(self._cp_sp())
++      b2.log = fl.fca11_log.EpisodeLogger("0")
++      self.assertFalse(b2.log.enabled)
++      b2.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam()), 0)
++      b2.update(self._cc(0.5), _CS(v_ego=0.0, cam=_cam(), brake=True), 2)
++      self.assertEqual([], os.listdir(d) if False else [x for x in os.listdir(d) if x != "episodes.jsonl"])
++
++  def test_logger_counts_panda_refusals(self):
++    """0040: the firmware's OWN refusal (pandad echo src 192 of an actuating 0x38D) is the ground truth on whether the
++    ESC was ever asked; the episode record counts them."""
++    import json
++    import tempfile
++    with tempfile.TemporaryDirectory() as d:
++      b = self._brake(self._cp_sp())
++      b.log = fl.fca11_log.EpisodeLogger(d)
++      b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam()), 0)
++      act = bytes([0] * 7 + [0])
++      # two rejected actuating echoes this tick
++      b.observe_echo([(192, act[:1] + bytes([9]) + act[2:]), (192, act[:1] + bytes([9]) + act[2:])])
++      b.update(self._cc(0.5), _CS(v_ego=20.0 / 3.6, cam=_cam(), brake=True), 2)   # release -> flush
++      rec = json.loads(open(os.path.join(d, "episodes.jsonl")).read().strip().splitlines()[0])
++      self.assertEqual(2, rec["refused_panda"])
+ 
+ 
+ class TestG8FrameContract(unittest.TestCase):
+@@ -945,14 +1094,14 @@ class TestInterfacePlumbing(unittest.TestCase):
+   def test_planner_pid_limits(self):
+     CarInterface = interfaces[CAR_UNDER_TEST]
+     _, CP, CP_SP = _get_ci(True, "1")
+-    # above the floor: brake authority to -2.0; below: coast-only (+0.0)
+-    lo, hi = CarInterface.get_pid_accel_limits(CP, CP_SP, 20.0, 20.0)
+-    self.assertEqual(-fl.FCA11_A_MAX_MSS2, lo)
+-    lo, hi = CarInterface.get_pid_accel_limits(CP, CP_SP, 3.0, 3.0)  # 10.8 km/h, below the 12 km/h floor
+-    self.assertEqual(0.0, lo)
+-    # toggle off: today's stock limits
++    # 0040: the planner floor is DELETED - brake authority to -2.0 at ANY speed, down to and through zero.
++    for v in (20.0, 3.0, 0.5, 0.0):   # 20 m/s, 10.8 km/h, 1.8 km/h, standstill
++      lo, hi = CarInterface.get_pid_accel_limits(CP, CP_SP, v, v)
++      self.assertEqual(-fl.FCA11_A_MAX_MSS2, lo, v)
++    # toggle off: today's stock limits, unchanged at any speed
+     _, CP2, CP_SP2 = _get_ci(True, "0")
+-    self.assertEqual((-3.5, 2.0), CarInterface.get_pid_accel_limits(CP2, CP_SP2, 20.0, 20.0))
++    for v in (20.0, 3.0, 0.0):
++      self.assertEqual((-3.5, 2.0), CarInterface.get_pid_accel_limits(CP2, CP_SP2, v, v))
+ 
+   def test_capnp_field_present_default_off(self):
+     # the CarParamsSP struct carries the toggle and defaults OFF (the capnp field fca11Brake is regenerated by CI)
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index 41f05d9..8e89fe8 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -60,10 +60,8 @@ HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH = 35
+ # Raw CR_VSM_DecCmd cap: 0.30 g. Measured on the car (roll-20261005T232357Z): 0.30 g -> 2.03 m/s^2 delivered (~69%,
+ # linear); ~COMFORT_BRAKE. Must equal HYUNDAI_FCA11_LONG_MAX_DEC.
+ HYUNDAI_FCA11_LONG_MAX_DEC = 30
+-# Speed floor (km/h, slowest wheel); must equal HYUNDAI_FCA11_LONG_MIN_SPEED (raw / 32). The car never responded below
+-# ~8-10 km/h; the PLANNER floor (FCA11_BRAKE_MIN_KPH in gas_interceptor.py) is higher, so this is the backstop.
+-# There is NO ceiling: production braking must work at any D speed.
+-HYUNDAI_FCA11_LONG_MIN_SPEED_KPH = 9
++# 0040: the speed floor constant HYUNDAI_FCA11_LONG_MIN_SPEED_KPH (9 km/h) is DELETED together with the panda's
++# HYUNDAI_FCA11_LONG_MIN_SPEED and the planner's FCA11_BRAKE_MIN_KPH. Actuation is legal at any speed, through zero.
+ # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
+ HYUNDAI_FCA11_LONG_RATE_STEP = 4
+ # 0038: driver-gas hold-off after the pedal RELEASES, microseconds; the panda refuses actuating FCA11 for this long

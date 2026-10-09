@@ -259,11 +259,32 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("Factory Cruise Armed: openpilot Long Off", "Press the CC button to turn it off"),
   },
 
-  # fork: Hyundai FCA11 braking below the comfort-braking floor while a lead is still closing — a WARNING only (openpilot
-  # keeps long engaged and hands the stop to the driver, as it always has below the floor): the driver must brake.
-  EventNameSP.fca11BrakeLowSpeed: {
-    ET.WARNING: Alert("FCA11: Take Over Below 12 km/h", "sunnypilot braking ends: press the brake for the stop", AlertStatus.normal,
-                      AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  # fork (0040): the low-speed hand-over alert "FCA11: Take Over Below 12 km/h" is DELETED - the speed floors it
+  # warned about (panda 9 km/h, planner 12 km/h) are gone and FCA11 now commands through zero and holds. It is
+  # replaced by the three owner-approved alerts below. EventNameSP.fca11BrakeLowSpeedDEPRECATED @28 holds the retired
+  # ordinal so old logs still decode; no alert is defined for it and nothing raises it.
+  #
+  # steady YELLOW "supervise stop": a stop is being guided at low speed. Warning only.
+  EventNameSP.fca11SuperviseStop: {
+    ET.WARNING: Alert("supervise stop", "FCA11 is braking to a stop - be ready to press the brake",
+                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  # steady YELLOW "stop complete - hold brake pedal": FCA11 has brought the car to a stop and is STILL holding. This
+  # is an explicit HAND-OFF, not a cap: the brake command keeps flowing. It tells the driver to put a foot on the
+  # brake so releasing openpilot/ignition leaves the car held.
+  EventNameSP.fca11StopComplete: {
+    ET.WARNING: Alert("stop complete - hold brake pedal", "FCA11 is holding the stop; keep a foot ready",
+                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  # RED persistent "BRAKE NOW": the ESC is not delivering what we asked (non-response) or the hold was lost. Urgent,
+  # driver-facing, cleared ONLY by the driver pressing the brake (the opendbc flag clears on that edge). Deliberately
+  # NOT a hold-duration alert.
+  EventNameSP.fca11BrakeNow: {
+    ET.PERMANENT: Alert("BRAKE NOW", "FCA11 braking is not responding - press the brake",
+                        AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                        AudibleAlert.warningImmediate, 3.),
   },
 
   EventNameSP.bigModelReady: {

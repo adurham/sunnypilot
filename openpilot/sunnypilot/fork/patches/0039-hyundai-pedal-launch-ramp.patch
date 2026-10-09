@@ -1,0 +1,247 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index bed703fa..0e51b49d 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -172,6 +172,24 @@ LOW_SPEED_MAX_GAS_V_OFFSET = {
+ # frames (DT_CTRL).
+ PEDAL_JERK_UP = 2.0  # m/s^3
+ 
++# *** 0039 (owner requirement 5): launch-specific fast ramp ***
++# PEDAL_JERK_UP alone gives rate_up(0) = 2.0 * 0.10 = 0.20 pedal-fraction/s, so from rest the command walks
++# 0.02 -> 0.10 -> 0.20 over ~1.5 s (0.12 rest ceiling in ~0.6 s, 0.20 at 5 m/s in ~3.9 s): the car feels asleep
++# off a green light - the owner's "at 2 %, then slowly ramps to 10, then 15, then 20". The ceiling is NOT the
++# problem and stays untouched. Below LAUNCH_RAMP_V_MAX a genuine pull-away uses a flat LAUNCH_RAMP_RATE_UP,
++# reaching the 0.12 rest ceiling in ~0.2 s; above it the gentler PEDAL_JERK_UP rate is byte-identical to before.
++# Why this cannot bring back the 12e/12f surge: the old fixed 0.75/s was removed because at 11-19 m/s (rolling
++# re-engagements) the ceiling is already high (0.35 by 11.2 m/s) so it jumped the command to the cap in 0.47 s
++# (+1.0 m/s^2). Here the fast branch is hard-gated to v <= LAUNCH_RAMP_V_MAX = 3 m/s (3.7x below that band), and
++# at 3 m/s the low-speed ceiling is only 0.168, so the fast rate can never reach a high command. The limiter
++# only bounds the RISE; a zero/negative request still lifts the very next frame (decreases stay immediate), so
++# a fast RISE is never a fast STOP. The rate is not personality-scaled (the rise limit never was): every tier
++# gets the same launch latency, and 0039 therefore changes STANDARD as well as relaxed/aggressive. This is a
++# deliberate, tier-independent latency change, not a personality change: all magnitude levers (per-tier
++# ceiling table, MAX_INTERCEPTOR_GAS, hold, down behaviour) are untouched.
++LAUNCH_RAMP_V_MAX = 3.0      # m/s; at or below this a launch from (near) rest is in progress
++LAUNCH_RAMP_RATE_UP = 0.6   # pedal fraction per second; 0 -> the 0.12 rest ceiling in 0.2 s
++
+ 
+ def get_personality_ceiling(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+   """Launch ceiling (pedal fraction) for this personality at this speed."""
+@@ -195,9 +213,15 @@ def get_hold_command(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+   return float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
+ 
+ 
+-def get_pedal_rate_up(v_ego: float) -> float:
+-  """Upward slew limit, pedal fraction per second. Not personality-scaled: the rise limit is the same comfort jerk for
+-  every tier (a launch is ~3 s either way; personality changes where the ramp lands, not how fast it climbs)."""
++def get_pedal_rate_up(v_ego: float, launching: bool = False) -> float:
++  """Upward slew limit, pedal fraction per second. Not personality-scaled: the rise limit is the same for every tier
++  (personality changes where the ramp lands, not how fast it climbs).
++
++  launching=True marks a pull-away from (near) rest: below LAUNCH_RAMP_V_MAX it returns the flat launch rate so the
++  command reaches its (unchanged) low-speed ceiling promptly. At or above LAUNCH_RAMP_V_MAX - and whenever launching is
++  False - it is the exact pre-0039 jerk rate, so a rolling re-engagement is never fast-ramped."""
++  if launching and v_ego <= LAUNCH_RAMP_V_MAX:
++    return LAUNCH_RAMP_RATE_UP
+   return PEDAL_JERK_UP * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+@@ -207,9 +231,9 @@ def get_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDA
+                        0., get_personality_ceiling(v_ego, personality)))
+ 
+ 
+-def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float) -> float:
+-  """Rise at most get_pedal_rate_up(v_ego) * DT_CTRL per controller frame; fall immediately."""
+-  return min(gas, gas_last + get_pedal_rate_up(v_ego) * DT_CTRL)
++def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False) -> float:
++  """Rise at most get_pedal_rate_up(v_ego, launching) * DT_CTRL per controller frame; fall immediately."""
++  return min(gas, gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL)
+ 
+ 
+ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
+@@ -277,6 +301,10 @@ class GasInterceptorCarController:
+     self.CP_SP = CP_SP
+ 
+     self.gas = 0.
++    # 0039: launch latch. Set while an engaged positive request is a (near)-rest pull-away (see the ramp branch
++    # below), cleared as soon as the car is moving above LAUNCH_RAMP_V_MAX or the request is non-positive (a
++    # lift/coast), so it only ever selects the fast launch rate from rest and never a rolling re-engagement.
++    self.gas_launching = False
+     self.interceptor_ids = get_interceptor_ids(CP_SP)
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+@@ -331,11 +359,23 @@ class GasInterceptorCarController:
+     # replicates the production condition (when the planner asks brake it never gases) and can only REDUCE
+     # actuation. Inert when cal mode is off (`_cal_active` is False).
+     if active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
+-      self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo)
++      accel = CC.actuators.accel
++      # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
++      # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
++      # (above LAUNCH_RAMP_V_MAX the two branches are the same function anyway). Cleared on any non-positive request
++      # or once vEgo exceeds LAUNCH_RAMP_V_MAX, so a rolling re-engagement at 11-19 m/s can never set it.
++      if accel > 0. and CS.out.vEgo <= LAUNCH_RAMP_V_MAX:
++        self.gas_launching = True
++      elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
++        self.gas_launching = False
++      self.gas = rate_limit_pedal_command(get_pedal_command(accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo,
++                                          self.gas_launching)
+     elif self.fca11_brake.braking or self.fca11_brake._cal_active:
+       self.gas = 0.
++      self.gas_launching = False
+     else:
+       self.gas = 0.
++      self.gas_launching = False
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+     send_slot = frame % 2 == 0
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 798ee12d..498819a1 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -347,19 +347,76 @@ class TestThresholds:
+     for v in np.linspace(0., 40., 41):
+       assert gi.get_pedal_rate_up(float(v)) / gi.get_pedal_scale(float(v)) == pytest.approx(2.0)
+ 
++  def test_launch_ramp_rate_gated_by_speed_and_flag(self):
++    # 0039: the launch branch is a flat rate, only below LAUNCH_RAMP_V_MAX and only when `launching`.
++    assert gi.LAUNCH_RAMP_V_MAX == 3.0 and gi.LAUNCH_RAMP_RATE_UP == 0.6
++    # it is faster than the old standstill jerk rate, and gentler than the removed 0.75/s fixed ramp
++    assert gi.get_pedal_rate_up(0., launching=False) < gi.LAUNCH_RAMP_RATE_UP < 0.75
++    for v in np.linspace(0., gi.LAUNCH_RAMP_V_MAX, 7):
++      assert gi.get_pedal_rate_up(float(v), launching=True) == gi.LAUNCH_RAMP_RATE_UP, v
++    # the boundary is INCLUSIVE: at exactly LAUNCH_RAMP_V_MAX a launch still uses the fast rate
++    assert gi.get_pedal_rate_up(gi.LAUNCH_RAMP_V_MAX, launching=True) == gi.LAUNCH_RAMP_RATE_UP
++    # above the launch speed cap the launching flag is inert: the jerk rate is returned unchanged
++    for v in np.linspace(gi.LAUNCH_RAMP_V_MAX + 0.1, 40., 40):
++      assert gi.get_pedal_rate_up(float(v), launching=True) == pytest.approx(gi.get_pedal_rate_up(float(v))), v
++      assert gi.get_pedal_rate_up(float(v), launching=True) == pytest.approx(2.0 * gi.get_pedal_scale(float(v))), v
++    # the limiter honours the flag, the lift is still immediate even while launching, and no step exceeds the rate
++    assert gi.rate_limit_pedal_command(0.3, 0., 0., launching=True) == pytest.approx(gi.LAUNCH_RAMP_RATE_UP * DT_CTRL)
++    assert gi.rate_limit_pedal_command(0., 0.3, 0., launching=True) == 0.
++    assert gi.rate_limit_pedal_command(0.1, 0.1 - gi.LAUNCH_RAMP_RATE_UP * DT_CTRL, 0., launching=True) == 0.1
++    # default (no flag) is byte-identical to the pre-0039 limiter at every speed
++    for v in np.linspace(0., 40., 81):
++      assert gi.get_pedal_rate_up(float(v)) == pytest.approx(2.0 * gi.get_pedal_scale(float(v)))
++      assert gi.rate_limit_pedal_command(0.3, 0.1, float(v)) == gi.rate_limit_pedal_command(0.3, 0.1, float(v), launching=False)
++
++  def test_launch_reaches_rest_ceiling_quickly(self):
++    # Owner complaint: a green-light launch sits at "2 %, then slowly ramps to 10, then 15, then 20". Closed-loop on
++    # the fork's own fitted steady-pedal gain (drive-12e/12f FIT_V/FIT_G, see test_launch_no_surge_on_fitted_plant):
++    # aEgo = G(v) * (cmd - hold(v)), integrated at 100 Hz. The real law + rate limiter drive it.
++    fit_v = self.FIT_V
++    fit_g = self.FIT_G
++
++    def trajectory(launching):
++      v, g = 0., 0.
++      t10 = t12 = None
++      for k in range(int(6.0 / DT_CTRL)):
++        t = k * DT_CTRL
++        target = gi.get_pedal_command(1.2, v)
++        g = gi.rate_limit_pedal_command(target, g, v, launching and v <= gi.LAUNCH_RAMP_V_MAX)
++        v = max(0., v + float(np.interp(v, fit_v, fit_g)) * (g - gi.get_hold_command(v)) * DT_CTRL)
++        if t10 is None and g >= 0.10:
++          t10 = t
++        if t12 is None and g >= 0.12:
++          t12 = t
++      return t10, t12
++
++    t10_before, t12_before = trajectory(False)
++    t10_after, t12_after = trajectory(True)
++    # after: 0 -> 0.10 in ~0.17 s, 0 -> the 0.12 rest ceiling in ~0.20 s
++    assert t10_after <= 0.25 and t12_after <= 0.30, (t10_after, t12_after)
++    # before was ~0.49 s / ~0.6 s: the launch is at least 2x quicker to real pedal authority
++    assert t10_before > 0.4 and t10_after < t10_before / 2.0, (t10_before, t10_after)
++    assert t12_after < t12_before / 2.0, (t12_before, t12_after)
++
+   def test_rolling_engage_ramp_time(self):
+     # 12e @112 / 12f @137 / @686: rolling engages at 11-19 m/s jumped 0 -> 0.35 in 0.47 s (+1.0 m/s^2 in ~0.5 s).
+     # Now 0 -> cap takes >= 1.0 s at 12 m/s, ~0.7 s at 18 m/s, and ~0.49 s on the highway (about as before)
+-    def ramp_s(v):
++    def ramp_s(v, launching=False):
+       g, n = 0., 0
+       while g < gi.MAX_INTERCEPTOR_GAS:
+-        g = gi.rate_limit_pedal_command(gi.MAX_INTERCEPTOR_GAS, g, v)
++        g = gi.rate_limit_pedal_command(gi.MAX_INTERCEPTOR_GAS, g, v, launching)
+         n += 1
+       return n * DT_CTRL
+     assert ramp_s(12.) == pytest.approx(gi.MAX_INTERCEPTOR_GAS / 0.33, abs=2 * DT_CTRL)
+     assert ramp_s(12.) > 1.0
+     assert ramp_s(18.) == pytest.approx(0.70, abs=0.02)
+     assert ramp_s(30.) == pytest.approx(gi.MAX_INTERCEPTOR_GAS / 0.72, abs=2 * DT_CTRL)
++    # 0039 regression: even if the launch latch were somehow still set at rolling speed, the ramp is UNCHANGED - the
++    # fast branch cannot fire above LAUNCH_RAMP_V_MAX, so the 11-19 m/s "jump to max" surge cannot come back. Exact
++    # equality with the pre-0039 ramp (the strongest form of "no faster"), and no rolling ramp is shorter than 0.6 s.
++    for v in (11., 12., 15., 18., 19.):
++      assert ramp_s(v, launching=True) == ramp_s(v, False), v
++      assert ramp_s(v, launching=True) > 0.6, v
+ 
+   @pytest.mark.parametrize("v_ego", [0., 5., 11.2, 20., 35.])
+   def test_pedal_command_accel_only(self, v_ego):
+@@ -706,6 +763,66 @@ class TestPedalFaultClearEndToEnd:
+     assert not CI.CS.pedal_fault_monitor.escalated and not CI.CS.pedal_fault_monitor.clear_frames
+ 
+ 
++class TestLaunchRampIntegration:
++  """0039: through the real CarInterface.apply path, the launch latch selects the fast ramp only from (near) rest."""
++  def _make(self, accel=1.2):
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    CI = CarInterface(CP, CP_SP)
++    CC = structs.CarControl()
++    CC.enabled = CC.latActive = CC.longActive = True
++    CC.actuators.accel = accel
++    return CI, CC.as_reader(), structs.CarControlSP()
++
++  def test_latch_sets_from_rest_and_clears_above_launch_speed(self):
++    assert gi.LAUNCH_RAMP_V_MAX == 3.0
++    CI, CC, CC_SP = self._make()
++    t = 0
++    seen = []
++    for v in [0., 0., 1., 2., 3., 3.01, 5., 12., 18., 25., 2.9, 0.]:
++      for _ in range(3):
++        t += int(DT_CTRL * 1e9)
++        CI.update([])
++        CI.CS.out.vEgo = v
++        CI.apply(CC, CC_SP, t)
++        seen.append((v, CI.CC.gas_launching))
++    # a positive request at v <= 3 m/s latches; above it (rolling re-engagement) it never does
++    assert all(l for v, l in seen if v <= gi.LAUNCH_RAMP_V_MAX), seen
++    assert not any(l for v, l in seen if v > gi.LAUNCH_RAMP_V_MAX), seen
++
++  def test_latch_clears_on_non_positive_request(self):
++    CI, CC, CC_SP = self._make()
++    t = 0
++    for _ in range(6):                       # positive at rest -> latched
++      t += int(DT_CTRL * 1e9)
++      CI.update([]); CI.CS.out.vEgo = 0.; CI.apply(CC, CC_SP, t)
++    assert CI.CC.gas_launching
++    cc_coast = structs.CarControl()
++    cc_coast.enabled = cc_coast.latActive = cc_coast.longActive = True
++    cc_coast.actuators.accel = -2.0
++    t += int(DT_CTRL * 1e9)
++    CI.update([]); CI.CS.out.vEgo = 0.; CI.apply(cc_coast.as_reader(), CC_SP, t)
++    assert not CI.CC.gas_launching
++
++  def test_standstill_launch_reaches_authority_fast(self):
++    # real path at v=0: the command must reach 0.05 pedal within the first 5 send slots and 0.10 within 9, and never
++    # exceed the unchanged 0.12 rest ceiling. Pre-0039 the same law needed 3x as long (0.05 @ 0.26 s, 0.10 @ 0.52 s);
++    # here 0.05 @ ~0.10 s, 0.10 @ ~0.18 s. Raw mapping (DBC, bench-pinned): raw = 465 + frac * 2151.
++    CI, CC, CC_SP = self._make(accel=1.2)
++    t, slots = 0, []
++    for i in range(80):
++      t += int(DT_CTRL * 1e9)
++      CI.update([])
++      CI.CS.out.vEgo = 0.
++      _, sends = CI.apply(CC, CC_SP, t)
++      cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
++      if cmd:
++        slots.append((cmd[0][0] << 8) | cmd[0][1])
++    assert len(slots) >= 11
++    assert slots[4] >= 573 - 6, slots[:6]       # 0.05 pedal by the 5th send slot (~0.10 s)
++    assert slots[8] >= 680 - 6, slots[:10]      # 0.10 pedal by the 9th send slot (~0.18 s)
++    assert max(slots) <= 465 + 0.12 * 2151 + 3, max(slots)  # never above the 0.12 rest ceiling
++
++
+ class TestNoClu11InPedalMode:
+   """Root-cause fix for the pedal SCE faults: openpilot never transmits CLU11 (0x4F1) in gas-interceptor mode. Our CLU11
+   shares the ID with the cluster's own 50 Hz CLU11; on routes 11c and 123 every commanded SCE onset followed one of our
