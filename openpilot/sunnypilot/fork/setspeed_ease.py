@@ -12,21 +12,70 @@ within ~1 m/s of the target (134 @157: 40 -> 80 mph, request 1.0-1.2 m/s^2, peda
 ``LongitudinalPersonality`` only changes the MPC follow gap / jerk weights, so it does not change this at all. The
 owner: "just because I raised max speed 10 mph doesn't mean I need to be going that speed right away; it's robotic".
 
+The same asymmetry, downwards, is the ping-pong the owner then complained about: LOWERING the set speed passed the
+reduced target straight through, so a single 5 mph DOWN press snapped the cruise error to -2.24 m/s (clipped, and
+jerk-limited, to ``A_CRUISE_MIN`` = -1.2 m/s^2 and held): a real, hard deceleration where the owner asked for engine
+braking. Owner: "we need to not immediately jump to braking when the max/set speed drops 5 or less mph / we can
+likely just engine brake to slow down enough for that / and we still accelerate a bit too quickly when cruising and
+bumping the max speed up 5 mph / remember I adjust max/set speed in 5mph increments". Both halves are addressed
+here, and both are expressed in terms of the car's own physics / the owner's increment rather than a magic number.
+
 What it does
 ------------
 The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``v_ease``:
 
-* Ramp: ``v_ease`` rises toward the target at ``rate(v_ego, personality)`` m/s per s. The cruise term is a 1/s P
-  controller on ``v_ease - v_ego``, so the request builds up over ~1 s (no step), settles near ``rate`` and tapers into
-  the new speed.
+* Ramp (UP): ``v_ease`` rises toward the target at ``rate(v_ego, personality) * bump_rate_scale(bump)`` m/s per s.
+  The cruise term is a 1/s P controller on ``v_ease - v_ego``, so the request builds up over ~1 s (no step), settles
+  near ``rate`` and tapers into the new speed.
+* Bump-scaled rate (UP): the rate is scaled by the SIZE of the raise the ramp is chasing, ``bump_rate_scale``. A
+  +5 mph raise -- the owner's increment -- ramps at ``BUMP_MIN_SCALE`` (0.5) x the personality rate; a +10 mph raise
+  (``BUMP_FULL`` = 2 x the increment) or bigger ramps at the full personality rate, linear in between. So bumping
+  the max speed up 5 mph while cruising pulls about half as hard as it did, while a +10 / +20 mph raise keeps the
+  feel the ease was tuned for. The raise is latched in ``_bump`` at its widest for the duration of the ramp (so the
+  rate is constant and the ramp still reaches the target -- no asymptotic crawl) and cleared once the car is within
+  ``RAMP_DONE_GAP`` of the target, so a LATER small raise is gentle again. Personality stays the feel dial on top of
+  it; no raise, no scale.
 * Leash: ``v_ease <= v_ego + rate * LEASH_S``. The cruise request can never exceed ~``LEASH_S * rate`` (car lagging on
   a hill / at the pedal cap, or the car was held below the target by a lead or a curve and the constraint goes away).
-* DOWN is immediate: ``v_ease <= target`` always (down press, long-press-down to current speed, SLA lowering, SCC
-  curve slowdown, forceDecel -> 0).
-* Never a slowdown: ``v_ease >= min(v_ego, target)``. So the eased cruise request lies between ``min(0, upstream)``
-  and ``upstream``: it can lower a POSITIVE request but never creates or deepens a decel. The final plan is the min over
-  the MPC (lead) / cruise / e2e candidates, so lead braking, lead-follow decel, curve slowdowns and stops are never
-  weaker than upstream.
+  The leash uses the same bump-scaled rate, so a small raise is bounded in the request it can ever ask for, not just
+  slower to build.
+* DOWN easing (small discretionary set-speed drops): lowering the set speed by an amount the car's own COAST closes
+  is no longer passed through as a commanded deceleration. The cruise speed is held at the car's own speed
+  (``v_ease = v_ego``), i.e. the cruise request is 0 -- neither throttle nor brake -- and the car bleeds the excess
+  with engine braking + road load, exactly as the owner asks ("we can likely just engine brake to slow down enough
+  for that"). The boundary is principled rather than a literal 5 mph: it is this car's MEASURED coast decel
+  (``DOWN_COAST_A`` ~0.4 m/s^2; the coast table in car-features/brake-smooth/esc_dynamics.json reads -0.30..-0.59
+  over 13-26 m/s) times the coast time that still counts as comfortable (``DOWN_COAST_S`` = 6 s), giving
+  ``DOWN_COAST_DROP`` = 2.4 m/s = 5.4 mph. The owner's increment is 5 mph, so ONE DOWN press coasts; TWO (10 mph,
+  4.47 m/s) is a real speed change the coast cannot close comfortably and is passed through to the planner's normal
+  decel EXACTLY as upstream.
+  Keyed off the SIZE of the drop, not the instantaneous speed error: the set speed changes in discrete steps (the
+  cruise handler applies a step per button release -- ``car/cruise.py``), so the ease watches it and, on the tick it
+  falls (last tick's ``_v_set_prev`` -> this tick's ``v_set``), latches a coast ONLY when that fall is
+  <= ``DOWN_COAST_DROP`` AND the set speed ITSELF is the arbitrated target (``v_target >= v_set - SET_EPS``, i.e. the
+  cruise candidate is the binding one) AND the car is still above the new speed. So the decision is all-or-nothing per
+  set-speed change: a big drop is never partially coasted (no "brake to within 5 mph, then coast the last 5" tail) and
+  the ease cannot oscillate around the boundary. The coast is held until the car reaches the latched target (``v_ego``
+  is tracked live, so it never overshoots below it) or the set speed moves again.
+  The ease is DISCRETIONARY ONLY. A curve (SCC-V) target, an SLA candidate and a stop / ``forceDecel`` (which zeroes
+  the set speed before the planner sees it) all fail the ``v_target >= v_set - SET_EPS`` / ``v_set > 0`` test and pass
+  through EXACTLY as upstream: this is the mirror image of the merge gate below, which steps the UP ease aside for a
+  non-discretionary (on-ramp) raise. A lead is never in this path either -- the lead lives in the MPC candidate, which
+  the ease never touches and which still wins the ``min()`` whenever it asks for real braking.
+  Known limitation (benign): on a non-PCM car SLA auto-apply WRITES the cluster set speed
+  (``speed_limit_assist.update_speed_limit_assist_v_cruise_non_pcm``), so a SMALL (<= 5 mph) limit drop is
+  indistinguishable from a driver press here and also coasts; a limit drop past ``DOWN_COAST_DROP`` and every drop SLA
+  asks the driver to confirm (> ``MAX_AUTO_DECREASE`` = 15 mph) passes through and brakes normally. Proper remediation
+  is an explicit "driver button" flag from the cruise handler; the effect here is gentler, not unsafe (no hazard decel
+  is weakened). Personality deliberately does NOT enter the DOWN boundary: whether a coast can close a drop is a
+  property of the car, not a feel preference (unlike the UP rate, which is pure feel).
+* Never a slowdown: ``v_ease >= min(v_ego, target)``. The eased cruise request lies between ``min(0, upstream)`` and
+  ``upstream``: it can lower a POSITIVE request but never creates or deepens a decel. The DOWN easing is the one
+  deliberate exception and stays on the safe side of that same guard: it holds ``v_ease`` at ``v_ego`` (>= the
+  target), so the request becomes 0. It never goes positive, never deepens a decel and never lowers the request
+  below ``min(0, upstream)``; all it does is relax OUR OWN discretionary overspeed correction. The final plan is the
+  min over the MPC (lead) / cruise / e2e candidates -- the MPC and e2e candidates are untouched -- so lead braking,
+  lead-follow decel, curve slowdowns and stops are never weaker than upstream.
 * While longitudinal is not engaged or the driver overrides with the gas, the target is passed through unchanged
   (identical to upstream) and the ramp is re-armed at the current speed, so an engage at a stored set speed ramps
   from the current speed.
@@ -74,7 +123,7 @@ The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``
   ``SetSpeedEase.merge_state`` exposes the gate so the planner can hand the SAME tick's result to the SCC-V exclusion
   (``fork/scc.py``): while merging, a predicted-only SCC-V (no current-lateral evidence) is released so it cannot bind
   the arbitrated target during the merge. Evaluating the gate once per tick keeps the debounce honest.
-* Personality is the ONLY input that changes the feel: relaxed gentlest, standard middle, aggressive ~= upstream.
+* Personality is the ONLY input that changes the UP feel: relaxed gentlest, standard middle, aggressive ~= upstream.
   When the drive-mode CAN signal is decoded, Eco/Normal/Sport -> relaxed/standard/aggressive feed this same input.
 
 Scope: only the cruise candidate. The MPC lead candidate and the e2e model candidate are untouched (a closer lead
@@ -97,7 +146,9 @@ from openpilot.sunnypilot.mapd.lib.road_type_classifier import HIGHWAY_SPEED_THR
 
 Personality = log.LongitudinalPersonality
 
-# ramp rate (m/s per s ~= the settled cruise accel request, m/s^2) vs v_ego (m/s), per personality.
+MPH = 0.44704
+
+# UP ramp rate (m/s per s ~= the settled cruise accel request, m/s^2) vs v_ego (m/s), per personality.
 # Upstream ceiling for comparison (ACC): A_CRUISE_MAX 1.2 @ 10, 0.8 @ 25, 0.6 @ 40 m/s; e2e 2.0.
 RATE_BP = [10., 20., 29.]
 RATE_V = {
@@ -106,13 +157,22 @@ RATE_V = {
   Personality.aggressive: [1.20, 0.95, 0.80],
 }
 LEASH_S = 1.5             # s; v_ease <= v_ego + rate * LEASH_S
+# bump-scaled UP rate (see the module doc): the personality rate is scaled by the size of the raise being chased.
+BUMP_FULL = 10 * MPH      # m/s; 2 x the owner's 5 mph increment: a raise this big (or bigger) uses the full rate
+BUMP_MIN_SCALE = 0.5      # a 5 mph (or smaller) raise ramps at half the personality rate
+RAMP_DONE_GAP = 0.1       # m/s; ramp "caught up" within this of the target: clear the latched raise
 LAUNCH_V = 3.0            # m/s; engaged below this = a launch (not eased)
 LAUNCH_DONE_MARGIN = 1.0  # m/s; launch over once v_ego >= target - this
 LAUNCH_END_A = 0.3        # m/s^2; ... or once the plan asked for less than this
 LAUNCH_END_S = 1.0        # s ... for this long
 RAMP_LOG_MIN_GAP = 1.0    # m/s; target - v_ease above this = "ramping" (diagnostics event on each edge)
 
-MPH = 0.44704
+# DOWN easing (see the module doc): a set-speed drop the car's own coast closes is coasted, not braked.
+DOWN_COAST_A = 0.40       # m/s^2; the car's measured coast decel (esc_dynamics.json coast: -0.30..-0.59 over 13-26 m/s)
+DOWN_COAST_S = 6.0        # s; a coast that closes the drop in this long still counts as comfortable
+DOWN_COAST_DROP = DOWN_COAST_A * DOWN_COAST_S  # m/s (2.4 = 5.4 mph): one 5 mph press coasts, two (10 mph) do not
+SET_EPS = 1e-3            # m/s; v_target >= v_set - SET_EPS <=> the arbitrated target IS the set speed
+
 # merge gate (see the module doc): pass the target through while the car is well below a highway-class speed
 MERGE_DEFICIT = 15 * MPH   # m/s; merging while v_ego < highway reference - this (owner's bumps are +5/+10 mph)
 NODATA_DEFICIT = 25 * MPH  # m/s; no map / car limit at all: merging while v_ego < v_target - this (highway-class target)
@@ -146,6 +206,25 @@ def get_rate(personality, v_ego: float) -> float:
   # an unknown personality (a value cereal adds later) gets the STANDARD table: the middle, never the un-eased one
   table = RATE_V.get(personality_id(personality), RATE_V[Personality.standard])
   return float(np.interp(v_ego, RATE_BP, table))
+
+
+def bump_rate_scale(bump: float) -> float:
+  """UP rate multiplier for a raise of ``bump`` m/s: the personality rate is used in full at ``BUMP_FULL`` and above,
+  ``BUMP_MIN_SCALE`` at the owner's 5 mph increment and below, linear in between. See the module doc."""
+  return float(np.clip(bump / BUMP_FULL, BUMP_MIN_SCALE, 1.0))
+
+
+def discretionary_down(v_target: float, v_ego: float, v_set: float | None, drop: float | None) -> bool:
+  """True for the DOWN easing (see the module doc): the SET SPEED just fell by ``drop`` (a DISCRETE change; the cruise
+  handler applies a step per button release) by at most ``DOWN_COAST_DROP``, and the set speed ITSELF is the binding
+  target -- so not a curve / SLA limit and not a stop / forceDecel. ``v_set`` / ``drop`` None = the caller has not told
+  us -> never ease down, the fail-safe direction. Keying off the size of the drop (not the instantaneous speed error)
+  is all-or-nothing: a big drop is never partially coasted, and the ease cannot oscillate around the boundary."""
+  if v_set is None or drop is None or v_set <= 0.:
+    return False                                             # no set speed / a stop (forceDecel zeroes it)
+  if v_target < v_set - SET_EPS:
+    return False                                             # a curve (SCC-V) / an SLA limit is binding: pass through
+  return 0. < drop <= DOWN_COAST_DROP and v_ego > v_target   # a small drop, the car still above it
 
 
 def merge_reference(road_type, map_limit: float, map_limit_valid: bool, ahead_limit: float, ahead_valid: bool,
@@ -217,18 +296,36 @@ class SetSpeedEase:
     self.v_ease: float | None = None
     self.launching = False
     self._low_accel_t = 0.
+    self._bump = 0.            # widest raise the current UP ramp is chasing (bump_rate_scale input)
+    self._down_target: float | None = None  # latched set speed of an in-progress DOWN coast (None = not coasting)
+    self._v_set_prev: float | None = None    # last tick's set speed, for the DOWN drop-edge test
     self.ramping = False
     self.merge_gate = MergeGate()
     self.merging = False
 
-  def step(self, v_target: float, v_ego: float, personality, active: bool, a_plan: float = 0., merging: bool = False) -> float:
+  def step(self, v_target: float, v_ego: float, personality, active: bool, a_plan: float = 0., merging: bool = False,
+           v_set: float | None = None) -> float:
     """Pure update. active = longitudinal engaged and the driver not overriding; a_plan = last plan accel;
-    merging = MergeGate output (target passed through, like a launch)."""
+    merging = MergeGate output (target passed through, like a launch); v_set = the raw cruise set speed, whose DISCRETE
+    fall is watched to tell a small discretionary drop (coast) from a hazard target (None = unknown -> never ease down)."""
     if not active:
       # not engaged / overriding: pass the target through (identical to upstream) and arm the ramp at the current speed
       self.launching = False
       self.v_ease = min(v_ego, v_target)
+      self._bump = 0.
+      self._down_target = None
+      self._v_set_prev = None
       return v_target
+
+    # DOWN easing: latch a coast on the tick the SET SPEED falls by a small amount (a discrete step per button
+    # release). The latch holds until the car reaches the latched target or a hazard target appears.
+    if self._down_target is None and not (self.launching or merging) and self._v_set_prev is not None and v_set is not None:
+      if discretionary_down(v_target, v_ego, v_set, self._v_set_prev - v_set):
+        self._down_target = v_target
+    if self._down_target is not None and (self._down_target < v_set - SET_EPS if v_set is not None else False):
+      self._down_target = None                                   # the set speed rose back: stop coasting
+    if v_set is not None:
+      self._v_set_prev = v_set
 
     if v_ego < LAUNCH_V:
       self.launching = True
@@ -243,14 +340,27 @@ class SetSpeedEase:
       # shipped launch / merge behaviour (raw target). After a merge the ramp's own leash hands over at
       # v_ego + rate * LEASH_S: the request steps down to ~1.5 x rate, never to zero
       v_ease = v_target
-    elif self.v_ease is None:
-      v_ease = min(v_ego, v_target)
+    elif self._down_target is not None and v_ego > self._down_target:
+      # a latched small discretionary drop: hold the car's own speed, so the cruise request is 0 (coast, engine
+      # braking) until the car reaches the dropped target. v_ego > v_target here, so the never-create-a-decel guard
+      # below holds with room to spare. A hazard target (lead / curve / stop) that appears now binds the arbitrated
+      # target BELOW v_target, so v_ease = v_ego >= that target too: the decel it asks for is only gentler, never a
+      # weakened hazard decel (the whole ease is a positive-direction-only relaxation).
+      v_ease = v_ego
     else:
-      rate = get_rate(personality, v_ego)
-      v_ease = min(self.v_ease + rate * self.dt, v_ego + rate * LEASH_S)  # ramp, leashed to the car
-      v_ease = max(v_ease, min(v_ego, v_target))                # never below the car (no easing-made slowdown)
-    self.v_ease = min(v_ease, v_target)                         # down is immediate; never above the target
-    return self.v_ease
+      self._down_target = None                                  # the car reached the target (or it is no longer active)
+      if self.v_ease is None:
+        v_ease = min(v_ego, v_target)
+      else:
+        # latch the widest raise this ramp is chasing and scale the rate by it (a +5 mph bump is gentler than a +20);
+        # clear it once the CAR has caught up to the target, so a later small raise is gentle again
+        gap = v_target - v_ego
+        self._bump = max(self._bump, gap) if gap > RAMP_DONE_GAP else 0.
+        rate = get_rate(personality, v_ego) * bump_rate_scale(self._bump)
+        v_ease = min(self.v_ease + rate * self.dt, v_ego + rate * LEASH_S)  # ramp, leashed to the car
+        v_ease = min(max(v_ease, min(v_ego, v_target)), v_target)           # never below the car / above the target
+    self.v_ease = v_ease
+    return v_ease
 
   def merge_state(self, sm, v_set: float, v_ego: float) -> bool:
     """Evaluate the merge gate ONCE for this tick. Shared by the SCC-V exclusion (fork/scc.py) and the ease, so the
@@ -264,17 +374,18 @@ class SetSpeedEase:
 
   def update(self, sm, v_target: float, long_enabled: bool, long_override: bool, a_plan: float,
              v_set: float | None = None, merging: bool | None = None) -> float:
-    """v_target = arbitrated target (cruise / SCC / SLA min); v_set = the cruise set speed (merge-gate cap);
+    """v_target = arbitrated target (cruise / SCC / SLA min); v_set = the cruise set speed (merge-gate cap, and the
+    DOWN-easing discriminator: a target that is not the set speed is a curve / SLA limit and is never eased);
     merging = the merge-gate result already evaluated this tick by the planner (None = evaluate here, standalone use)."""
     cs = sm['carState']
-    v_set = v_target if v_set is None else max(v_set, v_target)
+    v_set_cap = v_target if v_set is None else max(v_set, v_target)
     active = long_enabled and not long_override and sm['controlsState'].longControlState != LongCtrlState.off
     personality = sm['selfdriveState'].personality
     if merging is None:
-      merging = active and self.merge_gate.update_sm(sm, v_set, cs.vEgo, self.dt)
+      merging = active and self.merge_gate.update_sm(sm, v_set_cap, cs.vEgo, self.dt)
     if not active:
       self.merge_gate.reset()
-    v = self.step(v_target, cs.vEgo, personality, active, a_plan, merging)
+    v = self.step(v_target, cs.vEgo, personality, active, a_plan, merging, v_set)
     ramping = active and (v_target - v) > RAMP_LOG_MIN_GAP
     if ramping != self.ramping or merging != self.merging:
       self.ramping, self.merging = ramping, merging
