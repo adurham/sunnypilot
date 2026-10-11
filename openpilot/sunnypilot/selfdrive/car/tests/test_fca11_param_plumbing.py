@@ -224,5 +224,90 @@ class TestFca11ParamPlumbingE2E(OpenpilotTestCase):
     self.assertTrue(CP_SP.safetyParam & FCA11_BIT)
 
 
+def _run_shadow_path(brake, shaping, shadow):
+  """0045: real Params (compiled registry) -> initialize_params() -> setup_interfaces() with HyundaiFca11Shadow."""
+  params = Params()
+  for k in ("HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11AffineGain", "HyundaiFca11Shadow"):
+    params.remove(k)
+  params.put_bool("HyundaiGasInterceptor", True, block=True)
+  for k, v in (("HyundaiFca11Brake", brake), ("HyundaiFca11AffineGain", shaping), ("HyundaiFca11Shadow", shadow)):
+    if v is not None:
+      params.put_bool(k, v, block=True)
+  plist = sp_interfaces.initialize_params(params)
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = {**BASE_FINGERPRINT, **STD}
+  CarInterface = interfaces[CAR_UNDER_TEST]
+  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  setup_interfaces(CarInterface, CP, CP_SP, plist)
+  return CP, CP_SP, plist
+
+
+class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
+  """0045: HyundaiFca11Shadow end to end through the REAL compiled registry. Truth table (T4 config half): Shadow ON =>
+  never armed (fca11Brake / fca11AffineGain / bit 256 clear) whatever Brake / AffineGain; Shadow OFF => unchanged."""
+
+  def test_key_is_registered_in_the_compiled_registry(self):
+    params = Params()
+    params.check_key("HyundaiFca11Shadow")
+    params.put_bool("HyundaiFca11Shadow", True, block=True)
+    self.assertTrue(params.get_bool("HyundaiFca11Shadow"))
+    params.remove("HyundaiFca11Shadow")
+    self.assertFalse(params.get("HyundaiFca11Shadow", return_default=True), "default must be OFF")
+
+  def test_initialize_params_reads_the_key(self):
+    for setting in (True, False, None):
+      _, _, plist = _run_shadow_path(True, True, setting)
+      self.assertTrue(any("HyundaiFca11Shadow" in d for d in plist), setting)
+
+  def test_truth_table(self):
+    for brake in (True, False, None):
+      for shaping in (True, False, None):
+        for shadow in (True, False, None):
+          ctx = dict(brake=brake, shaping=shaping, shadow=shadow)
+          _, CP_SP, _ = _run_shadow_path(brake, shaping, shadow)
+          if shadow:
+            self.assertTrue(CP_SP.fca11Shadow, ctx)
+            self.assertFalse(CP_SP.fca11Brake, ctx)
+            self.assertFalse(CP_SP.fca11AffineGain, ctx)
+            self.assertFalse(CP_SP.safetyParam & FCA11_BIT, ctx)
+          else:
+            self.assertFalse(CP_SP.fca11Shadow, ctx)
+            self.assertEqual(bool(brake), CP_SP.fca11Brake, ctx)
+            self.assertEqual(bool(brake and shaping), CP_SP.fca11AffineGain, ctx)
+            self.assertEqual(bool(brake), bool(CP_SP.safetyParam & FCA11_BIT), ctx)
+
+  def test_shadow_safety_config_equals_brake_off(self):
+    CP_s, CP_SP_s, _ = _run_shadow_path(True, True, True)
+    CP_o, CP_SP_o, _ = _run_shadow_path(False, False, None)
+    self.assertEqual(CP_SP_o.safetyParam, CP_SP_s.safetyParam)
+    self.assertEqual(CP_o.safetyConfigs[-1].safetyParam, CP_s.safetyConfigs[-1].safetyParam)
+
+  def test_shadow_module_computes_and_never_sends(self):
+    CP, CP_SP, _ = _run_shadow_path(True, True, True)
+    os.environ["FCA11_LOG_DIR"] = "0"
+    try:
+      b = fl.Fca11LongBrake(CP, CP_SP)
+      self.assertTrue(b.shadow)
+      self.assertFalse(b.enabled)
+      CS = SimpleNamespace(out=structs.CarState(), interceptor_state=0, interceptor_fault_seen=False,
+                           fca11_cam_frame=(0, bytes(8)), fca11_now_nanos=0, fca11_wheel_min_kph=None)
+      CS.out.gearShifter = structs.CarState.GearShifter.drive
+      CS.out.vEgo = 50 / 3.6
+      CC = structs.CarControl()
+      CC.enabled = CC.longActive = True
+      CC.actuators.accel = -1.5
+      wb = []
+      for f in range(200):
+        CS.fca11_cam_frame = (f * 10_000_000, bytes(8))
+        CS.fca11_now_nanos = f * 10_000_000
+        self.assertEqual([], b.update(CC, CS, f))
+        self.assertTrue(b.shadow_out.non_actuating)
+        wb.append(b.shadow_out.shaped_lsb_wouldbe)
+      self.assertGreater(max(wb), 0)
+    finally:
+      os.environ.pop("FCA11_LOG_DIR", None)
+
+
 if __name__ == "__main__":
     unittest.main()

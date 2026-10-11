@@ -44,7 +44,8 @@ import re
 import sys
 
 # Keys whose names start with one of these are FORK-OWNED: they must be in params_keys.h. Extensible.
-FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonality")
+FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonality",
+                     "HyundaiFca11Shadow")  # 0045: named explicitly (also covered by HyundaiFca11) so a prefix edit can't drop it
 
 # CarParamsSP fields that are read but intentionally never written by the fork's wiring. Keep minimal; reason each.
 WRITER_ALLOWLIST: dict[str, str] = {}
@@ -61,6 +62,9 @@ ENV_ALLOWLIST = {
 ENV_GUARD_ALLOWLIST = {
   ("opendbc/sunnypilot/car/hyundai/fca11_long.py", "_refuse_affine_env"): {
     "FCA11_AFFINE": "refusal guard (0044): raises RuntimeError when the removed override is set; never enables anything",
+  },
+  ("opendbc/sunnypilot/car/hyundai/fca11_long.py", "_refuse_shadow_env"): {
+    "FCA11_SHADOW": "refusal guard (0045): raises RuntimeError when FCA11_SHADOW is set; Shadow is param-only",
   },
 }
 

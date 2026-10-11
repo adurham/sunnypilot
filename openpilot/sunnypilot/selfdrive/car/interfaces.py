@@ -164,4 +164,12 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11AffineGain param unknown to libparams (not rebuilt?); FCA11 brake shaping stays disabled")
 
+  # fork (0045): FCA11 SHADOW (log-only) mode. Same stale-libparams guard: a missing key leaves Shadow off. When ON, opendbc
+  # setup_interfaces configures the car exactly as FCA11 Braking OFF and the FCA11 module only computes + logs (never
+  # sends). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiFca11Shadow": params.get("HyundaiFca11Shadow", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11Shadow param unknown to libparams (not rebuilt?); FCA11 shadow mode stays disabled")
+
   return params_list

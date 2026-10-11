@@ -75,7 +75,9 @@ class CarSpecificEventsSP:
         # fork (adurham), patch 0030: FCA11-long is unavailable for the rest of this ignition (the panda has
         # handed FCA11 back to the camera / latched a pedal fault). Surfaced from CarStateSP.fca11Unavailable
         # (the opendbc half, CarStateExt): without it, openpilot silently plans stops it cannot execute.
-        if self.CP_SP.fca11Brake and CS_SP.fca11Unavailable:
+        # 0045: stays active in FCA11 SHADOW too (alert-only PERMANENT, no visual/audible car alert, never gates); in
+        # Shadow the flag is the v3 shadow core's mirror of the panda latch sources (camera hand-back / pedal fault).
+        if (self.CP_SP.fca11Brake or getattr(self.CP_SP, "fca11Shadow", False)) and CS_SP.fca11Unavailable:
           events_sp.add(EventNameSP.fca11Unavailable)
 
     elif self.CP.brand == 'toyota':

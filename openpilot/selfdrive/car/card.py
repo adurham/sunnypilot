@@ -22,6 +22,7 @@ from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
 
+from openpilot.sunnypilot.fork.fca11_shadow_guard import Fca11ShadowStats, fca11_shadow_filter
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.fork.cruise_prefs import experimental_active
@@ -89,6 +90,7 @@ class Car:
     self.params = Params()
 
     self.can_callbacks = can_comm_callbacks(self.can_sock, self.pm.sock['sendcan'])
+    self._fca11_shadow_stats = Fca11ShadowStats()   # fork (0045): host 0x38D dropped by the Shadow gate (must stay 0)
 
     is_release = False  # self.params.get_bool("IsReleaseBranch")
     is_release_sp = self.params.get_bool("IsReleaseSpBranch")
@@ -288,6 +290,9 @@ class Car:
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
+      # fork (0045): FCA11 SHADOW never sends - drop (and count) any host 0x38D before sendcan. The car layer already
+      # returns none in Shadow (gas_interceptor seam); this is the last gate before the panda. No-op unless Shadow.
+      can_sends = fca11_shadow_filter(self.CP_SP, can_sends, self._fca11_shadow_stats)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC

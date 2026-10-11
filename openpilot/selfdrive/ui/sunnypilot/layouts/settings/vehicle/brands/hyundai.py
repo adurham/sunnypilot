@@ -8,7 +8,8 @@ from openpilot.selfdrive.ui.sunnypilot.layouts.settings.vehicle.brands.base impo
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp, toggle_item_sp
-from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state
+from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state, \
+  fca11_shadow_toggle_state
 from opendbc.car.hyundai.values import CAR, UNSUPPORTED_LONGITUDINAL_CAR
 
 
@@ -27,11 +28,14 @@ class HyundaiSettings(BrandSettings):
     # Braking; visibility/enable come from the PURE fca11_settings functions (unit-tested headless).
     self.fca11_shaping_toggle = toggle_item_sp(tr("FCA11 Brake Shaping (Beta)"), "", param="HyundaiFca11AffineGain",
                                                callback=self._on_fca11_toggle_changed)
+    # fork (0045): FCA11 SHADOW (log-only). Visible with the pedal on, settable offroad only (pure fca11_settings function).
+    self.fca11_shadow_toggle = toggle_item_sp(tr("FCA11 Shadow (Log-Only)"), "", param="HyundaiFca11Shadow",
+                                              callback=self._on_fca11_toggle_changed)
     self.drive_mode_personality_toggle = toggle_item_sp(
       tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
-                  self.drive_mode_personality_toggle]
+                  self.fca11_shadow_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
   def _on_tuning_selected(index):
@@ -108,3 +112,16 @@ class HyundaiSettings(BrandSettings):
     self.fca11_shaping_toggle.set_description(shaping_desc)
     self.fca11_shaping_toggle.show_description(True)
     self.fca11_shaping_toggle.set_visible(shaping_state.visible)
+
+    # fork (0045): FCA11 Shadow (Log-Only) - visible with the pedal on, settable offroad only; next ignition.
+    shadow_state = fca11_shadow_toggle_state(pedal_raw, offroad)
+    self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)
+    shadow_desc = tr("Data collection only: computes what FCA11 brake shaping WOULD command on every frame and writes " +
+                     "it to a log on the device. It NEVER acts on the car and never sends a brake command. While ON, " +
+                     "FCA11 Braking and Brake Shaping do NOT brake the car (it drives exactly as with FCA11 Braking " +
+                     "off; you brake for every stop). Takes effect at the next ignition.")
+    if shadow_state.visible and not offroad:
+      shadow_desc = offroad_hint + shadow_desc
+    self.fca11_shadow_toggle.set_description(shadow_desc)
+    self.fca11_shadow_toggle.show_description(True)
+    self.fca11_shadow_toggle.set_visible(shadow_state.visible)

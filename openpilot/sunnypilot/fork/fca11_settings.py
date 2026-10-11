@@ -6,6 +6,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
 
   FCA11 Braking (Beta)          HyundaiFca11Brake       visible: pedal on;                 enabled: offroad
   FCA11 Brake Shaping (Beta)    HyundaiFca11AffineGain  visible: pedal on AND braking on;  enabled: offroad
+  FCA11 Shadow (Log-Only)       HyundaiFca11Shadow      visible: pedal on;                 enabled: offroad   (0045)
 
 Both keys are read at CarParams build time, so a change takes effect at the NEXT ignition; offroad-only enabling makes
 that consistent. The dependency (shaping needs braking) is ALSO enforced in the car layer (opendbc setup_interfaces), so
@@ -34,3 +35,10 @@ def fca11_brake_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
 def fca11_shaping_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleState:
   visible = _on(pedal_raw) and _on(brake_raw)
   return ToggleState(visible=visible, enabled=visible and bool(offroad))
+
+
+def fca11_shadow_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
+  """0045: FCA11 Shadow (Log-Only). Visible with the pedal on (independent of FCA11 Braking / Shaping: Shadow computes both
+  laws regardless), settable offroad only (read at CarParams build time => next ignition)."""
+  pedal_on = _on(pedal_raw)
+  return ToggleState(visible=pedal_on, enabled=pedal_on and bool(offroad))

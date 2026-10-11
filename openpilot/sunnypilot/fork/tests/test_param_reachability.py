@@ -74,6 +74,8 @@ class TestParamReachability(unittest.TestCase):
     rc, out = _run(REPO, _opendbc_root())
     self.assertEqual(0, rc, out)
     self.assertIn("HyundaiFca11AffineGain", out)       # the key is now seen AND registered
+    self.assertIn("HyundaiFca11Shadow", out)           # 0045: seen AND registered
+    self.assertIn("fca11Shadow", out)                  # 0045: read AND written (writer-lint green)
 
   def test_fork_keys_accepted_by_the_compiled_libparams(self):
     """DYNAMIC half: the real compiled registry (the libparams_c the Params wrapper loads) accepts every fork key the
@@ -84,6 +86,8 @@ class TestParamReachability(unittest.TestCase):
     keys = sorted({k for k, *_ in _collect(REPO, _opendbc_root()) if k.startswith(CPR.FORK_KEY_PREFIXES)})
     self.assertIn("HyundaiFca11AffineGain", keys)
     self.assertIn("HyundaiFca11Brake", keys)
+    self.assertIn("HyundaiFca11Shadow", keys)          # 0045
+    self.assertIn("HyundaiFca11Shadow", CPR.FORK_KEY_PREFIXES)
     for k in keys:
       with self.subTest(key=k):
         params.check_key(k)        # raises UnknownKeyName on a key the compiled registry does not know

@@ -1,0 +1,975 @@
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index b663ed75..e634f3f8 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -113,6 +113,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     # 0029 CAL: the lead's distance, for the cal sequencer's "no lead within min_lead_m" condition.
+     # None when there is no lead (the sequencer treats None as safe). Inert when cal is off.
+     CS.fca11_lead_drel_m = float(CC_SP.leadOne.dRel) if CC_SP.leadOne.status else None
++    # 0045: the lead's relative speed (m/s), a PRIMITIVE for the shadow log (TTC is derived offline). None without a lead.
++    CS.fca11_lead_vrel_mps = float(CC_SP.leadOne.vRel) if CC_SP.leadOne.status else None
+ 
+     can_sends = []
+ 
+diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
+index 4aaed29c..b726efb5 100644
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -365,7 +365,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
+       # pedal's rate so a dead pedal times out -> canValid=False (CarInterfaceBase ANDs every parser).
+       # Only the active ID dialect's sensor (0x201 GAS_SENSOR or remapped 0x701 GAS_SENSOR_R) is subscribed.
+       parsers[GAS_INTERCEPTOR_BUS_KEY] = CANParser(GAS_INTERCEPTOR_DBC, [(get_interceptor_ids(CP_SP).sensor_msg, 50)], 0)
+-    if CP_SP.fca11Brake:
++    if CP_SP.fca11Brake or CP_SP.fca11Shadow:   # 0045: the Shadow cores read the camera frame too (parser only)
+       # fork: production FCA11 long braking mirrors the camera's byte-exact 0x38D, so the bus-2 parser must keep the
+       # freshest RAW frame (not just decoded signals). Opt-in; empty set = zero cost in the hot loop.
+       parsers[Bus.cam].capture_addrs.add(FCA11_ADDR)
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 84910823..7c1d066b 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -67,6 +67,10 @@ class CarParamsSP:
+   # affine plant (extra = BITE + K*cmd_g, K~9.9 BITE~0.40) instead of the through-origin 0.67 gain, and the
+   # release-band floor drops from 8 to 4 LSB. OFF = byte-identical to 0040. Read once in Fca11LongBrake.__init__.
+   fca11AffineGain: bool = auto_field()
++  # 0045: SHADOW (log-only) mode (HyundaiFca11Shadow, default OFF). Written ONLY by setup_interfaces; when set the car is
++  # configured exactly as with FCA11 Braking OFF (fca11Brake / fca11AffineGain False, safetyParam bit 256 clear) and the
++  # FCA11 module computes + logs its would-be output, NEVER sends. Coupled with custom.capnp CarParamsSP.fca11Shadow @8.
++  fca11Shadow: bool = auto_field()
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index b79885ce..9b8693e5 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -170,7 +170,7 @@ class CarStateExt:
+ 
+       # fork: FCA11 long braking — keep the freshest raw bus-2 camera 0x38D frame for the byte-exact mirror. The bus-2
+       # parser has capture_addrs={0x38D} when the toggle is on (get_can_parsers); empty set otherwise = no hot-loop cost.
+-      if self.CP_SP.fca11Brake:
++      if self.CP_SP.fca11Brake or self.CP_SP.fca11Shadow:   # 0045: Shadow computes on the same camera frame
+         cap = can_parsers[Bus.cam].captured.get(FCA11_ADDR)
+         if cap is not None:
+           self.fca11_cam_frame = (cap[0], bytes(cap[1]))
+@@ -224,7 +224,8 @@ class CarStateExt:
+     ret_sp.driveMode = self.update_drive_mode(cp)
+     # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
+     # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
+-    ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
++    # 0045: the 0042 surfacing stays active in Shadow (spec 0b); in Shadow the flag is the v3 shadow core's.
++    ret_sp.fca11Unavailable = bool((self.CP_SP.fca11Brake or self.CP_SP.fca11Shadow) and getattr(self, "fca11_unavailable", False))
+     # 0040: the three FCA11 braking alerts (see structs.py CarStateSP). Only when the feature is armed, so the fields
+     # are exactly "this alert is up right now".
+     armed = bool(self.CP_SP.fca11Brake)
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 36d2f456..fba1e273 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -392,6 +392,86 @@ def _refuse_affine_env() -> None:
+     msg += "(Params -> initialize_params -> setup_interfaces -> CP_SP.fca11AffineGain, requires HyundaiFca11Brake). Unset the variable."
+     raise RuntimeError(msg)
+ 
++
++# *** 0045: SHADOW (log-only) mode — param HyundaiFca11Shadow -> CP_SP.fca11Shadow (DEFAULT OFF) ***
++#
++# The FCA11 final settlement BLOCKED actuating the v3 shaping law and AUTHORIZED a SHADOW deploy: the stock path
++# actuates exactly as today, and this build COMPUTES the would-be FCA11 output every frame and LOGS it - it NEVER sends.
++# How Shadow is wired (all of it is load-bearing for "never sends"):
++#   * setup_interfaces (opendbc sunnypilot/car/interfaces.py) is the ONLY writer of CP_SP.fca11Shadow. With Shadow ON it
++#     leaves the car configured EXACTLY as with FCA11 Braking OFF: fca11Brake False, fca11AffineGain False, safetyParam
++#     bit 256 (FCA11_LONG) clear - whatever HyundaiFca11Brake / HyundaiFca11AffineGain say. So the panda is not in
++#     FCA11-long mode, the PID accel bounds stay the pedal-only (-3.5, +2.0), the pedal is never hard-zeroed for a brake,
++#     and the camera's own FCA11 is forwarded as today. The sent CAN is the Brake-OFF stream byte-for-byte.
++#   * Fca11LongBrake in Shadow: `enabled` is False (this instance actuates nothing, ever) and update() returns a fresh
++#     empty list on every path. The would-be output comes from two PRIVATE compute cores (Fca11LongBrake instances built
++#     with core=True on a synthetic armed CP_SP): the v3 shaping law (affine_gain True) and the deployed 0.67 law. They
++#     run the full production state machine (debounce, min-on, hysteresis, ramp, caps, latches, alerts) on the same
++#     CC/CS the car sees, open-loop, assuming every would-be frame were accepted. Their frames are kept on
++#     `shadow_out.wouldbe_sends` (marked non_actuating) and written to the shadow log; they are never returned.
++#   * The hand-off seam (gas_interceptor.py create_gas_command: `can_sends.extend(brake_sends)`) additionally skips the
++#     extend in Shadow, and the superproject card.py drops any host 0x38D in Shadow (belt and braces, counted + logged).
++# Read ONCE at construction (CarParams build time => next ignition). A SET env FCA11_SHADOW is refused (env-override ban).
++FCA11_SHADOW_ENV_REMOVED = "FCA11_SHADOW"
++
++
++def shadow_enabled(CP_SP) -> bool:
++  """0045: the resolved Shadow state: CP_SP.fca11Shadow AND the pedal armed (the shadow cores read the pedal state).
++  Independent of fca11Brake / fca11AffineGain (Shadow computes both laws regardless). Missing field (older struct) = False."""
++  return bool(getattr(CP_SP, "fca11Shadow", False)) and bool(getattr(CP_SP, "enableGasInterceptor", False))
++
++
++def _refuse_shadow_env() -> None:
++  """0045: raise if FCA11_SHADOW is SET (any value): Shadow is reachable ONLY through the HyundaiFca11Shadow param."""
++  if FCA11_SHADOW_ENV_REMOVED in os.environ:
++    val = os.environ[FCA11_SHADOW_ENV_REMOVED]
++    msg = f"{FCA11_SHADOW_ENV_REMOVED} is set ({val!r}) but there is no env override for FCA11 Shadow (patch 0045): "
++    msg += "Shadow is enabled ONLY through the HyundaiFca11Shadow param "
++    msg += "(Params -> initialize_params -> setup_interfaces -> CP_SP.fca11Shadow). Unset the variable."
++    raise RuntimeError(msg)
++
++
++def _shadow_core_params(law_on: bool) -> structs.CarParamsSP:
++  """The synthetic, ARMED CarParamsSP a shadow compute core is built on. It never leaves this module: it is not the car's
++  CP_SP, never reaches card / the panda, and carries no safetyParam bit."""
++  return structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=bool(law_on), fca11Shadow=False)
++
++
++class _ShadowCC:
++  """The CarControl fields a shadow core reads (enabled, longActive, actuators.accel), with the ask clipped to the PID
++  bound the ACTUATING arm would have had (-FCA11_A_MAX_MSS2): in Shadow the car runs the pedal-only bounds (-3.5)."""
++  class _Act:
++    def __init__(self, accel: float):
++      self.accel = accel
++
++  def __init__(self, CC, accel_law: float):
++    self.enabled = bool(CC.enabled)
++    self.longActive = bool(CC.longActive)
++    self.actuators = _ShadowCC._Act(float(accel_law))
++
++
++class _ShadowCSView:
++  """Read-through view of the real CS for a shadow core: reads fall through to CS, WRITES stay on the view, so a core can
++  never publish anything (CS._fca11_braking_now, alert flags, ...) onto the car's CarState object."""
++  def __init__(self, cs):
++    object.__setattr__(self, "_cs", cs)
++
++  def __getattr__(self, name):
++    return getattr(object.__getattribute__(self, "_cs"), name)
++
++
++@dataclass
++class ShadowOutput:
++  """0045: one frame of the shadow module's output. ``non_actuating`` is ALWAYS True: nothing here is ever sent."""
++  non_actuating: bool = True
++  frame: int = -1
++  shaped_lsb_wouldbe: int = 0          # v3 law would-be SENT CR_VSM_DecCmd on this frame's send slot (0 = none/passive)
++  shaped_send_wouldbe: bool = False    # the v3 law would have put a 0x38D on the wire this frame
++  deployed_law_lsb: int = 0            # the unshaped instant 0.67 mapping of the same ask
++  deployed_wouldbe_lsb: int = 0        # the deployed 0.67 law's full state machine would-be SENT level
++  wouldbe_sends: tuple = ()            # the v3 would-be frames (CanData) - NEVER returned / sent
++
++
+ # camera-frame freshness for the mirror source (s): the camera sends ~50 Hz; anything older than
+ # two periods means we do not know the ESC's last-seen state -> no send (never a hardcoded frame).
+ FCA11_CAM_FRESH_S = 0.100
+@@ -543,10 +623,17 @@ class Fca11LongBrake:
+   planner (or a cal hold) asks and every gate holds.
+   """
+ 
+-  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None):
++  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None,
++               core: bool = False):
+     self.CP = CP
+     self.CP_SP = CP_SP
+-    self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
++    # 0045: `core` = a PRIVATE shadow compute core (built only by a Shadow instance below): no episode log, no cal
++    # sequencer, its CS writes go to a view. 0045 SHADOW: the actuating instance is NEVER enabled in Shadow (setup_interfaces
++    # already leaves fca11Brake False; re-applied here so a hand-built CP_SP can never actuate in Shadow).
++    _refuse_shadow_env()
++    self._core = bool(core)
++    self.shadow = (not self._core) and shadow_enabled(CP_SP)
++    self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor) and not self.shadow
+     # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
+     # frame. OFF -> the 0.67 through-origin law and the 8 LSB floor, byte-identical to 0040. 0044: CP_SP is the ONLY
+     # source (the env override is refused, the Params fallback is gone).
+@@ -580,6 +667,8 @@ class Fca11LongBrake:
+     self._brake_now_clear_since: float | None = None
+     # 0040: per-episode logger (/data/fca11-log/episodes.jsonl). See fca11_log.py for the schema and reasoning.
+     self.log = fca11_log.EpisodeLogger()
++    if self._core:
++      self.log.enabled = False         # 0045: a shadow core never writes the ACTUATION episode log (episodes.jsonl)
+     self._last_why = ""                # this frame's fca11_ok reason (the episode-end reason when !ok)
+     # 0038: gas hold-off state. `_gas_release_frame` is the controller frame the pedal last read released (None =
+     # none yet this controller); the hold-off refuses actuation for GAS_HOLDOFF_FRAMES after it. No edge is needed to
+@@ -637,11 +726,32 @@ class Fca11LongBrake:
+     # byte-identical to the shipped behaviour) unless /data/fca11-cal/plan.json exists, parses, and is
+     # fresh. See cal_mode.py for the full design.
+     self.cal_seq = None
+-    if self.enabled and os.environ.get("FCA11_CAL_DIR") != "0":
++    if self.enabled and not self._core and os.environ.get("FCA11_CAL_DIR") != "0":
+       self.cal_seq = cal_mode.CalSequencer(os.environ.get("FCA11_CAL_DIR", cal_mode.CAL_DIR))
+       self.cal_seq.mark_session(os.getpid())
+     self._cal_active = False           # this frame is a CAL hold (drives the gas neutralization)
+     self._cal_prev = False             # 0043 v2: previous frame's cal_on, for the cal-active EDGE reset of the shaped ramp
++    # ---- 0045 SHADOW (log-only): the two private compute cores + the shadow log. None unless Shadow. ----
++    self.shadow_out = ShadowOutput()
++    self._shadow_v3 = None
++    self._shadow_dep = None
++    self.shadow_log = None
++    if self.shadow:
++      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
++      self._shadow_v3 = Fca11LongBrake(CP, _shadow_core_params(law_on=True), dbc_names, core=True)
++      self._shadow_dep = Fca11LongBrake(CP, _shadow_core_params(law_on=False), dbc_names, core=True)
++      assert self._shadow_v3.affine_gain and not self._shadow_dep.affine_gain
++      self.shadow_log = fca11_shadow_log.ShadowLogger(header=dict(
++        note="FCA11 SHADOW (0045): log-only, NEVER sends; open-loop counterfactual (car not braked by this build)",
++        consts=dict(K=FCA11_SHAPE_K, BITE=FCA11_SHAPE_BITE, CLIFF_LO_EXTRA=FCA11_SHAPE_CLIFF_LO_EXTRA,
++                    CLIFF_HI_EXTRA=FCA11_SHAPE_CLIFF_HI_EXTRA, ONSET_HOLD_SENT=FCA11_SHAPE_ONSET_HOLD_SENT,
++                    JERK_TARGET=FCA11_SHAPE_JERK_TARGET, BRAKE_GAIN=FCA11_BRAKE_GAIN, A_MAX_MSS2=FCA11_A_MAX_MSS2,
++                    ONSET_ACCEL=FCA11_BRAKE_ONSET_ACCEL, RELEASE_ACCEL=FCA11_BRAKE_RELEASE_ACCEL)))
++    self._sh_engaged_prev = False
++    self._sh_engage_frame: int | None = None
++    self._sh_episode_id = 0
++    self._sh_ep: dict | None = None
++    self._sh_prev_echo: list = []      # 0045 (core only): synthetic ACCEPTED echoes of the previous frame's would-be frames
+ 
+   # ---- window ----
+ 
+@@ -834,6 +944,8 @@ class Fca11LongBrake:
+     Called once per controller frame from create_gas_command. Inert (and byte-identical to the shipped
+     behaviour) until the first call, which is what sets ``_echo_wired``.
+     """
++    if self.shadow:
++      return   # 0045: a Shadow instance sends nothing, so there is nothing to echo (its cores get synthetic echoes)
+     self._echo_wired = True
+     if not echoes:
+       return
+@@ -972,7 +1084,126 @@ class Fca11LongBrake:
+     # sent frame is the floor 4, which the panda accepts).
+     return min(int(new_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+ 
++  # ---- 0045 SHADOW (log-only) ----
++
++  def _shadow_update(self, CC, CS, frame: int, personality) -> list[CanData]:
++    """0045: one Shadow frame. Steps the two private cores (v3 shaping law + deployed 0.67 law) on the car's own CC/CS
++    (open-loop: every would-be frame is assumed ACCEPTED - each core gets synthetic src-128 echoes of its previous
++    frame's would-be frames, exactly what the actuating build sees when the panda accepts), publishes the would-be values
++    on ``shadow_out`` (non_actuating) and the shadow log, and RETURNS AN EMPTY LIST. This instance never brakes: braking /
++    _cal_active stay False (the pedal path is the Brake-OFF path) and the three 0040 braking alerts stay off (they assume
++    actuation; their would-be state is logged). The 0042 fca11_unavailable surfacing follows the v3 core."""
++    assert self._shadow_v3 is not None and self._shadow_dep is not None
++    accel = float(CC.actuators.accel)
++    accel_law = max(accel, -FCA11_A_MAX_MSS2)
++    cc = _ShadowCC(CC, accel_law)
++    out = {}
++    for name, core in (("v3", self._shadow_v3), ("dep", self._shadow_dep)):
++      core.observe_echo(list(core._sh_prev_echo))
++      core_sends = core.update(cc, _ShadowCSView(CS), frame, personality)
++      core._sh_prev_echo = [(128, bytes(s.dat)) for s in core_sends]
++      lsb = int(core_sends[-1].dat[1]) if core_sends else 0
++      out[name] = (core_sends, lsb)
++    v3_sends, v3_lsb = out["v3"]
++    _dep_sends, dep_lsb = out["dep"]
++    ask_onset = min(accel_law, FCA11_BRAKE_ONSET_ACCEL)
++    deployed_law_lsb = clamp_dec_cmd(dec_cmd_from_accel(ask_onset), personality) if accel_law <= FCA11_BRAKE_ONSET_ACCEL else 0
++    self.shadow_out = ShadowOutput(non_actuating=True, frame=int(frame), shaped_lsb_wouldbe=v3_lsb,
++                                   shaped_send_wouldbe=bool(v3_sends), deployed_law_lsb=int(deployed_law_lsb),
++                                   deployed_wouldbe_lsb=dep_lsb, wouldbe_sends=tuple(v3_sends))
++    # this instance: never braking, alerts off, unavailability surfaced from the v3 core (0042 stays active in Shadow)
++    self.braking = False
++    self._cal_active = False
++    self.supervise_stop = self.stop_complete = self.brake_now = self.low_speed_alert = False
++    self.brake_now_reason = ""
++    self.fca11_unavailable = bool(self._shadow_v3.fca11_unavailable)
++    try:
++      self._shadow_record(CC, CS, frame, personality, accel, accel_law)
++    except Exception:  # noqa: BLE001 - a log must never take card down
++      pass
++    return []
++
++  def _shadow_record(self, CC, CS, frame: int, personality, accel: float, accel_law: float) -> None:
++    v3 = self._shadow_v3
++    assert v3 is not None and self._shadow_dep is not None
++    o = self.shadow_out
++    engaged = bool(CC.enabled)
++    if engaged and not self._sh_engaged_prev:
++      self._sh_engage_frame = frame
++    if not engaged:
++      self._sh_engage_frame = None
++    self._sh_engaged_prev = engaged
++    braking = bool(v3.braking)
++    v = float(CS.out.vEgo)
++    if braking and self._sh_ep is None:
++      self._sh_episode_id += 1
++      self._sh_ep = dict(episode_id=self._sh_episode_id, frame_start=frame, t_wall_start=time.time(), n_frames=0,
++                         n_sent=0, shaped_min=None, shaped_max=0, shaped_last=0, deployed_law_max=0,
++                         deployed_wouldbe_max=0, cap_hit_frames=0, held_band_frames=0, v_start_mps=v, v_min_mps=v,
++                         ask_min_mps2=accel_law, camera_request_seen=False, tier_cap=personality_max_dec(personality))
++    if frame % FCA11_SEND_EVERY != 0 and not (self._sh_ep is not None and not braking):
++      return   # frame records ride the 50 Hz send slot (the would-be stream's own rate); episode close is never missed
++    cam = getattr(CS, "fca11_cam_frame", None)
++    dat = cam[1] if cam is not None and len(cam[1]) == 8 else None
++    cam_req = bool(dat is not None and camera_requesting(dat))
++    ep = self._sh_ep
++    if ep is not None and braking:
++      ep["n_frames"] += 1
++      ep["n_sent"] += int(o.shaped_send_wouldbe and o.shaped_lsb_wouldbe > 0)
++      if o.shaped_send_wouldbe and o.shaped_lsb_wouldbe > 0:
++        ep["shaped_min"] = o.shaped_lsb_wouldbe if ep["shaped_min"] is None else min(ep["shaped_min"], o.shaped_lsb_wouldbe)
++        ep["shaped_max"] = max(ep["shaped_max"], o.shaped_lsb_wouldbe)
++        ep["shaped_last"] = o.shaped_lsb_wouldbe
++        ep["cap_hit_frames"] += int(o.shaped_lsb_wouldbe >= personality_max_dec(personality))
++      ep["deployed_law_max"] = max(ep["deployed_law_max"], o.deployed_law_lsb)
++      ep["deployed_wouldbe_max"] = max(ep["deployed_wouldbe_max"], o.deployed_wouldbe_lsb)
++      ep["held_band_frames"] += int(bool(v3._shape_in_hold_band))
++      ep["v_min_mps"] = min(ep["v_min_mps"], v)
++      ep["ask_min_mps2"] = min(ep["ask_min_mps2"], accel_law)
++      ep["camera_request_seen"] = bool(ep["camera_request_seen"] or cam_req)
++    why = (v3._last_why or None) if CC.longActive else "long_inactive"
++    lead_d = getattr(CS, "fca11_lead_drel_m", None)
++    lead_vr = getattr(CS, "fca11_lead_vrel_mps", None)
++    rec = dict(
++      t_wall=time.time(), frame=int(frame),
++      t_since_engage=(None if self._sh_engage_frame is None else round((frame - self._sh_engage_frame) * 0.01, 2)),
++      v_ego_mps=round(v, 4), a_ego_mps2=round(float(getattr(CS.out, "aEgo", 0.0) or 0.0), 4),
++      ask_mps2=round(accel, 4), ask_law_mps2=round(accel_law, 4), camera_requesting=cam_req,
++      camera_request_level=(int(dat[1]) if dat is not None else None),
++      camera_warn=(_get_bits(dat, CAM_ACT_WARN_BITS[0], CAM_ACT_WARN_BITS[1]) if dat is not None else None),
++      cam_hex=(dat.hex() if dat is not None else None),
++      shaped_lsb_wouldbe=int(o.shaped_lsb_wouldbe), shaped_send_wouldbe=bool(o.shaped_send_wouldbe),
++      shaped_target_lsb=(int(personality_max_dec(personality)) if v3._shape_in_hold_band else
++                         int(shape_dec_cmd_from_extra(max(0.0, -min(accel_law, FCA11_BRAKE_ONSET_ACCEL)),
++                                                      personality_max_dec(personality)))) if braking else 0,
++      deployed_law_lsb=int(o.deployed_law_lsb), deployed_wouldbe_lsb=int(o.deployed_wouldbe_lsb),
++      tier_cap=int(personality_max_dec(personality)), personality=int(getattr(personality, "raw", personality)),
++      engaged=engaged, long_active=bool(CC.longActive), braking_wouldbe=braking,
++      held_band=bool(v3._shape_in_hold_band), latched=bool(v3.blocked_until_resume),
++      hc_unavailable=bool(v3.fca11_unavailable), hard_cut=bool(v3._hard_cut), pedal_cut=bool(v3._pedal_cut),
++      excl_reason=why, episode_id=(ep["episode_id"] if ep is not None else None),
++      standstill=bool(getattr(CS.out, "standstill", False)), gas_pressed=bool(CS.out.gasPressed),
++      brake_pressed=bool(CS.out.brakePressed),
++      lead_drel_m=(None if lead_d is None else round(float(lead_d), 2)),
++      lead_vrel_mps=(None if lead_vr is None else round(float(lead_vr), 3)),
++      alert_bits_wouldbe=int(v3.supervise_stop) | (int(v3.stop_complete) << 1) | (int(v3.brake_now) << 2),
++    )
++    if self.shadow_log is not None:
++      window = bool(braking or bool(self._shadow_dep.braking) or cam_req or
++                    (CC.longActive and accel_law <= FCA11_BRAKE_RELEASE_ACCEL))
++      self.shadow_log.frame(rec, window)
++    if ep is not None and not braking:
++      ep.update(frame_end=int(frame), t_wall_end=time.time(), duration_s=round((frame - ep["frame_start"]) * 0.01, 2),
++                v_end_mps=v, end_reason=(why or "release"), shaped_min=(ep["shaped_min"] or 0))
++      ep = {k: (round(x, 4) if isinstance(x, float) else x) for k, x in ep.items()}
++      if self.shadow_log is not None:
++        self.shadow_log.epilogue(ep)
++      self._sh_ep = None
++
+   def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
++    if self.shadow:
++      # 0045 SHADOW: compute + log only. NEVER returns a frame (the would-be frames live on shadow_out.wouldbe_sends).
++      return self._shadow_update(CC, CS, frame, personality)
+     sends: list[CanData] = []
+     if not self.enabled:
+       self.braking = False
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+new file mode 100644
+index 00000000..9096f0de
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+@@ -0,0 +1,167 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++0045: FCA11 SHADOW (log-only) writer -- ``fca11-shadow.jsonl``.
++
++WHY THIS EXISTS
++The FCA11 final settlement BLOCKED actuating the v3 shaping law (it trades braking authority for smoothness on a
++safety tail the sim plant cannot confirm or clear) and AUTHORIZED a SHADOW deploy: the build computes the law's
++would-be output every frame and LOGS it; it NEVER sends. This module is the log. It records PRIMITIVES only (asks,
++speeds, would-be levels of each law, camera request, latch/state flags, lead) so any authority-floor design can be
++derived OFFLINE; no floor formula is baked in here.
++
++FORMAT (one JSON object per line, ``sort_keys``; every record has ``"k"`` = record kind and ``"schema"``):
++  k="hdr"  once per writer (= once per ignition / card start): schema, t_wall, shadow law constants, note.
++  k="f"    one FRAME record per 50 Hz send slot while the shadow window is OPEN (see ``ShadowLogger.frame``):
++             t_wall, frame, t_since_engage, v_ego_mps, a_ego_mps2, ask_mps2 (raw planner accel = CC.actuators.accel),
++             ask_law_mps2 (the ask the law consumed: clipped to -FCA11_A_MAX_MSS2, the PID bound the actuating arm
++             would have had), camera_requesting (bool), camera_request_level (the camera's own CR_VSM_DecCmd raw LSB,
++             byte 1 of the freshest bus-2 0x38D; null with no frame), camera_warn (CF_VSM_Warn bits), cam_hex (raw
++             camera frame), shaped_lsb_wouldbe (the v3 law's would-be SENT CR_VSM_DecCmd this slot; 0 = passive/none),
++             shaped_send_wouldbe (a 0x38D would have gone out this slot: actuating or the passive close frame),
++             shaped_target_lsb (the v3 level target before slew/hold/+4 clamps), deployed_law_lsb (the UNSHAPED instant
++             mapping of the same ask: clamp_dec_cmd(dec_cmd_from_accel(ask)), 0 above the onset ask),
++             deployed_wouldbe_lsb (the deployed 0.67 law's full state machine would-be SENT level), tier_cap,
++             personality, engaged, long_active, braking_wouldbe, held_band, latched (blocked_until_resume),
++             hc_unavailable (the 0042 surfaced fca11_unavailable of the shadow core), hard_cut, pedal_cut,
++             excl_reason (the core's fca11_ok why-not, null when ok), episode_id (null outside an episode),
++             standstill, gas_pressed, brake_pressed, lead_drel_m, lead_vrel_mps, alert_bits_wouldbe
++             (1 supervise-stop | 2 stop-complete | 4 brake-now, as the actuating build would have raised them).
++  k="ep"   one EPILOGUE per would-be episode (shaped core braking true -> false): episode_id, frame/t bounds,
++             duration_s, n_frames, n_sent, shaped min/max/last, deployed_law max, deployed_wouldbe max, cap-hit and
++             hold-band frame counts, v start/min/end, ask min, camera_request_seen, end_reason, tier_cap.
++  k="trunc" once if the per-drive byte bound is hit (nothing further is written this drive).
++
++COUNTERFACTUAL NOTE (read before analysing): the car is NOT braked by this build. The would-be streams are computed
++OPEN-LOOP against the vehicle as it actually moved (stock behaviour), assuming every would-be frame were accepted
++by the panda (no echo verdicts exist in shadow). They are NOT the closed-loop trajectory v3 would have produced.
++
++WHERE / SIZE
++Directory = the FCA11 log dir convention (fca11_log.FCA11_LOG_DIR = /data/fca11-log, env FCA11_LOG_DIR; "0"
++disables I/O). File ``fca11-shadow.jsonl``. Per-drive bound: at construction the previous drive's file rotates to
++``.1`` (.1 -> .2 ... up to FCA11_SHADOW_KEEP generations; the oldest is dropped) and a drive writes at most
++FCA11_SHADOW_MAX_BYTES (then one k="trunc" record). Writes are buffered and flushed ~1/s and at every episode end;
++every OSError is swallowed (a log must never take card down).
++"""
++import json
++import os
++import time
++
++from opendbc.sunnypilot.car.hyundai import fca11_log
++
++FCA11_SHADOW_FILE = "fca11-shadow.jsonl"
++FCA11_SHADOW_SCHEMA = 1
++FCA11_SHADOW_MAX_BYTES = 25 * 1024 * 1024   # per drive
++FCA11_SHADOW_KEEP = 5                        # previous drives kept (.1 newest .. .5 oldest)
++FCA11_SHADOW_FLUSH_RECORDS = 50              # ~1 s of 50 Hz frame records
++# the shadow WINDOW (when frame records are written): open while the shaped core is braking, the ask is at/below the
++# release threshold, or the camera is requesting; plus PRE/POST context of this many 50 Hz records (1 s each).
++FCA11_SHADOW_CONTEXT_RECORDS = 50
++
++FRAME_FIELDS = (
++  "t_wall", "frame", "t_since_engage", "v_ego_mps", "a_ego_mps2", "ask_mps2", "ask_law_mps2", "camera_requesting",
++  "camera_request_level", "camera_warn", "cam_hex", "shaped_lsb_wouldbe", "shaped_send_wouldbe", "shaped_target_lsb",
++  "deployed_law_lsb", "deployed_wouldbe_lsb", "tier_cap", "personality", "engaged", "long_active", "braking_wouldbe",
++  "held_band", "latched", "hc_unavailable", "hard_cut", "pedal_cut", "excl_reason", "episode_id", "standstill",
++  "gas_pressed", "brake_pressed", "lead_drel_m", "lead_vrel_mps", "alert_bits_wouldbe",
++)
++EPILOGUE_FIELDS = (
++  "episode_id", "frame_start", "frame_end", "t_wall_start", "t_wall_end", "duration_s", "n_frames", "n_sent",
++  "shaped_min", "shaped_max", "shaped_last", "deployed_law_max", "deployed_wouldbe_max", "cap_hit_frames",
++  "held_band_frames", "v_start_mps", "v_min_mps", "v_end_mps", "ask_min_mps2", "camera_request_seen", "end_reason",
++  "tier_cap",
++)
++
++
++def resolve_dir(dir_path=None):
++  """explicit dir (tests / offline tools) > env FCA11_LOG_DIR > fca11_log.FCA11_LOG_DIR. "0" / "" = disabled."""
++  if dir_path is not None:
++    d = dir_path
++  else:
++    d = os.environ.get("FCA11_LOG_DIR", fca11_log.FCA11_LOG_DIR)
++  return d if (d and d != "0") else None
++
++
++class ShadowLogger:
++  """Buffered JSONL writer for the shadow streams. Inert (no I/O) when the dir resolves to disabled."""
++
++  def __init__(self, dir_path=None, header=None):
++    self.dir = resolve_dir(dir_path)
++    self.enabled = self.dir is not None
++    self.path = os.path.join(self.dir, FCA11_SHADOW_FILE) if self.enabled else None
++    self.bytes = 0
++    self.truncated = False
++    self.n_records = 0
++    self._buf: list[str] = []
++    self._pre: list[dict] = []        # pre-context ring (frame records not yet written)
++    self._post_left = 0
++    if self.enabled:
++      try:
++        os.makedirs(self.dir, exist_ok=True)
++        self._rotate()
++      except OSError:
++        self.enabled = False
++    self.write(dict(k="hdr", t_wall=time.time(), **(header or {})))
++
++  # ------------------------------------------------------------------ rotation / io
++  def _rotate(self) -> None:
++    for i in range(FCA11_SHADOW_KEEP - 1, 0, -1):
++      src = f"{self.path}.{i}"
++      if os.path.exists(src):
++        os.replace(src, f"{self.path}.{i + 1}")
++    if os.path.exists(self.path):
++      os.replace(self.path, f"{self.path}.1")
++
++  def write(self, rec: dict) -> None:
++    if not self.enabled or self.truncated:
++      return
++    rec.setdefault("schema", FCA11_SHADOW_SCHEMA)
++    line = json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n"
++    if self.bytes + len(line) > FCA11_SHADOW_MAX_BYTES:
++      self.truncated = True
++      self._buf.append(json.dumps(dict(k="trunc", schema=FCA11_SHADOW_SCHEMA, t_wall=time.time(), bytes=self.bytes),
++                                  sort_keys=True) + "\n")
++      self.flush()
++      return
++    self.bytes += len(line)
++    self.n_records += 1
++    self._buf.append(line)
++    if len(self._buf) >= FCA11_SHADOW_FLUSH_RECORDS:
++      self.flush()
++
++  def flush(self) -> None:
++    if not self._buf:
++      return
++    buf, self._buf = self._buf, []
++    if not self.enabled:
++      return
++    try:
++      with open(self.path, "a") as f:
++        f.write("".join(buf))
++    except OSError:
++      pass
++
++  # ------------------------------------------------------------------ windowed frame records
++  def frame(self, rec: dict, window_open: bool) -> None:
++    """Write a k="f" record if the shadow window is open (with 1 s pre/post context); otherwise keep it in the ring."""
++    rec = dict(rec, k="f")
++    if window_open:
++      for r in self._pre:
++        self.write(r)
++      self._pre = []
++      self.write(rec)
++      self._post_left = FCA11_SHADOW_CONTEXT_RECORDS
++    elif self._post_left > 0:
++      self.write(rec)
++      self._post_left -= 1
++    else:
++      self._pre.append(rec)
++      if len(self._pre) > FCA11_SHADOW_CONTEXT_RECORDS:
++        self._pre.pop(0)
++
++  def epilogue(self, rec: dict) -> None:
++    self.write(dict(rec, k="ep"))
++    self.flush()
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index d87aac2a..26105ec9 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -24,7 +24,7 @@ from opendbc.car import Bus, DT_CTRL, structs
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car import create_gas_interceptor_command
+-from opendbc.sunnypilot.car.hyundai.fca11_long import Fca11LongBrake
++from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR, Fca11LongBrake
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+ 
+ GAS_INTERCEPTOR_DBC = "hyundai_gas_interceptor_generated"
+@@ -308,6 +308,7 @@ class GasInterceptorCarController:
+     self.interceptor_ids = get_interceptor_ids(CP_SP)
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
++    self.shadow_dropped = 0   # 0045: host 0x38D frames the Shadow seam dropped (must stay 0: the module returns [])
+ 
+   def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0,
+                          personality: int = PERSONALITY_STANDARD) -> list[CanData]:
+@@ -390,5 +391,13 @@ class GasInterceptorCarController:
+       can_sends.append(create_gas_interceptor_command(self.interceptor_packer, 0. if clear else self.gas, frame // 2,
+                                                      self.interceptor_ids.command_msg))
+ 
+-    can_sends.extend(brake_sends)
++    # 0045 SHADOW: THE SEND SEAM. In Shadow the FCA11 hand-off is SKIPPED entirely - the would-be frames stay on
++    # fca11_brake.shadow_out (non_actuating) and in the shadow log, and NO 0x38D leaves this function on any path (the
++    # module already returns [] in Shadow; this is the structural gate, and any 0x38D that still reached it is dropped
++    # and counted). One-line revert of the gate: `can_sends.extend(brake_sends)`.
++    if self.fca11_brake.shadow:
++      self.shadow_dropped += sum(1 for s in brake_sends if s[0] == FCA11_ADDR)
++      can_sends = [s for s in can_sends if s[0] != FCA11_ADDR]   # CanData and plain (addr, dat, bus) tuples both index [0]
++    else:
++      can_sends.extend(brake_sends)
+     return can_sends
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+new file mode 100644
+index 00000000..296f86a9
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+@@ -0,0 +1,382 @@
++"""
++0045: FCA11 SHADOW (log-only) mode, opendbc side (HyundaiFca11Shadow -> CP_SP.fca11Shadow).
++
++Pins the load-bearing property (Shadow NEVER sends) and the compute/log contract:
++  * truthy parser (shared with the FCA11 siblings) + the Shadow OVERRIDE in setup_interfaces (car configured exactly as
++    FCA11 Braking OFF whatever Brake / AffineGain say);
++  * dependency semantics: Shadow computes BOTH laws regardless of Brake / AffineGain;
++  * env ban: a SET FCA11_SHADOW raises at construction;
++  * writer format: header / frame / epilogue records carry the documented fields;
++  * no-send: the module output is non_actuating and update() returns [] on every frame; through the REAL CarController
++    path the sent stream is byte-identical to the Brake-OFF stream and carries ZERO 0x38D;
++  * compute-equivalence (unit form): the shadow would-be streams equal what the actuating ON / OFF instances SEND on the
++    same inputs (the harness form over campaign windows is wsS T2).
++"""
++import json
++import os
++
++import pytest
++
++from opendbc.car import structs
++from opendbc.car.car_helpers import interfaces
++from opendbc.car.hyundai.values import CAR
++from opendbc.sunnypilot.car import interfaces as sp_ifaces
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai import fca11_shadow_log as shlog
++from opendbc.sunnypilot.car.hyundai import gas_interceptor as gi
++from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
++from opendbc.sunnypilot.car.interfaces import setup_interfaces
++
++CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++BASE_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8}
++STD = {0x201: 6}
++TRUTHY_TABLE = [
++  (True, True), ("1", True), (b"1", True), (" 1 ", True), ("1\n", True),
++  (False, False), ("0", False), (b"0", False), (None, False), ("", False), (b"", False),
++  ("true", False), ("True", False), ("yes", False), ("on", False), ("2", False), ("01", False), ("junk", False),
++]
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch, tmp_path):
++  for k in ("FCA11_SHADOW", "FCA11_AFFINE", "FCA11_CAL_DIR"):
++    monkeypatch.delenv(k, raising=False)
++  monkeypatch.setenv("FCA11_CAL_DIR", "0")
++  monkeypatch.setenv("FCA11_LOG_DIR", str(tmp_path / "fca11-log"))
++
++
++def _cp(brake=None, shaping=None, shadow=None, pedal=True):
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **STD}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  pl = [{"HyundaiGasInterceptor": pedal}]
++  for k, v in (("HyundaiFca11Brake", brake), ("HyundaiFca11AffineGain", shaping), ("HyundaiFca11Shadow", shadow)):
++    if v is not None:
++      pl.append({k: v})
++  setup_interfaces(CarInterface, CP, CP_SP, pl)
++  return CarInterface, CP, CP_SP
++
++
++def _cam(alive=5, warn=0, dec=0):
++  from opendbc.car.hyundai.hyundaican import hyundai_checksum
++  b = bytearray(8)
++
++  def setb(start, length, val):
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++  setb(3, 2, warn)
++  setb(8, 8, dec)
++  setb(18, 2, 2)
++  setb(22, 3, 1)
++  setb(35, 4, alive)
++  setb(39, 9, 255)
++  setb(48, 8, 254)
++  b[4] |= 0x80
++  b[7] = hyundai_checksum(bytes(b[:7]))
++  return bytes(b)
++
++
++class _CS:
++  def __init__(self, v=15.0):
++    self.out = structs.CarState()
++    self.out.vEgo = v
++    self.out.aEgo = 0.0
++    self.out.gearShifter = structs.CarState.GearShifter.drive
++    self.interceptor_state = 0
++    self.interceptor_fault_seen = False
++    self.fca11_cam_frame = None
++    self.fca11_now_nanos = 0
++    self.fca11_lead_closing = False
++    self.fca11_lead_drel_m = 30.0
++    self.fca11_lead_vrel_mps = -2.0
++    self.pedal_long_engaged = True
++    self.pedal_fault_monitor = gi.PedalFaultMonitor()
++    self.fca11_echoes = []
++
++  def __getattr__(self, name):
++    if name == "is_metric":
++      return False
++    raise AttributeError(name)
++
++
++def _cc(accel, long_active=True):
++  cc = structs.CarControl()
++  cc.enabled = cc.latActive = cc.longActive = long_active
++  cc.actuators.accel = accel
++  return cc
++
++
++# a scripted drive: cruise, a soft stop, a HARD ask, release, a camera FCW blip near the end (hand-back latch)
++def _script(n=900):
++  out = []
++  for k in range(n):
++    t = k * 0.01
++    if t < 1.0:
++      a = 0.3
++    elif t < 3.0:
++      a = -0.9
++    elif t < 4.0:
++      a = -2.6          # hard (and below the -2.0 law bound: exercises the shadow clip)
++    elif t < 5.0:
++      a = -1.4
++    elif t < 6.0:
++      a = 0.2
++    elif t < 8.0:
++      a = -0.7
++    else:
++      a = 0.4
++    v = max(0.0, 15.0 - 2.0 * max(0.0, t - 1.0))
++    warn = 2 if 8.5 <= t < 8.6 else 0
++    out.append((k, a, v, warn))
++  return out
++
++
++def _drive(brake: fl.Fca11LongBrake, script, accel_clip=None, echo=True):
++  """step an Fca11LongBrake (actuating or shadow) over a script; actuating instances get ACCEPTED echoes next frame."""
++  cs = _CS()
++  sent, prev = [], []
++  for k, a, v, warn in script:
++    cs.out.vEgo = v
++    cs.out.standstill = v < 0.1
++    cs.fca11_cam_frame = (k * 10_000_000, _cam(alive=(k // 2) % 16, warn=warn))
++    cs.fca11_now_nanos = k * 10_000_000
++    if echo:
++      brake.observe_echo(prev)
++    ask = a if accel_clip is None else max(a, accel_clip)
++    s = brake.update(_cc(ask), cs, k, fl.PERSONALITY_STANDARD)
++    prev = [(128, bytes(x.dat)) for x in s]
++    sent.append((k, s, brake.shadow_out if brake.shadow else None))
++  return sent
++
++
++# ---------------------------------------------------------------------------------------------- plumbing
++class TestShadowParamPlumbing:
++  def test_field_default_false(self):
++    assert structs.CarParamsSP().fca11Shadow is False
++    _, _, CP_SP = _cp()
++    assert CP_SP.fca11Shadow is False
++
++  @pytest.mark.parametrize("raw,want", TRUTHY_TABLE)
++  def test_truthy_parser_shared(self, raw, want):
++    assert sp_ifaces._param_truthy(raw) == want
++    _, _, CP_SP = _cp(shadow=raw)
++    assert CP_SP.fca11Shadow == want
++
++  @pytest.mark.parametrize("brake", [None, "0", "1"])
++  @pytest.mark.parametrize("shaping", [None, "0", "1"])
++  def test_shadow_overrides_actuation_config(self, brake, shaping):
++    """Shadow ON => the car config equals FCA11 Braking OFF (except the fca11Shadow field itself)."""
++    _, CP, CP_SP = _cp(brake=brake, shaping=shaping, shadow="1")
++    _, CP0, CP_SP0 = _cp(brake="0", shaping="0", shadow=None)
++    assert CP_SP.fca11Shadow and not CP_SP.fca11Brake and not CP_SP.fca11AffineGain
++    assert not (CP_SP.safetyParam & HyundaiSafetyFlagsSP.FCA11_LONG)
++    assert CP_SP.safetyParam == CP_SP0.safetyParam
++    assert CP.safetyConfigs[-1].safetyParam == CP0.safetyConfigs[-1].safetyParam
++    d, d0 = CP_SP.to_dict() if hasattr(CP_SP, "to_dict") else vars(CP_SP), None
++    d0 = CP_SP0.to_dict() if hasattr(CP_SP0, "to_dict") else vars(CP_SP0)
++    d = dict(d); d.pop("fca11Shadow"); d0 = dict(d0); d0.pop("fca11Shadow")
++    assert d == d0
++    CI = interfaces[CAR_UNDER_TEST]
++    assert CI.get_pid_accel_limits(CP, CP_SP, 10., 20.) == CI.get_pid_accel_limits(CP0, CP_SP0, 10., 20.)
++
++  def test_shadow_off_leaves_brake_path_unchanged(self):
++    _, _, CP_SP = _cp(brake="1", shaping="1", shadow="0")
++    assert CP_SP.fca11Brake and CP_SP.fca11AffineGain and not CP_SP.fca11Shadow
++    assert CP_SP.safetyParam & HyundaiSafetyFlagsSP.FCA11_LONG
++
++  def test_shadow_without_pedal_is_inert(self):
++    _, CP, CP_SP = _cp(shadow="1", pedal=False)
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    assert not b.shadow and not b.enabled and b._shadow_v3 is None
++
++
++# ---------------------------------------------------------------------------------------------- dependency / env
++class TestShadowDependencyAndEnv:
++  @pytest.mark.parametrize("brake", [None, "0", "1"])
++  @pytest.mark.parametrize("shaping", [None, "0", "1"])
++  def test_shadow_computes_regardless_of_brake_and_shaping(self, brake, shaping):
++    _, CP, CP_SP = _cp(brake=brake, shaping=shaping, shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    assert b.shadow and not b.enabled
++    assert b._shadow_v3.affine_gain and not b._shadow_dep.affine_gain
++    res = _drive(b, _script(400))
++    assert max(o.shaped_lsb_wouldbe for _, _, o in res) > 0
++    assert max(o.deployed_wouldbe_lsb for _, _, o in res) > 0
++    assert max(o.deployed_law_lsb for _, _, o in res) > 0
++
++  @pytest.mark.parametrize("val", ["1", "0", "", "on"])
++  def test_env_shadow_set_raises(self, monkeypatch, val):
++    monkeypatch.setenv("FCA11_SHADOW", val)
++    _, CP, CP_SP = _cp(brake="1")
++    with pytest.raises(RuntimeError, match="HyundaiFca11Shadow"):
++      fl.Fca11LongBrake(CP, CP_SP)
++
++  def test_env_shadow_raises_through_the_controller(self, monkeypatch):
++    monkeypatch.setenv("FCA11_SHADOW", "1")
++    CarInterface, CP, CP_SP = _cp(shadow="1")
++    with pytest.raises(RuntimeError):
++      CarInterface(CP, CP_SP)
++
++
++# ---------------------------------------------------------------------------------------------- no send
++class TestShadowNeverSends:
++  def test_module_returns_nothing_and_is_non_actuating(self):
++    _, CP, CP_SP = _cp(brake="1", shaping="1", shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    res = _drive(b, _script())
++    assert all(s == [] for _, s, _ in res)
++    assert all(o.non_actuating for _, _, o in res)
++    assert any(o.wouldbe_sends for _, _, o in res)      # the would-be frames exist ... but were never returned
++    assert not b.braking and not b._cal_active
++    assert not (b.supervise_stop or b.stop_complete or b.brake_now)
++
++  @pytest.mark.parametrize("brake,shaping", [("1", "1"), ("1", "0"), ("0", "0"), (None, "1")])
++  def test_controller_stream_equals_brake_off_and_has_zero_0x38d(self, brake, shaping):
++    """REAL CarController path (create_gas_command): Shadow stream == Brake-OFF stream byte-for-byte; zero 0x38D."""
++    CIc, CP, CP_SP = _cp(brake=brake, shaping=shaping, shadow="1")
++    CIo, CPo, CP_SPo = _cp(brake="0", shadow=None)
++    ci_s, ci_o = CIc(CP, CP_SP), CIo(CPo, CP_SPo)
++    cs_s, cs_o = _CS(), _CS()
++    n38d = 0
++    for k, a, v, warn in _script():
++      for cs in (cs_s, cs_o):
++        cs.out.vEgo = v
++        cs.fca11_cam_frame = (k * 10_000_000, _cam(alive=(k // 2) % 16, warn=warn))
++      s1 = ci_s.CC.create_gas_command(_cc(a), cs_s, k, k * 10_000_000)
++      s0 = ci_o.CC.create_gas_command(_cc(a), cs_o, k, k * 10_000_000)
++      n38d += sum(1 for m in s1 if m[0] == 0x38D)
++      assert [(m[0], bytes(m[1]), m[2]) for m in s1] == [(m[0], bytes(m[1]), m[2]) for m in s0], k
++      assert ci_s.CC.gas == ci_o.CC.gas
++    assert n38d == 0
++    assert ci_s.CC.shadow_dropped == 0
++    assert ci_s.CC.fca11_brake.shadow_out.non_actuating
++
++  def test_seam_drops_any_0x38d_that_reaches_it(self, monkeypatch):
++    """D2 assertion: even if the module DID return a frame in Shadow, the gas_interceptor seam never forwards it."""
++    CIc, CP, CP_SP = _cp(brake="1", shadow="1")
++    ci = CIc(CP, CP_SP)
++    leak = fl.CanData(0x38D, _cam(), 0)
++    monkeypatch.setattr(ci.CC.fca11_brake, "update", lambda *a, **k: [leak])
++    cs = _CS()
++    cs.fca11_cam_frame = (0, _cam())
++    sends = ci.CC.create_gas_command(_cc(-1.5), cs, 0, 0)
++    assert not any(m[0] == 0x38D for m in sends)
++    assert ci.CC.shadow_dropped == 1
++
++
++# ---------------------------------------------------------------------------------------------- compute equivalence
++class TestShadowComputeEquivalence:
++  @pytest.mark.parametrize("law_on", [True, False])
++  def test_wouldbe_stream_equals_actuating_instance_sent_stream(self, law_on):
++    """shaped_lsb_wouldbe (v3) / deployed_wouldbe_lsb (0.67) == what the ACTUATING ON / OFF instance sends, frame for frame,
++    on identical inputs (the actuating instance sees the -2.0 PID bound it would have; its frames all ACCEPTED)."""
++    script = _script()
++    _, CP, CP_SP = _cp(brake="1", shaping="1", shadow="1")
++    sh = _drive(fl.Fca11LongBrake(CP, CP_SP), script)
++    _, CPa, CP_SPa = _cp(brake="1", shaping="1" if law_on else "0")
++    act = _drive(fl.Fca11LongBrake(CPa, CP_SPa), script, accel_clip=-fl.FCA11_A_MAX_MSS2)
++    n_cmp = 0
++    for (k, _, o), (k2, s, _) in zip(sh, act, strict=True):
++      want = int(s[-1].dat[1]) if s else 0
++      got = o.shaped_lsb_wouldbe if law_on else o.deployed_wouldbe_lsb
++      assert got == want, (k, got, want)
++      if law_on:
++        assert [bytes(x.dat) for x in o.wouldbe_sends] == [bytes(x.dat) for x in s], k
++      n_cmp += int(bool(s))
++    assert n_cmp > 50
++
++  def test_deployed_law_lsb_is_the_instant_mapping(self):
++    _, CP, CP_SP = _cp(shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    for k, a, v, warn in _script(600):
++      cs = _CS(v)
++      cs.fca11_cam_frame = (k * 10_000_000, _cam())
++      cs.fca11_now_nanos = k * 10_000_000
++      b.update(_cc(a), cs, k, fl.PERSONALITY_STANDARD)
++      al = max(a, -fl.FCA11_A_MAX_MSS2)
++      want = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(al), fl.PERSONALITY_STANDARD) if al <= fl.FCA11_BRAKE_ONSET_ACCEL else 0
++      assert b.shadow_out.deployed_law_lsb == want
++
++  def test_cores_never_write_the_cars_cs(self):
++    _, CP, CP_SP = _cp(brake="1", shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    cs = _CS()
++    cs.fca11_cam_frame = (0, _cam())
++    for k in range(200):
++      cs.fca11_now_nanos = k * 10_000_000
++      cs.fca11_cam_frame = (k * 10_000_000, _cam(alive=(k // 2) % 16))
++      b.update(_cc(-1.5), cs, k, fl.PERSONALITY_STANDARD)
++    assert "_fca11_braking_now" not in vars(cs)
++
++  def test_unavailable_surfacing_follows_v3_core(self):
++    _, CP, CP_SP = _cp(brake="1", shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    _drive(b, _script())                          # the script ends with a camera FCW (warn=2) blip
++    assert b._shadow_v3._hard_cut and b.fca11_unavailable
++
++
++# ---------------------------------------------------------------------------------------------- writer format
++class TestShadowLogFormat:
++  def _records(self, tmp_path):
++    _, CP, CP_SP = _cp(brake="1", shaping="1", shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    _drive(b, _script())
++    b.shadow_log.flush()
++    path = tmp_path / "fca11-log" / shlog.FCA11_SHADOW_FILE
++    return [json.loads(ln) for ln in path.read_text().splitlines()]
++
++  def test_schema_of_records(self, tmp_path):
++    recs = self._records(tmp_path)
++    kinds = [r["k"] for r in recs]
++    assert kinds[0] == "hdr" and "f" in kinds and "ep" in kinds
++    assert all(r["schema"] == shlog.FCA11_SHADOW_SCHEMA for r in recs)
++    frames = [r for r in recs if r["k"] == "f"]
++    for r in frames:
++      assert set(shlog.FRAME_FIELDS) <= set(r), set(shlog.FRAME_FIELDS) - set(r)
++    for r in (r for r in recs if r["k"] == "ep"):
++      assert set(shlog.EPILOGUE_FIELDS) <= set(r), set(shlog.EPILOGUE_FIELDS) - set(r)
++    hard = [r for r in frames if r["ask_mps2"] == -2.6]
++    assert hard and all(r["ask_law_mps2"] == -fl.FCA11_A_MAX_MSS2 for r in hard)
++    assert any(r["shaped_lsb_wouldbe"] > 0 for r in frames)
++    assert any(r["camera_requesting"] for r in frames)
++    assert all(r["camera_request_level"] is not None for r in frames)
++    assert any(r["episode_id"] is not None for r in frames)
++
++  def test_logs_computed_values_not_constants(self, tmp_path):
++    recs = [r for r in self._records(tmp_path) if r["k"] == "f" and r["braking_wouldbe"]]
++    assert len({r["shaped_lsb_wouldbe"] for r in recs}) >= 3
++    assert len({r["deployed_law_lsb"] for r in recs}) >= 3
++
++  def test_disabled_dir_writes_nothing(self, monkeypatch, tmp_path):
++    monkeypatch.setenv("FCA11_LOG_DIR", "0")
++    _, CP, CP_SP = _cp(shadow="1")
++    b = fl.Fca11LongBrake(CP, CP_SP)
++    _drive(b, _script(300))
++    assert not b.shadow_log.enabled and b.shadow_log.n_records == 0
++    assert not os.path.exists(tmp_path / "fca11-log")
++
++  def test_rotation_per_drive_and_byte_bound(self, monkeypatch, tmp_path):
++    d = tmp_path / "rot"
++    for i in range(shlog.FCA11_SHADOW_KEEP + 2):
++      w = shlog.ShadowLogger(str(d), header=dict(drive=i))
++      w.flush()
++    files = sorted(os.listdir(d))
++    assert len(files) == shlog.FCA11_SHADOW_KEEP + 1     # current + KEEP generations
++    monkeypatch.setattr(shlog, "FCA11_SHADOW_MAX_BYTES", 2000)
++    w = shlog.ShadowLogger(str(d), header={})
++    for i in range(200):
++      w.write(dict(k="f", i=i))
++    w.flush()
++    lines = (d / shlog.FCA11_SHADOW_FILE).read_text().splitlines()
++    assert json.loads(lines[-1])["k"] == "trunc" and w.truncated
++    assert os.path.getsize(d / shlog.FCA11_SHADOW_FILE) < 2400
++
++
++# ---------------------------------------------------------------------------------------------- Shadow=0 identity
++def test_shadow_off_module_has_no_shadow_state():
++  _, CP, CP_SP = _cp(brake="1", shaping="1")
++  b = fl.Fca11LongBrake(CP, CP_SP)
++  assert not b.shadow and b.enabled and b._shadow_v3 is None and b.shadow_log is None
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index d207484b..25171e84 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -126,10 +126,18 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # pedal feature armed; leaves safetyParam bit 256 (FCA11_LONG) clear otherwise, so the panda TX path is byte-for-byte
+   # today's. A NEW key can be unreadable on a stale libparams (missing key -> get() returns None): treat anything but a
+   # clean "1" as OFF (never raise, never default ON).
++  # 0045: FCA11 SHADOW (log-only) mode (HyundaiFca11Shadow, PERSISTENT BOOL, default "0" = OFF), same truthy parser. ON =
++  # the FCA11 module computes + logs its would-be output and NEVER sends; the car is configured EXACTLY as with FCA11
++  # Braking OFF whatever HyundaiFca11Brake / HyundaiFca11AffineGain say (fca11Brake + fca11AffineGain stay False, safetyParam
++  # bit 256 stays clear: panda not in FCA11-long mode, pedal-only PID bounds, camera FCA11 forwarded as today), so the sent
++  # CAN is the Brake-OFF stream byte-for-byte. Read at CarParams build time => takes effect at the NEXT ignition.
++  shadow = _param_truthy(params_dict.get("HyundaiFca11Shadow"))
++  if shadow:
++    CP_SP.fca11Shadow = True
+   fca11_raw = params_dict.get("HyundaiFca11Brake")
+   # Params.get() returns a python bool for a BOOL key (openpilot/common/params.py CPP_2_PYTHON), while the raw libparams
+   # value is the string "1"/"0" -- accept both. Anything else (key missing on a stale libparams -> None, or junk) is OFF.
+-  if _param_truthy(fca11_raw):
++  if _param_truthy(fca11_raw) and not shadow:   # 0045: Shadow never arms actuation
+     CP_SP.fca11Brake = True
+     CP_SP.safetyParam |= HyundaiSafetyFlagsSP.FCA11_LONG
+ 
