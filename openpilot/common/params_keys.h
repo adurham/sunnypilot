@@ -240,9 +240,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // HyundaiFca11Brake is also ON (enforced in opendbc setup_interfaces). Read at CarParams build time => a toggle takes
     // effect at the NEXT ignition; the UI only enables it offroad.
     {"HyundaiFca11AffineGain", {PERSISTENT | BACKUP, BOOL, "0"}},
-    // fork (0045): log-only shadow of the FCA11 shaping law; computes + logs would-be output; NEVER sends; next-ignition;
-    // for fresh-route data. ON configures the car exactly as FCA11 Braking OFF (fca11Brake / fca11AffineGain / safetyParam
-    // bit 256 stay clear in opendbc setup_interfaces) and writes /data/fca11-log/fca11-shadow.jsonl. Default OFF.
+    // fork (0045): log-only shadow of the FCA11 V3 shaping law; computes + logs V3's would-be output; V3 NEVER sends;
+    // next-ignition; for fresh-route data. The wire stays OLD-LAW (the deployed law): HyundaiFca11Brake keeps its meaning,
+    // HyundaiFca11AffineGain is ignored (opendbc setup_interfaces). Writes /data/fca11-log/fca11-shadow.jsonl. Default OFF.
     {"HyundaiFca11Shadow", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.

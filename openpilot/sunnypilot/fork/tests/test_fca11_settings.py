@@ -82,8 +82,11 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("fca11_shadow_toggle_state(pedal_raw, offroad)", self.src)
     self.assertIn("self.fca11_shadow_toggle.set_visible(shadow_state.visible)", self.src)
     self.assertIn("self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)", self.src)
-    self.assertIn("It NEVER acts on the car", self.src)
+    self.assertIn("V3 NEVER acts on the car", self.src)
     self.assertIn("Data collection only", self.src)
+    self.assertIn("The car brakes exactly as today", self.src)
+    self.assertIn("(OLD-LAW)", self.src)
+    self.assertNotIn("you brake for every stop", self.src)   # the first build's FCA11-DISABLED reading is gone
 
 
 if __name__ == "__main__":

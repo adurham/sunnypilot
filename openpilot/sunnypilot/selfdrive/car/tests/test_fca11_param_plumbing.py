@@ -244,8 +244,9 @@ def _run_shadow_path(brake, shaping, shadow):
 
 
 class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
-  """0045: HyundaiFca11Shadow end to end through the REAL compiled registry. Truth table (T4 config half): Shadow ON =>
-  never armed (fca11Brake / fca11AffineGain / bit 256 clear) whatever Brake / AffineGain; Shadow OFF => unchanged."""
+  """0045 v2 (Amendment 1): HyundaiFca11Shadow end to end through the REAL compiled registry. Truth table: Shadow ON =>
+  the wire stays OLD-LAW: fca11Brake / bit 256 follow HyundaiFca11Brake exactly as the deployed build, fca11AffineGain is
+  FORCED False (V3 never actuates); Shadow OFF => unchanged freeze behaviour."""
 
   def test_key_is_registered_in_the_compiled_registry(self):
     params = Params()
@@ -266,30 +267,28 @@ class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
         for shadow in (True, False, None):
           ctx = dict(brake=brake, shaping=shaping, shadow=shadow)
           _, CP_SP, _ = _run_shadow_path(brake, shaping, shadow)
-          if shadow:
-            self.assertTrue(CP_SP.fca11Shadow, ctx)
-            self.assertFalse(CP_SP.fca11Brake, ctx)
-            self.assertFalse(CP_SP.fca11AffineGain, ctx)
-            self.assertFalse(CP_SP.safetyParam & FCA11_BIT, ctx)
-          else:
-            self.assertFalse(CP_SP.fca11Shadow, ctx)
-            self.assertEqual(bool(brake), CP_SP.fca11Brake, ctx)
-            self.assertEqual(bool(brake and shaping), CP_SP.fca11AffineGain, ctx)
-            self.assertEqual(bool(brake), bool(CP_SP.safetyParam & FCA11_BIT), ctx)
+          self.assertEqual(bool(shadow), CP_SP.fca11Shadow, ctx)
+          self.assertEqual(bool(brake), CP_SP.fca11Brake, ctx)                       # OLD-LAW armed exactly as today
+          self.assertEqual(bool(brake), bool(CP_SP.safetyParam & FCA11_BIT), ctx)
+          self.assertEqual(bool(brake and shaping and not shadow), CP_SP.fca11AffineGain, ctx)   # V3 never on the wire
 
-  def test_shadow_safety_config_equals_brake_off(self):
-    CP_s, CP_SP_s, _ = _run_shadow_path(True, True, True)
-    CP_o, CP_SP_o, _ = _run_shadow_path(False, False, None)
-    self.assertEqual(CP_SP_o.safetyParam, CP_SP_s.safetyParam)
-    self.assertEqual(CP_o.safetyConfigs[-1].safetyParam, CP_s.safetyConfigs[-1].safetyParam)
+  def test_shadow_safety_config_equals_deployed_oldlaw(self):
+    for brake in (True, False):
+      CP_s, CP_SP_s, _ = _run_shadow_path(brake, True, True)
+      CP_o, CP_SP_o, _ = _run_shadow_path(brake, False, None)
+      self.assertEqual(CP_SP_o.safetyParam, CP_SP_s.safetyParam)
+      self.assertEqual(CP_o.safetyConfigs[-1].safetyParam, CP_s.safetyConfigs[-1].safetyParam)
 
-  def test_shadow_module_computes_and_never_sends(self):
+  def test_shadow_module_wire_is_oldlaw_and_v3_computes(self):
+    """the module built from the real-registry CP_SP: Shadow + Brake + Shaping persisted ON => the actuating instance is
+    OLD-LAW (affine_gain False) and its frames equal a Shadow-OFF OLD-LAW instance's; V3 computes post-send."""
     CP, CP_SP, _ = _run_shadow_path(True, True, True)
+    CPo, CP_SPo, _ = _run_shadow_path(True, False, None)
     os.environ["FCA11_LOG_DIR"] = "0"
     try:
       b = fl.Fca11LongBrake(CP, CP_SP)
-      self.assertTrue(b.shadow)
-      self.assertFalse(b.enabled)
+      bo = fl.Fca11LongBrake(CPo, CP_SPo)
+      self.assertTrue(b.shadow and b.enabled and not b.affine_gain and b._shadow_v3.affine_gain)
       CS = SimpleNamespace(out=structs.CarState(), interceptor_state=0, interceptor_fault_seen=False,
                            fca11_cam_frame=(0, bytes(8)), fca11_now_nanos=0, fca11_wheel_min_kph=None)
       CS.out.gearShifter = structs.CarState.GearShifter.drive
@@ -297,13 +296,18 @@ class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
       CC = structs.CarControl()
       CC.enabled = CC.longActive = True
       CC.actuators.accel = -1.5
-      wb = []
+      wb, n_sent = [], 0
       for f in range(200):
         CS.fca11_cam_frame = (f * 10_000_000, bytes(8))
         CS.fca11_now_nanos = f * 10_000_000
-        self.assertEqual([], b.update(CC, CS, f))
+        s1 = b.update(CC, CS, f)
+        s0 = bo.update(CC, CS, f)
+        self.assertEqual([bytes(x.dat) for x in s0], [bytes(x.dat) for x in s1], f)
+        n_sent += len(s1)
+        b.v3_post_send()
         self.assertTrue(b.shadow_out.non_actuating)
-        wb.append(b.shadow_out.shaped_lsb_wouldbe)
+        wb.append(b.shadow_out.v3_wouldbe_lsb)
+      self.assertGreater(n_sent, 50)
       self.assertGreater(max(wb), 0)
     finally:
       os.environ.pop("FCA11_LOG_DIR", None)

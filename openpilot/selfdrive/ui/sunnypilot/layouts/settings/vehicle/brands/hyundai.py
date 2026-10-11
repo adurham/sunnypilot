@@ -28,7 +28,7 @@ class HyundaiSettings(BrandSettings):
     # Braking; visibility/enable come from the PURE fca11_settings functions (unit-tested headless).
     self.fca11_shaping_toggle = toggle_item_sp(tr("FCA11 Brake Shaping (Beta)"), "", param="HyundaiFca11AffineGain",
                                                callback=self._on_fca11_toggle_changed)
-    # fork (0045): FCA11 SHADOW (log-only). Visible with the pedal on, settable offroad only (pure fca11_settings function).
+    # fork (0045): FCA11 SHADOW - wire = OLD-LAW (today's law), V3 logged. Visible with the pedal on, settable offroad only.
     self.fca11_shadow_toggle = toggle_item_sp(tr("FCA11 Shadow (Log-Only)"), "", param="HyundaiFca11Shadow",
                                               callback=self._on_fca11_toggle_changed)
     self.drive_mode_personality_toggle = toggle_item_sp(
@@ -116,10 +116,10 @@ class HyundaiSettings(BrandSettings):
     # fork (0045): FCA11 Shadow (Log-Only) - visible with the pedal on, settable offroad only; next ignition.
     shadow_state = fca11_shadow_toggle_state(pedal_raw, offroad)
     self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)
-    shadow_desc = tr("Data collection only: computes what FCA11 brake shaping WOULD command on every frame and writes " +
-                     "it to a log on the device. It NEVER acts on the car and never sends a brake command. While ON, " +
-                     "FCA11 Braking and Brake Shaping do NOT brake the car (it drives exactly as with FCA11 Braking " +
-                     "off; you brake for every stop). Takes effect at the next ignition.")
+    shadow_desc = tr("Data collection only. The car brakes exactly as today: FCA11 Braking keeps using the current " +
+                     "law (OLD-LAW) if it is on, and nothing changes if it is off. Alongside, the new shaped law (V3) " +
+                     "is computed on every frame and written to a log on the device; V3 NEVER acts on the car. While " +
+                     "ON, Brake Shaping is ignored. Takes effect at the next ignition.")
     if shadow_state.visible and not offroad:
       shadow_desc = offroad_hint + shadow_desc
     self.fca11_shadow_toggle.set_description(shadow_desc)

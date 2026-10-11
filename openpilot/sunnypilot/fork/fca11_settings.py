@@ -38,7 +38,7 @@ def fca11_shaping_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleSta
 
 
 def fca11_shadow_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
-  """0045: FCA11 Shadow (Log-Only). Visible with the pedal on (independent of FCA11 Braking / Shaping: Shadow computes both
-  laws regardless), settable offroad only (read at CarParams build time => next ignition)."""
+  """0045: FCA11 Shadow (Log-Only). Visible with the pedal on (independent of FCA11 Braking: the wire stays OLD-LAW as
+  Braking says, V3 is computed + logged regardless), settable offroad only (read at CarParams build time => next ignition)."""
   pedal_on = _on(pedal_raw)
   return ToggleState(visible=pedal_on, enabled=pedal_on and bool(offroad))
