@@ -583,6 +583,19 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           python3 openpilot/sunnypilot/fork/tests/check_capnp_parity.py --tree "$RUNNER_TEMP/prebuilt"
 
+      - name: Verify fork param reachability (key registry / CarParamsSP writer / FCA11 env ban)
+        # Static, stdlib-only guard (patch 0044): every fork-owned param key the code
+        # uses must be registered in params_keys.h, every CarParamsSP field the code
+        # reads must have a writer in setup_interfaces / the brand interfaces, and no
+        # FCA11_* feature flag may be read from os.environ.  0043 gated the shaping
+        # law on CP_SP.fca11AffineGain, but the key was never registered and nothing
+        # wrote the field (unreachable on the car; the sim's env override hid it).
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 openpilot/sunnypilot/fork/tests/check_param_reachability.py --tree "$RUNNER_TEMP/prebuilt"
+
       - name: Build and install the panda H7 firmware
         # Cross-compiles the H7 app with the toolchain pinned in panda/pyproject.toml
         # (Arm GNU 13.2.1, delivered as a uv wheel), which is why a hosted ubuntu

@@ -156,4 +156,12 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11Brake param unknown to libparams (not rebuilt?); FCA11 braking stays disabled")
 
+  # fork (0044): FCA11 brake-SHAPING law opt-in. Before 0044 this key was read by NOTHING here (and not registered in
+  # params_keys.h), so CP_SP.fca11AffineGain could never be set on the car. Same stale-libparams guard as the sibling: a
+  # missing key leaves the law off (opendbc also requires HyundaiFca11Brake). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiFca11AffineGain": params.get("HyundaiFca11AffineGain", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11AffineGain param unknown to libparams (not rebuilt?); FCA11 brake shaping stays disabled")
+
   return params_list

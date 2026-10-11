@@ -235,6 +235,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"HyundaiGasInterceptor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: comma pedal longitudinal (non-SCC), opt-in
     {"HyundaiGasInterceptorIDSet", {PERSISTENT | BACKUP, STRING, "auto"}},  // fork: pedal CAN IDs: auto/standard/remapped
     {"HyundaiFca11Brake", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: FCA11 longitudinal braking on the comma pedal (default OFF)
+    // fork (0044): FCA11 brake-SHAPING law, default OFF. The key name is a historical misnomer (it first gated the 0041
+    // affine gain); since 0043 it selects the shaping law (UI: "FCA11 Brake Shaping (Beta)"). Inert unless
+    // HyundaiFca11Brake is also ON (enforced in opendbc setup_interfaces). Read at CarParams build time => a toggle takes
+    // effect at the NEXT ignition; the UI only enables it offroad.
+    {"HyundaiFca11AffineGain", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
     // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may

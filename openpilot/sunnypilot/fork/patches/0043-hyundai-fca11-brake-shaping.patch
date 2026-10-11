@@ -1,8 +1,8 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index a4a20127..029d91f3 100644
+index a4a20127..083db21f 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -244,6 +244,97 @@ FCA11_AFFINE_STOP_BAND_KPH = 3.0
+@@ -244,6 +244,112 @@ FCA11_AFFINE_STOP_BAND_KPH = 3.0
  # min(8, 4+4)=8 (ACCEPTED) -> reaches the hold floor in ~40 ms. So these values can never exceed the panda gate.
  
  
@@ -19,12 +19,12 @@ index a4a20127..029d91f3 100644
 +# WHAT THIS LAW DOES (ON path, gated by HyundaiFca11AffineGain; OFF = BYTE-IDENTICAL to 0042):
 +#   1. demand:      want = max(0.0, -accel_ask); no coast subtraction.
 +#   2. level (moving, above FCA11_SHAPE_HOLD_BAND_KPH): a piecewise-MONOTONE inverse of the measured steady
-+#      curve, clamped [FCA11_SHAPE_FLOOR_LSB, tier cap]. Anchors (extra -> LSB): (0.15 -> 4) and (1.42 -> 8). For
-+#      extra >= ~1.42 the affine inverse cmd = round(((extra - BITE)/K)*100), clamped [8, tier cap]; for extra in
-+#      (0.15, 1.42) a LINEAR interpolation across the cliff; extra < 0.15 -> the 4 LSB floor (never below 4 while
++#      curve, clamped [FCA11_SHAPE_FLOOR_LSB, tier cap]. Anchors (extra -> LSB): (0.15 -> 4) and (1.50 -> 8). For
++#      extra >= 1.50 the affine inverse cmd = round(((extra - BITE)/K)*100), clamped [8, tier cap]; for extra in
++#      (0.15, 1.50) a LINEAR interpolation across the cliff; extra < 0.15 -> the 4 LSB floor (never below 4 while
 +#      moving).
-+#   3. onset shaping: an episode (re)open starts at the floor and HOLDS FCA11_SHAPE_ONSET_HOLD_S (0.4 s, in
-+#      SENT-frame time) before growth; then a JERK-LIMITED slew (target delivered jerk FCA11_SHAPE_JERK_TARGET
++#   3. onset shaping: an episode (re)open starts at the floor and HOLDS FCA11_SHAPE_ONSET_HOLD_S (0.2 s since
++#      0043 v3 / C1, was 0.4 s; in SENT-frame time) before growth; then a JERK-LIMITED slew (target delivered jerk FCA11_SHAPE_JERK_TARGET
 +#      = 0.75 m/s^3, band 0.5-1.0) computed through the local d(extra)/d(cmd) slope of the curve (cliff band
 +#      ~1 LSB per ~0.5 s; above 8 ~9 LSB/s). Growth never exceeds the panda's +RATE_STEP / sent-frame ceiling.
 +#      A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) is an EMERGENCY: it BYPASSES the onset hold AND the comfort jerk
@@ -42,19 +42,34 @@ index a4a20127..029d91f3 100644
 +#      stepping the command cap<->level (e.g. 20 -> 6 -> 20) on the boundary.
 +#   6. release:     unchanged (episode close + passive frame). NO release ramp in this patch (deferred).
 +#
++# 0043 v3 (C0, the owner-feel study wsG-feel, 285 accepted episodes over 9 FCA11 routes): K/BITE refit on 8-20 LSB to
++# 9.6/0.74 (the 155+157-only 8.23/0.85 sat outside the pooled CI and over-delivered +0.10 m/s^2 mean at 12-20 LSB; the
++# refit's inverse error is +0.02 mean). CLIFF_HI_EXTRA 1.42 -> 1.50 = the measured 8 LSB median 1.499, so the inverse
++# stays CONTINUOUS at the 8 LSB boundary (affine(1.50) = round(7.92) = 8) and monotone (pinned by a test). Per-route K
++# still spans 8.1-10.6 (day-to-day), so a low-K day under-delivers soft asks slightly; the gate sim covers K = 8.1.
++# These constants are read ONLY by the shaping law (shape_dec_cmd_from_extra / shape_local_slope_extra_per_lsb); the
++# OFF (deployed 0.67) path never reads them.
++# 0043 v3 (C1): the onset hold 0.4 -> 0.2 s. The study measured the 0.4 s floor hold as ~0.4 s of dead time (the 4 LSB
++# floor delivers ~0.15 m/s^2) that made the law 0.35 s later than the owner's own onset. The hold has NO frame-acceptance
++# role: the panda's onset rule (hyundai.h, 0035) caps the FIRST actuating frame at +RATE_STEP over a 0 reference and each
++# later frame at +RATE_STEP over the last ACCEPTED one, with no time term, and Prefill rides every actuating frame from
++# the first; hard asks already skip the hold entirely and are accepted. The hold is comfort-only (wsB-feel (b)2: 300-500
++# ms was a feel proposal, the 0.2 s choice is the study's C1). The G5 onset DEBOUNCE (FCA11_ONSET_HOLD_FRAMES, 0.2 s
++# of ask before an episode opens) is a SEPARATE constant and is unchanged.
 +# The anchors + cliff slope ARE PROVISIONAL: the 5-7 LSB band was NEVER emitted by the old law (it jumped 4->8 in
 +# one +4 step), so it is UNMEASURED. Refit FCA11_SHAPE_CLIFF_LO/HI_EXTRA (+ FCA11_SHAPE_K/BITE) after the next
 +# drive logs the 5/6/7 LSB levels. The whole mapping is behind these few constants so the refit is a constant
 +# change, not a code change.
 +FCA11_SHAPE_FLOOR_LSB = 4          # the moving floor; the law never commands below this while moving
 +FCA11_SHAPE_CLIFF_LO_EXTRA = 0.15  # PROVISIONAL: delivered extra (m/s^2) measured at 4 LSB (0.12-0.17)
-+FCA11_SHAPE_CLIFF_HI_EXTRA = 1.42  # PROVISIONAL: the steady curve at 8 LSB (the fit BITE + K*0.08)
++FCA11_SHAPE_CLIFF_HI_EXTRA = 1.50  # 0043 v3 (C0): MEASURED 8 LSB median 1.499 [1.42, 1.57], 106 episodes (== BITE + K*0.08 = 1.508)
 +FCA11_SHAPE_CLIFF_LO_LSB = 4
 +FCA11_SHAPE_CLIFF_HI_LSB = 8
-+FCA11_SHAPE_K = 8.23               # steady-window affine slope (m/s^2 per g), CI [8.07, 8.39]
-+FCA11_SHAPE_BITE = 0.85            # steady-window affine bite (m/s^2), CI [0.82, 0.87]
-+FCA11_SHAPE_ONSET_HOLD_S = 0.4     # the onset hold at the floor, seconds of SENT-frame time
-+FCA11_SHAPE_ONSET_HOLD_SENT = 20   # == FCA11_SHAPE_ONSET_HOLD_S / 0.02 (the 50 Hz sent-frame period); pinned by a test
++FCA11_SHAPE_K = 9.6                # 0043 v3 (C0): 8-20 LSB refit over 285 episodes, K 9.58 [8.98, 10.34] (was 8.23, 155+157 only)
++FCA11_SHAPE_BITE = 0.74            # 0043 v3 (C0): 8-20 LSB refit over 285 episodes, BITE 0.74 [0.64, 0.81] (was 0.85)
++FCA11_SHAPE_ONSET_HOLD_S = 0.2     # 0043 v3 (C1): the onset hold at the floor, seconds of SENT-frame time (was 0.4)
++FCA11_SHAPE_ONSET_HOLD_SENT = 10   # == FCA11_SHAPE_ONSET_HOLD_S / 0.02 (the 50 Hz sent-frame period); pinned by a test
++# 0043 v3: the study's C2 (jerk 0.75 -> 0.9) is NOT folded - the pre-registered rule R1 fired (REPORT-0043 v3).
 +FCA11_SHAPE_JERK_TARGET = 0.75     # target delivered jerk (m/s^3); the comfort band is 0.5-1.0
 +FCA11_SHAPE_JERK_BAND = (0.5, 1.0)
 +FCA11_SHAPE_HOLD_BAND_KPH = 3.0    # ENTER the stop/hold band at/below this (or CarState.standstill): floor at the tier cap
@@ -65,8 +80,8 @@ index a4a20127..029d91f3 100644
 +def shape_dec_cmd_from_extra(extra: float, cap: int = HYUNDAI_FCA11_LONG_MAX_DEC) -> int:
 +  """0043: the piecewise-MONOTONE inverse of the measured steady curve (wanted extra m/s^2 -> raw CR_VSM_DecCmd).
 +
-+  Clamped to [FCA11_SHAPE_FLOOR_LSB, cap]. extra <= 0.15 -> the 4 LSB floor; extra in (0.15, 1.42) -> a LINEAR
-+  interpolation across the CLIFF (PROVISIONAL - the 5/6/7 LSB band is unmeasured); extra >= 1.42 -> the affine
++  Clamped to [FCA11_SHAPE_FLOOR_LSB, cap]. extra <= 0.15 -> the 4 LSB floor; extra in (0.15, 1.50) -> a LINEAR
++  interpolation across the CLIFF (PROVISIONAL - the 5/6/7 LSB band is unmeasured); extra >= 1.50 -> the affine
 +  inverse round(((extra - BITE)/K)*100), clamped [8, cap] (which keeps the curve continuous at the 8 anchor)."""
 +  if extra <= FCA11_SHAPE_CLIFF_LO_EXTRA:
 +    return FCA11_SHAPE_FLOOR_LSB
@@ -91,8 +106,8 @@ index a4a20127..029d91f3 100644
 +def shape_slew_lsb_per_sent(lsb: float) -> float:
 +  """The jerk-limited growth allowed in ONE 50 Hz sent frame at command level ``lsb`` (LSB per sent frame).
 +
-+  dLSB/dt = jerk_target / (d(extra)/dLSB), times the 0.02 s sent-frame period. Cliff band -> ~0.047 LSB/frame
-+  (~1 LSB per ~0.4 s); above 8 -> ~0.18 LSB/frame (~9 LSB/s)."""
++  dLSB/dt = jerk_target / (d(extra)/dLSB), times the 0.02 s sent-frame period. 0043 v3 (C0 slopes, jerk 0.75):
++  cliff band -> ~0.044 LSB/frame (~1 LSB per ~0.45 s); above 8 -> ~0.16 LSB/frame (~7.8 LSB/s)."""
 +  slope = shape_local_slope_extra_per_lsb(lsb)
 +  return FCA11_SHAPE_JERK_TARGET / slope * FCA11_SHAPE_SENT_DT
 +
@@ -100,7 +115,7 @@ index a4a20127..029d91f3 100644
  def dec_cmd_from_accel_affine(accel: float, K: float = FCA11_AFFINE_K, BITE: float = FCA11_AFFINE_BITE) -> int:
    """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB) through the AFFINE plant, clamp [0, 30].
  
-@@ -534,6 +625,13 @@ class Fca11LongBrake:
+@@ -534,6 +640,13 @@ class Fca11LongBrake:
      self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
      self._dec_last_sent = 0
      self._sent_this_episode = False
@@ -114,7 +129,7 @@ index a4a20127..029d91f3 100644
      # ---- G5 anti-flap state ----
      self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
      self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
-@@ -553,6 +651,7 @@ class Fca11LongBrake:
+@@ -553,6 +666,7 @@ class Fca11LongBrake:
        self.cal_seq = cal_mode.CalSequencer(os.environ.get("FCA11_CAL_DIR", cal_mode.CAL_DIR))
        self.cal_seq.mark_session(os.getpid())
      self._cal_active = False           # this frame is a CAL hold (drives the gas neutralization)
@@ -122,7 +137,7 @@ index a4a20127..029d91f3 100644
  
    # ---- window ----
  
-@@ -816,6 +915,73 @@ class Fca11LongBrake:
+@@ -816,6 +930,73 @@ class Fca11LongBrake:
      m = Fca11MirrorFrame(dec_cmd=0, prefill=False, warn=0, cmd_act=False, dec_cmd_act=False)
      return [CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0)]
  
@@ -170,7 +185,7 @@ index a4a20127..029d91f3 100644
 +    if (not in_hold_band) and (not hard) and self._shape_sent_n < FCA11_SHAPE_ONSET_HOLD_SENT:
 +      # onset hold: NO GROWTH before the hold has elapsed. At an episode open `prev` IS the floor, so this holds the
 +      # floor exactly as before. 0043 v2: after a HARD phase (the fast lane grew `prev` above the floor) an ask that
-+      # eases into the soft band inside the first 0.4 s must NOT be forced back down to the floor - that would be a
++      # eases into the soft band inside the onset hold must NOT be forced back down to the floor - that would be a
 +      # 12 -> 4 step across the delivered-decel cliff and a re-climb at the comfort slew (a release-and-reapply). Hold
 +      # the level, and follow the (lower) honest soft level down immediately (decreases are the safe direction).
 +      new_acc = prev if target >= prev else float(target)
@@ -196,7 +211,7 @@ index a4a20127..029d91f3 100644
    def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
      sends: list[CanData] = []
      if not self.enabled:
-@@ -851,6 +1017,9 @@ class Fca11LongBrake:
+@@ -851,6 +1032,9 @@ class Fca11LongBrake:
        # 0038: no gas hold-off state either.
        self._gas_release_frame = None
        self._gas_prev = False
@@ -206,7 +221,7 @@ index a4a20127..029d91f3 100644
        return sends
  
      # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
-@@ -941,6 +1110,8 @@ class Fca11LongBrake:
+@@ -941,6 +1125,8 @@ class Fca11LongBrake:
        # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
        self._ask_frames = 0
        self._on_frames = 0
@@ -215,7 +230,7 @@ index a4a20127..029d91f3 100644
        self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
        self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
        return sends
-@@ -978,6 +1149,12 @@ class Fca11LongBrake:
+@@ -978,6 +1164,12 @@ class Fca11LongBrake:
        self._cal_frames = 0
      cal_on = bool(cal_ask and ok)
      self._cal_active = False   # re-latched below iff THIS frame commands a scripted hold
@@ -228,7 +243,7 @@ index a4a20127..029d91f3 100644
  
      # ---- G5 anti-flap decision ----------------------------------------------------------------
      # ask: the planner wants a brake THIS frame and every pre-condition (fca11_ok) holds. `ask` drives
-@@ -1016,56 +1193,66 @@ class Fca11LongBrake:
+@@ -1016,56 +1208,66 @@ class Fca11LongBrake:
        # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
        # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
        self._cal_active = bool(cal_on and ok)
@@ -344,10 +359,10 @@ index a4a20127..029d91f3 100644
        t_cam, dat = cam
        if frame % FCA11_SEND_EVERY == 0:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index 9c429dde..f5b7d09e 100644
+index 9c429dde..6ae67525 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-@@ -2288,91 +2288,567 @@ class Test0041AffineGain(unittest.TestCase):
+@@ -2288,91 +2288,616 @@ class Test0041AffineGain(unittest.TestCase):
      self.assertEqual(min(old, fl.HYUNDAI_FCA11_LONG_RATE_STEP), decs[0], "first sent frame is rate-limited")
      self.assertEqual(old, max(decs), "OFF must command the 0.67 value, unchanged")
  
@@ -495,7 +510,7 @@ index 9c429dde..f5b7d09e 100644
 +class Test0043ShapedLaw(unittest.TestCase):
 +  """0043: the brake-SHAPING law. It supersedes the 0041 affine-only LEVEL path on the planner-ask path and is
 +  gated by the EXISTING param HyundaiFca11AffineGain (DEFAULT OFF). This class pins: the piecewise-monotone LEVEL
-+  mapping (cliff anchors + clamp + floor + tier-cap hold band), the 0.4 s onset hold then the JERK-LIMITED comfort slew
++  mapping (cliff anchors + clamp + floor + tier-cap hold band), the onset hold (0.2 s since v3) then the JERK-LIMITED comfort slew
 +  (soft asks: 4->8 takes >= 1.5 s vs ~20 ms before), the HARD-ask fast lane (bypasses hold AND slew: 8 LSB <= 0.3 s,
 +  tier cap <= 0.5 s at 50 km/h), the hold-band exit hysteresis, the cal-edge reset, the panda frame contract (fuzz +
 +  sweeps), and OFF-path byte-identity. The env FCA11_AFFINE override is cleared so the field-based cases are
@@ -536,10 +551,23 @@ index 9c429dde..f5b7d09e 100644
 +  def test_constants_pinned_to_the_measured_fit_and_curve_is_monotone(self):
 +    self.assertEqual(4, fl.FCA11_SHAPE_FLOOR_LSB)
 +    self.assertEqual(0.15, fl.FCA11_SHAPE_CLIFF_LO_EXTRA)
-+    self.assertEqual(1.42, fl.FCA11_SHAPE_CLIFF_HI_EXTRA)
-+    self.assertEqual(8.23, fl.FCA11_SHAPE_K)          # steady-window slope CI [8.07, 8.39]
-+    self.assertEqual(0.85, fl.FCA11_SHAPE_BITE)       # steady-window bite CI [0.82, 0.87]
-+    self.assertEqual(0.4, fl.FCA11_SHAPE_ONSET_HOLD_S)
++    # 0043 v3 (C0): the 285-episode 8-20 LSB refit (wsG-feel). Was 1.42 / 8.23 / 0.85 (155+157 only, outside the pooled
++    # CI). CLIFF_HI_EXTRA = the measured 8 LSB median 1.499 [1.42, 1.57]; K 9.58 [8.98, 10.34]; BITE 0.74 [0.64, 0.81].
++    self.assertEqual(1.50, fl.FCA11_SHAPE_CLIFF_HI_EXTRA)
++    self.assertEqual(9.6, fl.FCA11_SHAPE_K)
++    self.assertEqual(0.74, fl.FCA11_SHAPE_BITE)
++    # C0 continuity: the cliff anchor and the affine law AGREE at the 8 LSB boundary (BITE + K*0.08 rounds to 8 LSB
++    # from 1.50), so there is no step in the inverse where the interpolation hands over to the affine branch.
++    self.assertEqual(8, int(round((fl.FCA11_SHAPE_CLIFF_HI_EXTRA - fl.FCA11_SHAPE_BITE) / fl.FCA11_SHAPE_K * 100)))
++    self.assertAlmostEqual(fl.FCA11_SHAPE_CLIFF_HI_EXTRA, fl.FCA11_SHAPE_BITE + fl.FCA11_SHAPE_K * 0.08, delta=0.05)
++    # 0043 v3 (C1): the onset hold 0.4 -> 0.2 s (10 sent frames). The study: the 0.4 s floor hold was ~0.4 s of dead
++    # time (4 LSB delivers ~0.15 m/s^2), 0.35 s later than the owner; the hold has no frame-acceptance role (see the
++    # fca11_long.py C1 note), and 0.2 s still exceeds the ESC's own t10 (0.16 s).
++    self.assertEqual(0.2, fl.FCA11_SHAPE_ONSET_HOLD_S)
++    self.assertEqual(10, fl.FCA11_SHAPE_ONSET_HOLD_SENT)
++    # 0043 v3: C2 (jerk 0.9) was NOT folded - the pre-registered rule R1 fired (median onset delivered-jerk > 1.0
++    # under H-lin and H-opt); the comfort jerk target stays 0.75.
++    self.assertEqual(0.75, fl.FCA11_SHAPE_JERK_TARGET)
 +    self.assertEqual(3.0, fl.FCA11_SHAPE_HOLD_BAND_KPH)
 +    self.assertEqual(5.0, fl.FCA11_SHAPE_HOLD_EXIT_KPH)   # 0043 v2: hold-band EXIT hysteresis edge
 +    self.assertGreater(fl.FCA11_SHAPE_HOLD_EXIT_KPH, fl.FCA11_SHAPE_HOLD_BAND_KPH)
@@ -566,24 +594,55 @@ index 9c429dde..f5b7d09e 100644
 +    # below the low anchor -> the 4 LSB floor (never below 4 while moving)
 +    for x in (0.0, 0.05, 0.14, -1.0):
 +      self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, fl.shape_dec_cmd_from_extra(x), x)
-+    # at/above the high anchor the affine inverse applies (clamped to the panda gate)
-+    self.assertEqual(14, fl.shape_dec_cmd_from_extra(2.0))
++    # at/above the high anchor the affine inverse applies (clamped to the panda gate). 0043 v3 (C0): (2.0-0.74)/9.6 =
++    # 13.1 -> 13 LSB (was 14 with 8.23/0.85): the refit's ~1 LSB less over-brake at 12-20 LSB, by design.
++    self.assertEqual(13, fl.shape_dec_cmd_from_extra(2.0))
 +    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, fl.shape_dec_cmd_from_extra(9.0))
 +    # the tier cap clamps the level (relaxed 12)
 +    self.assertEqual(12, fl.shape_dec_cmd_from_extra(2.0, 12))
 +    self.assertEqual(4, fl.shape_dec_cmd_from_extra(0.1, 12))
 +
++  def test_c0_inverse_continuous_and_monotone_at_the_8_lsb_boundary(self):
++    """0043 v3 (C0 refit) REQUIRED proof: with K 9.6 / BITE 0.74 / CLIFF_HI_EXTRA 1.50 the inverse is CONTINUOUS and
++    MONOTONE where the linear cliff interpolation hands over to the affine branch. cmd(1.50) == 8 exactly; over a fine
++    1 mm/s^2 sweep of extra in [0, 4] the command never decreases and never steps by more than 1 LSB (a jump would be
++    a hidden delivered-decel step at a branch edge). The affine branch's max(8, ...) clamp is what guarantees no dip
++    right after the hand-over; the C0 values additionally make the UNclamped affine value round to 8 at the anchor
++    ((1.50 - 0.74) / 9.6 = 7.92 LSB), i.e. the anchor and the fit agree rather than relying on the clamp."""
++    self.assertEqual(8, fl.shape_dec_cmd_from_extra(1.50))
++    self.assertEqual(8, fl.shape_dec_cmd_from_extra(fl.FCA11_SHAPE_CLIFF_HI_EXTRA))
++    self.assertLess(fl.shape_dec_cmd_from_extra(fl.FCA11_SHAPE_CLIFF_HI_EXTRA - 0.2), 8)   # the cliff band is below 8
++    prev = fl.shape_dec_cmd_from_extra(0.0)
++    for i in range(1, 4001):
++      x = i * 0.001
++      c = fl.shape_dec_cmd_from_extra(x)
++      self.assertGreaterEqual(c, prev, f"non-monotone at extra={x:.3f}: {prev} -> {c}")
++      self.assertLessEqual(c - prev, 1, f"step > 1 LSB at extra={x:.3f}: {prev} -> {c}")
++      prev = c
++    # the affine branch just above the anchor never commands below the anchor LSB (no dip right after the hand-over)
++    for x in (1.50, 1.501, 1.51, 1.55, 1.60):
++      self.assertGreaterEqual(fl.shape_dec_cmd_from_extra(x), fl.FCA11_SHAPE_CLIFF_HI_LSB, x)
++
 +  def test_jerk_slew_matches_the_measured_slopes(self):
-+    # cliff band: ~1 LSB per ~0.42 s; above 8: ~9 LSB/s (the two slopes the spec names)
-+    self.assertAlmostEqual(0.0472, fl.shape_slew_lsb_per_sent(5), places=3)
-+    self.assertAlmostEqual(0.1823, fl.shape_slew_lsb_per_sent(10), places=3)
-+    self.assertAlmostEqual(2.36, fl.shape_slew_lsb_per_sent(5) / fl.FCA11_SHAPE_SENT_DT, places=1)
-+    self.assertAlmostEqual(9.11, fl.shape_slew_lsb_per_sent(10) / fl.FCA11_SHAPE_SENT_DT, places=1)
++    # Derived, not hand-pinned (0043 v3): slew = JERK_TARGET / slope * SENT_DT with the cliff-band slope
++    # (CLIFF_HI_EXTRA - CLIFF_LO_EXTRA) / 4 LSB and the affine slope K/100 per LSB above 8.
++    cliff_slope = (fl.FCA11_SHAPE_CLIFF_HI_EXTRA - fl.FCA11_SHAPE_CLIFF_LO_EXTRA) / 4.0
++    self.assertAlmostEqual(fl.FCA11_SHAPE_JERK_TARGET / cliff_slope * fl.FCA11_SHAPE_SENT_DT, fl.shape_slew_lsb_per_sent(5))
++    self.assertAlmostEqual(fl.FCA11_SHAPE_JERK_TARGET / (fl.FCA11_SHAPE_K / 100.0) * fl.FCA11_SHAPE_SENT_DT,
++                           fl.shape_slew_lsb_per_sent(10))
++    # the delivered jerk the slew produces through the modelled slope is EXACTLY the target in both regions
++    self.assertAlmostEqual(fl.FCA11_SHAPE_JERK_TARGET, fl.shape_slew_lsb_per_sent(5) / fl.FCA11_SHAPE_SENT_DT * cliff_slope)
++    self.assertAlmostEqual(fl.FCA11_SHAPE_JERK_TARGET,
++                           fl.shape_slew_lsb_per_sent(10) / fl.FCA11_SHAPE_SENT_DT * fl.FCA11_SHAPE_K / 100.0)
++    # pinned values for the shipped constants (C0 slopes 0.3375 / 0.096 m/s^2 per LSB):
++    #   cliff band 0.75/0.3375*0.02 = 0.0444 LSB/frame (2.22 LSB/s); above 8 0.75/0.096*0.02 = 0.1563 LSB/frame (7.81 LSB/s)
++    self.assertAlmostEqual(0.0444 * fl.FCA11_SHAPE_JERK_TARGET / 0.75, fl.shape_slew_lsb_per_sent(5), places=3)
++    self.assertAlmostEqual(0.1563 * fl.FCA11_SHAPE_JERK_TARGET / 0.75, fl.shape_slew_lsb_per_sent(10), places=3)
 +
 +  # ---- the onset hold + jerk-limited growth ----
 +
 +  def test_onset_hold_then_jerk_limited_growth(self):
-+    """A (non-hard) episode holds at the floor for the 0.4 s onset (20 SENT frames) before any growth, then grows
++    """A (non-hard) episode holds at the floor for the onset hold (FCA11_SHAPE_ONSET_HOLD_SENT SENT frames) before any growth, then grows
 +    slowly. The old law stepped 4->8 within ~20-40 ms."""
 +    b = self._brake(True)
 +    sent = self._sent(b, -1.0, 500, personality=fl.PERSONALITY_AGGRESSIVE)
@@ -602,7 +661,7 @@ index 9c429dde..f5b7d09e 100644
 +
 +  def test_soft_ask_is_jerk_limited_and_slow(self):
 +    """A SOFT (comfort) ask is JERK-LIMITED (0043 v2: the fast lane is reserved for HARD asks <= -1.2): it holds the
-+    4 LSB floor for the 0.4 s onset, then creeps toward its honest level (<= 7 LSB: a soft ask never reaches the
++    4 LSB floor for the onset hold, then creeps toward its honest level (<= 7 LSB: a soft ask never reaches the
 +    8 LSB cliff edge) at the comfort slew - vs ~20-40 ms for the old law. The 4->8 slew itself takes >= 1.5 s."""
 +    b = self._brake(True)
 +    sent = self._sent(b, -1.0, 400, personality=fl.PERSONALITY_AGGRESSIVE)
@@ -612,7 +671,7 @@ index 9c429dde..f5b7d09e 100644
 +    self.assertEqual(7, level)
 +    self.assertEqual(level, max(d for _, d in sent), "it does ramp to its honest level (not stuck at the floor)")
 +    self.assertNotIn(8, [d for _, d in sent], "a soft ask never reaches the cliff edge")
-+    # ... but only SLOWLY: the onset hold (0.4 s) + the comfort slew put the honest level >= 1.5 s after the open
++    # ... but only SLOWLY: the onset hold + the comfort slew put the honest level >= 1.5 s after the open
 +    t_level = (next(fr for fr, dv in sent if dv >= level) - sent[0][0]) / 100.0
 +    self.assertGreaterEqual(t_level, 1.5, f"soft ask reached its level in {t_level:.2f}s (< 1.5): not jerk-limited")
 +    # and the comfort slew ITSELF still takes >= 1.5 s to traverse the 4->8 cliff band (the shaping is intact)
@@ -645,10 +704,10 @@ index 9c429dde..f5b7d09e 100644
 +    b3 = self._brake(True)
 +    soft = self._sent(b3, -1.0, 60, personality=fl.PERSONALITY_STANDARD)
 +    self.assertNotIn(8, [d for _, d in soft], "a soft ask must not jump to 8 LSB")
-+    self.assertEqual({fl.FCA11_SHAPE_FLOOR_LSB}, {d for _, d in soft}, "a soft ask holds the floor through the 0.4 s onset")
++    self.assertEqual({fl.FCA11_SHAPE_FLOOR_LSB}, {d for _, d in soft}, "a soft ask holds the floor through the onset hold + first slew frames")
 +
 +  def test_hard_to_soft_inside_the_onset_hold_never_drops_to_the_floor(self):
-+    """0043 v2 edge the fast lane CREATES: a HARD ask grows the accumulator above the floor within the first 0.4 s;
++    """0043 v2 edge the fast lane CREATES: a HARD ask grows the accumulator above the floor within the onset hold;
 +    if the ask then eases into the SOFT band while the onset hold is still running, the hold must NOT force the
 +    command back to the 4 LSB floor (a 12 -> 4 step across the delivered-decel cliff, then a re-climb at the comfort
 +    slew = an accidental release-and-reapply). It follows the honest soft level DOWN immediately (the safe direction)
@@ -723,16 +782,18 @@ index 9c429dde..f5b7d09e 100644
 +    command re-ramps at +RATE_STEP per sent frame back to the shaped level (it can only ever LOWER the command)."""
 +    b = self._brake(True)
 +    sent = self._sent(b, -2.0, 60, personality=fl.PERSONALITY_STANDARD)
-+    self.assertEqual(14, sent[-1][1], "settled at the honest -2.0 level")
-+    b.observe_echo([(192, bytes([0, 14] + [0] * 6))])        # a REFUSED actuating echo while braking
++    level = fl.shape_dec_cmd_from_extra(2.0)                  # 0043 v3 (C0): 13 (was 14 with 8.23/0.85)
++    self.assertEqual(13, level)
++    self.assertEqual(level, sent[-1][1], "settled at the honest -2.0 level")
++    b.observe_echo([(192, bytes([0, level] + [0] * 6))])     # a REFUSED actuating echo while braking
 +    self.assertEqual(0, b._dec_last_sent)
 +    again = [d for _, d in self._sent(b, -2.0, 12, personality=fl.PERSONALITY_STANDARD, start=60)]
-+    self.assertEqual([4, 8, 12, 14, 14, 14], again, "re-ramp at +RATE_STEP per sent frame, then back at the level")
++    self.assertEqual([4, 8, 12, level, level, level], again, "re-ramp at +RATE_STEP per sent frame, then back at the level")
 +
 +  def test_soft_ask_never_grows_the_sent_value_during_the_onset_hold(self):
 +    """Consult-found edge in the v2 hold-line change: `_shape_acc` is stored BEFORE the panda clamp, so after a short
-+    HARD phase it sits up to one +RATE_STEP AHEAD of the last SENT frame. A soft ask that eases in during the 0.4 s
-+    hold must not let the SENT value climb to it (4 -> 6 in one frame = growth the comfort slew should govern).
++    HARD phase it sits up to one +RATE_STEP AHEAD of the last SENT frame. A soft ask that eases in during the onset
++    hold (0.2 s since 0043 v3) must not let the SENT value climb to it (4 -> 6 in one frame = growth the comfort slew should govern).
 +    Over every (speed x hard-phase length x soft ask), and with a refused echo mid-hold, the sent series from the last
 +    hard-phase frame on is NON-INCREASING while the hold runs. FALSIFIABLE: without the `_dec_last_sent` cap in the
 +    onset branch, hard x1 then soft -0.9 sends [4, 6, 6, ...]."""
@@ -742,7 +803,10 @@ index 9c429dde..f5b7d09e 100644
 +          for refuse_at in (None, 2 * k_hard + 3):                # also: a REFUSED actuating echo mid-hold
 +            b = self._brake(True)
 +            series = []
-+            for f in range(40):                                   # f < 40 == the 20 sent-frame (0.4 s) onset hold
++            # 0043 v3 (C1): the window is DERIVED from the hold (2 controller frames per sent frame), not a hardcoded
++            # 40 (= the v2 0.4 s hold). With the 0.2 s hold a fixed 40-frame window ran past the hold's end and flagged
++            # the comfort slew's legitimate post-hold growth (4 -> 5) as hold growth.
++            for f in range(fl.FCA11_SEND_EVERY * fl.FCA11_SHAPE_ONSET_HOLD_SENT):   # == the onset hold, in frames
 +              if refuse_at is not None and f == refuse_at:
 +                b.observe_echo([(192, bytes([0, 8] + [0] * 6))])
 +              accel = -3.0 if f < 2 * k_hard else soft
