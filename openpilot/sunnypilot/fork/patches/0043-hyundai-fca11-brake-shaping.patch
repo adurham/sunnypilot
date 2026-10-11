@@ -1,0 +1,972 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index a4a20127..029d91f3 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -244,6 +244,97 @@ FCA11_AFFINE_STOP_BAND_KPH = 3.0
+ # min(8, 4+4)=8 (ACCEPTED) -> reaches the hold floor in ~40 ms. So these values can never exceed the panda gate.
+ 
+ 
++# *** 0043: FCA11_SHAPE_* — the OPT-IN BRAKE-SHAPING command law (behind HyundaiFca11AffineGain, DEFAULT OFF) ***
++#
++# WHY (measured 2026-10-10, routes 155/157; wsB-feel). An FCA11 brake ONSET is a near-STEP. The deployed law's
++# request path (0.67 through-origin inverse) plus the +RATE_STEP rate limiter sends 4 LSB and then 8 LSB within
++# 40-60 ms; the ESC's own plant has a CLIFF between 4 and 8 LSB (delivered EXTRA decel ~0.15 m/s^2 at 4 LSB vs
++# ~1.42 at 8), so the 4->8 step is a ~1.3 m/s^2 delivered step -> onset jerk median 7.6 m/s^3 (max 38; comfort
++# <= 2-3). 86% of stops are grabby. The steady plant, though, is AFFINE (delivered = BITE + K*cmd_g, K = 8.23
++# [8.07, 8.39] m/s^2/g, BITE = 0.85 [0.82, 0.87], r^2 = 0.69, n = 2701), and the 0.67 law OVER-delivers by ~0.9
++# m/s^2 (steady moving delivered -1.71 vs ask -0.77).
++#
++# WHAT THIS LAW DOES (ON path, gated by HyundaiFca11AffineGain; OFF = BYTE-IDENTICAL to 0042):
++#   1. demand:      want = max(0.0, -accel_ask); no coast subtraction.
++#   2. level (moving, above FCA11_SHAPE_HOLD_BAND_KPH): a piecewise-MONOTONE inverse of the measured steady
++#      curve, clamped [FCA11_SHAPE_FLOOR_LSB, tier cap]. Anchors (extra -> LSB): (0.15 -> 4) and (1.42 -> 8). For
++#      extra >= ~1.42 the affine inverse cmd = round(((extra - BITE)/K)*100), clamped [8, tier cap]; for extra in
++#      (0.15, 1.42) a LINEAR interpolation across the cliff; extra < 0.15 -> the 4 LSB floor (never below 4 while
++#      moving).
++#   3. onset shaping: an episode (re)open starts at the floor and HOLDS FCA11_SHAPE_ONSET_HOLD_S (0.4 s, in
++#      SENT-frame time) before growth; then a JERK-LIMITED slew (target delivered jerk FCA11_SHAPE_JERK_TARGET
++#      = 0.75 m/s^3, band 0.5-1.0) computed through the local d(extra)/d(cmd) slope of the curve (cliff band
++#      ~1 LSB per ~0.5 s; above 8 ~9 LSB/s). Growth never exceeds the panda's +RATE_STEP / sent-frame ceiling.
++#      A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) is an EMERGENCY: it BYPASSES the onset hold AND the comfort jerk
++#      slew - its growth runs at up to the panda ceiling (+RATE_STEP = 4 LSB per SENT frame, the same speed class as
++#      the pre-shaping path's fast ramp) so a hard demand reaches the tier cap in a few sent frames, not seconds.
++#      The shaped LEVEL target is KEPT (an honest inverse level once reached). The comfort slew is for comfort asks,
++#      not emergencies. (0043 v2: v1 bypassed only the hold but still jerk-slewed the growth, which added ~1.7 s to
++#      8 LSB / ~3 s to the cap - up to +44 m of open-loop stopping distance. Fixed.)
++#   4. steady:      cmd tracks the level inverse; the only rate limit is the jerk slew. Decreases are IMMEDIATE
++#      (the safe direction); the release ramp is deliberately NOT in this patch (see the REPORT).
++#   5. stop/hold:   v <= FCA11_SHAPE_HOLD_BAND_KPH (or CarState.standstill) ENTERS the hold band; it is left only at
++#      >= FCA11_SHAPE_HOLD_EXIT_KPH (EXIT hysteresis, 0043 v2). Inside, the command floors at the PERSONALITY TIER CAP
++#      (12/20/30), reached at the panda's +RATE_STEP so a proven hold (which ran at the cap, 8-20 s) is never
++#      weakened. This is the last-meter snub. The hysteresis stops a DCT creeping across the 3 km/h edge from
++#      stepping the command cap<->level (e.g. 20 -> 6 -> 20) on the boundary.
++#   6. release:     unchanged (episode close + passive frame). NO release ramp in this patch (deferred).
++#
++# The anchors + cliff slope ARE PROVISIONAL: the 5-7 LSB band was NEVER emitted by the old law (it jumped 4->8 in
++# one +4 step), so it is UNMEASURED. Refit FCA11_SHAPE_CLIFF_LO/HI_EXTRA (+ FCA11_SHAPE_K/BITE) after the next
++# drive logs the 5/6/7 LSB levels. The whole mapping is behind these few constants so the refit is a constant
++# change, not a code change.
++FCA11_SHAPE_FLOOR_LSB = 4          # the moving floor; the law never commands below this while moving
++FCA11_SHAPE_CLIFF_LO_EXTRA = 0.15  # PROVISIONAL: delivered extra (m/s^2) measured at 4 LSB (0.12-0.17)
++FCA11_SHAPE_CLIFF_HI_EXTRA = 1.42  # PROVISIONAL: the steady curve at 8 LSB (the fit BITE + K*0.08)
++FCA11_SHAPE_CLIFF_LO_LSB = 4
++FCA11_SHAPE_CLIFF_HI_LSB = 8
++FCA11_SHAPE_K = 8.23               # steady-window affine slope (m/s^2 per g), CI [8.07, 8.39]
++FCA11_SHAPE_BITE = 0.85            # steady-window affine bite (m/s^2), CI [0.82, 0.87]
++FCA11_SHAPE_ONSET_HOLD_S = 0.4     # the onset hold at the floor, seconds of SENT-frame time
++FCA11_SHAPE_ONSET_HOLD_SENT = 20   # == FCA11_SHAPE_ONSET_HOLD_S / 0.02 (the 50 Hz sent-frame period); pinned by a test
++FCA11_SHAPE_JERK_TARGET = 0.75     # target delivered jerk (m/s^3); the comfort band is 0.5-1.0
++FCA11_SHAPE_JERK_BAND = (0.5, 1.0)
++FCA11_SHAPE_HOLD_BAND_KPH = 3.0    # ENTER the stop/hold band at/below this (or CarState.standstill): floor at the tier cap
++FCA11_SHAPE_HOLD_EXIT_KPH = 5.0    # 0043 v2: EXIT the band only at/above this (hysteresis) - no cap<->level step chatter at 3 km/h
++FCA11_SHAPE_SENT_DT = 0.02         # seconds per SENT (50 Hz) frame: the jerk slew is per SENT frame
++
++
++def shape_dec_cmd_from_extra(extra: float, cap: int = HYUNDAI_FCA11_LONG_MAX_DEC) -> int:
++  """0043: the piecewise-MONOTONE inverse of the measured steady curve (wanted extra m/s^2 -> raw CR_VSM_DecCmd).
++
++  Clamped to [FCA11_SHAPE_FLOOR_LSB, cap]. extra <= 0.15 -> the 4 LSB floor; extra in (0.15, 1.42) -> a LINEAR
++  interpolation across the CLIFF (PROVISIONAL - the 5/6/7 LSB band is unmeasured); extra >= 1.42 -> the affine
++  inverse round(((extra - BITE)/K)*100), clamped [8, cap] (which keeps the curve continuous at the 8 anchor)."""
++  if extra <= FCA11_SHAPE_CLIFF_LO_EXTRA:
++    return FCA11_SHAPE_FLOOR_LSB
++  if extra < FCA11_SHAPE_CLIFF_HI_EXTRA:
++    frac = (extra - FCA11_SHAPE_CLIFF_LO_EXTRA) / (FCA11_SHAPE_CLIFF_HI_EXTRA - FCA11_SHAPE_CLIFF_LO_EXTRA)
++    cmd = FCA11_SHAPE_CLIFF_LO_LSB + frac * (FCA11_SHAPE_CLIFF_HI_LSB - FCA11_SHAPE_CLIFF_LO_LSB)
++    return int(round(max(FCA11_SHAPE_FLOOR_LSB, min(cap, cmd))))
++  cmd = int(round(((extra - FCA11_SHAPE_BITE) / FCA11_SHAPE_K) * 100))
++  return max(FCA11_SHAPE_CLIFF_HI_LSB, min(cap, cmd))
++
++
++def shape_local_slope_extra_per_lsb(lsb: float) -> float:
++  """d(extra)/d(LSB) of the shaped curve at a command level (m/s^2 per LSB) - the slope the jerk slew rides.
++
++  Cliff band (4-8 LSB): the linear interpolation's slope. At/above 8: the affine slope K/100 (the inverse's
++  d(extra)/d(cmd_g) = K with cmd_g = LSB/100), so the map back to LSB growth is K/100 per LSB."""
++  if lsb < FCA11_SHAPE_CLIFF_HI_LSB:
++    return (FCA11_SHAPE_CLIFF_HI_EXTRA - FCA11_SHAPE_CLIFF_LO_EXTRA) / (FCA11_SHAPE_CLIFF_HI_LSB - FCA11_SHAPE_CLIFF_LO_LSB)
++  return FCA11_SHAPE_K / 100.0
++
++
++def shape_slew_lsb_per_sent(lsb: float) -> float:
++  """The jerk-limited growth allowed in ONE 50 Hz sent frame at command level ``lsb`` (LSB per sent frame).
++
++  dLSB/dt = jerk_target / (d(extra)/dLSB), times the 0.02 s sent-frame period. Cliff band -> ~0.047 LSB/frame
++  (~1 LSB per ~0.4 s); above 8 -> ~0.18 LSB/frame (~9 LSB/s)."""
++  slope = shape_local_slope_extra_per_lsb(lsb)
++  return FCA11_SHAPE_JERK_TARGET / slope * FCA11_SHAPE_SENT_DT
++
++
+ def dec_cmd_from_accel_affine(accel: float, K: float = FCA11_AFFINE_K, BITE: float = FCA11_AFFINE_BITE) -> int:
+   """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB) through the AFFINE plant, clamp [0, 30].
+ 
+@@ -534,6 +625,13 @@ class Fca11LongBrake:
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+     self._sent_this_episode = False
++    # 0043: the shaped-law state (ON path only). `_shape_acc` is the float LSB accumulator the jerk slew ramps
++    # (starts at the floor); `_shape_sent_n` counts SENT actuating frames since this episode opened (the onset
++    # hold is measured in SENT-frame time); `_shape_in_hold_band` is the hold-band latch (ENTRY <= 3 km/h, EXIT
++    # >= 5 km/h - 0043 v2 hysteresis). Never read on the OFF path -> the OFF behaviour is untouched.
++    self._shape_acc = float(FCA11_SHAPE_FLOOR_LSB)
++    self._shape_sent_n = 0
++    self._shape_in_hold_band = False
+     # ---- G5 anti-flap state ----
+     self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
+     self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
+@@ -553,6 +651,7 @@ class Fca11LongBrake:
+       self.cal_seq = cal_mode.CalSequencer(os.environ.get("FCA11_CAL_DIR", cal_mode.CAL_DIR))
+       self.cal_seq.mark_session(os.getpid())
+     self._cal_active = False           # this frame is a CAL hold (drives the gas neutralization)
++    self._cal_prev = False             # 0043 v2: previous frame's cal_on, for the cal-active EDGE reset of the shaped ramp
+ 
+   # ---- window ----
+ 
+@@ -816,6 +915,73 @@ class Fca11LongBrake:
+     m = Fca11MirrorFrame(dec_cmd=0, prefill=False, warn=0, cmd_act=False, dec_cmd_act=False)
+     return [CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0)]
+ 
++  def _shape_reset(self) -> None:
++    """0043: arm a fresh shaped episode - the float LSB accumulator starts at the floor, the onset-hold
++    sent-frame counter and the hold-band latch are cleared. Called on every (re)open, on disable, on the
++    longActive-off exit, and on a cal-active EDGE (0043 v2: a cal->planner hand-off must not carry stale state)."""
++    self._shape_acc = float(FCA11_SHAPE_FLOOR_LSB)
++    self._shape_sent_n = 0
++    self._shape_in_hold_band = False
++
++  def _shape_level(self, accel_ask: float, v_kph: float, CS, frame: int,
++                   personality=PERSONALITY_STANDARD) -> int:
++    """0043: the raw CR_VSM_DecCmd the SHAPED law requests for one 100 Hz frame (ON path).
++
++    State advances ONLY on the 50 Hz SENT slot (frame % FCA11_SEND_EVERY == 0): the emitted level is a staircase
++    and the jerk slew counts per SENT frame. On a non-send frame the last accumulator value is re-offered (it is
++    not transmitted, so this only feeds the alert/logger view). The return is capped by the panda contract - a
++    sent frame may grow at most +RATE_STEP over the last ACCEPTED frame (0 at an episode open, which is why the
++    FIRST sent frame is the floor 4). Never returns 0 within an episode; a release is the caller's job.
++    """
++    cap = personality_max_dec(personality)
++    want = max(0.0, -accel_ask)
++    # 0043 v2: hold-band EXIT hysteresis. ENTER at <= FCA11_SHAPE_HOLD_BAND_KPH (3 km/h) or CarState.standstill;
++    # leave only at >= FCA11_SHAPE_HOLD_EXIT_KPH (5 km/h). Without it a DCT creeping across the 3 km/h edge steps the
++    # command cap<->level (e.g. 20 -> 6 -> 20), a repeated ~1 m/s^2 step. The latch is updated every frame (it is
++    # above the send-slot return) so the exit is seen promptly.
++    standstill = bool(getattr(CS.out, "standstill", False))
++    if standstill or v_kph <= FCA11_SHAPE_HOLD_BAND_KPH:
++      self._shape_in_hold_band = True
++    elif v_kph >= FCA11_SHAPE_HOLD_EXIT_KPH:
++      self._shape_in_hold_band = False
++    in_hold_band = self._shape_in_hold_band
++    # level-law target (integer LSB): the tier cap in the stop/hold band, else the shaped inverse of the demand.
++    target = cap if in_hold_band else shape_dec_cmd_from_extra(want, cap)
++    if frame % FCA11_SEND_EVERY != 0:
++      return int(self._shape_acc)
++    hard = bool(accel_ask <= FCA11_ONSET_BYPASS_ACCEL)
++    # 0043 v2: a HARD ask is an EMERGENCY. It bypasses the onset hold AND the comfort jerk slew: its growth runs at
++    # up to the panda ceiling, the SAME +RATE_STEP/sent-frame rate the (pre-shaping) fast ramp uses, so a hard demand
++    # reaches the tier cap in a few sent frames (~0.1 s) instead of seconds. The shaped LEVEL target is kept (an
++    # honest inverse level once reached). The hold band is exempt for the same reason (a stop wants the cap promptly).
++    fast = bool(hard or in_hold_band)
++    prev = self._shape_acc
++    if (not in_hold_band) and (not hard) and self._shape_sent_n < FCA11_SHAPE_ONSET_HOLD_SENT:
++      # onset hold: NO GROWTH before the hold has elapsed. At an episode open `prev` IS the floor, so this holds the
++      # floor exactly as before. 0043 v2: after a HARD phase (the fast lane grew `prev` above the floor) an ask that
++      # eases into the soft band inside the first 0.4 s must NOT be forced back down to the floor - that would be a
++      # 12 -> 4 step across the delivered-decel cliff and a re-climb at the comfort slew (a release-and-reapply). Hold
++      # the level, and follow the (lower) honest soft level down immediately (decreases are the safe direction).
++      new_acc = prev if target >= prev else float(target)
++      # ... and NO growth of the SENT value either. `_shape_acc` is stored BEFORE the panda clamp below, so after a
++      # short HARD phase it sits up to one +RATE_STEP AHEAD of the last sent frame; without this cap a soft ask
++      # that eases in during the hold would let the sent value CLIMB to it (4 -> 7 in one frame). Cap at the last
++      # sent level (the floor at an episode open, where _dec_last_sent is 0). Only ever lowers the command.
++      new_acc = min(new_acc, float(max(self._dec_last_sent, FCA11_SHAPE_FLOOR_LSB)))
++    elif target >= prev:
++      # grow toward the target: the panda's own +RATE_STEP on a hard ask / in the hold band, the comfort jerk slew
++      # on a soft (comfort) moving ask.
++      slew = float(HYUNDAI_FCA11_LONG_RATE_STEP) if fast else shape_slew_lsb_per_sent(prev)
++      new_acc = min(float(target), prev + slew)
++    else:
++      new_acc = float(target)                           # decrease is immediate (safe direction; release ramp deferred)
++    new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
++    self._shape_acc = new_acc
++    self._shape_sent_n += 1
++    # panda contract: never exceed +RATE_STEP over the last ACCEPTED frame (0 at an episode open -> the first
++    # sent frame is the floor 4, which the panda accepts).
++    return min(int(new_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++
+   def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     sends: list[CanData] = []
+     if not self.enabled:
+@@ -851,6 +1017,9 @@ class Fca11LongBrake:
+       # 0038: no gas hold-off state either.
+       self._gas_release_frame = None
+       self._gas_prev = False
++      # 0043: and no shaped-law state survives a disable (a re-arm starts at the floor). 0043 v2: nor the cal-edge tracker.
++      self._shape_reset()
++      self._cal_prev = False
+       return sends
+ 
+     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+@@ -941,6 +1110,8 @@ class Fca11LongBrake:
+       # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
+       self._ask_frames = 0
+       self._on_frames = 0
++      # 0043: and the shaped-law ramp state (the next episode re-opens at the floor with the onset hold armed).
++      self._shape_reset()
+       self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
+       self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+@@ -978,6 +1149,12 @@ class Fca11LongBrake:
+       self._cal_frames = 0
+     cal_on = bool(cal_ask and ok)
+     self._cal_active = False   # re-latched below iff THIS frame commands a scripted hold
++    # 0043 v2: reset the shaped ramp on a cal-active EDGE. While cal is active the shaped law takes the 0041-era
++    # path; without this reset an episode that OPENS under cal and then continues on the planner ask would inherit
++    # stale `_shape_acc`/`_shape_sent_n` (which can skip the onset hold). A cal->planner hand-off must start fresh.
++    if self.affine_gain and bool(cal_on) != self._cal_prev:     # ON path only: the OFF path runs no shaped-law code here
++      self._shape_reset()
++      self._cal_prev = bool(cal_on)
+ 
+     # ---- G5 anti-flap decision ----------------------------------------------------------------
+     # ask: the planner wants a brake THIS frame and every pre-condition (fca11_ok) holds. `ask` drives
+@@ -1016,56 +1193,66 @@ class Fca11LongBrake:
+       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
+       # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
+       self._cal_active = bool(cal_on and ok)
+-      # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+-      # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+-      # 0041: the OPT-IN affine law (self.affine_gain, DEFAULT OFF) replaces the through-origin inverse with the
+-      # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040.
+       accel_ask = min(accel, FCA11_BRAKE_ONSET_ACCEL)
+-      if self.affine_gain:
+-        dec_cmd = dec_cmd_from_accel_affine(accel_ask)
+-      else:
+-        dec_cmd = dec_cmd_from_accel(accel_ask)
+-      # production tiering of the planner ask (unchanged when cal is off -> byte-identical). 0041: under the affine
+-      # law the command may legitimately taper to 0 (no honest request), so the floor is the honest level, not the
+-      # fixed 1 the through-origin law uses; OFF keeps the 0040 clamp exactly (raw CR_VSM_DecCmd >= 1).
+-      if self.affine_gain:
+-        dec_cmd = min(dec_cmd, personality_max_dec(personality))
++      # 0043: the OPT-IN brake-shaping law (self.affine_gain, DEFAULT OFF). On the planner-ask path it SUPERSEDES
++      # the 0041 affine-only LEVEL path (and the 0.67 through-origin path): it owns its own jerk-limited slew and
++      # the 4 LSB moving floor / tier-cap hold floor, so it replaces the whole request+floor+rate-limit block
++      # below. cal_on still takes the 0041-era path UNCHANGED (cal is a subordinate test tool - a scripted level
++      # with a clean +RATE_STEP entry step). OFF (no cal, no affine) is byte-identical to 0042.
++      if self.affine_gain and not cal_on:
++        if not self.braking:
++          self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
++        dec_cmd = self._shape_level(accel_ask, v_kph_now, CS, frame, personality)
+       else:
+-        dec_cmd = clamp_dec_cmd(dec_cmd, personality)
+-      # 0041 (low-speed refusal fix): the affine hold/release floor is applied to the REQUEST here, BEFORE the
+-      # +RATE_STEP rate limiter below -- NOT after it. Applied after, the floor lifted the FIRST frame of an episode
+-      # straight to 8 LSB, over the panda's onset gate (the firmware allows only +RATE_STEP over the last ACCEPTED
+-      # frame, which is 0 at an episode open), so panda refused EVERY actuating frame (dec=8 last=0) and the brake
+-      # never engaged at low speed. Applied to the request, the limiter still governs the ONSET: request 8 ->
+-      # min(8, 0+4) = 4 (first frame, ACCEPTED) -> min(8, 4+4) = 8 (ACCEPTED) -> 4 -> 8 in ~40 ms. The floor applies
+-      # ONLY when the law commands > 0 (an honest taper to 0 stays 0) and never when cal sets the level itself.
+-      if self.affine_gain and not cal_on and dec_cmd > 0:
+-        in_hold_band = bool(v_kph_now <= FCA11_AFFINE_STOP_BAND_KPH or getattr(CS.out, "standstill", False))
+-        dec_cmd = max(dec_cmd, FCA11_AFFINE_HOLD_LSB if in_hold_band else FCA11_AFFINE_RELEASE_LSB)
+-        dec_cmd = min(dec_cmd, personality_max_dec(personality))
+-      if cal_on:
+-        # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
+-        # planner. max() with the scripted level means: planner coasting -> the cal level (the
+-        # controlled step the fit needs); a HARDER planner ask (e.g. a lead cuts in mid-hold) -> the
+-        # planner wins, so cal can never make the car brake LESS than production would (Fable: closes
+-        # the planner-silenced window). The level is clamped to the PANDA gate 30 LSB = 0.30 g, NOT the
+-        # personality tier cap -- cal must reach 0.30 g regardless of the feel dial, and 30 is the
+-        # personality-agnostic firmware gate, so there is NO new authority. (Deliberate, disclosed
+-        # exception: cal may exceed the owner's configured tier cap, never the panda gate.)
+-        dec_cmd = max(dec_cmd, max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, int(self.cal_seq.level_lsb))))
+-      # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
+-      # camera period of growth; release is immediate. Reference = our last SENT frame.
+-      # 0029 CAL: this +RATE_STEP-per-SENT-frame clamp IS the clean entry step the BITE fit needs --
+-      # a scripted step enters through the panda-rate ramp even for a low level (where the production
+-      # path's LPF + slew would otherwise smear the step). Do NOT bypass it for cal.
+-      dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+-      if cal_on:
+-        dec_cmd = max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, dec_cmd))  # <= panda gate (30)
+-      elif not self.affine_gain:
+-        # 0041: the affine ON path applies its hold/release floor to the REQUEST *before* this limiter (above), so the
+-        # panda's onset gate still governs the ramp and there is nothing left to clamp for it here. OFF keeps the 0040
+-        # clamp exactly.
+-        dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
++        # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
++        # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
++        # 0041: the OPT-IN affine law (self.affine_gain, DEFAULT OFF) replaces the through-origin inverse with the
++        # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040.
++        if self.affine_gain:
++          dec_cmd = dec_cmd_from_accel_affine(accel_ask)
++        else:
++          dec_cmd = dec_cmd_from_accel(accel_ask)
++        # production tiering of the planner ask (unchanged when cal is off -> byte-identical). 0041: under the affine
++        # law the command may legitimately taper to 0 (no honest request), so the floor is the honest level, not the
++        # fixed 1 the through-origin law uses; OFF keeps the 0040 clamp exactly (raw CR_VSM_DecCmd >= 1).
++        if self.affine_gain:
++          dec_cmd = min(dec_cmd, personality_max_dec(personality))
++        else:
++          dec_cmd = clamp_dec_cmd(dec_cmd, personality)
++        # 0041 (low-speed refusal fix): the affine hold/release floor is applied to the REQUEST here, BEFORE the
++        # +RATE_STEP rate limiter below -- NOT after it. Applied after, the floor lifted the FIRST frame of an episode
++        # straight to 8 LSB, over the panda's onset gate (the firmware allows only +RATE_STEP over the last ACCEPTED
++        # frame, which is 0 at an episode open), so panda refused EVERY actuating frame (dec=8 last=0) and the brake
++        # never engaged at low speed. Applied to the request, the limiter still governs the ONSET: request 8 ->
++        # min(8, 0+4) = 4 (first frame, ACCEPTED) -> min(8, 4+4) = 8 (ACCEPTED) -> 4 -> 8 in ~40 ms. The floor applies
++        # ONLY when the law commands > 0 (an honest taper to 0 stays 0) and never when cal sets the level itself.
++        if self.affine_gain and not cal_on and dec_cmd > 0:
++          in_hold_band = bool(v_kph_now <= FCA11_AFFINE_STOP_BAND_KPH or getattr(CS.out, "standstill", False))
++          dec_cmd = max(dec_cmd, FCA11_AFFINE_HOLD_LSB if in_hold_band else FCA11_AFFINE_RELEASE_LSB)
++          dec_cmd = min(dec_cmd, personality_max_dec(personality))
++        if cal_on:
++          # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
++          # planner. max() with the scripted level means: planner coasting -> the cal level (the
++          # controlled step the fit needs); a HARDER planner ask (e.g. a lead cuts in mid-hold) -> the
++          # planner wins, so cal can never make the car brake LESS than production would (Fable: closes
++          # the planner-silenced window). The level is clamped to the PANDA gate 30 LSB = 0.30 g, NOT the
++          # personality tier cap -- cal must reach 0.30 g regardless of the feel dial, and 30 is the
++          # personality-agnostic firmware gate, so there is NO new authority. (Deliberate, disclosed
++          # exception: cal may exceed the owner's configured tier cap, never the panda gate.)
++          dec_cmd = max(dec_cmd, max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, int(self.cal_seq.level_lsb))))
++        # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
++        # camera period of growth; release is immediate. Reference = our last SENT frame.
++        # 0029 CAL: this +RATE_STEP-per-SENT-frame clamp IS the clean entry step the BITE fit needs --
++        # a scripted step enters through the panda-rate ramp even for a low level (where the production
++        # path's LPF + slew would otherwise smear the step). Do NOT bypass it for cal.
++        dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++        if cal_on:
++          dec_cmd = max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, dec_cmd))  # <= panda gate (30)
++        elif not self.affine_gain:
++          # 0041: the affine ON path applies its hold/release floor to the REQUEST *before* this limiter (above), so the
++          # panda's onset gate still governs the ramp and there is nothing left to clamp for it here. OFF keeps the 0040
++          # clamp exactly.
++          dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
+ 
+       t_cam, dat = cam
+       if frame % FCA11_SEND_EVERY == 0:
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 9c429dde..f5b7d09e 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -2288,91 +2288,567 @@ class Test0041AffineGain(unittest.TestCase):
+     self.assertEqual(min(old, fl.HYUNDAI_FCA11_LONG_RATE_STEP), decs[0], "first sent frame is rate-limited")
+     self.assertEqual(old, max(decs), "OFF must command the 0.67 value, unchanged")
+ 
+-  def test_affine_path_changed_when_on(self):
+-    """ON -> the request inverts the AFFINE plant; a -0.8 ask commands 4 LSB while MOVING, not the 0.67 law's 12."""
+-    b = self._brake(True)
+-    decs = []
+-    for f in range(0, 120, 2):
+-      for s in b.update(self._cc(-0.8), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+-        decs.append(fl._get_bits(s.dat, 8, 8))
+-    self.assertTrue(decs)
+-    self.assertEqual(4, max(decs), "the affine law commands 4 LSB for a -0.8 ask, not 12")
+-    self.assertEqual(4, min(decs), "and it holds there (the honest level), never over-commanding")
+-
+-  def test_affine_on_keeps_the_hold_floor_at_standstill(self):
+-    """FIX (B): at a standstill the affine ON path must NOT weaken the hold below today's 8 LSB. A DCT car creeps at a
+-    stop and the sim cannot see the ESC, so the released 4 LSB floor is only legal WHILE MOVING.
++  # ---- 0043 SUPERSESSION: these pin the SHAPED law (the ON path no longer uses the 0041 affine LEVEL mapping) ----
+ 
+-    FIX (low-speed refusal): the 8 LSB hold floor is a REQUEST floor applied BEFORE the +RATE_STEP rate limiter, so the
+-    FIRST emitted actuating frame is the rate-limited onset step (4 LSB, <= RATE_STEP, which the panda ACCEPTS) and the
+-    hold floor (8) is reached by the 2nd frame. The floor is never applied after the limiter (that lifted the first
+-    frame straight to 8, over the panda's onset gate, so every frame was refused and the brake never engaged)."""
++  def test_shaped_on_commands_the_cliff_level_not_the_0041_mapping(self):
++    """SUPERSEDED by 0043: the ON path is the SHAPE law now, not the 0041 affine-only LEVEL mapping. A -0.8 moving
++    ask wants extra 0.8 m/s^2 -> the cliff anchor maps it to 6 LSB (4 + (0.8-0.15)/1.27*4), reached SLOWLY (the
++    onset hold then the jerk-limited slew). The old 0041 law commanded a flat 4; the 0.67 law commands 12."""
+     b = self._brake(True)
+     decs = []
+-    for f in range(0, 120, 2):
+-      for s in b.update(self._cc(-0.73), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0), f,
+-                        fl.PERSONALITY_AGGRESSIVE):
++    for f in range(0, 900, 2):
++      for s in b.update(self._cc(-0.8), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+         decs.append(fl._get_bits(s.dat, 8, 8))
+     self.assertTrue(decs)
+-    # onset obeys the panda's +RATE_STEP gate ...
+-    self.assertLessEqual(decs[0], fl.HYUNDAI_FCA11_LONG_RATE_STEP,
+-                         f"first standstill frame must be <= RATE_STEP so the panda accepts it, got {decs}")
+-    self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0])
+-    # ... and the >= 8 LSB hold floor is reached by the 2nd emitted frame (4 -> 8 in one 20 ms camera period)
+-    self.assertGreaterEqual(decs[1], fl.FCA11_AFFINE_HOLD_LSB, f"hold floor reached by frame 2, got {decs}")
+-    self.assertEqual(8, max(decs))
+-    # the ramp NEVER jumps: every consecutive SENT frame grows <= RATE_STEP (the panda's per-accepted-frame rule)
+-    for a, c in zip(decs, decs[1:]):
+-      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
++    self.assertEqual(fl.shape_dec_cmd_from_extra(0.8), max(decs))
++    self.assertEqual(6, max(decs), f"the shaped cliff level for a -0.8 ask is 6 LSB, got {sorted(set(decs))}")
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, min(decs), "starts at the moving floor")
++
++  def test_shaped_hold_band_floors_at_the_personality_tier_cap(self):
++    """0043 supersedes the 0041 '8 LSB hold floor': at a standstill the SHAPED law floors the command at the
++    PERSONALITY TIER CAP (12/20/30) - the level the PROVEN holds ran at (8-20 s) - reached at the panda's
++    +RATE_STEP, so the FIRST sent frame is still the floor 4 (which the panda accepts at an episode open)."""
++    for p, cap in ((fl.PERSONALITY_RELAXED, 12), (fl.PERSONALITY_STANDARD, 20), (fl.PERSONALITY_AGGRESSIVE, 30)):
++      b = self._brake(True)
++      decs = []
++      for f in range(0, 160, 2):
++        for s in b.update(self._cc(-0.73), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0), f, p):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertTrue(decs, p)
++      self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0], (p, decs))
++      self.assertEqual(cap, max(decs), (p, decs))
++      for a, c in zip(decs, decs[1:]):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (p, a, c))
+ 
+-  def test_affine_on_standstill_first_frame_never_exceeds_the_panda_onset_gate(self):
+-    """RED-on-the-bug regression: the OLD affine path applied the 8 LSB floor AFTER the +RATE_STEP limiter, so the
+-    FIRST emitted actuating frame was 8 LSB -- over the panda's onset rule (only +RATE_STEP over the last ACCEPTED
+-    frame, which is 0 at an episode open), so the panda refused EVERY frame (dec=8 last=0, 494 refusals observed) and
+-    the brake never engaged. With the floor on the REQUEST the first frame is the rate-limited step (4), which the
+-    panda accepts. Asserted on the emitted CR_VSM_DecCmd bytes, not on internals."""
++  def test_shaped_first_frame_never_exceeds_the_panda_onset_gate(self):
++    """RED-on-the-bug regression, kept for the shaped path: the FIRST emitted actuating frame of an episode must be
++    <= +RATE_STEP (the panda accepts only +RATE_STEP over the last ACCEPTED frame, 0 at an episode open). The shaped
++    law guarantees this by capping every sent frame at last_sent + RATE_STEP - both in the hold band (where it ramps
++    to the tier cap) and while moving."""
+     for in_hold in (True, False):
+       cs = _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0) if in_hold else _CS(v_ego=20.0 / 3.6, cam=_cam())
+       b = self._brake(True)
+       decs = []
+-      for f in range(0, 120, 2):
++      for f in range(0, 200, 2):
+         for s in b.update(self._cc(-0.73), cs, f, fl.PERSONALITY_AGGRESSIVE):
+           decs.append(fl._get_bits(s.dat, 8, 8))
+       self.assertTrue(decs)
+       self.assertLessEqual(decs[0], fl.HYUNDAI_FCA11_LONG_RATE_STEP,
+                            f"hold_band={in_hold}: first emitted frame must not exceed RATE_STEP, got {decs}")
+-      # the floor the law wants is reached by the 2nd frame either way (hold 8 / release 4); a moving ask stays at 4
+-      want = fl.FCA11_AFFINE_HOLD_LSB if in_hold else fl.FCA11_AFFINE_RELEASE_LSB
+-      self.assertGreaterEqual(decs[1], min(want, fl.FCA11_AFFINE_RELEASE_LSB), (in_hold, decs))
+-      self.assertEqual(want, max(decs), (in_hold, decs))
+       for a, c in zip(decs, decs[1:]):
+         self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (in_hold, a, c))
++      # the hold band floors at the tier cap; a moving ask settles at the shaped cliff level (6)
++      self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE] if in_hold
++                       else fl.shape_dec_cmd_from_extra(0.73), max(decs), (in_hold, decs))
+ 
+-  def test_affine_on_moving_modest_ask_commands_the_affine_result(self):
+-    """FIX (B) contrast: an identical modest ask while MOVING (above the stop band) commands the honest affine result
+-    (4 LSB), NOT the 8 LSB hold floor - the hold floor is scoped to the low-speed band only."""
++  def test_shaped_moving_modest_ask_uses_the_cliff_level_not_the_cap(self):
++    """Contrast: an identical modest ask while MOVING (above the stop band) settles at the honest shaped cliff level
++    (6 LSB), NOT the tier cap - the cap floor is scoped to the low-speed hold band only."""
+     b = self._brake(True)
+     decs = []
+-    for f in range(0, 120, 2):
+-      for s in b.update(self._cc(-0.8), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++    for f in range(0, 900, 2):
++      for s in b.update(self._cc(-0.73), _CS(v_ego=20.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+         decs.append(fl._get_bits(s.dat, 8, 8))
+-    self.assertEqual([4], sorted(set(decs)), f"moving affine ask is 4 LSB, got {decs}")
++    self.assertEqual(6, max(decs), f"moving shaped cliff level is 6 LSB, got {sorted(set(decs))}")
++    self.assertLess(max(decs), fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE])
+ 
+-  def test_affine_on_creep_stays_in_the_hold_band(self):
+-    """FIX (B) band edge: v <= FCA11_AFFINE_STOP_BAND_KPH (3 km/h), or standstill, keeps the 8 LSB floor; just above it,
+-    the honest affine level applies."""
++  def test_shaped_hold_band_edge_is_three_kph(self):
++    """Band edge: v <= FCA11_SHAPE_HOLD_BAND_KPH (3 km/h), or CarState.standstill, floors at the tier cap; just above
++    it the shaped moving level applies."""
+     b = self._brake(True)
+     decs = []
+-    for f in range(0, 60, 2):
++    for f in range(0, 160, 2):
+       for s in b.update(self._cc(-0.73), _CS(v_ego=2.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+         decs.append(fl._get_bits(s.dat, 8, 8))
+-    self.assertEqual(8, max(decs), "creeping (2 km/h <= 3) keeps the hold floor")
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE], max(decs),
++                     "creeping (2 km/h <= 3) keeps the tier-cap floor")
+     b2 = self._brake(True)
+     decs2 = []
+-    for f in range(0, 60, 2):
++    for f in range(0, 900, 2):
+       for s in b2.update(self._cc(-0.73), _CS(v_ego=10.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+         decs2.append(fl._get_bits(s.dat, 8, 8))
+-    self.assertEqual(4, max(decs2), "above the band the affine level applies")
++    self.assertEqual(6, max(decs2), "above the band the shaped moving level applies")
++
++
++# ============================================================================================
++# 0043: the OPT-IN brake-SHAPING law (behind HyundaiFca11AffineGain, DEFAULT OFF)
++# ============================================================================================
++
++class Test0043ShapedLaw(unittest.TestCase):
++  """0043: the brake-SHAPING law. It supersedes the 0041 affine-only LEVEL path on the planner-ask path and is
++  gated by the EXISTING param HyundaiFca11AffineGain (DEFAULT OFF). This class pins: the piecewise-monotone LEVEL
++  mapping (cliff anchors + clamp + floor + tier-cap hold band), the 0.4 s onset hold then the JERK-LIMITED comfort slew
++  (soft asks: 4->8 takes >= 1.5 s vs ~20 ms before), the HARD-ask fast lane (bypasses hold AND slew: 8 LSB <= 0.3 s,
++  tier cap <= 0.5 s at 50 km/h), the hold-band exit hysteresis, the cal-edge reset, the panda frame contract (fuzz +
++  sweeps), and OFF-path byte-identity. The env FCA11_AFFINE override is cleared so the field-based cases are
++  deterministic."""
++
++  def setUp(self):
++    self._env_prev = os.environ.pop("FCA11_AFFINE", None)
++
++  def tearDown(self):
++    os.environ.pop("FCA11_AFFINE", None)
++    if self._env_prev is not None:
++      os.environ["FCA11_AFFINE"] = self._env_prev
++
++  def _brake(self, affine=True):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    cp_sp.fca11AffineGain = affine
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _sent(self, b, accel, frames, cs=None, personality=fl.PERSONALITY_AGGRESSIVE, start=0):
++    """Drive `frames` controller frames; return [(frame, dec)] for every emitted actuating/passive 0x38D."""
++    out = []
++    for f in range(start, start + frames):
++      for s in b.update(self._cc(accel), cs or _CS(v_ego=20.0 / 3.6, cam=_cam()), f, personality):
++        out.append((f, fl._get_bits(s.dat, 8, 8)))
++    return out
++
++  # ---- the pure level law ----
++
++  def test_constants_pinned_to_the_measured_fit_and_curve_is_monotone(self):
++    self.assertEqual(4, fl.FCA11_SHAPE_FLOOR_LSB)
++    self.assertEqual(0.15, fl.FCA11_SHAPE_CLIFF_LO_EXTRA)
++    self.assertEqual(1.42, fl.FCA11_SHAPE_CLIFF_HI_EXTRA)
++    self.assertEqual(8.23, fl.FCA11_SHAPE_K)          # steady-window slope CI [8.07, 8.39]
++    self.assertEqual(0.85, fl.FCA11_SHAPE_BITE)       # steady-window bite CI [0.82, 0.87]
++    self.assertEqual(0.4, fl.FCA11_SHAPE_ONSET_HOLD_S)
++    self.assertEqual(3.0, fl.FCA11_SHAPE_HOLD_BAND_KPH)
++    self.assertEqual(5.0, fl.FCA11_SHAPE_HOLD_EXIT_KPH)   # 0043 v2: hold-band EXIT hysteresis edge
++    self.assertGreater(fl.FCA11_SHAPE_HOLD_EXIT_KPH, fl.FCA11_SHAPE_HOLD_BAND_KPH)
++    lo, hi = fl.FCA11_SHAPE_JERK_BAND
++    self.assertLessEqual(lo, fl.FCA11_SHAPE_JERK_TARGET)
++    self.assertLessEqual(fl.FCA11_SHAPE_JERK_TARGET, hi)
++    # the onset-hold sent-frame count == the seconds / the 50 Hz sent period
++    self.assertEqual(fl.FCA11_SHAPE_ONSET_HOLD_SENT,
++                     round(fl.FCA11_SHAPE_ONSET_HOLD_S / (fl.FCA11_SEND_EVERY / 100.0)))
++    # monotone non-decreasing over a dense sweep, always within [floor, panda gate]
++    prev = 0
++    for i in range(401):
++      x = i * 0.01
++      c = fl.shape_dec_cmd_from_extra(x)
++      self.assertGreaterEqual(c, prev, x)
++      self.assertGreaterEqual(c, fl.FCA11_SHAPE_FLOOR_LSB, x)
++      self.assertLessEqual(c, fl.HYUNDAI_FCA11_LONG_MAX_DEC, x)
++      prev = c
++
++  def test_level_anchors_floor_and_tier_clamp(self):
++    # the two cliff anchors
++    self.assertEqual(4, fl.shape_dec_cmd_from_extra(fl.FCA11_SHAPE_CLIFF_LO_EXTRA))
++    self.assertEqual(8, fl.shape_dec_cmd_from_extra(fl.FCA11_SHAPE_CLIFF_HI_EXTRA))
++    # below the low anchor -> the 4 LSB floor (never below 4 while moving)
++    for x in (0.0, 0.05, 0.14, -1.0):
++      self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, fl.shape_dec_cmd_from_extra(x), x)
++    # at/above the high anchor the affine inverse applies (clamped to the panda gate)
++    self.assertEqual(14, fl.shape_dec_cmd_from_extra(2.0))
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, fl.shape_dec_cmd_from_extra(9.0))
++    # the tier cap clamps the level (relaxed 12)
++    self.assertEqual(12, fl.shape_dec_cmd_from_extra(2.0, 12))
++    self.assertEqual(4, fl.shape_dec_cmd_from_extra(0.1, 12))
++
++  def test_jerk_slew_matches_the_measured_slopes(self):
++    # cliff band: ~1 LSB per ~0.42 s; above 8: ~9 LSB/s (the two slopes the spec names)
++    self.assertAlmostEqual(0.0472, fl.shape_slew_lsb_per_sent(5), places=3)
++    self.assertAlmostEqual(0.1823, fl.shape_slew_lsb_per_sent(10), places=3)
++    self.assertAlmostEqual(2.36, fl.shape_slew_lsb_per_sent(5) / fl.FCA11_SHAPE_SENT_DT, places=1)
++    self.assertAlmostEqual(9.11, fl.shape_slew_lsb_per_sent(10) / fl.FCA11_SHAPE_SENT_DT, places=1)
++
++  # ---- the onset hold + jerk-limited growth ----
++
++  def test_onset_hold_then_jerk_limited_growth(self):
++    """A (non-hard) episode holds at the floor for the 0.4 s onset (20 SENT frames) before any growth, then grows
++    slowly. The old law stepped 4->8 within ~20-40 ms."""
++    b = self._brake(True)
++    sent = self._sent(b, -1.0, 500, personality=fl.PERSONALITY_AGGRESSIVE)
++    act = [d for _, d in sent if d > 0]
++    self.assertTrue(act)
++    # the leading run of floor frames is at least the onset hold (20 SENT frames)
++    lead = 0
++    for d in act:
++      if d == fl.FCA11_SHAPE_FLOOR_LSB:
++        lead += 1
++      else:
++        break
++    self.assertGreaterEqual(lead, fl.FCA11_SHAPE_ONSET_HOLD_SENT, f"onset hold frames: {lead}")
++    # and it eventually grows above the floor (the ramp is real, not a stuck floor)
++    self.assertGreater(max(act), fl.FCA11_SHAPE_FLOOR_LSB)
++
++  def test_soft_ask_is_jerk_limited_and_slow(self):
++    """A SOFT (comfort) ask is JERK-LIMITED (0043 v2: the fast lane is reserved for HARD asks <= -1.2): it holds the
++    4 LSB floor for the 0.4 s onset, then creeps toward its honest level (<= 7 LSB: a soft ask never reaches the
++    8 LSB cliff edge) at the comfort slew - vs ~20-40 ms for the old law. The 4->8 slew itself takes >= 1.5 s."""
++    b = self._brake(True)
++    sent = self._sent(b, -1.0, 400, personality=fl.PERSONALITY_AGGRESSIVE)
++    self.assertTrue(sent)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, sent[0][1], "the first sent frame is the floor")
++    level = fl.shape_dec_cmd_from_extra(1.0)               # the honest level of a -1.0 ask: 7 LSB (< the 8 edge)
++    self.assertEqual(7, level)
++    self.assertEqual(level, max(d for _, d in sent), "it does ramp to its honest level (not stuck at the floor)")
++    self.assertNotIn(8, [d for _, d in sent], "a soft ask never reaches the cliff edge")
++    # ... but only SLOWLY: the onset hold (0.4 s) + the comfort slew put the honest level >= 1.5 s after the open
++    t_level = (next(fr for fr, dv in sent if dv >= level) - sent[0][0]) / 100.0
++    self.assertGreaterEqual(t_level, 1.5, f"soft ask reached its level in {t_level:.2f}s (< 1.5): not jerk-limited")
++    # and the comfort slew ITSELF still takes >= 1.5 s to traverse the 4->8 cliff band (the shaping is intact)
++    lsb, n = float(fl.FCA11_SHAPE_CLIFF_LO_LSB), 0
++    while lsb < fl.FCA11_SHAPE_CLIFF_HI_LSB:
++      lsb += fl.shape_slew_lsb_per_sent(lsb)
++      n += 1
++    self.assertGreaterEqual(n * fl.FCA11_SHAPE_SENT_DT, 1.5, f"4->8 slew took {n * fl.FCA11_SHAPE_SENT_DT:.2f}s")
++
++  def test_hard_ask_time_to_level_is_fast(self):
++    """0043 v2 (BLOCKER B1 fix): a HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) BYPASSES the onset hold AND the comfort
++    jerk slew - its growth runs at up to the panda ceiling (+RATE_STEP per SENT frame). At ~50 km/h it reaches 8 LSB
++    within ~0.3 s and the tier cap within ~0.5 s (B1 measured 1.68 s / 3.0 s on the v1 law). The shaped LEVEL is
++    still kept (an honest inverse level once reached)."""
++    # 8 LSB fast (standard tier, moving 50 km/h, ask -2.0 -> honest level 14)
++    b = self._brake(True)
++    sent = self._sent(b, -2.0, 60, personality=fl.PERSONALITY_STANDARD)
++    self.assertEqual(0, sent[0][0], "a hard ask opens on the first frame (G5 bypass)")
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, sent[0][1])
++    eight = next(fr for fr, dv in sent if dv >= 8)
++    self.assertLessEqual((eight - sent[0][0]) / 100.0, 0.3, f"hard ask 8 LSB at {(eight - sent[0][0]) / 100.0:.2f}s")
++    self.assertEqual(fl.shape_dec_cmd_from_extra(2.0), max(d for _, d in sent), "the honest level is kept")
++    # the TIER CAP fast: standard -3.0 (cap 20) and aggressive -4.0 (cap 30), each <= 0.5 s
++    for accel, pers in ((-3.0, fl.PERSONALITY_STANDARD), (-4.0, fl.PERSONALITY_AGGRESSIVE)):
++      cap = fl.PERSONALITY_MAX_DEC[pers]
++      cap_sent = self._sent(self._brake(True), accel, 60, personality=pers)
++      at_cap = next(fr for fr, dv in cap_sent if dv >= cap)
++      self.assertLessEqual((at_cap - cap_sent[0][0]) / 100.0, 0.5, f"hard {accel} cap {cap} at {at_cap / 100.0:.2f}s")
++    # CONTROL: a SOFT ask (same speed) is held at the floor for the onset hold and never jumps to 8 LSB
++    b3 = self._brake(True)
++    soft = self._sent(b3, -1.0, 60, personality=fl.PERSONALITY_STANDARD)
++    self.assertNotIn(8, [d for _, d in soft], "a soft ask must not jump to 8 LSB")
++    self.assertEqual({fl.FCA11_SHAPE_FLOOR_LSB}, {d for _, d in soft}, "a soft ask holds the floor through the 0.4 s onset")
++
++  def test_hard_to_soft_inside_the_onset_hold_never_drops_to_the_floor(self):
++    """0043 v2 edge the fast lane CREATES: a HARD ask grows the accumulator above the floor within the first 0.4 s;
++    if the ask then eases into the SOFT band while the onset hold is still running, the hold must NOT force the
++    command back to the 4 LSB floor (a 12 -> 4 step across the delivered-decel cliff, then a re-climb at the comfort
++    slew = an accidental release-and-reapply). It follows the honest soft level DOWN immediately (the safe direction)
++    and holds it. FALSIFIABLE: with the old `new_acc = FLOOR` hold line this series is [4, 8, 12, 4, 4, ...]."""
++    b = self._brake(True)
++    sent = []
++    for f in range(40):
++      accel = -3.0 if f < 6 else -1.0                     # 3 sent frames HARD, then SOFT (honest level 7)
++      sent += [d for s in b.update(self._cc(accel), _CS(v_ego=50.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_STANDARD)
++               for d in [fl._get_bits(s.dat, 8, 8)]]
++    self.assertEqual([4, 8, 12], sent[:3], sent[:6])      # the fast lane
++    soft_level = fl.shape_dec_cmd_from_extra(1.0)
++    self.assertEqual(7, soft_level)
++    self.assertEqual({soft_level}, set(sent[3:]), f"hard->soft must settle at the soft level, not the floor: {sent[:12]}")
++
++  def test_soft_to_hard_escalation_uses_the_fast_lane(self):
++    """A SOFT brake already running (comfort-slewed, level ~7) that ESCALATES to a HARD ask (a lead cuts in) must take
++    the fast lane at once: the hold is long over, `fast` flips on, and the command climbs +RATE_STEP per sent frame to
++    the tier cap in a few sent frames (not at the comfort slew). This is the scenario the shaping must NOT slow down."""
++    b = self._brake(True)
++    sent = []
++    for f in range(400):
++      accel = -1.0 if f < 250 else -3.0                   # 2.5 s of soft braking, then a hard demand
++      sent += [(f, fl._get_bits(s.dat, 8, 8)) for s in
++               b.update(self._cc(accel), _CS(v_ego=50.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_STANDARD)]
++    before = [d for f, d in sent if f < 250]
++    self.assertEqual(7, max(before), "the soft phase settled at its honest level")
++    after = [(f, d) for f, d in sent if f >= 250]
++    cap = fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_STANDARD]
++    t_cap = (next(f for f, d in after if d >= cap) - 250) / 100.0
++    self.assertLessEqual(t_cap, 0.15, f"escalation soft->hard reached the cap {cap} only {t_cap:.2f}s after the demand")
++    steps = [c - a for (_, a), (_, c) in zip([(0, before[-1])] + after, after, strict=False)]
++    self.assertLessEqual(max(steps), fl.HYUNDAI_FCA11_LONG_RATE_STEP, steps)
++
++  def test_shaped_law_fuzz_keeps_the_panda_contract(self):
++    """Seeded fuzz over the WHOLE shaped law (hard/soft/coast asks, standstill + the 3/5 km/h hysteresis edges, all
++    three tiers, longActive drops): every ACTUATING sent frame is >= the 4 LSB floor, <= the tier cap, and grows at
++    most +RATE_STEP over the last SENT frame (the panda's last-ACCEPTED reference; a passive close frame resets it to
++    0). Guards the fast lane + the hold-line change against ever tripping the firmware rate gate."""
++    import random
++    speeds = [0.0, 0.0, 2.0, 2.9, 3.1, 3.5, 4.5, 4.9, 5.1, 6.0, 12.0, 50.0]
++    asks = [0.5, -0.1, -0.35, -0.5, -0.73, -1.0, -1.19, -1.21, -1.5, -2.0, -3.0, -5.0]
++    for seed in range(8):
++      rng = random.Random(seed)
++      pers = (fl.PERSONALITY_AGGRESSIVE, fl.PERSONALITY_STANDARD, fl.PERSONALITY_RELAXED)[seed % 3]
++      cap = fl.personality_max_dec(pers)
++      b = self._brake(True)
++      last, accel, kph, active = 0, -2.0, 50.0, True
++      for f in range(3000):
++        if f % 7 == 0:
++          accel = rng.choice(asks)
++        if f % 11 == 0:
++          kph = rng.choice(speeds)
++        if f % 400 == 399:
++          active = not active                             # an occasional longActive drop/re-engage
++        cs = _CS(v_ego=kph / 3.6, cam=_cam(), standstill=(kph == 0.0))
++        for s in b.update(self._cc(accel, long_active=active), cs, f, pers):
++          d = fl._get_bits(s.dat, 8, 8)
++          if d == 0:
++            last = 0                                      # a passive close frame drops the panda's reference to 0
++            continue
++          ctx = (seed, f, accel, kph, d, last)
++          self.assertGreaterEqual(d, fl.FCA11_SHAPE_FLOOR_LSB, ctx)
++          self.assertLessEqual(d, cap, ctx)
++          self.assertLessEqual(d - last, fl.HYUNDAI_FCA11_LONG_RATE_STEP, ctx)
++          last = d
++
++  def test_refused_actuating_echo_restarts_the_shaped_command_at_rate_step(self):
++    """wsR NIT (the wsF2 report claimed a refused echo 'does not fast-restart the shaped ramp'): in fact observe_echo
++    drops `_dec_last_sent` to 0 on a refused ACTUATING echo while braking, and `_shape_level` returns
++    min(accumulator, _dec_last_sent + RATE_STEP), so after a refusal the next SENT frame is RATE_STEP (4) and the
++    command re-ramps at +RATE_STEP per sent frame back to the shaped level (it can only ever LOWER the command)."""
++    b = self._brake(True)
++    sent = self._sent(b, -2.0, 60, personality=fl.PERSONALITY_STANDARD)
++    self.assertEqual(14, sent[-1][1], "settled at the honest -2.0 level")
++    b.observe_echo([(192, bytes([0, 14] + [0] * 6))])        # a REFUSED actuating echo while braking
++    self.assertEqual(0, b._dec_last_sent)
++    again = [d for _, d in self._sent(b, -2.0, 12, personality=fl.PERSONALITY_STANDARD, start=60)]
++    self.assertEqual([4, 8, 12, 14, 14, 14], again, "re-ramp at +RATE_STEP per sent frame, then back at the level")
++
++  def test_soft_ask_never_grows_the_sent_value_during_the_onset_hold(self):
++    """Consult-found edge in the v2 hold-line change: `_shape_acc` is stored BEFORE the panda clamp, so after a short
++    HARD phase it sits up to one +RATE_STEP AHEAD of the last SENT frame. A soft ask that eases in during the 0.4 s
++    hold must not let the SENT value climb to it (4 -> 6 in one frame = growth the comfort slew should govern).
++    Over every (speed x hard-phase length x soft ask), and with a refused echo mid-hold, the sent series from the last
++    hard-phase frame on is NON-INCREASING while the hold runs. FALSIFIABLE: without the `_dec_last_sent` cap in the
++    onset branch, hard x1 then soft -0.9 sends [4, 6, 6, ...]."""
++    for kph in (50.0, 20.0, 8.0):
++      for k_hard in range(9):                                     # 0..8 sent frames of HARD ask, then SOFT
++        for soft in (-0.55, -0.73, -0.9, -1.0, -1.19):
++          for refuse_at in (None, 2 * k_hard + 3):                # also: a REFUSED actuating echo mid-hold
++            b = self._brake(True)
++            series = []
++            for f in range(40):                                   # f < 40 == the 20 sent-frame (0.4 s) onset hold
++              if refuse_at is not None and f == refuse_at:
++                b.observe_echo([(192, bytes([0, 8] + [0] * 6))])
++              accel = -3.0 if f < 2 * k_hard else soft
++              for s in b.update(self._cc(accel), _CS(v_ego=kph / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++                series.append((f, fl._get_bits(s.dat, 8, 8)))
++            seq = [d for f, d in series if f < 2 * k_hard][-1:] + [d for f, d in series if f >= 2 * k_hard]
++            for a, c in zip(seq, seq[1:], strict=False):
++              self.assertLessEqual(c, a, (kph, k_hard, soft, refuse_at, [d for _, d in series][:14]))
++
++  def test_fast_lane_contract_sweep(self):
++    """The fast lane must never break the panda contract: over every HARD ask x tier x speed, the first sent frame is
++    the 4 LSB floor, no sent frame grows more than +RATE_STEP, none exceeds the tier cap, the final level is the
++    honest level (cap in the hold band), and the level is reached within 0.5 s."""
++    for ask in [-1.2 - 0.3 * i for i in range(14)]:                       # -1.2 .. -5.1
++      for pers in (fl.PERSONALITY_AGGRESSIVE, fl.PERSONALITY_STANDARD, fl.PERSONALITY_RELAXED):
++        cap = fl.personality_max_dec(pers)
++        for kph in (50.0, 10.0, 6.0, 3.1, 2.0):
++          sent = [(f, d) for f, d in self._sent(self._brake(True), ask, 80, cs=_CS(v_ego=kph / 3.6, cam=_cam()),
++                                                personality=pers) if d > 0]
++          decs = [d for _, d in sent]
++          ctx = (ask, pers, kph, decs[:12])
++          self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, decs[0], ctx)
++          self.assertLessEqual(max(decs), cap, ctx)
++          for a, c in zip([0] + decs, decs, strict=False):
++            self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, ctx)
++          want = cap if kph <= fl.FCA11_SHAPE_HOLD_BAND_KPH else fl.shape_dec_cmd_from_extra(-ask, cap)
++          self.assertEqual(want, decs[-1], ctx)
++          self.assertLessEqual((next(f for f, d in sent if d >= want) - sent[0][0]) / 100.0, 0.5, ctx)
++
++  def test_growth_never_exceeds_the_panda_rate_step(self):
++    # moving ramp: every consecutive SENT frame grows <= RATE_STEP
++    b = self._brake(True)
++    decs = [d for _, d in self._sent(b, -2.0, 600, personality=fl.PERSONALITY_AGGRESSIVE)]
++    for a, c in zip(decs, decs[1:], strict=False):
++      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
++    self.assertEqual(fl.shape_dec_cmd_from_extra(2.0), max(decs), "a -2.0 moving ask settles at the shaped level")
++    # hold-band ramp: also <= RATE_STEP, and it reaches the cap
++    b2 = self._brake(True)
++    decs2 = [d for _, d in self._sent(b2, -0.73, 200, cs=_CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0))]
++    for a, c in zip(decs2, decs2[1:], strict=False):
++      self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(decs2))
++
++  # ---- the stop/hold band ----
++
++  def test_hold_band_floors_at_the_tier_cap_and_skips_the_onset_hold(self):
++    """v <= 3 kph (or standstill) floors the command at the PERSONALITY tier cap: the proven hold level. It must be
++    reached PROMPTLY (the stop is not jerk-shaped), i.e. within ~5 sent frames, not after the moving onset."""
++    for p, cap in ((fl.PERSONALITY_RELAXED, 12), (fl.PERSONALITY_STANDARD, 20), (fl.PERSONALITY_AGGRESSIVE, 30)):
++      b = self._brake(True)
++      decs = [d for _, d in self._sent(b, -0.73, 60, cs=_CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0),
++                                        personality=p)]
++      self.assertTrue(decs, p)
++      self.assertEqual(cap, decs[-1], (p, decs))
++      # reached within the +RATE_STEP ramp (ceil((cap-floor)/RATE_STEP) sent frames, ~0.14 s at the cap), i.e. no
++      # 0.4 s moving onset hold in the hold band.
++      n = -(-(cap - fl.FCA11_SHAPE_FLOOR_LSB) // fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++      idx = next(i for i, d in enumerate(decs) if d == cap)
++      self.assertEqual(n, idx, (p, decs))
++      self.assertLessEqual(idx, 8, (p, decs))
++
++  def test_hold_band_creep_is_floored_just_above_it_is_not(self):
++    # 3 km/h band edge (no standstill flag): cap at <=3, shaped moving level just above
++    b = self._brake(True)
++    creep = [d for _, d in self._sent(b, -0.73, 160, cs=_CS(v_ego=2.0 / 3.6, cam=_cam()))]
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(creep))
++    b2 = self._brake(True)
++    mover = [d for _, d in self._sent(b2, -0.73, 900, cs=_CS(v_ego=10.0 / 3.6, cam=_cam()))]
++    self.assertEqual(6, max(mover))
++
++  def test_hold_band_exit_hysteresis(self):
++    """0043 v2 (MINOR m1 fix): ENTER the <=3 km/h hold band at <= 3.0, EXIT only at >= 5.0. A DCT creeping in the
++    3..5 km/h window keeps the proven hold cap (no 20 -> 6 step at the boundary), and re-crossing the 3 km/h edge
++    cannot chatter the command."""
++    self.assertEqual(3.0, fl.FCA11_SHAPE_HOLD_BAND_KPH)
++    self.assertEqual(5.0, fl.FCA11_SHAPE_HOLD_EXIT_KPH)
++    # moving at 4 km/h (ask warmed open) does NOT enter the band (4 > 3)
++    b = self._brake(True)
++    self._sent(b, -0.73, 40, cs=_CS(v_ego=4.0 / 3.6, cam=_cam()))
++    self.assertTrue(b.braking)
++    self.assertFalse(b._shape_in_hold_band)
++    # a standstill hold ENTERS; once in, creeping to 3.5 / 4.5 km/h (below EXIT) KEEPS the cap
++    b2 = self._brake(True)
++    self._sent(b2, -0.73, 40, cs=_CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0))   # warm the ask + ENTER
++    self.assertTrue(b2._shape_in_hold_band)
++    for kph in (3.5, 4.5):
++      last = self._sent(b2, -0.73, 30, cs=_CS(v_ego=kph / 3.6, cam=_cam()))[-1][1]
++      self.assertTrue(b2._shape_in_hold_band, kph)
++      self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, last, f"in the band at {kph} km/h the cap must hold")
++    # at 5.2 km/h (above the EXIT edge) the band is LEFT: the -0.73 moving level (6 LSB) returns immediately
++    last = self._sent(b2, -0.73, 30, cs=_CS(v_ego=5.2 / 3.6, cam=_cam()))[-1][1]
++    self.assertFalse(b2._shape_in_hold_band)
++    self.assertEqual(6, last)
++    # once out, dropping back to 4 km/h does NOT re-enter (exit hysteresis holds)
++    self._sent(b2, -0.73, 10, cs=_CS(v_ego=4.0 / 3.6, cam=_cam()))
++    self.assertFalse(b2._shape_in_hold_band)
++
++  def test_cal_edge_resets_the_shaped_ramp(self):
++    """0043 v2 (MINOR m3 fix): the shaped ramp resets on a cal-active EDGE, so an episode that OPENS under cal and
++    then continues on the planner ask does not inherit stale `_shape_acc`/`_shape_sent_n` (which would skip the
++    onset hold). A cal->planner hand-off starts a FRESH episode (floor + onset hold)."""
++
++    class _StubCalSeq:
++      def __init__(self):
++        self.active_actuation = False
++        self.level_lsb = 10
++
++      def tick(self, *a, **k): pass
++      def watchdog_abort(self, *a, **k): pass
++
++    b = self._brake(True)
++    b.cal_seq = _StubCalSeq()                             # a fake sequencer: only active_actuation is read
++    self._sent(b, -2.0, 120)                              # advance the shaped ramp
++    self.assertGreater(b._shape_sent_n, 0)
++    # cal becomes ACTIVE: the edge resets the ramp
++    b.cal_seq.active_actuation = True
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 122)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, b._shape_acc)
++    self.assertEqual(0, b._shape_sent_n)
++    # cal drops (cal -> planner hand-off): the edge resets again AND the shaped law re-arms the onset hold, so a soft
++    # ask starts at the FLOOR (sent_n 1), not at a stale ramp level
++    b.cal_seq.active_actuation = False
++    b.update(self._cc(-1.0), _CS(cam=_cam()), 124)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, b._shape_acc)
++    self.assertEqual(1, b._shape_sent_n)
++    self.assertFalse(b._cal_active)
++
++  # ---- contract invariants ----
++
++  def test_no_zero_commanded_mid_episode(self):
++    """The shaped law never commands 0 inside an episode (a 0 would be a release): a swept ask from hard to the
++    hysteresis band keeps emitting >= the floor while braking."""
++    b = self._brake(True)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    self.assertTrue(b.braking)
++    for accel in (-2.0, -1.0, -0.5, -0.4, -0.31):
++      sends = b.update(self._cc(accel), _CS(cam=_cam()), 0)
++      self.assertTrue(b.braking, accel)
++      self.assertTrue(any(fl._get_bits(s.dat, 8, 8) >= fl.FCA11_SHAPE_FLOOR_LSB for s in sends), accel)
++
++  def test_hysteresis_min_on_and_release_still_hold(self):
++    """The G5 hysteresis / min-on / release behaviour is UNCHANGED under the shaped law: an ask that rises above
++    -0.30 keeps braking through the 0.6 s min-on, then releases with exactly one passive close frame."""
++    b = self._brake(True)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)       # hard ask opens
++    self.assertTrue(b.braking)
++    sends = b.update(self._cc(-0.1), _CS(cam=_cam()), 2)
++    self.assertTrue(b.braking, "inside min-on the shaped episode keeps braking")
++    self.assertNotEqual([], sends)
++    self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), fl.FCA11_SHAPE_FLOOR_LSB)
++    got = []
++    for f in range(4, 500):
++      got += [fl._get_bits(s.dat, 8, 8) for s in b.update(self._cc(-0.1), _CS(cam=_cam()), f)]
++      if not b.braking:
++        break
++    self.assertFalse(b.braking, "an ask above -0.30 releases after min-on")
++    self.assertEqual(1, sum(1 for d in got if d == 0), "exactly one passive close frame")
++
++  def test_reopen_restarts_at_the_floor(self):
++    b = self._brake(True)
++    e1 = [d for _, d in self._sent(b, -2.0, 200)]
++    self.assertGreater(max(e1), fl.FCA11_SHAPE_FLOOR_LSB)
++    f = 200
++    for f in range(200, 500):                          # release
++      b.update(self._cc(0.5), _CS(cam=_cam()), f)
++      if not b.braking:
++        break
++    self.assertFalse(b.braking)
++    act = [d for _, d in self._sent(b, -2.0, 10, start=f + 1) if d > 0]
++    self.assertTrue(act)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, act[0], f"a re-open starts at the floor, got {act}")
++
++  def test_shaped_state_reset_on_disable_and_longactive_off(self):
++    b = self._brake(True)
++    self._sent(b, -2.0, 100)
++    self.assertGreater(b._shape_sent_n, 0)
++    # longActive off -> reset
++    b.update(self._cc(-2.0, long_active=False), _CS(cam=_cam()), 0)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, b._shape_acc)
++    self.assertEqual(0, b._shape_sent_n)
++    # disable -> reset
++    self._sent(b, -2.0, 60)
++    b._cal_prev = True                                    # a stale cal-edge tracker must not survive a disable either
++    b.enabled = False
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, b._shape_acc)
++    self.assertEqual(0, b._shape_sent_n)
++    self.assertFalse(b._shape_in_hold_band)
++    self.assertFalse(b._cal_prev)
++
++  # ---- OFF-path byte-identity ----
++
++  def test_off_path_byte_identical_replay(self):
++    """OFF = byte-identical to 0042. (a) Over a rich synthetic timeline (hard asks, modest asks, a crawl) the
++    flag-OFF class NEVER enters the shaped code - `_shape_level` is patched to raise - and still emits frames.
++    (b) For a sustained hard ask the emitted DEC series equals the 0042 law's series exactly:
++    clamp_dec_cmd(dec_cmd_from_accel(ask)) rate-limited at +RATE_STEP per SENT frame."""
++    orig = fl.Fca11LongBrake._shape_level
++
++    def _boom(*a, **k):
++      raise AssertionError("the shaped law ran with the flag OFF")
++
++    fl.Fca11LongBrake._shape_level = _boom
++    try:
++      b = self._brake(affine=False)
++      any_send = False
++      for f in range(600):
++        accel = -2.0 if (f // 30) % 2 == 0 else 0.4
++        v = 20.0 / 3.6 if (f // 30) % 3 else 2.0 / 3.6
++        any_send = any_send or bool(b.update(self._cc(accel), _CS(v_ego=v, cam=_cam()), f))
++      self.assertTrue(any_send, "the OFF path must still emit frames")
++    finally:
++      fl.Fca11LongBrake._shape_level = orig
++    # (b) reference: the 0042 OFF law
++    b = self._brake(affine=False)
++    decs = [fl._get_bits(s.dat, 8, 8) for f in range(0, 60, 2)
++            for s in b.update(self._cc(-2.0), _CS(cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE)]
++    ref, prev = [], 0
++    for _ in range(len(decs)):
++      req = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(-2.0), fl.PERSONALITY_AGGRESSIVE)
++      prev = fl.clamp_dec_cmd(min(req, prev + fl.HYUNDAI_FCA11_LONG_RATE_STEP), fl.PERSONALITY_AGGRESSIVE)
++      ref.append(prev)
++    self.assertEqual(ref, decs)
++    self.assertEqual([4, 8, 12, 16, 20, 24, 28, 30], decs[:8])
+ 
+ 
+ # ============================================================================================

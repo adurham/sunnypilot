@@ -302,13 +302,21 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("N Mode: openpilot Long Off", "Drive mode N blocks openpilot longitudinal"),
   },
 
-  # fork (adurham), patch 0030: FCA11-long braking has been HANDED BACK to the stock camera for the REST OF THIS
-  # IGNITION (the panda's fail-closed camera_owns latch: a stock FCA11 actuation/warning frame on bus 2, or a
-  # pedal fault). The panda now refuses every openpilot 0x38D until the next ignition, so openpilot plans stops
-  # it cannot execute; without this the loss is completely silent. Permanent + driver-facing, the same pattern as
-  # pedalFactoryCruiseLockout. Raised by car_specific.py from CarStateSP.fca11Unavailable (the opendbc half) only
-  # when CP_SP.fca11Brake is on (the feature is armed).
+  # fork (adurham), patches 0030 / 0042: FCA11-long braking is UNAVAILABLE for the REST OF THIS IGNITION. Three
+  # fail-closed causes now converge on this one alert (all published by CarStateExt as CarStateSP.fca11Unavailable):
+  #   - the panda HANDED FCA11 BACK to the stock camera (a bus-2 FCA11 actuation/warning frame), or
+  #   - a PEDAL FAULT latched the panda's cut (0042: mirrored in the car layer as _pedal_cut), or
+  #   - the panda is REFUSING a sustained wall of our actuating 0x38D (0042: echo-confirmed, >= 3 consecutive
+  #     refusals while braking -> _refused_cut).
+  # The main text is deliberately NOT camera-specific because the alert now covers all three (it read
+  # "Camera Has Brake" while a pedal fault or an echo-confirmed refusal wall was equally covered). The panda refuses
+  # every openpilot 0x38D until the next ignition, so openpilot plans stops it cannot execute; without this the loss
+  # is completely silent. Permanent + driver-facing, the same pattern as pedalFactoryCruiseLockout. Raised by
+  # car_specific.py from CarStateSP.fca11Unavailable (the opendbc half) only when CP_SP.fca11Brake is on (armed).
+  # 0042 v2: the pedal-fault mirror is ALERT-ONLY (it never gates a send) and self-heals on an accepted ACTUATING
+  # echo (proof the panda is not latched), so a pre-arm blip shows this alert only until the first echoed actuating
+  # frame proves the panda is clear.
   EventNameSP.fca11Unavailable: {
-    ET.PERMANENT: NormalPermanentAlert("FCA11 Unavailable: Camera Has Brake", "openpilot braking is off until restart"),
+    ET.PERMANENT: NormalPermanentAlert("FCA11 Braking Unavailable", "openpilot braking is off until restart"),
   },
 }
