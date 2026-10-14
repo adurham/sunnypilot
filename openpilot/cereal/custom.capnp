@@ -471,6 +471,20 @@ struct CarStateSP @0xb86e6369214c01c8 {
   brakeNow @5 :Bool;  # persistent RED: ESC non-response or hold lost ("BRAKE NOW"); clears only on driver brake
   fuelLevel @6 :Float32;  # fork (0047): CLU13 CF_Clu_FuelLevel - tank % (KDMLink-validated sender decode;
                            # see opendbc/sunnypilot/car/hyundai/fuel_level.py); 0 = no valid level accepted yet
+  # fork (0048): KDMLink-derived telemetry (see opendbc/sunnypilot/car/hyundai/carstate_ext.py
+  # update_telemetry); 0 = not decoded / no frame yet unless stated.
+  intakeTemp @7 :Float32;       # EMS_453 degC (x0.75 - 48)
+  lateralAccel @8 :Float32;    # ESP_49D g (16-bit centered; 0 is a real value)
+  longAccel @9 :Float32;       # ESP_49D g (12-bit)
+  batteryVoltage @10 :Float32; # BATT_568 V (x0.1)
+  # N_MODE_4A0 N-Custom settings: 0/1/2 per setting, 3 = unset/default (all 0 while NORMAL)
+  nModeEngine @11 :UInt8;       # 0 Normal / 1 Sport / 2 Sport+
+  nModeSuspension @12 :UInt8;   # 0 Comfort / 1 Normal / 2 Sport
+  nModeEsc @13 :UInt8;          # 0 On / 1 Sport / 2 Off
+  nModeExhaust @14 :UInt8;      # 0 Quiet / 1 Normal / 2 Sport+
+  nModeRevMatch @15 :UInt8;     # 0 off / 1 on
+  nModeELSD @16 :UInt8;         # 0 Normal / 1 Sport / 2 Sport+
+  nModeSteering @17 :UInt8;     # 0 Comfort / 1 Normal / 2 Sport
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
