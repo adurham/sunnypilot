@@ -469,6 +469,8 @@ struct CarStateSP @0xb86e6369214c01c8 {
   superviseStop @3 :Bool;  # steady YELLOW: braking below 15 km/h ("supervise stop")
   stopComplete @4 :Bool;  # steady YELLOW: at/near a stop while holding ("stop complete - hold brake pedal")
   brakeNow @5 :Bool;  # persistent RED: ESC non-response or hold lost ("BRAKE NOW"); clears only on driver brake
+  fuelLevel @6 :Float32;  # fork (0047): CLU13 CF_Clu_FuelLevel - tank % (KDMLink-validated sender decode;
+                           # see opendbc/sunnypilot/car/hyundai/fuel_level.py); 0 = no valid level accepted yet
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
