@@ -1,0 +1,774 @@
+From da8cd2df07a0af1bfa42e278c53700d8a6fa5669 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 14 Oct 2026 23:16:35 -0500
+Subject: [PATCH] =?UTF-8?q?hyundai:=20FCA11=20brake=20feel=20on=20the=20de?=
+ =?UTF-8?q?ployed=20law=20=E2=80=94=20coast-first=20open,=20lag-aware=20on?=
+ =?UTF-8?q?set=20ramp=20through=20the=20intermediate=20LSBs,=20anticipator?=
+ =?UTF-8?q?y=20release?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Drive-feedback 159/15a ("too early and too hard"; 85/89 gas-ended episodes cancelled
+mid-brake). The deployed (OLD-LAW) path only ever emitted {0, 4, 8..20} LSB. That is
+the law, not the wire: CR_VSM_DecCmd is an 8-bit 0.01 g integer and the panda accepts
+any level <= +RATE_STEP over the last accepted frame. The -0.5 onset maps through the
+0.67 inverse to 8, the release band clamps the ask to -0.5 (floor 8), and the limiter
+goes 0 -> 4 -> 8 in 40 ms - straight into the plant's worst over-delivery (L=8 ~1.2
+m/s^2, 1.5-2x nominal), 0.28 s lag and 0.53 s release tail.
+
+0049 adds a feel layer on the OLD-LAW instance only (not the shaping/V3 law, not cal,
+not the <=3 km/h hold band, which run exactly as before):
+  * coast-first open at ask <= -0.60 (coast 0.15 + margin 0.45); release rule unchanged
+    (hysteresis); HARD asks (<= -1.2) open on frame 1; a small ask sustained <= -0.5 for
+    1.0 s opens anyway (dwell escape);
+  * onset ramp: first frame 4, then jerk-limited growth (2.5 m/s^3 through the
+    per-level delivered slope; the 4-8 band slope is PROVISIONAL) blending to the full
+    +RATE_STEP at -1.2; an ask deepening faster than -2 m/s^3 also gets +RATE_STEP;
+  * anticipatory release: while the ask eases, the target uses the ask 0.28 s ahead
+    (capped 0.25 m/s^2), and the release band follows the 0.67 inverse down through
+    7/6/5/4 instead of clamping at 8. The exit frame and passive close are unchanged.
+
+Authority: the requested level is never above the deployed request for the same ask;
+the steady level for asks <= -0.5 is unchanged; a hard ask from idle is byte-identical.
+Disclosed trade: soft->hard can reach the cap up to ~3 sent frames later. Panda
+contract, passive close on every exit, R7 latch, camera hand-back, arming, the
+shadow log schema: untouched. FCA11_FEEL_ENABLED=False is byte-identical to 0048
+(proven over the three recorded drives x three personalities). No param / CP_SP field
+in this patch (module constants; a runtime param needs a coordinated capnp change).
+
+Tests: test_fca11_feel.py (30) + all existing fca11 tests (274) green; 16/16 guard
+mutations killed. Offline replay (open-loop, routes 158/159/15a): onset command jerk
+p50 4.91 -> 2.45 m/s^3; 12 of 131 episodes not opened.
+---
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  | 202 +++++++-
+ .../car/hyundai/tests/test_fca11_feel.py      | 444 ++++++++++++++++++
+ 2 files changed, 644 insertions(+), 2 deletions(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 453b3d6..b9ca367 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -393,6 +393,117 @@ def _refuse_affine_env() -> None:
+     raise RuntimeError(msg)
+ 
+ 
++# *** 0049: FCA11_FEEL_* — brake FEEL on the DEPLOYED (OLD-LAW) path: coast-first open, lag-aware onset ramp through the
++# intermediate LSBs, and an anticipatory release (DEFAULT ON; the shaping/V3 path and cal are untouched) ***
++#
++# WHY (drive-feedback-159, routes 158/159/15a, 46.5k shadow frames; plant ID in plant-notes.md): the deployed law only
++# ever emitted {0, 4, 8..20} LSB. That is NOT a wire limit - CR_VSM_DecCmd is an 8-bit integer at 0.01 g and the panda
++# accepts ANY level 1..30 within +RATE_STEP over the last accepted frame. It is the law: (a) the -0.5 onset maps through
++# the 0.67 inverse to 7.6 -> round = 8, so 8 is the mapping's floor; (b) inside the release band (-0.50, -0.30] and the
++# min-on window the ask is clamped to the onset value (`min(accel, ONSET)`), so the command is floored at 8; (c) the
++# +RATE_STEP limiter takes 0 -> 4 -> 8 in two sent frames (40 ms). The plant over-delivers exactly there (L=8: ~1.20 m/s^2
++# incremental for a ~0.5 ask, 1.5-2x nominal), lags ~0.28 s and has a ~0.53 s release tail, so a small ask became a
++# grabby 1.2 m/s^2 hit and the owner cancelled 85/89 gas-ended episodes with the throttle.
++#
++# WHAT 0049 DOES (OLD-LAW instance only: not the V3/shaping law, not cal, not the low-speed hold band):
++#   1. COAST-FIRST OPEN: a NEW episode (and the 0.2 s onset debounce) needs the RESIDUAL demand beyond zero-throttle coast,
++#      -ask - FCA11_FEEL_COAST_DECEL, to reach FCA11_FEEL_OPEN_MARGIN (defaults 0.15 + 0.45 -> the ask must reach -0.60, was
++#      -0.50). Hysteresis: once open, the deployed release rule (-0.30 + 0.6 s min-on) is unchanged. A HARD ask
++#      (<= FCA11_ONSET_BYPASS_ACCEL) still opens on its first frame, and an ask SUSTAINED at/below the deployed -0.5 for
++#      FCA11_FEEL_DWELL_FRAMES (1.0 s) opens anyway (dwell escape: suppress transients, never a sustained demand).
++#   2. ONSET RAMP (lag-aware): the first sent frame is FCA11_FEEL_FIRST_LSB (4, the panda's onset step); growth is then
++#      jerk-limited per SENT frame: FCA11_FEEL_JERK_TARGET / (delivered m/s^2 per LSB at the current level) x 0.02 s, i.e.
++#      ~0.19 LSB/frame across the 4-8 band (PROVISIONAL steep low-band slope) and ~0.51 LSB/frame above 8, for asks at/above
++#      FCA11_FEEL_RATE_SOFT_ACCEL, blending linearly to the panda's +RATE_STEP at FCA11_ONSET_BYPASS_ACCEL (a HARD ask is
++#      never slowed; nor is an ask DEEPENING faster than FCA11_FEEL_DEEPEN_SLOPE). DISCLOSED TRADE: a soft ramp that then
++#      turns hard climbs at +RATE_STEP from a lower level, so it can reach the cap up to ~3 sent frames (60 ms) after the
++#      deployed law; a jump to the old trajectory would violate the panda's +RATE_STEP rule, so this is inherent. Over the 0.28 s plant lag the planner sees no response and deepens its ask; the old law followed it
++#      instantly and the delayed plant then over-shot. The ramp walks through 5/6/7 (never emitted before).
++#   3. ANTICIPATORY RELEASE: while the ask is EASING, the target is computed from the ask predicted FCA11_FEEL_ANTICIPATE_S
++#      (the plant lag) ahead (slope = an EMA over sent frames, lead capped at FCA11_FEEL_ANTICIPATE_MAX); and inside the
++#      release band / min-on window the command FOLLOWS the ask down through the intermediate LSBs (the same 0.67 inverse,
++#      floored at FCA11_FEEL_FLOOR_LSB = 4) instead of being clamped at 8. Episode exit timing is UNCHANGED (the passive
++#      close frame goes out on the same frame as before); only the level ahead of it is lower.
++#   4. HOLD BAND: at/below FCA11_FEEL_HOLD_BAND_KPH (or CarState.standstill), until >= FCA11_FEEL_HOLD_EXIT_KPH, the
++#      deployed law runs EXACTLY (open at -0.5, +RATE_STEP ramp, 8 LSB floor): a standstill hold is never weakened.
++# AUTHORITY INVARIANT (pinned by tests + replay): the requested level is never above the deployed law's level for the same
++# ask (the target map is the same 0.67 inverse at/below -0.5, the anticipated ask is only ever LESS negative, the ramp only
++# slows growth), a HARD ask from idle produces the deployed law's frames byte-for-byte, and the steady level for any ask
++# <= -0.5 is unchanged. Every panda contract (Warn 3, +RATE_STEP over the last SENT frame, passive close on every exit,
++# R7 latch, camera hand-back, no auto-resume, arming) is untouched - this block only chooses a level <= the old one.
++# Set FCA11_FEEL_ENABLED False to restore the pre-0049 OLD-LAW byte-for-byte (read once per instance).
++FCA11_FEEL_ENABLED = True
++FCA11_FEEL_COAST_DECEL = 0.15        # m/s^2 zero-throttle coast near the onset asks (measured 0.13-0.19 by speed band)
++FCA11_FEEL_OPEN_MARGIN = 0.45        # m/s^2 residual (beyond coast) a NEW episode needs -> open at ask <= -0.60
++FCA11_FEEL_OPEN_ACCEL = -(FCA11_FEEL_COAST_DECEL + FCA11_FEEL_OPEN_MARGIN)
++FCA11_FEEL_FIRST_LSB = 4             # first sent frame of a soft episode (== the panda's onset RATE_STEP)
++FCA11_FEEL_FLOOR_LSB = 4             # moving floor while an episode is open (never 0 mid-episode; 0 is the release)
++FCA11_FEEL_JERK_TARGET = 2.5         # m/s^3 delivered onset jerk the soft ramp aims at (was ~8 raw p50 measured)
++# Delivered decel per LSB the ramp divides by (m/s^2 per LSB). Above 8 LSB = the MEASURED marginal slope (0.098, plant-notes
++# 3: L 8->19 rises 1.20 -> 2.25). Below 8 = PROVISIONAL: 1-3 / 5-7 were never commanded and 4 only as a 20 ms pulse, so the
++# 0043 cliff interpolation (0.15 m/s^2 at 4 -> 1.20 at 8 = 0.26 / LSB) is assumed - the CONSERVATIVE choice (if the low band
++# is in fact linear, the ramp there is just gentler than needed). Refit once a drive logs the 5/6/7 levels.
++FCA11_FEEL_SLOPE_LOW = 0.26          # m/s^2 per LSB below FCA11_FEEL_SLOPE_KNEE_LSB (PROVISIONAL)
++FCA11_FEEL_SLOPE_HIGH = 0.098        # m/s^2 per LSB at/above the knee (measured)
++FCA11_FEEL_SLOPE_KNEE_LSB = 8
++FCA11_FEEL_RATE_SOFT_ACCEL = -1.0    # asks at/above this ramp at the jerk target; linear to +RATE_STEP at the HARD bypass
++FCA11_FEEL_ANTICIPATE_S = 0.28       # measured total command -> aEgo lag: look this far ahead while the ask eases
++FCA11_FEEL_ANTICIPATE_MAX = 0.25     # m/s^2 cap on the anticipated easing (noise / outlier bound)
++FCA11_FEEL_SLOPE_ALPHA = 0.2         # EMA weight per SENT frame for the ask slope (~0.1 s time constant)
++FCA11_FEEL_HOLD_BAND_KPH = 3.0       # at/below (or standstill): the deployed law runs unchanged (stop/hold)
++# Coast-first DWELL ESCAPE (closed-loop guard): an ask held at/below the deployed onset (-0.5) for this long opens anyway
++# (and then ramps softly). Coast-first must suppress transient small asks, never leave a SUSTAINED one unactuated while
++# a gap closes (the planner would only re-ask later and deeper). 100 frames = 1.0 s.
++FCA11_FEEL_DWELL_FRAMES = 100
++# DEEPENING bypass: while the ask is getting more negative faster than this (m/s^3, EMA over sent frames), the onset ramp
++# grows at the panda's full +RATE_STEP - a demand that is building quickly is not throttled by the comfort ramp.
++FCA11_FEEL_DEEPEN_SLOPE = -2.0
++FCA11_FEEL_HOLD_EXIT_KPH = 5.0       # leave the hold band only at/above this (hysteresis, as 0043 v2)
++
++
++def feel_target_lsb(accel: float, personality=None) -> int:
++  """0049: the level the feel layer REQUESTS for an ask (before the onset ramp and the panda clamp).
++
++  At/below the onset (-0.5) this is EXACTLY the deployed request, clamp_dec_cmd(dec_cmd_from_accel(accel)); above it (the
++  release band / min-on window, where the deployed law clamps the ask to -0.5 -> 8 LSB) it continues the SAME 0.67 inverse
++  down through 7/6/5, floored at FCA11_FEEL_FLOOR_LSB. Monotone in accel and never above the deployed request."""
++  if personality is None:
++    personality = PERSONALITY_STANDARD
++  if accel <= FCA11_BRAKE_ONSET_ACCEL:
++    return clamp_dec_cmd(dec_cmd_from_accel(accel), personality)
++  lsb = int(round((-accel / FCA11_BRAKE_GAIN) / 9.81 * 100))
++  return max(FCA11_FEEL_FLOOR_LSB, min(personality_max_dec(personality), lsb))
++
++
++def feel_soft_rate_lsb_per_sent(lsb: float) -> float:
++  """0049: the jerk-limited growth per SENT frame at command level ``lsb``: JERK_TARGET / slope(lsb) x 0.02 s, where
++  slope is the delivered m/s^2 per LSB (PROVISIONAL low band below the knee, measured above)."""
++  slope = FCA11_FEEL_SLOPE_LOW if lsb < FCA11_FEEL_SLOPE_KNEE_LSB else FCA11_FEEL_SLOPE_HIGH
++  return FCA11_FEEL_JERK_TARGET / slope * (FCA11_SEND_EVERY * 0.01)
++
++
++def feel_rate_lsb_per_sent(accel: float, lsb: float = float(FCA11_FEEL_SLOPE_KNEE_LSB)) -> float:
++  """0049: the onset growth allowed per SENT frame: the jerk-limited soft rate for asks at/above RATE_SOFT_ACCEL, the
++  panda's +RATE_STEP for a HARD ask (<= FCA11_ONSET_BYPASS_ACCEL, never slowed), linear in between. Never above
++  +RATE_STEP (the panda ceiling is applied again by the caller)."""
++  step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
++  if accel <= FCA11_ONSET_BYPASS_ACCEL:
++    return step
++  soft = min(step, feel_soft_rate_lsb_per_sent(lsb))
++  if accel >= FCA11_FEEL_RATE_SOFT_ACCEL:
++    return soft
++  frac = (FCA11_FEEL_RATE_SOFT_ACCEL - accel) / (FCA11_FEEL_RATE_SOFT_ACCEL - FCA11_ONSET_BYPASS_ACCEL)
++  return soft + frac * (step - soft)
++
++
++def feel_anticipated_accel(accel: float, slope: float) -> float:
++  """0049: the ask predicted FCA11_FEEL_ANTICIPATE_S ahead, used ONLY while it is EASING (slope > 0) and never for a HARD
++  ask. Only ever returns an ask that is equal or LESS negative (a lower request) - never more braking."""
++  if accel <= FCA11_ONSET_BYPASS_ACCEL or slope <= 0.0:
++    return accel
++  return accel + min(slope * FCA11_FEEL_ANTICIPATE_S, FCA11_FEEL_ANTICIPATE_MAX)
++
++
+ # *** 0045 (v2, settlement Amendment 1): SHADOW mode — param HyundaiFca11Shadow -> CP_SP.fca11Shadow (DEFAULT OFF) ***
+ #
+ # TERMS (fixed by the settlement; used everywhere in this module, the log and the UI):
+@@ -749,6 +860,15 @@ class Fca11LongBrake:
+     self._shape_acc = float(FCA11_SHAPE_FLOOR_LSB)
+     self._shape_sent_n = 0
+     self._shape_in_hold_band = False
++    # 0049: the FEEL layer (OLD-LAW instance only; see the FCA11_FEEL_* block). Read ONCE here. Never on the shaping/V3
++    # path (affine_gain) - so the Shadow V3 core and the shadow log are untouched.
++    self.feel = bool(FCA11_FEEL_ENABLED) and self.enabled and not self.affine_gain
++    self._feel_acc = 0.0               # float LSB accumulator of the onset ramp (episode-local)
++    self._feel_slope = 0.0             # EMA of d(ask)/dt over SENT frames (m/s^3), episode-local
++    self._feel_prev_ask: float | None = None
++    self._feel_in_hold_band = False    # hold-band latch (ENTER <= 3 km/h or standstill, EXIT >= 5 km/h)
++    self._feel_cal_prev = False        # previous frame's cal_on (a cal->planner hand-off re-seeds the ramp)
++    self._feel_dwell = 0               # consecutive frames of (ok AND ask <= the deployed -0.5 onset): the dwell escape
+     # ---- G5 anti-flap state ----
+     self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
+     self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
+@@ -1126,6 +1246,58 @@ class Fca11LongBrake:
+     # sent frame is the floor 4, which the panda accepts).
+     return min(int(new_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+ 
++  def _feel_reset(self, seed: float = float(FCA11_FEEL_FIRST_LSB)) -> None:
++    """0049: arm the feel ramp for a (re)opened episode: the accumulator starts at ``seed`` (the first-frame level, or
++    the last SENT level on a cal->planner hand-off so there is no step), the slope estimate is cleared."""
++    self._feel_acc = float(seed)
++    self._feel_slope = 0.0
++    self._feel_prev_ask = None
++
++  def _feel_update_band(self, v_kph: float, CS) -> bool:
++    """0049: update + return the hold-band latch (ENTER <= FCA11_FEEL_HOLD_BAND_KPH or standstill; EXIT >= EXIT_KPH)."""
++    if bool(getattr(CS.out, "standstill", False)) or v_kph <= FCA11_FEEL_HOLD_BAND_KPH:
++      self._feel_in_hold_band = True
++    elif v_kph >= FCA11_FEEL_HOLD_EXIT_KPH:
++      self._feel_in_hold_band = False
++    return self._feel_in_hold_band
++
++  def _feel_level(self, accel: float, frame: int, personality=PERSONALITY_STANDARD) -> int:
++    """0049: the raw CR_VSM_DecCmd the OLD-LAW feel layer requests for one 100 Hz frame (planner ask, moving).
++
++    State advances only on the 50 Hz SENT slot (the ramp + slope are per SENT frame); a non-send frame re-offers the
++    accumulator (not transmitted - alerts/logger view only). The return is ALWAYS capped by the panda contract (+RATE_STEP
++    over the last SENT frame), and is never above the deployed law's request for the same ask."""
++    if self._feel_in_hold_band:
++      # the stop/hold band runs the DEPLOYED law exactly: request clamped like before, +RATE_STEP over the last sent frame.
++      dec = clamp_dec_cmd(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
++      dec = clamp_dec_cmd(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
++      if frame % FCA11_SEND_EVERY == 0:
++        self._feel_acc = float(dec)
++        self._feel_prev_ask = accel
++      return dec
++    if frame % FCA11_SEND_EVERY != 0:
++      return max(1, min(int(self._feel_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP))
++    if self._feel_prev_ask is not None:
++      inst = (accel - self._feel_prev_ask) / (FCA11_SEND_EVERY * 0.01)
++      self._feel_slope += FCA11_FEEL_SLOPE_ALPHA * (inst - self._feel_slope)
++    self._feel_prev_ask = accel
++    target = feel_target_lsb(feel_anticipated_accel(accel, self._feel_slope), personality)
++    prev = self._feel_acc
++    if target > prev:
++      rate = feel_rate_lsb_per_sent(accel, prev)
++      if self._feel_slope <= FCA11_FEEL_DEEPEN_SLOPE:
++        rate = float(HYUNDAI_FCA11_LONG_RATE_STEP)   # a fast-building demand is not throttled by the comfort ramp
++      new_acc = min(float(target), prev + rate)
++    else:
++      new_acc = float(target)          # decreases are immediate (the safe direction)
++    new_acc = max(float(FCA11_FEEL_FLOOR_LSB), new_acc)
++    # the panda contract caps the SENT value at +RATE_STEP over the last SENT frame (0 at an episode open -> the first
++    # frame is 4). The accumulator is held to the same ceiling so it can never run AHEAD of the wire: otherwise growth
++    # earned on a capped frame would be released in one +4 jump on the next (the 4 -> 8 step this layer exists to remove).
++    ceiling = self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP
++    self._feel_acc = min(new_acc, float(ceiling))
++    return max(1, min(int(new_acc), ceiling))
++
+   # ---- 0045 SHADOW: V3 computed post-send + logged, never sent ----
+ 
+   def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+@@ -1321,6 +1493,10 @@ class Fca11LongBrake:
+       # 0043: and no shaped-law state survives a disable (a re-arm starts at the floor). 0043 v2: nor the cal-edge tracker.
+       self._shape_reset()
+       self._cal_prev = False
++      self._feel_reset()                     # 0049: no feel-ramp state survives a disable
++      self._feel_cal_prev = False
++      self._feel_in_hold_band = False
++      self._feel_dwell = 0
+       return sends
+ 
+     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+@@ -1413,6 +1589,9 @@ class Fca11LongBrake:
+       self._on_frames = 0
+       # 0043: and the shaped-law ramp state (the next episode re-opens at the floor with the onset hold armed).
+       self._shape_reset()
++      self._feel_reset()                     # 0049: and the feel ramp
++      self._feel_cal_prev = False
++      self._feel_dwell = 0
+       self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
+       self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+@@ -1456,11 +1635,19 @@ class Fca11LongBrake:
+     if self.affine_gain and bool(cal_on) != self._cal_prev:     # ON path only: the OFF path runs no shaped-law code here
+       self._shape_reset()
+       self._cal_prev = bool(cal_on)
++    # 0049: the feel layer's cal edge tracker is read in the want_brake branch below; it is updated AFTER that use.
+ 
+     # ---- G5 anti-flap decision ----------------------------------------------------------------
+     # ask: the planner wants a brake THIS frame and every pre-condition (fca11_ok) holds. `ask` drives
+     # the onset debounce only; the release/min-on logic below consumes the *raw* accel.
+-    ask = bool(ok and accel <= FCA11_BRAKE_ONSET_ACCEL)
++    # 0049 COAST-FIRST: on the OLD-LAW feel path, while moving above the hold band, a NEW episode needs the residual demand
++    # beyond zero-throttle coast (open at FCA11_FEEL_OPEN_ACCEL, -0.60 by default); the release rule below is unchanged
++    # (that is the hysteresis). Off the feel path / in the hold band the deployed -0.5 is used, byte-identical.
++    open_accel = FCA11_BRAKE_ONSET_ACCEL
++    if self.feel and not self._feel_update_band(v_kph_now, CS):
++      open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
++    ask = bool(ok and accel <= open_accel)
++    self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
+     self._ask_frames = self._ask_frames + 1 if ask else 0
+ 
+     # onset: a NEW episode opens only after ONSET_HOLD_FRAMES consecutive ask frames (0.2 s), EXCEPT a
+@@ -1475,6 +1662,8 @@ class Fca11LongBrake:
+     # the PRODUCTION path (a veto stops braking on this frame; a soft cal end lets the same release
+     # logic run).
+     onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or accel <= FCA11_ONSET_BYPASS_ACCEL))
++    if self.feel and self._feel_dwell >= FCA11_FEEL_DWELL_FRAMES:
++      onset = True   # 0049 dwell escape (feel path only; `ok` is part of the dwell count): a SUSTAINED small ask opens
+     holding = bool(self.braking and ok and
+                    (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+     want_brake = bool(onset or holding or cal_on)
+@@ -1500,7 +1689,15 @@ class Fca11LongBrake:
+       # the 4 LSB moving floor / tier-cap hold floor, so it replaces the whole request+floor+rate-limit block
+       # below. cal_on still takes the 0041-era path UNCHANGED (cal is a subordinate test tool - a scripted level
+       # with a clean +RATE_STEP entry step). OFF (no cal, no affine) is byte-identical to 0042.
+-      if self.affine_gain and not cal_on:
++      if self.feel and not cal_on:
++        # 0049: the OLD-LAW feel layer (coast-first / lag-aware onset ramp / anticipatory release); see FCA11_FEEL_*.
++        # A (re)opened episode starts at the first-frame level; a cal->planner hand-off re-seeds at the last SENT level.
++        if not self.braking:
++          self._feel_reset()
++        elif self._feel_cal_prev:
++          self._feel_reset(float(max(self._dec_last_sent, FCA11_FEEL_FLOOR_LSB)))
++        dec_cmd = self._feel_level(accel, frame, personality)
++      elif self.affine_gain and not cal_on:
+         if not self.braking:
+           self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
+         dec_cmd = self._shape_level(accel_ask, v_kph_now, CS, frame, personality)
+@@ -1592,6 +1789,7 @@ class Fca11LongBrake:
+             self._pending_echo_frame = frame
+             self._echo_rejected = False
+ 
++    self._feel_cal_prev = bool(cal_on)   # 0049: previous frame's cal_on, for the feel ramp's cal->planner re-seed
+     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+     self._on_frames = self._on_frames + 1 if want_brake else 0
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+new file mode 100644
+index 0000000..0514abb
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+@@ -0,0 +1,444 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++0049: FCA11 brake FEEL on the DEPLOYED (OLD-LAW) path - coast-first open, lag-aware onset ramp through the intermediate
++LSBs, anticipatory release. Pins:
++  * the pure maps (target == the deployed request at/below -0.5, never above it, intermediate levels in the band; the ramp
++    never exceeds +RATE_STEP and is +RATE_STEP for a HARD ask; anticipation only ever eases);
++  * the controller behaviour (coast-first suppression + hysteresis, onset ramp 4 -> 5 -> 6 -> 7 -> 8, follow-down in the
++    release band, the hold band and HARD asks byte-identical to the pre-0049 law);
++  * the AUTHORITY invariant (sent level <= the pre-0049 law's on every slot, randomized);
++  * the untouched panda contract with FEEL on (Warn 3, <= +RATE_STEP over the last SENT frame, one passive frame on every
++    exit, no frames while blocked, camera hand-back latch);
++  * the scope (OLD-LAW instance only: the shaping/V3 core and cal never run the feel layer).
++"""
++import random
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam, _real_camera_frame
++
++STEP = fl.HYUNDAI_FCA11_LONG_RATE_STEP
++
++
++def _cc(accel=0.0, engaged=True, long_active=True):
++  cc = structs.CarControl()
++  cc.enabled = engaged
++  cc.longActive = long_active
++  cc.actuators.accel = accel
++  return cc
++
++
++def _cp_sp(affine=False):
++  return structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=affine)
++
++
++class _FeelSwitch:
++  """Build an instance with FCA11_FEEL_ENABLED forced (read once at construction), restoring the module value."""
++  def __init__(self, on: bool):
++    self.on = on
++
++  def __enter__(self):
++    self.prev = fl.FCA11_FEEL_ENABLED
++    fl.FCA11_FEEL_ENABLED = self.on
++    return self
++
++  def __exit__(self, *a):
++    fl.FCA11_FEEL_ENABLED = self.prev
++
++
++def _brake(feel=True, affine=False):
++  with _FeelSwitch(feel):
++    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(affine))
++  b.log.enabled = False
++  b.cal_seq = None
++  return b
++
++
++def _run(b, asks, v=20.0, personality=fl.PERSONALITY_STANDARD, start=0, cs_fn=None):
++  """Step frames; return [(frame, dec, warn)] of every 0x38D sent."""
++  out = []
++  for i, a in enumerate(asks):
++    f = start + i
++    cs = cs_fn(f) if cs_fn else _CS(v_ego=v, cam=_cam())
++    for s in b.update(_cc(a), cs, f, personality):
++      out.append((f, fl._get_bits(s.dat, 8, 8), fl._get_bits(s.dat, 3, 2)))
++  return out
++
++
++class TestFeelPure(unittest.TestCase):
++
++  def test_target_equals_deployed_at_and_below_onset(self):
++    for p in (fl.PERSONALITY_RELAXED, fl.PERSONALITY_STANDARD, fl.PERSONALITY_AGGRESSIVE):
++      a = fl.FCA11_BRAKE_ONSET_ACCEL
++      while a >= -3.5:
++        self.assertEqual(fl.clamp_dec_cmd(fl.dec_cmd_from_accel(a), p), fl.feel_target_lsb(a, p), (a, p))
++        a -= 0.01
++
++  def test_target_band_uses_intermediate_levels_monotone_and_never_above_deployed(self):
++    prev = None
++    seen = set()
++    a = 0.0
++    while a >= -3.0:
++      t = fl.feel_target_lsb(a)
++      deployed = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(min(a, fl.FCA11_BRAKE_ONSET_ACCEL)))
++      self.assertLessEqual(t, deployed, a)
++      self.assertGreaterEqual(t, fl.FCA11_FEEL_FLOOR_LSB, a)
++      if prev is not None:
++        self.assertGreaterEqual(t, prev, f"monotone at {a}")
++      prev = t
++      seen.add(t)
++      a -= 0.005
++    for lvl in (4, 5, 6, 7):
++      self.assertIn(lvl, seen, "the release band must reach the intermediate LSBs the old law never emitted")
++
++  def test_rate_hard_is_panda_step_soft_is_jerk_limited_never_above_step(self):
++    self.assertEqual(float(STEP), fl.feel_rate_lsb_per_sent(fl.FCA11_ONSET_BYPASS_ACCEL))
++    self.assertEqual(float(STEP), fl.feel_rate_lsb_per_sent(-3.0, 4.0))
++    lo = fl.feel_rate_lsb_per_sent(-0.6, 4.0)
++    hi = fl.feel_rate_lsb_per_sent(-0.6, 12.0)
++    self.assertAlmostEqual(fl.FCA11_FEEL_JERK_TARGET / fl.FCA11_FEEL_SLOPE_LOW * 0.02, lo)
++    self.assertAlmostEqual(fl.FCA11_FEEL_JERK_TARGET / fl.FCA11_FEEL_SLOPE_HIGH * 0.02, hi)
++    self.assertLess(lo, 1.0)
++    self.assertLess(hi, 1.0)
++    a = 0.0
++    while a >= -3.0:
++      for lsb in range(1, 31):
++        r = fl.feel_rate_lsb_per_sent(a, float(lsb))
++        self.assertGreater(r, 0.0)
++        self.assertLessEqual(r, float(STEP))
++      a -= 0.05
++
++  def test_anticipation_only_eases_and_never_for_hard(self):
++    for a in (-0.4, -0.6, -1.0, -1.19):
++      for s in (-5.0, -0.5, 0.0, 0.3, 1.0, 50.0):
++        got = fl.feel_anticipated_accel(a, s)
++        self.assertGreaterEqual(got, a)
++        self.assertLessEqual(got - a, fl.FCA11_FEEL_ANTICIPATE_MAX + 1e-9)
++        if s <= 0:
++          self.assertEqual(a, got)
++    for a in (fl.FCA11_ONSET_BYPASS_ACCEL, -2.0):
++      self.assertEqual(a, fl.feel_anticipated_accel(a, 10.0))
++    # and it DOES look ahead by the plant lag while easing (capped)
++    self.assertAlmostEqual(-0.8 + 0.5 * fl.FCA11_FEEL_ANTICIPATE_S, fl.feel_anticipated_accel(-0.8, 0.5))
++    self.assertAlmostEqual(-0.8 + fl.FCA11_FEEL_ANTICIPATE_MAX, fl.feel_anticipated_accel(-0.8, 50.0))
++
++  def test_open_threshold_is_coast_plus_margin(self):
++    self.assertAlmostEqual(-0.60, fl.FCA11_FEEL_OPEN_ACCEL)
++    self.assertLess(fl.FCA11_FEEL_OPEN_ACCEL, fl.FCA11_BRAKE_ONSET_ACCEL)
++    self.assertGreater(fl.FCA11_FEEL_OPEN_ACCEL, fl.FCA11_ONSET_BYPASS_ACCEL)
++
++
++class TestFeelScope(unittest.TestCase):
++
++  def test_feel_on_old_law_only(self):
++    self.assertTrue(_brake(True).feel)
++    self.assertFalse(_brake(False).feel)
++    self.assertFalse(_brake(True, affine=True).feel, "the shaping/V3 law never runs the feel layer")
++    with _FeelSwitch(True):
++      off = fl.Fca11LongBrake(structs.CarParams(), structs.CarParamsSP(fca11Brake=False, enableGasInterceptor=True))
++    self.assertFalse(off.feel)
++
++  def test_shadow_v3_core_never_runs_feel_and_old_law_does(self):
++    import os
++    import tempfile
++    from unittest import mock
++    with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"FCA11_LOG_DIR": d}):
++      with _FeelSwitch(True):
++        cp_sp = structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11Shadow=True)
++        b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++      self.assertTrue(b.shadow)
++      self.assertTrue(b.feel, "the actuating OLD-LAW instance runs the feel layer")
++      core = b._shadow_v3
++      assert core is not None
++      self.assertFalse(core.feel, "the V3 core is the frozen shaping law")
++
++  def test_feel_disabled_is_byte_identical_to_pre_0049(self):
++    """FCA11_FEEL_ENABLED False must reproduce the pre-0049 law - pinned against the deployed sequence shape."""
++    b = _brake(False)
++    sent = _run(b, [-0.55] * 40 + [-0.35] * 60 + [-0.2] * 10)
++    decs = [d for _, d, _ in sent]
++    self.assertEqual([4, 8], decs[:2], "pre-0049: 0 -> 4 -> 8")
++    self.assertNotIn(5, decs)
++    self.assertNotIn(6, decs)
++    self.assertNotIn(7, decs)
++
++
++class TestCoastFirst(unittest.TestCase):
++
++  def test_transient_small_ask_below_coast_plus_margin_never_opens(self):
++    b = _brake(True)
++    asks = ([-0.55] * 80 + [-0.2] * 20) * 3   # 0.8 s small asks with gaps: transients, never a sustained 1 s
++    self.assertEqual([], _run(b, asks))
++    self.assertFalse(b.braking)
++    old = _brake(False)
++    self.assertTrue(any(d > 0 for _, d, _ in _run(old, asks)), "the pre-0049 law opens on -0.55")
++
++  def test_dwell_escape_opens_a_sustained_small_ask(self):
++    b = _brake(True)
++    for f in range(fl.FCA11_FEEL_DWELL_FRAMES - 1):
++      b.update(_cc(-0.55), _CS(cam=_cam()), f)
++      self.assertFalse(b.braking, f)
++    b.update(_cc(-0.55), _CS(cam=_cam()), fl.FCA11_FEEL_DWELL_FRAMES - 1)
++    self.assertTrue(b.braking, "a sustained -0.55 opens after the dwell")
++    sent = _run(b, [-0.55] * 100, start=fl.FCA11_FEEL_DWELL_FRAMES)
++    for x, y in zip(sent, sent[1:], strict=False):
++      self.assertLessEqual(y[1] - x[1], 1, "and ramps softly")
++
++  def test_dwell_counts_only_ok_frames(self):
++    b = _brake(True)
++    _run(b, [-0.55] * 150, cs_fn=lambda f: _CS(cam=_cam(), gas=True))
++    self.assertFalse(b.braking)
++    self.assertEqual(0, b._feel_dwell)
++
++  def test_ask_past_threshold_opens_after_the_same_debounce(self):
++    b = _brake(True)
++    for f in range(fl.FCA11_ONSET_HOLD_FRAMES - 1):
++      b.update(_cc(-0.62), _CS(cam=_cam()), f)
++      self.assertFalse(b.braking, f)
++    b.update(_cc(-0.62), _CS(cam=_cam()), fl.FCA11_ONSET_HOLD_FRAMES - 1)
++    self.assertTrue(b.braking)
++
++  def test_hysteresis_release_rule_unchanged(self):
++    """Once open, the deployed release rule (-0.30 + min-on) governs: an ask easing to -0.45 STAYS braking."""
++    b = _brake(True)
++    _run(b, [-0.8] * 30)
++    self.assertTrue(b.braking)
++    _run(b, [-0.45] * 200, start=30)
++    self.assertTrue(b.braking, "inside the hysteresis band the episode stays open")
++    _run(b, [-0.2] * 2, start=230)
++    self.assertFalse(b.braking)
++
++  def test_hard_ask_opens_on_first_frame(self):
++    b = _brake(True)
++    sent = _run(b, [-1.5])
++    self.assertTrue(b.braking)
++    self.assertEqual([(0, STEP, 3)], sent)
++
++  def test_hold_band_runs_the_deployed_law_byte_identical(self):
++    for v in (0.0, 0.5, 0.8):
++      for asks in ([-0.55] * 200, [-0.9] * 50 + [-0.4] * 100 + [-0.2] * 50, [-2.0] * 100):
++        def cs_fn(f, v=v):
++          return _CS(v_ego=v, cam=_cam(), standstill=(v == 0.0))
++        self.assertEqual(_run(_brake(False), asks, cs_fn=cs_fn), _run(_brake(True), asks, cs_fn=cs_fn), v)
++
++  def test_hold_band_uses_deployed_open(self):
++    for v in (0.5, 0.8):   # m/s (<= 3 km/h)
++      b = _brake(True)
++      self.assertTrue(any(d > 0 for _, d, _ in _run(b, [-0.55] * 60, v=v)), v)
++
++
++class TestOnsetRamp(unittest.TestCase):
++
++  def test_soft_onset_walks_intermediate_lsbs_with_small_steps(self):
++    b = _brake(True)
++    sent = [(f, d) for f, d, _ in _run(b, [-0.9] * 200)]
++    decs = [d for _, d in sent]
++    self.assertEqual(STEP, decs[0], "first frame is the panda onset step")
++    for lvl in (5, 6, 7):
++      self.assertIn(lvl, decs)
++    for x, y in zip(decs, decs[1:], strict=False):
++      self.assertLessEqual(y - x, 1, "a soft onset never steps more than 1 LSB per sent frame")
++    target = fl.feel_target_lsb(-0.9)
++    self.assertEqual(target, decs[-1], "and reaches the deployed steady level")
++    t8 = next(i for i, d in enumerate(decs) if d >= 8) * 0.02
++    self.assertGreaterEqual(t8, 0.25, "4 -> 8 spans at least the plant lag (was 0.02 s)")
++
++  def test_hard_ask_from_idle_is_byte_identical_to_pre_0049(self):
++    for p in (fl.PERSONALITY_RELAXED, fl.PERSONALITY_STANDARD, fl.PERSONALITY_AGGRESSIVE):
++      for ask in (-1.2, -1.6, -2.0, -3.5):
++        new = _run(_brake(True), [ask] * 120, personality=p)
++        old = _run(_brake(False), [ask] * 120, personality=p)
++        self.assertEqual(old, new, (p, ask))
++
++  def test_steady_level_unchanged_for_onset_asks(self):
++    for ask in (-0.6, -0.8, -1.0, -1.4):
++      new = _run(_brake(True), [ask] * 300)
++      old = _run(_brake(False), [ask] * 300)
++      self.assertEqual(old[-1][1], new[-1][1], ask)
++
++
++class TestAnticipatoryRelease(unittest.TestCase):
++
++  def test_band_follows_ask_down_instead_of_clamping_at_8(self):
++    b = _brake(True)
++    _run(b, [-0.9] * 200)
++    sent = _run(b, [-0.36] * 40, start=200)
++    self.assertTrue(b.braking)
++    self.assertLessEqual(sent[-1][1], 6, "inside the release band the level follows the 0.67 inverse (5-6), not 8")
++    old = _brake(False)
++    _run(old, [-0.9] * 200)
++    self.assertEqual(8, _run(old, [-0.36] * 40, start=200)[-1][1])
++
++  def test_anticipation_lowers_the_level_while_the_ask_eases_below_the_onset(self):
++    """Strictly in the ask <= -0.5 region (where the target map == the deployed map), an easing ask must already be
++    commanded LOWER than the deployed law - that is the lag look-ahead, not the band follow-down."""
++    ease = [-1.6] * 150 + [-1.6 + 1.0 * i / 100 for i in range(100)]    # -1.6 -> -0.6 at +1 m/s^3 (all <= -0.5)
++    new = {f: d for f, d, _ in _run(_brake(True), ease)}
++    old = {f: d for f, d, _ in _run(_brake(False), ease)}
++    lower = [f for f in new if 180 <= f < 250 and new[f] < old[f]]
++    self.assertGreater(len(lower), 10)
++    self.assertTrue(all(new[f] <= old[f] for f in new))
++
++  def test_easing_ask_drops_level_ahead_of_the_deployed_law_and_exit_timing_is_unchanged(self):
++    ease = [-1.0] * 150 + [-1.0 + 0.7 * i / 100 for i in range(100)] + [-0.25] * 10
++    new_b, old_b = _brake(True), _brake(False)
++    new = _run(new_b, ease)
++    old = _run(old_b, ease)
++    by_f_new = {f: d for f, d, _ in new}
++    by_f_old = {f: d for f, d, _ in old}
++    lower = [f for f in by_f_new if 150 <= f < 250 and by_f_new[f] < by_f_old.get(f, 0)]
++    self.assertGreater(len(lower), 5, "the anticipated (eased) ask lowers the level during the ease")
++    for f in by_f_new:
++      self.assertLessEqual(by_f_new[f], by_f_old.get(f, 99), f)
++    pass_new = [f for f, d, w in new if d == 0]
++    pass_old = [f for f, d, w in old if d == 0]
++    self.assertEqual(pass_old, pass_new, "the passive close frame goes out on the same frame")
++    self.assertEqual(1, len(pass_new))
++
++
++class TestAuthorityInvariant(unittest.TestCase):
++
++  def test_randomized_feel_never_exceeds_the_pre_0049_law(self):
++    """Two invariants over random ask traces (speeds incl. the hold band, every personality):
++      (1) REQUEST domain - on EVERY actuating slot the 0049 level is <= what the deployed law REQUESTS for the same ask
++          (clamp_dec_cmd(dec_cmd_from_accel(min(ask, -0.5)))) - feel never asks for more braking than the deployed map;
++      (2) TRAJECTORY domain - the 0049 level is <= the deployed law's SENT level on the same slot, except where the two
++          episodes are misaligned in time: coast-first opens later, so the UNCHANGED min-on / hysteresis window ends later
++          and can overlap the deployed law's next re-open ramp or its gap. Those slots are disclosed and must be rare."""
++    rng = random.Random(49)
++    misaligned = total = 0
++    for trial in range(40):
++      asks, a = [], 0.0
++      for _ in range(600):
++        a += rng.gauss(0, 0.06)
++        if rng.random() < 0.01:
++          a = rng.uniform(-3.0, 0.3)
++        a = max(-3.5, min(0.5, a))
++        asks.append(a)
++      v = rng.choice([1.0, 8.0, 25.0])
++      p = rng.choice([0, 1, 2])
++      new = {f: d for f, d, _ in _run(_brake(True), asks, v=v, personality=p)}
++      old = {f: d for f, d, _ in _run(_brake(False), asks, v=v, personality=p)}
++      for f, d in new.items():
++        if d <= 0:
++          continue
++        total += 1
++        deployed_req = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(min(asks[f], fl.FCA11_BRAKE_ONSET_ACCEL)), p)
++        self.assertLessEqual(d, deployed_req, f"trial {trial} f={f}: above the deployed request for this ask")
++        if d > old.get(f, 0):
++          misaligned += 1
++    self.assertLess(misaligned, 0.01 * total, f"misaligned slots must be rare: {misaligned}/{total}")
++
++
++class TestContractWithFeel(unittest.TestCase):
++
++  def test_warn3_and_rate_step_on_every_actuating_frame(self):
++    rng = random.Random(7)
++    asks = [max(-3.5, min(0.2, -0.9 + rng.gauss(0, 0.6))) for _ in range(2000)]
++    b = _brake(True)
++    last = 0
++    for f, d, w in _run(b, asks, personality=fl.PERSONALITY_AGGRESSIVE):
++      if d > 0:
++        self.assertEqual(3, w)
++        self.assertLessEqual(d, last + STEP, f)
++        self.assertLessEqual(d, fl.HYUNDAI_FCA11_LONG_MAX_DEC)
++      else:
++        self.assertEqual(0, w, "passive frame: Warn 0")
++      last = d
++
++  def test_one_passive_frame_on_every_exit_from_a_soft_episode(self):
++    cam_req = (0, _real_camera_frame(warn=2))
++    exits = {
++      "brake": lambda f: _CS(cam=_cam(), brake=True),
++      "gas": lambda f: _CS(cam=_cam(), gas=True),
++      "gear": lambda f: _CS(cam=_cam(), gear=structs.CarState.GearShifter.sport),
++      "camera_owns": lambda f: _CS(cam=cam_req),
++      "stale": lambda f: _CS(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9)),
++      "release": lambda f: _CS(cam=_cam()),
++    }
++    for name, cs_fn in exits.items():
++      for odd in (0, 1):
++        b = _brake(True)
++        _run(b, [-0.8] * (100 + odd))
++        self.assertTrue(b.braking, name)
++        start = 100 + odd
++        ask = -0.1 if name == "release" else -0.8
++        got = _run(b, [ask] * 6, start=start, cs_fn=cs_fn)
++        self.assertFalse(b.braking, name)
++        self.assertEqual(1, len([g for g in got if g[1] == 0]), f"{name}@{odd}: {got}")
++        self.assertEqual([], [g for g in got if g[1] > 0], f"{name}: no actuation after the exit")
++    # longActive-off: owed and delivered on the first frame back, before any actuation
++    b = _brake(True)
++    _run(b, [-0.8] * 100)
++    b.update(_cc(-0.8, long_active=False), _CS(cam=_cam()), 100)
++    self.assertTrue(b._release_pending)
++    got = _run(b, [-0.8] * 4, start=101)
++    self.assertEqual(0, got[0][1])
++
++  def test_camera_handback_latches_and_no_auto_resume(self):
++    b = _brake(True)
++    _run(b, [-0.8] * 100)
++    _run(b, [-0.8] * 2, start=100, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(warn=2))))
++    self.assertTrue(b.blocked_until_resume)
++    self.assertEqual([], [g for g in _run(b, [-2.0] * 200, start=102) if g[1] > 0], "hard cut: never resumes")
++
++  def test_refused_echo_restarts_the_ramp_within_the_panda_onset_step(self):
++    """0035 contract: a REFUSED actuating echo while braking drops our reference to 0 -> the next SENT frame is <= +RATE_STEP
++    (the panda's onset rule). The feel accumulator must not run ahead of it."""
++    b = _brake(True)
++    _run(b, [-1.0] * 300)
++    lvl = b._dec_last_sent
++    self.assertGreater(lvl, STEP)
++    b.observe_echo([(192, bytes([0, lvl, 0, 0, 0, 0, 0, 0]))])
++    sent = _run(b, [-1.0] * 6, start=300)
++    self.assertLessEqual(sent[0][1], STEP)
++    for x, y in zip(sent, sent[1:], strict=False):
++      self.assertLessEqual(y[1] - x[1], STEP)
++    # and a SOFT re-climb after the reset is a fresh soft onset (the ESC has been back on the camera's idle frame): the
++    # accumulator is held to the wire ceiling, so it cannot release banked growth as a +4 jump (4 -> 8).
++    b2 = _brake(True)
++    _run(b2, [-0.9] * 300)
++    lvl2 = b2._dec_last_sent
++    self.assertGreaterEqual(lvl2, 8)
++    b2.observe_echo([(192, bytes([0, lvl2, 0, 0, 0, 0, 0, 0]))])
++    re = [d for _, d, _ in _run(b2, [-0.9] * 40, start=300)]
++    self.assertEqual(STEP, re[0])
++    for x, y in zip(re, re[1:], strict=False):
++      self.assertLessEqual(y - x, 1, f"soft re-climb must stay on the comfort ramp: {re}")
++
++  def test_reopen_restarts_at_the_onset_step(self):
++    b = _brake(True)
++    _run(b, [-1.0] * 200)
++    _run(b, [-0.1] * 70, start=200)
++    self.assertFalse(b.braking)
++    sent = _run(b, [-1.0] * 30, start=270)
++    self.assertEqual(STEP, [d for _, d, _ in sent if d > 0][0])
++
++  def test_fast_deepening_ask_uses_the_full_panda_rate(self):
++    """An ask deepening faster than FCA11_FEEL_DEEPEN_SLOPE inside the SOFT band (never reaching -1.0) still grows by more
++    than the comfort ramp's <= 1 LSB per sent frame."""
++    asks = [-0.62] * 60 + [-0.62 - 0.04 * i for i in range(10)] + [-1.0] * 40     # -4 m/s^3, -0.62 -> -0.98
++    sent = [(f, d) for f, d, _ in _run(_brake(True), asks)]
++    steps = [y[1] - x[1] for x, y in zip(sent, sent[1:], strict=False) if asks[y[0]] >= -1.0]
++    self.assertGreater(max(steps), 1, "a fast-building demand is not throttled by the comfort ramp")
++    self.assertLessEqual(max(steps), STEP)
++
++  def test_mid_ask_turning_hard_catches_up_at_the_panda_rate(self):
++    """Disclosed trade: a soft ramp that turns HARD starts its +RATE_STEP climb from a lower level, then climbs at the
++    panda's full rate - it must reach the deployed level within a bounded number of sent frames."""
++    asks = [-0.9] * 30 + [-2.0] * 60
++    new = {f: d for f, d, _ in _run(_brake(True), asks, personality=fl.PERSONALITY_AGGRESSIVE)}
++    old = {f: d for f, d, _ in _run(_brake(False), asks, personality=fl.PERSONALITY_AGGRESSIVE)}
++    cap = fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE]
++    t_new = min(f for f, d in new.items() if d >= cap)
++    t_old = min(f for f, d in old.items() if d >= cap)
++    self.assertLessEqual(t_new - t_old, 6, "at most ~3 sent frames (60 ms) behind")
++
++
++if __name__ == "__main__":
++  unittest.main()
+-- 
+2.54.0 (Apple Git-157)
+
