@@ -268,6 +268,17 @@ jobs:
             exit 0
           fi
           if git merge --no-edit "${SYNC_TARGET}"; then
+            # The fork's workflow files are authoritative: never carry upstream's
+            # .github/workflows changes into main. GITHUB_TOKEN pushes that touch
+            # .github/workflows are rejected outright ("refusing to allow a GitHub
+            # App to create or update workflow ... without `workflows` permission"),
+            # and the fork deliberately runs its own minimal workflow set anyway.
+            if ! git diff --quiet ORIG_HEAD HEAD -- .github/workflows; then
+              git rm -r -q --ignore-unmatch -- .github/workflows >/dev/null 2>&1 || true
+              git checkout ORIG_HEAD -- .github/workflows
+              git commit --amend --no-edit -q
+              echo "reset .github/workflows to the fork's version in the merge commit"
+            fi
             echo "MERGED=true" >> "$GITHUB_ENV"
             echo "merged upstream ${SYNC_TARGET:0:10}"
           else
