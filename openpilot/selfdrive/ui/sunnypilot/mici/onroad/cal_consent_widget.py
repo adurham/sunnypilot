@@ -216,7 +216,10 @@ class CalConsentWidget(Widget):
     font = self._get_font()
     p = self._pill_rect()
     rl.draw_rectangle_rounded(p, 0.28, 8, rl.Color(12, 12, 14, 224))
-    rl.draw_rectangle_rounded_lines_ex(p, 0.28, 8, rl.Color(255, 255, 255, 90))
+    # fork fix: DrawRectangleRoundedLinesEx is (rec, roundness, segments, lineThick, color). The old 4-arg
+    # call raised RuntimeError on the FIRST frame a rep was pending -- an uncaught exception in the UI render
+    # loop -- so the prompt could never have been drawn on any device.
+    rl.draw_rectangle_rounded_lines_ex(p, 0.28, 8, 2, rl.Color(255, 255, 255, 90))
 
     level_txt = f"{self._level_g:.2f} g"
     # fork: show the owner's own units -- the prompt is for HIM to approve, and this car is imperial.
@@ -230,7 +233,8 @@ class CalConsentWidget(Widget):
     # 0034: the STEERING-WHEEL hint. The touch path is unchanged (the TAP button below still fires); this
     # only tells the owner the wheel gesture exists. Rendered in the pill's left region, clear of the TAP
     # button, in a smaller font so it never competes with the level/band readout.
-    rl.draw_text_ex(font, "wheel: double-press  \u25b2 / \u25bc", rl.Vector2(text_x, p.y + 120), 24, 0,
+    # fork fix: Inter has no U+25B2/U+25BC glyphs (they rendered as "?"); spell the arrows out.
+    rl.draw_text_ex(font, "wheel: double-press UP / DOWN", rl.Vector2(text_x, p.y + 120), 24, 0,
                     rl.Color(170, 175, 185, 210))
 
     if self._state == CalConsentState.FIRING:
@@ -253,7 +257,7 @@ class CalConsentWidget(Widget):
     # DISMISS target
     d = self._dismiss_rect()
     rl.draw_rectangle_rounded(d, 0.35, 6, rl.Color(52, 52, 56, 235))
-    x = "✕"
+    x = "×"   # fork fix: U+00D7 is in the loaded glyph set; U+2715 is not in Inter (it rendered as "?")
     xw = measure_text_cached(font, x, 44).x
     rl.draw_text_ex(font, x, rl.Vector2(d.x + (d.width - xw) / 2.0, d.y + (d.height - 44) / 2.0),
                     44, 0, rl.Color(235, 235, 235, 235))
