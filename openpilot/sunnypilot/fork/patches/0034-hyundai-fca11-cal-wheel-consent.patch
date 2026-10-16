@@ -1,0 +1,396 @@
+From 0000034000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Thu, 8 Oct 2026 12:30:00 -0500
+Subject: [PATCH] hyundai: FCA11-long CAL wheel consent -- double-press the cruise arrow (0034)
+
+0033 added the mici touch prompt ("tap to fire") for a cal rep. The owner asked for the STEERING WHEEL
+instead -- but "a button that isn't in use". This car's CLU11 emits exactly THREE cruise codes (measured
+14a/14b/14d/14e/14f): 1 = RES_ACCEL (up), 2 = SET_DECEL (down), 4 = CANCEL (pause/resume). There is NO gap
+button and NO unused button, and all three are already consumed (pause/resume is the ONLY engage/disengage;
+up/down are set-speed, with long-press variants). The only free encoding is therefore a DOUBLE-TAP of an
+existing arrow -- an event PATTERN that nothing in the fork consumes.
+
+0034 adds, purely in Python (no safety/ file, no panda change -> FIRMWARE BYTES UNCHANGED, no reflash):
+
+  * double-press UP   -> FIRE the parked rep    (the wheel twin of the UI's "TAP TO FIRE")
+  * double-press DOWN -> DISMISS the parked rep (the wheel twin of the UI's "X")
+
+The gesture is recognised in a new module ``wheel_consent.py`` (a small, side-effect-free detector: two
+taps of the SAME arrow, the second press starting within ``DOUBLE_PRESS_WINDOW_S`` = 0.8 s of the first
+release). A tap held at/above ``TAP_MAX_HOLD_S`` = 0.5 s (== CRUISE_LONG_PRESS in cruise.py) never seeds a
+pair, so the long-press gestures (UP big-step, DOWN set-speed-to-current) can never be mistaken for it.
+
+It is wired the way the existing fork features are: the detector runs in the CarState phase
+(``CarStateExt.update_wheel_consent``, i.e. where the CLU11 stream is parsed), and the FCA11 controller
+(``GasInterceptorCarController.create_gas_command`` -> ``Fca11LongBrake``) hands its sequencer over and
+consumes the verdict, exactly like the pause/resume press is handled today.
+
+  * REUSES THE 0033 CHANNEL. It writes the SAME ``/data/fca11-cal/consent.json`` the UI writes (via a new
+    ``cal_mode.write_consent`` helper that mirrors the widget byte-for-byte), bound to the parked rep's
+    rep_id + plan_id + prompt seq. The sequencer consumes it under the IDENTICAL rules: <= 2 s freshness,
+    full rep/plan/seq binding, a real-bool accept, and a RE-VERIFICATION of every condition (incl. the
+    0032 blind-spot veto) plus the 0031 budget at the instant of the fire. This is a second WRITER of the
+    one channel, never a second channel; the touch path keeps working unchanged.
+  * FAIL-CLOSED. The detector holds no authority and writes nothing itself. With no rep parked it is never
+    even stepped, so a single press and any double-tap flow through byte-for-byte as today. When a rep IS
+    parked, the gesture CONSUMES its own triggering tap (so it is not also read as a set-speed short press):
+    the gesture and its set-speed side-effect are mutually exclusive by construction. The first tap of a
+    pair is left alone -- it is an ordinary single press, exactly as a lone tap is today.
+
+Python-only. Inert when cal mode is off or ``consent_mode=off`` (the sequencer is never reached, and no rep
+is ever parked).
+
+---
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index 7d6f23dc..d0655f28 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -373,6 +373,20 @@ def _write_json_atomic(path: str, doc: dict) -> None:
+     pass
+ 
+ 
++def write_consent(cal_dir: str, rep_id, plan_id, seq, accept: bool, now: float | None = None) -> None:
++  """0034: write the SAME ``consent.json`` the mici UI writes on a tap, so the STEERING-WHEEL gesture
++  and the TOUCH path share ONE channel, ONE schema and ONE set of binding/freshness rules. This is the
++  byte-identical twin of the widget's ``CalConsentWidget._write_consent``; the owner may fire a rep by
++  either route and the sequencer cannot tell the two apart (it only ever reads the file).
++
++  Atomic (tmp + ``os.replace``). The sequencer is the sole consumer: it re-binds on ``rep_id`` +
++  ``plan_id`` + prompt ``seq``, re-checks ``CONSENT_FRESHNESS_S`` and RE-VERIFIES every condition at the
++  instant it reads this. A failed write simply leaves the rep pending -- it can never actuate."""
++  doc = {"rep_id": rep_id, "plan_id": plan_id, "seq": seq,
++         "ts": (time.time() if now is None else now), "accept": bool(accept)}
++  _write_json_atomic(os.path.join(cal_dir, "consent.json"), doc)
++
++
+ class CalSequencer:
+   """In-car cal state machine. Ticked once per 100 Hz controller frame from ``Fca11LongBrake.update``
+   (inside the ``enabled`` branch, so it is structurally dead when the FCA11 toggle is off).
+@@ -745,6 +759,25 @@ class CalSequencer:
+       return False, "stale"
+     return True, "accepted"
+ 
++  def wheel_gesture(self, gesture: str, frame: int) -> str:
++    """0034: act on a STEERING-WHEEL consent gesture recognised by the CarState-phase detector. ``gesture``
++    is ``"fire"`` (double-press UP) or ``"dismiss"`` (double-press DOWN). It writes the EXACT consent.json
++    the mici UI writes -- bound to the rep parked RIGHT NOW (rep_id + plan + prompt seq), with ``accept``
++    True for fire / False for dismiss -- so the STEERING WHEEL and the TOUCH path share ONE channel, ONE
++    schema and ONE set of rules. This is a SECOND WRITER of the one 0033 channel, never a second channel:
++    the sequencer consumes the file on its next tick and applies the SAME freshness window, the SAME
++    rep/plan/seq binding and the SAME re-verification (0032 blind-spot veto + 0031 budget) as for a tap.
++
++    Returns the gesture name when it resolved a parked rep, else ``"consumed"`` (nothing was parked, so
++    the gesture is dropped and NOTHING is written -- a double-tap with no rep is completely inert)."""
++    pending = self._pending
++    if pending is None:
++      return "consumed"
++    write_consent(self.dir, pending.id, self.pid, self._pending_seq, gesture == "fire")
++    self._append_log({"event": "consent_wheel", "gesture": gesture, "rep": pending.id, "plan_id": self.pid,
++                      "seq": self._pending_seq, "session": self._session, "ts": round(time.time(), 3)})
++    return gesture
++
+   def _start_rep(self, rep: CalRep, frame: int, now_wall: float, consent: bool = False) -> None:
+     """Arm ``rep``: command its level NOW (the brake enters on the panda-rate ramp, a clean step).
+     Shared by the autonomous pick path and the 0033 accepted-tap path, so the two never drift."""
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 8d4b970a..64ffdd08 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -6,6 +6,7 @@ See the LICENSE.md file in the root directory for more details.
+ """
+ 
+ from enum import StrEnum
++import time
+ 
+ from opendbc.car import Bus, structs
+ from opendbc.can.parser import CANParser
+@@ -15,6 +16,7 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_K
+ from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_MSG, DRIVE_MODE_SIGNAL, DriveModeDebouncer
+ from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PauseResumeTracker
++from opendbc.sunnypilot.car.hyundai.wheel_consent import WheelConsentDetector, WheelGesture
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+@@ -62,6 +64,14 @@ class CarStateExt:
+     # the published raw off CarStateSP.driveMode and maps it to a personality / a longitudinal block.
+     self.drive_mode_debouncer = DriveModeDebouncer()
+     self.drive_mode = 0
++    # 0034: the STEERING-WHEEL consent gesture. The double-press detector lives HERE, in the CarState
++    # phase, because that is the ONE place that both sees the raw CLU11 button stream AND can act on a
++    # frame BEFORE the CarController consumes CS.buttonEvents -- which is what lets a gesture swallow its
++    # own taps so they never reach cruise.py's set-speed path. The detector writes NOTHING; it only
++    # produces a "fire"/"dismiss"/None verdict, consumed by the FCA11 controller via the two methods below.
++    self.wheel_consent_detector = WheelConsentDetector()
++    self._pending_wheel_gesture: str | None = None   # a fresh verdict for the controller to consume this frame
++    self._wheel_fca11_brake = None                    # the Fca11LongBrake instance registered by the controller
+ 
+   def update_drive_mode(self, cp) -> int:
+     """Read CLU13 CF_Clu_DriveMode off the C-CAN parser (debounced one source frame). Absent -> unknown (0)."""
+@@ -186,12 +196,60 @@ class CarStateExt:
+       # engage in this mode (CarState.update_button_enable), so they need no brake/MAIN bookkeeping here
+       ret.buttonEvents = kept + pause_events
+ 
++      # 0034: the STEERING-WHEEL consent gesture. Runs AFTER ret.buttonEvents is finalised (so it sees the
++      # up/down events whether they came from the base create_button_events or any fork override) and
++      # BEFORE the CarController consumes them. It is inert unless a rep is actually parked; when it is,
++      # it CONSUMES its own two taps (they leave buttonEvents here, exactly like the pause/resume press
++      # above) so a wheel consent gesture never also nudges the set speed.
++      self.update_wheel_consent(ret)
++
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
+     ret_sp.driveMode = self.update_drive_mode(cp)
+     # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
+     # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
+     ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
+ 
++  # ------------------------------------------------------------------ 0034 wheel consent gesture
++  def register_wheel_brake(self, brake) -> None:
++    """0034: the FCA11 controller hands its Fca11LongBrake here (called every controller frame, right
++    before it consumes the gesture) so the CarState phase can ask it for the pending rep id. Idempotent."""
++    self._wheel_fca11_brake = brake
++
++  def update_wheel_consent(self, ret) -> None:
++    """0034: run the double-press detector on this frame's cruise-button events and decide whether the
++    taps leave for the set-speed path or are consumed as a wheel consent gesture. Sets
++    ``_pending_wheel_gesture`` ("fire" / "dismiss") for the controller to consume this frame.
++
++    INERT unless the FCA11 cal sequencer has a rep parked: with no rep the detector is never called, so
++    ``ret.buttonEvents`` is left EXACTLY as built above and set-speed behaves byte-for-byte as today."""
++    self._pending_wheel_gesture = None
++    brake = self._wheel_fca11_brake
++    seq = getattr(brake, "cal_seq", None) if brake is not None else None
++    if seq is None:
++      return
++    pending = seq.pending_rep_id
++    if pending is None and not self.wheel_consent_detector.active:
++      # no rep parked and no tap window open -> the detector is never stepped, so ordinary set-speed
++      # presses (single, double, either arrow) are byte-for-byte today's behaviour.
++      return
++    gesture, consumed = self.wheel_consent_detector.update(ret.buttonEvents, pending, time.monotonic())
++    if gesture != WheelGesture.NONE:
++      self._pending_wheel_gesture = "fire" if gesture == WheelGesture.FIRE else "dismiss"
++    if consumed:
++      # CONSUME the edges the gesture acted on, so its taps do not ALSO nudge the set speed: the gesture
++      # and the set-speed action are mutually exclusive BY CONSTRUCTION. Only the triggering tap of a
++      # gesture is dropped, and only while a rep is pending -- exactly the frames on which it matters.
++      kept = [be for be in ret.buttonEvents
++              if (be.type, bool(be.pressed)) not in consumed]
++      ret.buttonEvents = kept
++
++  def consume_wheel_consent(self) -> str | None:
++    """0034: called by the FCA11 controller each frame AFTER it has stepped the sequencer. Returns the
++    gesture to apply ("fire" / "dismiss") or None, consuming it (so a gesture fires at most once)."""
++    gesture = self._pending_wheel_gesture
++    self._pending_wheel_gesture = None
++    return gesture
++
+   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
+                        speed_factor: float) -> None:
+     cp = can_parsers[Bus.pt]
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index ca7a8a97..dcd70fde 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -300,6 +300,16 @@ class GasInterceptorCarController:
+     # 0030 (D2-iii): feed the pandad echo of our own 0x38D frames (collected in CarInterface.update) so the class can
+     # confirm the passive close frame was ACCEPTED before it starts the cooldown; a refused close frame is re-owed.
+     self.fca11_brake.observe_echo(getattr(CS, "fca11_echoes", None))
++    # 0034: STEERING-WHEEL consent. The CarState phase recognised a double-press on this frame's cruise
++    # buttons and (if it was a consent gesture for the rep parked on a PREVIOUS frame) dropped its taps
++    # from CS.buttonEvents. Register this brake so CarState can read the pending rep, consume the verdict,
++    # and let the sequencer write the SAME consent.json the mici UI writes -- consumed by the tick below
++    # (<= 1 send slot, ~20 ms), under the identical freshness/binding/re-verify rules as a touch tap.
++    if hasattr(CS, "register_wheel_brake") and self.fca11_brake.cal_seq is not None:
++      CS.register_wheel_brake(self.fca11_brake)
++      wheel = CS.consume_wheel_consent()
++      if wheel is not None:
++        self.fca11_brake.cal_seq.wheel_gesture(wheel, frame)
+     brake_sends = self.fca11_brake.update(CC, CS, frame, personality)
+     # 0030 (D1-b): publish the FCA11-long hand-back so the CarState side can surface it (CarStateSP.fca11Unavailable);
+     # _hard_cut == the panda's fail-closed hyundai_fca11_long_cut (camera owns / pedal fault), NOT re-armed this ignition.
+diff --git a/opendbc/sunnypilot/car/hyundai/wheel_consent.py b/opendbc/sunnypilot/car/hyundai/wheel_consent.py
+new file mode 100644
+index 00000000..9770bd95
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/wheel_consent.py
+@@ -0,0 +1,179 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Fork (adurham): FCA11-long CAL driver consent over the STEERING WHEEL (opendbc patch 0034).
++
++WHY
++---
++0033 gave the owner a touch prompt ("tap to fire") for a cal rep. The owner asked for a wheel gesture
++instead -- but "a steering wheel button that isn't in use". This car's CLU11 emits exactly THREE cruise
++button codes (measured across routes 14a/14b/14d/14e/14f): 1 = RES_ACCEL (up), 2 = SET_DECEL (down),
++4 = CANCEL (pause/resume). There is NO gap button and NO unused button. All three are already consumed:
++CANCEL is the ONLY engage/disengage (pause_resume.py); up = set-speed up (+ a long-press big-step via
++cruise_ext.update_v_cruise_delta); down = set-speed down (+ long-press-down = set-speed-to-current, in
++cruise.py::_update_v_cruise_pedal). So the ONLY free encoding is a DOUBLE-TAP of an existing arrow -- an
++event PATTERN nothing in the fork consumes (verified: no double/release_toggle gesture exists anywhere;
++the raw bitmask is published as selfdriveStateSP.buttonsPressed/.buttonsReleaseToggle but nothing treats
++a double-press as a gesture).
++
++WHAT
++----
++* double-press UP   -> FIRE the parked rep    (the wheel twin of the UI's "TAP TO FIRE")
++* double-press DOWN -> DISMISS the parked rep (the wheel twin of the UI's "X")
++
++A "double press" is TWO complete taps of the SAME arrow: the FIRST tap's RELEASE opens the window, and
++the SECOND tap's PRESS (falling within DOUBLE_PRESS_WINDOW_S of that release) is the trigger. This needs
++no new button, emits no new CAN frame, and adds no cereal/capnp field.
++
++HOW IT COMPOSES WITH THE EXISTING GESTURES (why it is separable -- verified against the source)
++--------------------------------------------------------------------------------------------------
++* The long-press gestures are HOLDs, not taps. cruise.py::_update_v_cruise_pedal acts on a long press only
++  once a button timer reaches CRUISE_LONG_PRESS = 50 controller frames (0.5 s at 100 Hz) and only while the
++  button is HELD. A tap on this car is 1-4 CLU11 samples at 50 Hz (20-80 ms); a double-TAP keeps the button
++  down only for those short taps, so it never approaches 50 held frames. A double-tap therefore can never
++  be mistaken for a long press, and vice versa:
++    - long-press DOWN (set speed = current) fires at the 50th held frame and RETURNS; its release applies
++      nothing extra. A double-tap never reaches 50 frames -> set-to-current is untouched.
++    - long-press UP (the x5 big-step) has the same 0.5 s hold prerequisite -> untouched.
++* The caller runs the detector ONLY while a rep is parked. With no rep parked it is never called, so a
++  single press, a double press, or an up/down pair all behave byte-for-byte as they do today.
++* This module CONSUMES the edges it acted on (the triggering tap's press and its release) so the two taps
++  of a gesture are not ALSO re-read as set-speed short presses. The FIRST tap of a pair is deliberately
++  left alone: it is a normal single press and behaves exactly as one (this is why a wheel fire is
++  accompanied by the same +1 set-speed that a lone tap gives -- it is the price of not inventing a button).
++
++THE WINDOW (DOUBLE_PRESS_WINDOW_S = 0.8 s)
++-----------------------------------------
++Measured from the RELEASE of the first tap to the PRESS of the second. 0.8 s is chosen from the measured
++CLU11 timing on this car plus human double-tap behaviour:
++  * a CLU11 press/release here is 1-4 samples at 50 Hz (20-80 ms), so a deliberate double-tap is dominated
++    by the open-loop gap BETWEEN the two taps, not by the taps themselves;
++  * human double-tap inter-tap intervals cluster around 200-500 ms; 0.8 s sits comfortably above that (a
++    deliberate double-tap is essentially never missed) yet well below the ~1.5-2 s at which a second press
++    starts to read as a fresh, unrelated single press;
++  * 0.8 s is ~40x the machine-side cost of a tap (the sequencer consumes a consent on its next 50 Hz send
++    slot, ~20 ms), so the timing budget is dominated by the human, not by the code.
++Rejected: 0.4 s (too tight -- a slow deliberate double-tap is missed and the owner re-aims); 1.5 s (a
++driver who taps up, pauses, then taps up again out of habit would fire a rep they did not intend).
++
++FAIL-CLOSED
++-----------
++This module only DETECTS; the authority stays entirely in cal_mode.CalSequencer. The written consent file
++is bound to the rep_id + plan_id + prompt seq of the parked rep, must be <= CONSENT_FRESHNESS_S (2 s)
++fresh, and the sequencer RE-VERIFIES every condition (incl. the 0032 blind-spot veto) and the 0031 budget
++at the instant it consumes it. A detector bug can at worst fail to prompt, or fire a rep the sequencer
++would have parked anyway -- it can never actuate without the sequencer's own re-verification. The
++detector itself writes nothing and holds no actuation state.
++"""
++import time
++from enum import IntEnum
++
++from opendbc.car import structs
++
++ButtonType = structs.CarState.ButtonEvent.Type
++
++_UP = ButtonType.accelCruise
++_DOWN = ButtonType.decelCruise
++
++# Measured: a deliberate human double-tap. See the module docstring for the derivation + rejected values.
++DOUBLE_PRESS_WINDOW_S = 0.8
++# A genuine TAP is short. A press held at/above CRUISE_LONG_PRESS (cruise.py / cruise_helpers.py = 50
++# controller frames = 0.5 s at 100 Hz) is a HOLD -- the long-press UP big-step or long-press DOWN
++# set-to-current. A hold may never SEED a double-press, so those gestures can never be mistaken for the
++# first half of a wheel consent gesture, and a long-press-down can never arm a later misfire.
++TAP_MAX_HOLD_S = 0.5
++
++
++class WheelGesture(IntEnum):
++  NONE = 0
++  FIRE = 1
++  DISMISS = 2
++
++
++class WheelConsentDetector:
++  """Recognises the FCA11-CAL consent gestures on the cruise arrows.
++
++  ``update(events, pending_rep_id, now)`` is called once per CarState frame with that frame's
++  ``CS.buttonEvents`` and the currently parked rep id (or None). It returns ``(gesture, consumed)``:
++
++    * ``gesture``  -- ``FIRE`` (double-press UP), ``DISMISS`` (double-press DOWN) or ``NONE``;
++    * ``consumed`` -- a set of ``(ButtonType, pressed)`` edges the caller must DROP from the button
++      stream, so the triggering tap is not also read as a set-speed short press.
++
++  It is a pure function of the event stream: it holds no actuation state, writes nothing, and every
++  timing decision uses ``time.monotonic``. When ``pending_rep_id`` is None it fires nothing AND consumes
++  nothing (completely inert), so the caller's no-rep path is byte-identical to today.
++  """
++
++  def __init__(self):
++    self._armed_btn = None                  # arrow whose first tap's release opened the window (or None)
++    self._armed_at = 0.0                    # monotonic ts of that release
++    self._suppress_release = None           # after firing, drop that tap's release so it cannot re-arm
++    self._press_btn = None                  # arrow currently held (to time a hold vs a tap)
++    self._press_at = 0.0                    # monotonic ts of that press
++
++  @property
++  def active(self) -> bool:
++    """True while the detector holds state (an open first-tap window, or a release still owed a
++    suppression). The caller uses this to keep stepping the detector across the few frames it takes for a
++    tap's release to arrive, even if the rep has already left the pending state in the meantime."""
++    return self._armed_btn is not None or self._suppress_release is not None
++
++  def _expire(self, now: float) -> None:
++    if self._armed_btn is not None and (now - self._armed_at) > DOUBLE_PRESS_WINDOW_S:
++      self._armed_btn = None
++
++  def update(self, events, pending_rep_id, now: float | None = None):
++    if now is None:
++      now = time.monotonic()
++    self._expire(now)
++
++    gesture = WheelGesture.NONE
++    consumed: set = set()
++    fire = pending_rep_id is not None
++
++    for b in events:
++      bt = b.type
++      if bt not in (_UP, _DOWN):
++        continue
++      pressed = bool(b.pressed)
++      if pressed:
++        if self._suppress_release == bt:
++          # a PRESS before the expected release (cannot happen on a real stream): clear the stale
++          # suppression and fall through to treat this as an ordinary press.
++          self._suppress_release = None
++        if self._armed_btn == bt and (now - self._armed_at) <= DOUBLE_PRESS_WINDOW_S:
++          # SECOND tap of a pair on the SAME arrow -> this IS the gesture.
++          self._armed_btn = None
++          # Only a FIRE/DISMISS gesture suppresses its trigger tap; a double-tap with no rep parked is
++          # inert and its two taps flow on as ordinary presses (so it cannot swallow a set-speed step).
++          self._suppress_release = bt if fire else None
++          if fire:
++            consumed.add((bt, True))           # drop the trigger press now; its release is dropped below
++            gesture = WheelGesture.FIRE if bt == _UP else WheelGesture.DISMISS
++          # no rep parked -> inert: consume nothing so the double-tap is two ordinary presses
++        elif self._armed_btn is not None and self._armed_btn != bt:
++          # a press on the OTHER arrow is not a continuation -> abort the open window
++          self._armed_btn = None
++        # otherwise this press may be the FIRST tap of a pair; the window opens on its release (below)
++        self._press_btn = bt
++        self._press_at = now
++      else:
++        if self._suppress_release == bt:
++          self._suppress_release = None
++          consumed.add((bt, False))            # the release that ended a fired pair does not re-arm (nor step)
++          self._press_btn = None
++          continue
++        # a release ends a tap -> open the window for a matching second tap, IFF it was a genuine short
++        # TAP. A hold at/above TAP_MAX_HOLD_S is the long-press gesture (big-step / set-to-current) and
++        # must NOT seed a double-press.
++        held = (now - self._press_at) if self._press_btn == bt else 0.0
++        if held < TAP_MAX_HOLD_S:
++          self._armed_btn = bt
++          self._armed_at = now
++        self._press_btn = None
++
++    return gesture, consumed

@@ -1,0 +1,915 @@
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 29c22258..ddf7d750 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -177,16 +177,63 @@ static bool hyundai_fca11_long_camera_owns;   // LATCHED: camera requested actua
+ static bool hyundai_fca11_long_tx_seen;       // panda has transmitted an accepted 0x38D since this arm
+ static uint32_t hyundai_fca11_long_ts_tx;     // ... last one at
+ static int hyundai_fca11_long_dec_last;       // last ACCEPTED CR_VSM_DecCmd (rate-limit reference; -1 = none this arm)
+-// G9 (R7-B): the DRIVER-INPUT cut (brake / gas / gear != D) is kept in its own latch so it can re-arm on the
++// G9 (R7-B): the DRIVER-INPUT cut (brake / gear != D) is kept in its own latch so it can re-arm on the
+ // openpilot resume edge (controls_allowed rising), mirroring the car layer's blocked_until_resume. The camera
+ // hand-back and the pedal-fault cut stay in hyundai_fca11_long_cut, latched for the whole arm (fail-closed).
+-static bool hyundai_fca11_long_driver_cut;    // LATCHED until the first CLEAN frame after the next openpilot RESUME edge
++// 0038: the GAS contribution to this latch is DELETED. Gas is now handled by the per-frame window check plus a
++// short elapsed-time hold-off (hyundai_fca11_long_gas_holdoff_ok); see the block comment below. The latch now
++// covers brake and gear != D ONLY - both are deliberate "I own this car right now" assertions, and a brake press
++// already drops controls_allowed (generic_rx_checks), so the latch is mostly belt-and-braces on top of that.
++static bool hyundai_fca11_long_driver_cut;    // LATCHED (brake / gear != D) until the first CLEAN frame after the next openpilot RESUME edge
+ static bool hyundai_fca11_long_controls_prev; // resume-edge tracker (controls_allowed prev sample)
+ // G9b (drive-14): the resume edge only ARMS the re-arm; the latch clears on the first CLEAN frame after the grant.
+ // A driver input merely HELD at the grant (the drive-14 case: engage with the foot still on the gas) therefore keeps
+ // the latch for that frame but stops barring actuation the moment it is actually released.
+ static bool hyundai_fca11_long_driver_cut_pending;
+ 
++// *** 0038: gas = per-frame suppression + a short hold-off, NOT a latch ***
++// The owner's requirement: hitting the gas to escape an over-brake must override the CURRENT frame (human always
++// wins) but must NEVER lock out FUTURE braking events. The old rule latched a driver-cut on ANY RX frame with
++// gas_pressed, cleared only by a deliberate disengage+re-engage, so a single gas tap killed braking for the rest of
++// the engagement. The latch's only effect beyond the per-frame window was exactly that. It is DELETED for gas.
++//
++// Safety rest on: the per-frame window (`!gas_pressed`, in hyundai_fca11_long_window_ok) already refuses every
++// actuating frame while the driver's physical pedal is down, so a wedged host can never brake through a gas press.
++// The gas signal is the interceptor's own sensor frame (0x201/0x701 = the DRIVER's pedal, not openpilot's throttle
++// command), so the gate cannot self-trigger.
++//
++// The hold-off is a plain elapsed-time check on the last gas_pressed sample: for a short window after the gas
++// RELEASES, actuation stays refused. Purpose is ONLY to stop a 1-2 Hz brake/gas fight at the current ~3.5x
++// over-delivery (braking returning the instant the pedal lifts made the driver press it again). It is NOT a latch
++// and NOT a hold cap: it self-clears purely on elapsed time, needs no edge, and a NEW braking request after it is
++// served normally (first frame at the onset floor, then ramping as usual).
++#define HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US 500000U  // 0.5 s
++static uint32_t hyundai_fca11_long_gas_released_ts;  // ts of the last gas release edge
++static bool hyundai_fca11_long_gas_release_seen;     // a release edge has been observed this arm (avoids the ts==0 sentinel aliasing a real release at t=0)
++static bool hyundai_fca11_long_gas_prev;             // previous RX sample's gas_pressed (release-edge tracker)
++
++// *** 0038: panda heartbeat / host-liveness watchdog (~500 ms), a LIVENESS bound, never a hold cap ***
++// If the host stops streaming frames for this long, the controls loop that produces the brake command is gone;
++// refuse actuation. Implemented as an additional clause in the TX hook, sampled BEFORE its own update so it
++// measures the gap since the PREVIOUS host frame and self-clears the moment a fresh frame arrives (cannot wedge).
++// It reuses the SAME observable the stale-TX hand-back uses - "is a stream of host frames still flowing" - but at a
++// coarser bound: the hand-back (TX_STALE, 100 ms) fires only while an episode was open, so it ends an episode but
++// does NOT stop a host that comes back after a gap and immediately re-demands at a high level. This watchdog refuses
++// that first post-gap frame, so the 100 ms hand-back can land (camera re-owns FCA11 = the ESC sees explicit zeros)
++// BEFORE any new command. It acts on ACTUATING frames only: the passive close frame (how the car layer releases)
++// is never gated by it, and neither is any non-brake host frame.
++#define HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US 500000U  // 0.5 s
++static uint32_t hyundai_fca11_long_host_hb_ts;  // ts of the previous host TX hook call (0 = none yet this arm)
++
++// *** 0038: throttle exclusivity ***
++// While the host is commanding ACTUATING brake fields, strip throttle pass-through: a host frame at the pedal's
++// command address (0x200/0x700) is refused unless it is a ZERO (clear) frame. This can NEVER reduce braking
++// authority - it only ever rejects a THROTTLE command, and a zero/clear gas frame is always accepted. The window is
++// a couple of camera periods wide so the FCA11 mirror and the GAS_COMMAND frame (separate TX-hook calls in the same
++// ~20 ms tick) are caught in either order. A wedged host can therefore never brake AND throttle simultaneously.
++#define HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US 100000U  // 100 ms
++static uint32_t hyundai_fca11_long_host_brake_active_ts;  // last host 0x38D frame that carried actuating brake fields (0 = none)
++
+ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_cut = false;
+   // G9: the driver-input latch starts SET. hyundai_init also clears brake_pressed/gas_pressed, so a mid-drive
+@@ -203,6 +250,13 @@ static void hyundai_fca11_long_reset(void) {
+   // physically holding a pedal / the gear out of D) therefore stays latched, exactly like the G9 rule: only a
+   // genuine controls_allowed rising edge this arm observed may arm its clearing.
+   hyundai_fca11_long_driver_cut_pending = false;
++  // 0038: a fresh arm starts with no gas release on record and no host-liveness evidence (host_hb_ts = 0 reads as
++  // "not stale" so the FIRST brake of an engagement is never refused by the watchdog).
++  hyundai_fca11_long_gas_released_ts = 0U;
++  hyundai_fca11_long_gas_release_seen = false;
++  hyundai_fca11_long_gas_prev = false;
++  hyundai_fca11_long_host_hb_ts = 0U;
++  hyundai_fca11_long_host_brake_active_ts = 0U;
+   hyundai_fca11_long_seen = 0U;
+   hyundai_fca11_long_gear_d = false;
+   hyundai_fca11_long_speed_min = 0U;
+@@ -259,21 +313,33 @@ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+     }
+   }
+ 
++  // 0038: track the GAS RELEASE edge for the per-frame hold-off. gas_pressed is the driver's physical pedal
++  // (interceptor 0x201/0x701). On every RX sample, if gas was pressed last sample and is now released, stamp the
++  // release time; the actuating gate (hyundai_fca11_long_window_ok) refuses for GAS_HOLDOFF_US after it. This is a
++  // plain elapsed-time hold-off, NOT a latch: nothing needs an edge to clear it, it just expires.
++  if (hyundai_fca11_long_gas_prev && !gas_pressed) {
++    hyundai_fca11_long_gas_released_ts = ts;
++    hyundai_fca11_long_gas_release_seen = true;
++  }
++  hyundai_fca11_long_gas_prev = gas_pressed;
++
+   // G9b (drive-14): the DRIVER-INPUT latch re-arms on the openpilot RESUME edge (controls_allowed rising, mirroring
+   // the car layer's blocked_until_resume) - but only CLEARS on the first CLEAN frame after that grant. G9 cleared the
+   // latch directly on the edge and then re-set it in the SAME call whenever a driver input was still held at that
+   // instant, so engaging with the foot still on the gas (the drive-14 failure: gas_raw 574 > 420 for the first 80 ms
+   // of a 24.7 s engagement) latched the cut for the whole episode and refused all 117 braking frames. Here the edge
+-  // only ARMS pending; the held input keeps the latch this frame, and the first frame with no input clears it. Any
+-  // driver input still cuts the CURRENT episode immediately, and every actuating frame is re-checked against the LIVE
+-  // !brake_pressed && !gas_pressed && gear D window (hyundai_fca11_long_window_ok). The clear runs AFTER the set so
+-  // driver wins on any frame carrying an input.
++  // only ARMS pending; the held input keeps the latch this frame, and the first frame with no input clears it.
++  //
++  // 0038: the driver-input latch covers BRAKE and GEAR != D ONLY. Gas is deliberately EXCLUDED (the owner requires
++  // that a gas press never lock out future braking): it is enforced per-frame by the window (`!gas_pressed`) plus the
++  // elapsed-time hold-off above. Brake and gear != D keep the G9/G9b semantics unchanged - both are deliberate "I
++  // own this" assertions, and a brake press also drops controls_allowed via generic_rx_checks.
+   bool controls_rising = controls_allowed && !hyundai_fca11_long_controls_prev;
+   if (controls_rising) {
+     hyundai_fca11_long_driver_cut_pending = true;
+   }
+ 
+-  bool driver_cut = brake_pressed || gas_pressed;
++  bool driver_cut = brake_pressed;
+   if ((hyundai_fca11_long_seen & HYUNDAI_LONG_SEEN_GEAR) != 0U) {
+     driver_cut |= !hyundai_fca11_long_gear_d;
+   }
+@@ -303,17 +369,27 @@ static bool hyundai_fca11_long_fresh(uint32_t ts, uint32_t ts_last) {
+   return safety_get_ts_elapsed(ts, ts_last) <= HYUNDAI_FCA11_LONG_RX_MAX_AGE_US;
+ }
+ 
++// 0038: the GAS hold-off predicate for actuating frames. Refuse for GAS_HOLDOFF_US after the driver's pedal last
++// released (a plain elapsed-time check on the last release sample; no edge, no latch, self-clearing). 0 = no release
++// seen yet this arm -> allowed (the FIRST brake of an engagement is never held off).
++static bool hyundai_fca11_long_gas_holdoff_ok(uint32_t ts) {
++  return !hyundai_fca11_long_gas_release_seen ||
++         (safety_get_ts_elapsed(ts, hyundai_fca11_long_gas_released_ts) >= HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US);
++}
++
+ // The window, evaluated for every actuating FCA11 frame in the long mode. The cut inputs are re-checked here (not
+ // only via the latch) so a frame can never race the latch. NOTE: the speed FLOOR is deliberately NOT a cut and NOT
+ // part of ok - the car layer stops asking below its own (higher) floor; if a frame still arrives below the panda
+ // floor it is rejected by the tx hook's own floor check, not by the latch, so re-entering the window when the car
+-// speeds back up needs no re-arm.
++// speeds back up needs no re-arm. 0038: `!gas_pressed` (per-frame, the driver's live pedal) plus the short
++// elapsed-time hold-off are the ONLY gas barriers; there is no gas latch.
+ static bool hyundai_fca11_long_window_ok(void) {
+   uint32_t ts = microsecond_timer_get();
+   bool ok = (hyundai_fca11_long_seen == (uint32_t)HYUNDAI_LONG_SEEN_ALL);
+   ok = ok && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_speed) && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_gear) &&
+        hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_brake) && hyundai_fca11_long_fresh(ts, hyundai_fca11_long_ts_gas);
+   ok = ok && !hyundai_fca11_long_cut && !hyundai_fca11_long_driver_cut && hyundai_fca11_long_gear_d && !brake_pressed && !gas_pressed;
++  ok = ok && hyundai_fca11_long_gas_holdoff_ok(ts);
+   return ok;
+ }
+ 
+@@ -955,6 +1031,18 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+ 
+   bool tx = true;
+ 
++  // 0038: host-liveness (panda heartbeat) watchdog. Sample the gap since the PREVIOUS host TX-hook call BEFORE
++  // updating, so `host_hb_fresh` measures the last inter-frame gap and self-clears the instant the host resumes
++  // (cannot wedge). `0` means no host frame seen yet this arm -> read as fresh, so the FIRST brake of an engagement
++  // is never refused by this clause. A gap over HOST_HB_TIMEOUT_US means the host/controls loop went silent, so the
++  // actuating FCA11 frame is refused; the host's own passive close frame and every non-brake frame still pass, and
++  // the very next host frame (a few ms later) is fresh again. This is the LIVENESS bound the owner asked for - it is
++  // NOT a duration cap on any hold; while the host keeps streaming, a brake may run unbounded.
++  uint32_t host_hb_now = microsecond_timer_get();
++  bool host_hb_fresh = (hyundai_fca11_long_host_hb_ts == 0U) ||
++                       (safety_get_ts_elapsed(host_hb_now, hyundai_fca11_long_host_hb_ts) <= HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US);
++  hyundai_fca11_long_host_hb_ts = host_hb_now;
++
+   // FCA11: Block any potential actuation
+   if (msg->addr == 0x38DU) {
+     int CR_VSM_DecCmd = msg->data[1];
+@@ -971,13 +1059,20 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       //     byte-identical to what the ESC sees from the camera every idle frame.
+       // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2), FCA_StopReq (bit 21), CF_VSM_DecCmdAct,
+       // Warn 1/2 (never a shape this car answered), Warn 3 on a passive frame (a warning we have no reason to send),
+-      // any ACTUATION outside the window / after a cut / below the floor / while the camera owns FCA11.
++      // any ACTUATION outside the window / after a cut / below the floor / while the camera owns FCA11 / from a host
++      // that has gone silent past HOST_HB_TIMEOUT_US (0038 liveness watchdog).
+       int CF_VSM_HBACmd = (msg->data[0] >> 1) & 0x3U;
+       bool CF_VSM_Prefill = GET_BIT(msg, 0U);
+       int CF_VSM_Warn = (msg->data[0] >> 3) & 0x3U;
+       bool FCA_StopReq = GET_BIT(msg, 21U);
+       bool actuation = (CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct || CF_VSM_Prefill;
+ 
++      // 0038 throttle exclusivity: record that the host is commanding brake fields (this frame, accepted or not) so
++      // the GAS_COMMAND branch below strips its throttle for the next BRAKE_THROTTLE_EXCL window.
++      if (actuation) {
++        hyundai_fca11_long_host_brake_active_ts = microsecond_timer_get();
++      }
++
+       bool violation = (CR_VSM_DecCmd > HYUNDAI_FCA11_LONG_MAX_DEC);
+       violation |= (CF_VSM_HBACmd != 0);
+       violation |= FCA_StopReq;
+@@ -995,6 +1090,10 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       violation |= actuation && (!controls_allowed || !heartbeat_engaged);
+       violation |= actuation && !hyundai_fca11_long_window_ok();
+       violation |= actuation && (hyundai_fca11_long_speed_min <= HYUNDAI_FCA11_LONG_MIN_SPEED);
++      // 0038: host-liveness watchdog. `host_hb_fresh` was sampled at the top of this hook (gap since the PREVIOUS
++      // host frame); a stale host may not command actuation. It self-clears on the next host frame (a few ms later),
++      // and it never gates a passive frame (the release path).
++      violation |= actuation && !host_hb_fresh;
+ 
+       uint32_t ts = microsecond_timer_get();
+       if (actuation && !violation) {
+@@ -1142,6 +1241,16 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+     if ((gas_a > HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A) || (gas_b > HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_B)) {
+       tx = false;
+     }
++    // 0038 throttle exclusivity (FCA11 long only): while the host is commanding ACTUATING brake fields, strip
++    // throttle pass-through for this frame. A non-zero GAS_COMMAND within the brake window is refused; a zero
++    // (clear) frame is always accepted, and this clause never touches 0x38D - so braking authority is UNCHANGED, it
++    // only ever removes throttle while braking. A wedged host can therefore never brake AND throttle at once.
++    if (hyundai_fca11_long && hyundai_fca11_long_host_brake_active_ts != 0U &&
++        (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_fca11_long_host_brake_active_ts) <= HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US)) {
++      if ((gas_a != 0U) || (gas_b != 0U)) {
++        tx = false;
++      }
++    }
+   }
+ 
+   // BUTTONS: used for resume spamming and cruise cancellation
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 77c694f0..4e29598f 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -44,6 +44,12 @@ def _c_define(path: str, name: str) -> int:
+   return int(m.group(1))
+ 
+ 
++# 0038: the gas hold-off and the host-liveness watchdog, pinned to the header values
++HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US = _c_define(HYUNDAI_H, "HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US")
++HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US = _c_define(HYUNDAI_H, "HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US")
++HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US = _c_define(HYUNDAI_H, "HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US")
++
++
+ def fc_cancel_episode(safety, rx, ems16, clu_raw, brake_msg, period_us=19800, n=150):
+   """Engaged long (panda grant + heartbeat), then the factory cruise comes on and stays on for n cluster frames.
+   Returns the number of CLU11 frames panda transmitted by itself. Shared by the non-pedal / test-mode inertness tests."""
+@@ -2818,6 +2824,18 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+         refusals.append((i * self.PERIOD_MS, dec))
+     return t, dec, refusals
+ 
++  def _host_alive(self, t0_us, gap_ms):
++    """Advance wall-clock `gap_ms` while the HOST keeps streaming benign zero-throttle frames, exactly as the real
++    host does between brake episodes. Returns the new timer value. 0038: without fresh host frames the liveness
++    watchdog would (correctly) refuse the next actuating frame, so a gap test that intends to measure the RATE law
++    must keep the host alive."""
++    t = t0_us
++    for i in range(max(1, gap_ms // self.PERIOD_MS)):
++      t = t0_us + i * self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self._tx(self._interceptor_gas_cmd(0))
++    return t0_us + gap_ms * 1000
++
+   def test_f1_no_truncation_30s_continuous(self):
+     """F1: gates held, a legal-slew actuating stream for 30 000 ms wall clock -> ZERO refusals. RED on the 0034 tree:
+     the 2.5 s budget refuses the frame after 2500 ms and the cooldown refuses everything for the next 3000 ms."""
+@@ -2852,7 +2870,8 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+ 
+   def test_f2_back_to_back_episodes_both_fully_actuate(self):
+     """F2: back-to-back episodes separated by gaps well under the old 3 s cooldown, each held LONGER than the old
+-    2.5 s budget, all fully actuate (zero refusals across the whole profile). RED on 0034."""
++    2.5 s budget, all fully actuate (zero refusals across the whole profile). RED on 0034. 0038: the gaps are spent
++    with the HOST still streaming (the real host does), so the liveness watchdog is not the thing under test here."""
+     self._rearm()
+     self._open_window()
+     t = 1000000
+@@ -2862,7 +2881,7 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+       t += self.PERIOD_MS * 1000
+       self.safety.set_timer(t)
+       self.assertTrue(self._tx(self._fca11()))                     # passive close
+-      t += gap_ms * 1000
++      t = self._host_alive(t, gap_ms)
+     _, _, refusals = self._stream(t, 4000)
+     self.assertEqual([], refusals)
+ 
+@@ -3060,12 +3079,136 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._user_brake_msg(True))
+     self._assert_cut_latched()
+ 
+-  def test_cut_on_driver_gas(self):
++  def test_cut_on_driver_gas_does_not_latch(self):
++    """0038 (owner requirement): a gas press SUPPRESSES braking per-frame but must NOT latch. Braking is refused
++    while the pedal is down, refused for GAS_HOLDOFF_US after it releases (a plain elapsed-time hold-off, not a
++    latch), and ACCEPTED again after the hold-off - with NO disengage / re-engage. Contrast the old rule (asserted
++    below): today a single gas tap killed braking for the rest of the engagement. FALSIFIABLE: the final
++    assertTrue (re-arm without a resume edge) fails on the pre-0038 tree."""
+     self._open_window()
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+-    # above HYUNDAI_GAS_INTERCEPTOR_THRESHOLD: the pedal sensor latches gas_pressed
++    # above HYUNDAI_GAS_INTERCEPTOR_THRESHOLD: the pedal sensor sets gas_pressed -> the live window refuses
+     self._rx(self._interceptor_user_gas(0x1000))
+-    self._assert_cut_latched()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # release the gas: still refused inside the hold-off (brake/gas fight suppression)
++    self._rx(self._interceptor_user_gas(0))
++    self._feed_inputs()
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # past the hold-off, with NO new resume edge and the same engagement: braking is served again
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)), "gas must not lock out future braking (no resume edge)")
++
++  def test_gas_press_never_sets_the_driver_latch(self):
++    """0038: gas is removed from the driver-input latch entirely. A gas press must not set the latch that survives
++    on brake / gear-out, so once the live window is clean (post hold-off) actuation is served with no re-arm."""
++    self._open_window()
++    self._rx(self._interceptor_user_gas(0x1000))
++    self._rx(self._interceptor_user_gas(0))
++    self._feed_inputs()
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  # *** 0038: the owner's exact scenario - gas escape must not lock out the NEXT braking event ***
++
++  def test_owner_scenario_gas_escape_then_a_new_brake_event_is_served(self):
++    """ENGAGE -> brake -> driver presses gas (override) -> release -> keep driving -> a NEW brake request seconds
++    later, with NO disengage/re-engage, must be APPLIED. This is the exact bug the owner reported (gas to escape an
++    over-brake, then the next stop is unbraked). FALSIFIABLE: on the pre-0038 tree the final assertTrue fails (the
++    gas latch never clears without a resume edge)."""
++    self._rearm()
++    self._open_window()
++    # (1) an episode is running and accepted
++    self.assertTrue(self._tx_brake(self.DEC_CAP))
++    # (2) the driver escapes with the gas: braking is refused while the pedal is down
++    self._rx(self._interceptor_user_gas(0x1000))
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    # (3) the driver lifts off and CRUISES for several seconds (the host keeps streaming); the hold-off expires
++    self._rx(self._interceptor_user_gas(0))
++    t = 1000000
++    for _ in range(50):                       # 1 s of benign host traffic, gas released
++      t += self.PERIOD_MS * 1000
++      self.safety.set_timer(t)
++      self._feed_inputs()
++      self._tx(self._interceptor_gas_cmd(0))
++    # (4) a NEW, distinct brake request arrives (approaching a slowing car) - NO re-engage happened
++    t += self.PERIOD_MS * 1000
++    self.safety.set_timer(t)
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)),
++                    "a new brake event after a gas escape must be served (no lockout)")
++
++  def test_first_frame_after_the_holdoff_restarts_at_the_onset_floor(self):
++    """0038 (criterion c): the first ACCEPTED frame after the hold-off restarts at the onset floor (RATE_STEP from 0,
++    the stream having gone stale past TX_STALE during the suppression), so there is no jump back to the pre-gas
++    level. A reopen at RATE_STEP+1 is refused; at RATE_STEP it is accepted and then ramps."""
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx_brake(HYUNDAI_FCA11_LONG_MAX_DEC))     # running at the cap
++    self._rx(self._interceptor_user_gas(0x1000))                    # gas: episode suppressed
++    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_MAX_DEC)))
++    self._rx(self._interceptor_user_gas(0))
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_inputs()
++    # no jump: the pre-gas level is refused, the onset step is accepted
++    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_MAX_DEC)))
++    self.assertFalse(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP + 1)))
++    self.assertTrue(self._tx(self._brake_cmd(HYUNDAI_FCA11_LONG_RATE_STEP)))
++
++  # *** 0038: host-liveness (heartbeat) watchdog ***
++
++  def test_host_liveness_watchdog_stale_refuses_then_fresh_resumes(self):
++    """0038 (criterion e): if the host stops streaming for > HOST_HB_TIMEOUT_US, its next actuating frame is refused
++    (the controls loop was gone); the following frame - a few ms later - is fresh again and accepted, so the clause
++    cannot wedge. The passive release frame is never gated by the watchdog."""
++    self._rearm()
++    self._open_window()
++    # seed the host clock with a benign frame at t0
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(0)))
++    # the host went silent for 600 ms, then a fresh window + an actuating frame
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US + 100000)
++    self._feed_inputs()
++    self.assertFalse(self._tx(self._brake_cmd(1)), "stale host: actuation refused")
++    # the passive close frame is NOT gated by the watchdog (the release path)
++    self.assertTrue(self._tx(self._fca11()))
++    # a few ms later the host is fresh again -> accepted
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US + 100000 + self.PERIOD_MS * 1000)
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)), "fresh host: actuation resumes")
++
++  def test_host_liveness_watchdog_never_refuses_the_first_frame_of_an_arm(self):
++    """0038: with no host frame yet this arm (host_hb_ts unset) the watchdog reads as fresh, so the very first brake
++    of an engagement is never refused by it - however long the arm has been idle."""
++    self._rearm()
++    self.safety.set_timer(1000000)
++    self._open_window()
++    self.safety.set_timer(1000000 + 10 * HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US)   # long after the arm
++    self._feed_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  # *** 0038: throttle exclusivity ***
++
++  def test_throttle_stripped_while_the_host_commands_brake(self):
++    """0038 (criterion f): while an actuating brake frame is on the wire, a NON-ZERO GAS_COMMAND is refused (a
++    wedged host can never brake AND throttle); the ZERO/clear frame is always accepted, and after the brake window
++    the throttle passes again. This can only ever remove throttle - braking authority is untouched."""
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))                     # actuating brake frame accepted
++    self.assertFalse(self._tx(self._interceptor_gas_cmd(GAS_ON)), "no throttle alongside a brake command")
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(0)))          # the clear frame always passes
++    # after the brake window elapses with no brake frame, throttle passes again
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US + 1)
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(GAS_ON)))
++
++  def test_throttle_not_stripped_by_a_passive_frame(self):
++    """0038: only an ACTUATING mirror frame (non-zero brake fields) arms the throttle strip; a passive close frame
++    must not, so ordinary throttle passes whenever openpilot is not braking."""
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._fca11()))                         # passive frame
++    self.assertTrue(self._tx(self._interceptor_gas_cmd(GAS_ON)), "throttle passes without an actuating brake")
+ 
+   def test_cut_on_gear_not_d(self):
+     self._open_window()
+@@ -3109,8 +3252,8 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+ 
+   def test_driver_cut_before_engage_clears_on_resume(self):
+-    """T1 (R7-B regression): a driver-input cut latched while openpilot is NOT engaged (gear P / a brake tap /
+-    a gas tap before the first engage — the route-149 Park->D shuttle) must clear on the next controls_allowed
++    """T1 (R7-B regression): a driver-input cut latched while openpilot is NOT engaged (gear P / a brake tap
++    before the first engage — the route-149 Park->D shuttle) must clear on the next controls_allowed
+     rising edge, i.e. the first real engagement / resume. Fails on the shipped rule (the cut never clears until
+     hyundai_init)."""
+     self._rearm()
+@@ -3123,9 +3266,11 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+     self.assertTrue(self._tx(self._brake_cmd(1)))     # G9: re-armed
+ 
+-  def test_driver_cut_while_engaged_does_not_auto_clear(self):
+-    """T2: a gas cut latched while ENGAGED, with controls_allowed never dropping, must NOT clear by itself
+-    (no auto-resume). A gas press while engaged does not move controls_allowed, so there is no rising edge."""
++  def test_gas_release_within_the_engagement_does_not_lock_out(self):
++    """0038: a gas press while ENGAGED no longer latches anything. After the pedal releases and the short hold-off
++    elapses (still the same engagement, controls_allowed never dropping), braking is served again - the exact
++    scenario the owner described (gas to escape an over-brake, then the NEXT stop must still brake). FALSIFIABLE:
++    on the pre-0038 tree the final assertTrue fails (the latch never clears without a resume edge)."""
+     self._rearm()
+     self._open_window()
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+@@ -3133,7 +3278,10 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertFalse(self._tx(self._brake_cmd(1)))
+     self._rx(self._interceptor_user_gas(0))           # release the gas, same engagement, no re-engage
+     self._feed_clean_window_inputs()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # still latched: no auto-resume
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # still inside the hold-off
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_clean_window_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # 0038: served again, no auto-resume needed
+ 
+   def test_pedal_fault_survives_resume(self):
+     """T3: the pedal-FAULT cut is deliberately hard-latched for the whole arm (the pedal sensor is
+@@ -3175,41 +3323,41 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._feed_clean_window_inputs()                  # release it, no new edge
+     self.assertTrue(self._tx(self._brake_cmd(1)))     # G9b: first CLEAN frame after the grant -> re-armed
+ 
+-  def test_driver_input_released_within_the_engagement_rearms_gas(self):
+-    """G9b, the drive-14 root cause in miniature: engage with the driver's foot still on the gas (0x201 pedal,
+-    gas_pressed), the gas falls below threshold ~80 ms later, and FCA11 must brake from that first clean frame —
+-    NOT be refused for the whole engagement. On the shipped rule and on plain G9 the latch set on the grant frame
+-    (gas still over threshold) never clears, so every actuating frame in the window is refused.
+-    """
++  def test_gas_held_at_grant_does_not_lock_out_braking(self):
++    """0038: engaging with the foot still on the gas no longer latches anything. The gas press refuses per-frame
++    while it is held, and once it releases (plus the short hold-off) braking is served - NOT barred for the whole
++    engagement (the drive-14 bug: 117 refused frames under the old gas latch)."""
+     self._rearm()
+     self._disengage_frame()
+-    self._rx(self._interceptor_user_gas(0x1000))      # driver gas over threshold while disengaged -> driver cut
++    self._rx(self._interceptor_user_gas(0x1000))      # driver gas over threshold while disengaged
+     self.assertFalse(self._tx(self._brake_cmd(1)))
+     self._engage(True, True)                          # grant with the foot STILL on the gas
+-    self._rx(self._interceptor_user_gas(0x1000))      # grant frame CARRYING the held gas: driver wins THIS frame
++    self._rx(self._interceptor_user_gas(0x1000))      # grant frame CARRYING the held gas -> refused this frame
+     self.assertFalse(self._tx(self._brake_cmd(1)))     # refused while the gas is actually held
+     # the gas falls below threshold (still inside the same engagement, no new rising edge) and the window is clean
+     self._feed_clean_window_inputs()
+-    self.assertTrue(self._tx(self._brake_cmd(1)))     # G9b: first CLEAN frame -> accepted
++    self.assertFalse(self._tx(self._brake_cmd(1)))     # inside the hold-off
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_clean_window_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))      # 0038: first frame past the hold-off -> accepted
+ 
+   def test_engage_with_gas_still_held_is_refused(self):
+-    """G9b required regression: engage with the gas STILL over threshold and KEEP it held -> every actuating frame
+-    stays refused. The re-arm is level-triggered on the live input, so a pedal that never falls below the
+-    threshold never re-arms (no auto-resume from a re-arm that was never earned).
+-    """
++    """0038 required regression: engage with the gas STILL over threshold and KEEP it held -> every actuating frame
++    stays refused. The refusal is per-frame on the live pedal, so a pedal that never falls below the threshold never
++    lets a brake through (no auto-resume from a re-arm that was never earned)."""
+     self._rearm()
+     self._disengage_frame()
+-    self._rx(self._interceptor_user_gas(0x1000))      # gas held while disengaged -> driver cut
++    self._rx(self._interceptor_user_gas(0x1000))      # gas held while disengaged
+     self._engage(True, True)                          # grant with gas held
+     self._rx(self._interceptor_user_gas(0x1000))      # grant frame, gas still held
+     self.assertFalse(self._tx(self._brake_cmd(0)))
+-    # window inputs clean EXCEPT the gas (still held): the re-arm must not fire
++    # window inputs clean EXCEPT the gas (still held): the live !gas_pressed window refuses
+     self._rx(self._user_brake_msg(False))
+     self._rx(self._user_gas_msg(0))
+     self._rx(self._gear_msg(5))
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+     self._rx(self._interceptor_user_gas(0x1000))      # still held
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused (live gas re-sets the latch every frame)
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused (live gas blocks the window every frame)
+ 
+   def test_engage_with_brake_held_is_refused(self):
+     """G9b required regression: engage with the brake still held -> refused, and refused for as long as it is
+@@ -3276,20 +3424,20 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+     self.assertTrue(self._tx(self._brake_cmd(1)))     # G9: re-armed
+ 
+-  def test_driver_gas_before_engage_clears_on_resume(self):
+-    """Item-3: the gas override (pedal sensor, 0x201), latched while NOT engaged (a gas tap before the first
+-    engage), must re-arm on the next controls_allowed rising edge. Sibling of T1 (gear) and of the brake
+-    variant above."""
++  def test_driver_gas_before_engage_does_not_latch(self):
++    """0038: a gas tap before the first engage no longer latches anything (gas is out of the driver latch), so the
++    first engagement actuates freely once the pedal is released and the hold-off elapses - no resume edge needed.
++    Sibling of T1 (gear) and of the brake variant above; covers that gas was removed from THIS latch."""
+     self._rearm()
+     self._disengage_frame()
+-    self._rx(self._interceptor_user_gas(0x1000))      # driver gas while disengaged -> driver cut latches
+-    self._rx(self._interceptor_user_gas(0))           # release: no rising edge -> still latched
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._rx(self._interceptor_user_gas(0x1000))      # driver gas while disengaged (no longer latches)
++    self._rx(self._interceptor_user_gas(0))           # release
+     self._feed_clean_window_inputs()
+-    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # inside the hold-off
+     self._engage(True, True)
+-    self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+-    self.assertTrue(self._tx(self._brake_cmd(1)))     # G9: re-armed
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US)
++    self._feed_clean_window_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # 0038: served with no re-arm
+ 
+   def test_reinit_with_a_latched_cut_refuses_until_a_genuine_resume_edge(self):
+     """Item-2 discriminator (paired with the `controls_prev = controls_allowed` seed). After a mid-drive
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 90b27bc9..ea0258ee 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -101,6 +101,20 @@ FCA11_ONSET_HOLD_S = FCA11_ONSET_HOLD_FRAMES / 100.0
+ # (`_dec_last_sent` resets on release). 0035: there is NO actuation-duration budget / cooldown any more, in the
+ # panda or here, so nothing in this module may end a brake or hold one off on a clock.
+ 
++# *** 0038: driver GAS = per-frame suppression + a short hold-off, NOT a latch ***
++# Owner requirement: hitting the gas to escape an over-brake must override the CURRENT frame (human wins) but must
++# NEVER lock out FUTURE braking events. Before 0038 a gas press latched the driver cut, cleared only by a deliberate
++# disengage+re-engage, so the next stop after a gas escape was unbraked. Gas is now removed from the driver latch
++# (which keeps brake / gear != D only) and enforced per-frame, exactly like the panda (safety/modes/hyundai.h):
++#   * while gasPressed -> fca11_ok is False, so the episode releases and the passive (all-zero) frame goes out;
++#   * for GAS_HOLDOFF_FRAMES after the pedal releases, fca11_ok stays False (a plain elapsed-frame hold-off, no edge
++#     needed to clear it), so a 1-2 Hz brake/gas fight cannot start. A NEW, distinct brake request after the hold-off
++#     is served normally, first frame at the onset floor then ramping.
++# Frames are the car layer's clock (controller frames are 100 Hz): 50 frames = 0.5 s, matching the panda's
++# HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US. Must stay equal (a unit test pins both).
++GAS_HOLDOFF_FRAMES = 50
++GAS_HOLDOFF_S = GAS_HOLDOFF_FRAMES / 100.0
++
+ # planner-side speed floor (km/h). 3 km/h above the panda's 9 km/h backstop so the panda floor is
+ # never the thing that ends a brake; below this the planner requests coast-only (the PID limits in
+ # the interface are floored at 0) and this module never sends.
+@@ -282,6 +296,11 @@ class Fca11LongBrake:
+     self._hard_cut = False
+     self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+     self.low_speed_alert = False       # hand-over-before-the-floor warning (this frame)
++    # 0038: gas hold-off state. `_gas_release_frame` is the controller frame the pedal last read released (None =
++    # none yet this controller); the hold-off refuses actuation for GAS_HOLDOFF_FRAMES after it. No edge is needed to
++    # clear it (it just ages out), and gas is NOT part of _driver_cut any more.
++    self._gas_release_frame: int | None = None
++    self._gas_prev = False
+     # 0030 (D1-b): the panda's camera-owns / pedal-fault hand-back (hyundai_fca11_long_cut) is fail-closed for the
+     # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed and that latch is set the panda will
+     # refuse EVERY actuating frame for the whole drive. Today that failure is silent (the driver sees openpilot plan
+@@ -322,12 +341,27 @@ class Fca11LongBrake:
+ 
+   # ---- window ----
+ 
+-  def fca11_ok(self, CS) -> tuple[bool, str]:
++  def _gas_holdoff_ok(self, frame: int) -> bool:
++    """0038: True once the driver's gas has been released for at least GAS_HOLDOFF_FRAMES controller frames (or no
++    release has been seen this controller). A plain elapsed-frame check - no edge is needed to clear it, it just
++    ages out, so it can never lock out a later braking event."""
++    if self._gas_release_frame is None:
++      return True
++    return (frame - self._gas_release_frame) >= GAS_HOLDOFF_FRAMES
++
++  def fca11_ok(self, CS, frame: int = 0) -> tuple[bool, str]:
+     """(ok, why-not) from the CarState-provided inputs. The panda re-polices everything anyway."""
+     if not self.enabled:
+       return False, "disabled"
+     if self.blocked_until_resume:
+       return False, "blocked_until_resume"
++    # 0038: the driver's gas overrides braking per-frame (human always wins), and the short elapsed-frame hold-off
++    # after it releases stops a 1-2 Hz brake/gas fight. This is NOT the old latch - it clears on time alone, so a NEW
++    # brake request after the hold-off is served normally.
++    if bool(CS.out.gasPressed):
++      return False, "gas_pressed"
++    if not self._gas_holdoff_ok(frame):
++      return False, "gas_holdoff"
+     v_kph = float(CS.out.vEgo) * 3.6
+     if v_kph <= FCA11_BRAKE_MIN_KPH:
+       return False, "below_floor"
+@@ -431,6 +465,9 @@ class Fca11LongBrake:
+       self._rearm_pending = False
+       self.blocked_until_resume = False
+       self._cal_active = False
++      # 0038: no gas hold-off state either.
++      self._gas_release_frame = None
++      self._gas_prev = False
+       return sends
+ 
+     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+@@ -448,11 +485,13 @@ class Fca11LongBrake:
+       self._rearm_pending = True
+     self._engaged_prev = engaged
+ 
+-    # latch the cut on what the car layer CAN observe (camera request, driver pedal, gear).
+-    # The DRIVER latch (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut: it re-arms on
+-    # the resume edge but clears only on the first clean engaged frame. The CAMERA hand-back and a
+-    # pedal fault go to _hard_cut, which matches the panda's hyundai_fca11_long_cut and is NOT re-armed.
+-    driver_cut = (bool(CS.out.brakePressed) or bool(CS.out.gasPressed) or
++    # latch the cut on what the car layer CAN observe (camera request, driver brake, gear).
++    # 0038: GAS is deliberately NOT part of _driver_cut any more (owner requires a gas press never lock out future
++    # braking). It is enforced per-frame in fca11_ok below plus the elapsed-frame hold-off. The DRIVER latch
++    # (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut (brake / gear != D): it re-arms on the resume
++    # edge but clears only on the first clean engaged frame. The CAMERA hand-back and a pedal fault go to _hard_cut,
++    # which matches the panda's hyundai_fca11_long_cut and is NOT re-armed.
++    driver_cut = (bool(CS.out.brakePressed) or
+                   CS.out.gearShifter != structs.CarState.GearShifter.drive)
+     if CC.longActive and driver_cut:
+       self._driver_cut = True
+@@ -471,6 +510,13 @@ class Fca11LongBrake:
+     if not engaged:
+       self._rearm_pending = False
+     self.blocked_until_resume = self._driver_cut or self._hard_cut
++    # 0038: track the driver's gas RELEASE edge (for the elapsed-frame hold-off). CS.out.gasPressed is the driver's
++    # physical pedal (the panda's gas source is the interceptor sensor, not our throttle command). On the frame the
++    # pedal releases, stamp the frame; _gas_holdoff_ok refuses for GAS_HOLDOFF_FRAMES after it. No latch.
++    gas_now = bool(CS.out.gasPressed)
++    if self._gas_prev and not gas_now:
++      self._gas_release_frame = frame
++    self._gas_prev = gas_now
+     # 0030 (D1-b): surface the hand-back. _hard_cut == the panda's hyundai_fca11_long_cut (camera owns / pedal fault)
+     # and is NOT re-armed, so while it is set FCA11-long braking is unavailable for the rest of this ignition.
+     self.fca11_unavailable = bool(self.enabled and self._hard_cut)
+@@ -492,7 +538,7 @@ class Fca11LongBrake:
+       return sends
+ 
+     accel = float(CC.actuators.accel)
+-    ok, _why = self.fca11_ok(CS)
++    ok, _why = self.fca11_ok(CS, frame)
+ 
+     # ---- 0029 CAL: step the autonomous sequencer and set the scripted ask source -------------------
+     # The sequencer decides (off the plan file + progress) whether a scripted level is DUE now. It is
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 362c735c..ac9f88ad 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -267,10 +267,10 @@ class TestController(unittest.TestCase):
+       assert b.braking
+       return b
+ 
+-    # gas pressed -> latch + release
++    # gas pressed -> per-frame release (0038: no latch)
+     b = engaged_ctrl()
+     self.assertFalse(b.update(self._cc(-2.0), _CS(cam=_cam(), gas=True), 1))
+-    self.assertTrue(b.blocked_until_resume)
++    self.assertFalse(b.blocked_until_resume, "0038: gas releases per-frame without latching")
+     # gear not D -> latch + release
+     b = engaged_ctrl()
+     self.assertFalse(b.update(self._cc(-2.0), _CS(cam=_cam(), gear=structs.CarState.GearShifter.sport), 1))
+@@ -394,6 +394,41 @@ class TestController(unittest.TestCase):
+       for x in b2.update(self._cc(-2.0), _CS(cam=_cam()), f):
+         self.assertGreaterEqual(fl._get_bits(x.dat, 8, 8), 1)
+ 
++  # *** 0038: EXPLICIT ZERO on override (the load-bearing escape) ***
++
++  def test_override_sends_an_explicit_zero_frame_not_omission(self):
++    """0038 (criterion 4, load-bearing): when braking is suppressed by the driver's gas, the transmitted frame must
++    carry EXPLICIT ZERO brake fields (DecCmd 0, Prefill 0, Warn 0, CmdAct 0, DecCmdAct 0) - never a stale value and
++    never merely STOPPED (omission). The escape from a hold is not 'driver gas' by itself: it is OUR explicit zero
++    reaching the ESC. The mirror is always sourced from a fresh camera frame and the zero is written into it, so the
++    ESC sees the camera's idle shape with our fields cleared."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)               # brake episode opens at a high level
++    self.assertTrue(b.braking)
++    t = 2
++    for f in range(2, 40):                                     # keep the ask up; force a 50 Hz slot boundary
++      out = b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), f)   # gas: override this frame
++      if out:
++        self.assertEqual(1, len(out), f)
++        dat = out[0].dat
++        self.assertEqual(fl.FCA11_ADDR, out[0].address)
++        self.assertEqual(0, fl._get_bits(dat, 8, 8), "CR_VSM_DecCmd must be an EXPLICIT 0")
++        self.assertEqual(0, fl._get_bits(dat, 0, 1), "CF_VSM_Prefill 0")
++        self.assertEqual(0, fl._get_bits(dat, 3, 2), "CF_VSM_Warn 0")
++        self.assertEqual(0, fl._get_bits(dat, 20, 1), "FCA_CmdAct 0")
++        self.assertEqual(0, fl._get_bits(dat, 31, 1), "CF_VSM_DecCmdAct 0")
++        self.assertEqual(hyundai_checksum(dat[:7]), dat[7], "fresh CRC over the zeroed fields")
++        t = f
++      break
++    else:
++      self.fail("no passive zero frame was emitted on the gas override")
++
++  def test_holdoff_and_panda_constants_match(self):
++    """0038: the car layer's frame-based gas hold-off must equal the panda's microsecond hold-off (the two layers
++    must agree on the same 0.5 s: 100 Hz controller frames)."""
++    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US
++    self.assertEqual(HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US, fl.GAS_HOLDOFF_FRAMES * 10000)
++
+   # *** 0035 (F7): no duration budget, no cooldown in the car layer ***
+ 
+   def _withheld(self, b, frames, accel=-2.0, start=0, cs=None):
+@@ -668,33 +703,58 @@ class TestG9bDriverCutRearm(unittest.TestCase):
+     cc.actuators.accel = accel
+     return cc
+ 
+-  def test_engage_with_gas_just_released_rearms(self):
+-    """The drive-14 root cause: engaging with the foot still on the gas must clear the latch on the first clean
+-    frame, not block braking for the whole engagement. Frame 0 is the resume edge with gasPressed still True (the
+-    driver-cut sets); frame 2 is the first clean gasReleased frame (must clear and accept)."""
++  def test_gas_escape_then_a_new_brake_event_is_served(self):
++    """0038 (the owner's exact scenario at the car layer): engage -> brake -> driver presses gas -> releases ->
++    keeps driving -> a NEW brake request seconds later must be SENT, with NO disengage/re-engage (no new resume
++    edge). Before 0038 the gas press latched _driver_cut and the car layer never sent another actuating frame for
++    the rest of the engagement, so the next stop was unbraked. FALSIFIABLE: on the pre-0038 tree the final
++    assertNotEqual([]) fails."""
+     b = self._brake(self._cp_sp())
+-    # a cut latched earlier (gas tap before the engage) — latch set, no braking
+-    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
+-    self.assertTrue(b._driver_cut)
+-    # resume edge with the gas STILL pressed: the pending re-arm is armed but the held gas re-sets the latch
+-    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)
+-    self.assertTrue(b._driver_cut)
+-    self.assertTrue(b.blocked_until_resume)
+-    # first CLEAN frame (gasReleased): the latch clears and a hard ask brakes on the same frame
+-    sends = b.update(self._cc(accel=-2.0), _CS(gas=False, cam=_cam()), 4)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)               # brake episode opens (hard ask)
++    self.assertTrue(b.braking)
++    b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), 2)     # driver escapes with the gas: per-frame release
++    self.assertFalse(b.braking)
++    self.assertFalse(b.blocked_until_resume, "gas never latches on the car layer either")
++    # the pedal releases and the driver cruises for a while (well past the 0.5 s hold-off = 50 frames)
++    b.update(self._cc(-0.2), _CS(gas=False, cam=_cam()), 3)    # release edge stamped here
++    for f in range(4, 200):
++      b.update(self._cc(-0.2), _CS(gas=False, cam=_cam()), f)
+     self.assertFalse(b.blocked_until_resume)
+-    self.assertFalse(b._driver_cut)
+-    self.assertNotEqual([], sends)
++    # a NEW brake request arrives, still the SAME engagement, no new resume edge
++    sends = b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 200)
++    self.assertNotEqual([], sends, "a new brake event after a gas escape must be sent")
+     self.assertTrue(b.braking)
+ 
+-  def test_engage_with_gas_still_held_stays_latched(self):
+-    """The re-arm is level-triggered: a pedal never released never re-arms (no auto-resume)."""
++  def test_gas_holdoff_blocks_for_50_frames_then_allows(self):
++    """0038: the only post-release delay is the ~0.5 s (50-frame) hold-off, and it clears on ELAPSED TIME alone
++    (no resume edge). Inside it fca11_ok is False; at the edge it becomes True and a new request then sends."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), 0)     # gas (no prior press): release edge on frame 1
++    b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 1)
++    self.assertEqual(1, b._gas_release_frame)
++    for f in range(2, 1 + fl.GAS_HOLDOFF_FRAMES):              # frames 2 .. 50: still inside the hold-off
++      self.assertFalse(b._gas_holdoff_ok(f), f)
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), f), f)
++    self.assertTrue(b._gas_holdoff_ok(1 + fl.GAS_HOLDOFF_FRAMES))
++    # a new request now sends (allow for the 50 Hz slot + onset debounce)
++    sent = []
++    for f in range(2 + fl.GAS_HOLDOFF_FRAMES, 2 + fl.GAS_HOLDOFF_FRAMES + 60):
++      sent += b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), f)
++    self.assertNotEqual([], sent, "past the hold-off a new request is served")
++
++  def test_engage_with_gas_held_is_refused_per_frame(self):
++    """0038 required regression: engage with the gas STILL over threshold and KEEP it held -> every actuating
++    frame stays refused (live per-frame gas), but no latch is set, so releasing + the hold-off restores braking."""
+     b = self._brake(self._cp_sp())
+     b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
+     b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)
+-    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 4)   # still held
+-    self.assertTrue(b.blocked_until_resume)
+-    self.assertFalse(b.braking)
++    self.assertFalse(b.blocked_until_resume)
++    for f in range(3, 12):
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), f), f)
++    # released: hold-off then served
++    b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 12)
++    sends = b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 12 + fl.GAS_HOLDOFF_FRAMES)
++    self.assertNotEqual([], sends)
+ 
+   def test_gear_override_rearms_on_resume(self):
+     """Gear out of D latched before the engage clears on the first clean frame after the resume (G9 T1 parity)."""
+@@ -721,28 +781,35 @@ class TestG9bDriverCutRearm(unittest.TestCase):
+     b.update(self._cc(engaged=True), _CS(cam=_cam()), 6)
+     self.assertTrue(b.blocked_until_resume)
+ 
+-  def test_no_auto_resume_while_engaged_without_edge(self):
+-    """A gas cut latched while ENGAGED, controls never dropping, must not clear by itself (no rising edge)."""
++  def test_gas_release_serves_the_next_request_without_any_edge(self):
++    """0038: a gas press while ENGAGED, controls never dropping, must NOT bar actuation afterwards. Once the pedal
++    releases and the hold-off elapses (no disengage/re-engage, no resume edge), a fresh request is served."""
+     b = self._brake(self._cp_sp())
+     b.update(self._cc(), _CS(cam=_cam()), 0)
+     self.assertTrue(b.braking)
+     b.update(self._cc(), _CS(gas=True, cam=_cam()), 2)
+-    self.assertTrue(b.blocked_until_resume)
+-    for f in range(4, 20):
+-      b.update(self._cc(), _CS(gas=False, cam=_cam()), f)
+-    self.assertTrue(b.blocked_until_resume)                         # never re-armed: no new resume edge
++    self.assertFalse(b.blocked_until_resume)
++    # the release is stamped on frame 3; hold off for the next 50 frames, then serve a fresh request
++    b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 3)
++    for f in range(4, 4 + fl.GAS_HOLDOFF_FRAMES):
++      self.assertEqual([], b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), f), f)
++    sent = []
++    for f in range(4 + fl.GAS_HOLDOFF_FRAMES, 4 + fl.GAS_HOLDOFF_FRAMES + 60):
++      sent += b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), f)
++    self.assertNotEqual([], sent)
+ 
+   def test_disengage_abandons_a_pending_rearm(self):
+     """An armed re-arm that is never consumed by a clean engaged frame is dropped on the next disengage: a cut
+-    held across a disengage must not slip through on a later clean frame without a fresh edge."""
++    held across a disengage must not slip through on a later clean frame without a fresh edge. (0038: uses the
++    GEAR latch, a real driver latch - gas no longer latches.)"""
+     b = self._brake(self._cp_sp())
+-    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
+-    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)   # edge armed, gas held -> not consumed
++    b.update(self._cc(engaged=False), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 0)
++    b.update(self._cc(engaged=True), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 2)   # edge armed, gear out -> not consumed
+     self.assertTrue(b._rearm_pending)
+-    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 4)  # disengage: abandon the pending re-arm
++    b.update(self._cc(engaged=False), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 4)  # disengage: abandon
+     self.assertFalse(b._rearm_pending)
+     self.assertTrue(b._driver_cut)
+-    b.update(self._cc(engaged=False), _CS(gas=False, cam=_cam()), 6)
++    b.update(self._cc(engaged=False), _CS(gear=structs.CarState.GearShifter.drive, cam=_cam()), 6)
+     self.assertTrue(b._driver_cut)                                  # clean but disengaged -> stays latched
+ 
+ 
+@@ -1193,10 +1260,12 @@ class TestCalModeActuation(unittest.TestCase):
+       self.assertEqual(1, sum(1 for g in got if g[1] == 0))
+ 
+   def test_cal_driver_cut_still_cuts_mid_hold(self):
+-    """Every production veto still applies on every frame: a driver brake / gas / gear-out mid-hold
+-    cuts the cal episode on the same frame (and latches until the next resume)."""
++    """Every production veto still applies on every frame: a driver brake / gas / gear-out mid-hold releases the
++    cal episode on the same frame. (0038: gas releases per-frame without latching, brake/gear still latch until the
++    next resume.)"""
+     with tempfile.TemporaryDirectory() as d:
+-      for bad in ({"brake": True}, {"gas": True}, {"gear": structs.CarState.GearShifter.sport}):
++      for bad, latches in (({"brake": True}, True), ({"gas": True}, False),
++                           ({"gear": structs.CarState.GearShifter.sport}, True)):
+         b = self._mk(d)
+         self.assertIsNotNone(b.cal_seq)
+         _write_plan(d, _cal_plan([(60, 25)]))
+@@ -1211,7 +1280,7 @@ class TestCalModeActuation(unittest.TestCase):
+         cut = _CalCS(v_ego=60 / 3.6, cam=_cam(), **bad)
+         b.update(cc, cut, 200)
+         self.assertFalse(b.braking, bad)
+-        self.assertTrue(b.blocked_until_resume, bad)
++        self.assertEqual(latches, b.blocked_until_resume, bad)
+ 
+   def test_cal_holds_and_moves_on_when_a_rep_completes(self):
+     """The sequencer persists completion and never re-runs a finished rep (idempotent)."""
+@@ -1547,7 +1616,8 @@ class TestCalModeActuation(unittest.TestCase):
+   def test_0036_rep_vetoed_end_to_end_is_no_brake_not_ok(self):
+     """Route 151: r2-stair-up-24/20/30 were logged 'ok' with ZERO actuating frames (a gas press had latched the
+     car-layer driver cut). A rep whose whole hold is vetoed must be recorded 'no_brake' (not complete, retried),
+-    and a rep that did brake is still 'ok'. RED on 0035: the vetoed rep is recorded 'ok'."""
++    and a rep that did brake is still 'ok'. RED on 0035: the vetoed rep is recorded 'ok'. (0038: gas no longer
++    latches, so a BRAKE-held veto - a real driver latch - stands in for the same 'vetoed whole hold' scenario.)"""
+     with tempfile.TemporaryDirectory() as d:
+       b = self._mk(d)
+       _write_plan(d, _cal_plan([(60, 24, 1.0)]))
+@@ -1555,12 +1625,13 @@ class TestCalModeActuation(unittest.TestCase):
+       cc.enabled = cc.longActive = True
+       cc.actuators.accel = 0.0
+       cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      cut = _CalCS(v_ego=60 / 3.6, cam=_cam(), brake=True)
+       b.update(cc, cs, 0)                                                # engage edge consumed on a clean frame
+-      b.update(cc, _CalCS(v_ego=60 / 3.6, cam=_cam(), gas=True), 1)     # gas press while engaged -> driver cut
++      b.update(cc, cut, 1)                                             # brake held while engaged -> driver cut
+       self.assertTrue(b.blocked_until_resume)                           # latched, no resume edge to re-arm it
+       sent = []
+       for f in range(2, 1200):
+-        sent += [fl._get_bits(x.dat, 8, 8) for x in b.update(cc, cs, f)]
++        sent += [fl._get_bits(x.dat, 8, 8) for x in b.update(cc, cut, f)]   # brake held the whole hold
+         pj = os.path.join(d, "progress.json")
+         if os.path.exists(pj) and json.load(open(pj)).get("reps", {}).get("r0"):
+           break
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index bbff85ec..41f05d92 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -66,6 +66,13 @@ HYUNDAI_FCA11_LONG_MAX_DEC = 30
+ HYUNDAI_FCA11_LONG_MIN_SPEED_KPH = 9
+ # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
+ HYUNDAI_FCA11_LONG_RATE_STEP = 4
++# 0038: driver-gas hold-off after the pedal RELEASES, microseconds; the panda refuses actuating FCA11 for this long
++# (a plain elapsed-time check, NOT a latch and NOT a hold cap). Must equal HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US in
++# safety/modes/hyundai.h; the car layer mirrors it as GAS_HOLDOFF_FRAMES (100 Hz controller frames) in fca11_long.py.
++HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US = 500000   # 0.5 s
++# 0038: panda host-liveness (heartbeat) watchdog: no fresh host TX frame for this long -> refuse actuation. Must equal
++# HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US in safety/modes/hyundai.h.
++HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US = 500000   # 0.5 s
+ # *** TEST-ONLY parked LKAS11 sweep (LKAS_PARK_TEST) constants; unit tests pin each against safety/modes/hyundai.h ***
+ HYUNDAI_LKAS_PARK_MAX_TORQUE = 384      # = CarControllerParams STEER_MAX
+ HYUNDAI_LKAS_PARK_RATE_UP = 3           # = STEER_DELTA_UP

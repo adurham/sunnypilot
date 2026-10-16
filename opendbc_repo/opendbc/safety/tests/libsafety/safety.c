@@ -13,6 +13,53 @@ uint32_t microsecond_timer_get(void) {
 #include "opendbc/safety/safety.h"
 #include "opendbc/safety/ignition.h"
 
+// *** board stand-ins for safety code that transmits by itself (Hyundai gas-interceptor timed factory-cruise cancel).
+// On the panda these are board/drivers/can_common.h. Here every packet is recorded with the timer value at queue time.
+#define TEST_TX_LOG_SIZE 64
+static CANPacket_t test_tx_log[TEST_TX_LOG_SIZE];
+static uint32_t test_tx_log_ts[TEST_TX_LOG_SIZE];
+static int test_tx_log_bus[TEST_TX_LOG_SIZE];
+static bool test_tx_log_skip_hook[TEST_TX_LOG_SIZE];
+static int test_tx_log_len = 0;
+
+void can_set_checksum(CANPacket_t *packet) {
+  packet->checksum = 0U;
+}
+
+void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook) {
+  if (test_tx_log_len < TEST_TX_LOG_SIZE) {
+    test_tx_log[test_tx_log_len] = *to_push;
+    test_tx_log_ts[test_tx_log_len] = timer_cnt;
+    test_tx_log_bus[test_tx_log_len] = bus_number;
+    test_tx_log_skip_hook[test_tx_log_len] = skip_tx_hook;
+  }
+  test_tx_log_len++;
+}
+
+int get_self_tx_count(void) {
+  return test_tx_log_len;
+}
+
+void clear_self_tx(void) {
+  test_tx_log_len = 0;
+}
+
+// copies packet i into *out; returns its queue timestamp (us) or 0xFFFFFFFF if out of range
+uint32_t get_self_tx(int i, CANPacket_t *out, int *bus, bool *skip_tx_hook) {
+  uint32_t ret = 0xFFFFFFFFU;
+  if ((i >= 0) && (i < test_tx_log_len) && (i < TEST_TX_LOG_SIZE)) {
+    *out = test_tx_log[i];
+    *bus = test_tx_log_bus[i];
+    *skip_tx_hook = test_tx_log_skip_hook[i];
+    ret = test_tx_log_ts[i];
+  }
+  return ret;
+}
+
+void set_heartbeat_engaged(bool c) {
+  heartbeat_engaged = c;
+}
+
 void safety_tick_current_safety_config() {
   safety_tick(&current_safety_config);
 }
@@ -341,4 +388,7 @@ void init_tests(void){
   mads_button_press = MADS_BUTTON_UNAVAILABLE;
   heartbeat_engaged_mads = false;
   heartbeat_engaged_mads_mismatches = 0U;
+
+  heartbeat_engaged = false;
+  test_tx_log_len = 0;
 }

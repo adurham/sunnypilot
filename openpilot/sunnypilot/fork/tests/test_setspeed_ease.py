@@ -1,0 +1,844 @@
+"""
+Tests for fork/setspeed_ease.py (personality-dependent set-speed easing). Every rule in the module docstring has a test
+here
+car-features/setspeed-ease-mutation.py mutates each rule and checks this file fails.
+"""
+import inspect
+from unittest import mock
+
+import numpy as np
+
+import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
+from openpilot.common.realtime import DT_MDL
+from openpilot.common.params import Params
+from openpilot.common.test import OpenpilotTestCase
+from openpilot.selfdrive.controls.lib import longitudinal_planner as upstream_lp
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.sunnypilot.fork import setspeed_ease as se
+from openpilot.sunnypilot.fork import scc as fscc
+from openpilot.cereal import custom
+from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+
+P = log.LongitudinalPersonality
+VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.VisionState
+PERSONALITIES = (P.relaxed, P.standard, P.aggressive)
+MPH = 0.44704
+
+
+def capnp_personality(p):
+  """selfdriveState.personality as the planner really sees it (a capnp _DynamicEnum, not an int)."""
+  sd = messaging.new_message('selfdriveState').selfdriveState
+  sd.personality = p
+  return sd.personality
+
+
+def run_steps(e, n, v_target, v_ego, personality=P.standard, active=True, a_plan=0.5):
+  out = []
+  for _ in range(n):
+    out.append(e.step(v_target, v_ego, personality, active, a_plan))
+  return out
+
+
+def engaged(e, v_ego, personality=P.standard):
+  """an engaged, settled ease at v_ego (target == v_ego)"""
+  e.step(v_ego, v_ego, personality, True, 0.)
+  return e
+
+
+class TestRate(OpenpilotTestCase):
+  def test_personality_order_at_every_speed(self):
+    for v in np.arange(0., 45., 0.5):
+      r, s, a = (se.get_rate(p, v) for p in PERSONALITIES)
+      self.assertLess(r, s, v)
+      self.assertLess(s, a, v)
+
+  def test_relaxed_and_standard_well_under_upstream_ceiling(self):
+    # the owner's complaint: 1.0-1.2 m/s^2 flat. relaxed / standard must ask well under the upstream ACC ceiling
+    for v in np.arange(8., 40., 1.):
+      ceiling = float(upstream_lp.get_max_accel(v))
+      self.assertLessEqual(se.get_rate(P.standard, v) * se.LEASH_S, 1.15 * ceiling + 1e-6, v)
+      self.assertLess(se.get_rate(P.relaxed, v), 0.6 * ceiling, v)
+      self.assertLess(se.get_rate(P.standard, v), 0.8 * ceiling, v)
+
+  def test_capnp_enum_personality_is_honoured(self):
+    # regression: a capnp _DynamicEnum == int but does not hash like it; a raw dict lookup silently fell back to standard
+    for p in PERSONALITIES:
+      self.assertEqual(se.get_rate(capnp_personality(p), 20.), se.get_rate(p, 20.))
+    self.assertNotEqual(se.get_rate(capnp_personality(P.relaxed), 20.), se.get_rate(P.standard, 20.))
+
+  def test_unknown_personality_is_standard(self):
+    self.assertEqual(se.get_rate(7, 20.), se.get_rate(P.standard, 20.))
+
+  def test_uncastable_personality_is_standard(self):
+    # a renamed / non-numeric enum must not raise inside the planner: it falls back to standard
+    for bad in ('sport', None, object()):
+      self.assertEqual(se.personality_id(bad), int(P.standard))
+      self.assertEqual(se.get_rate(bad, 20.), se.get_rate(P.standard, 20.))
+
+
+class TestStep(OpenpilotTestCase):
+  def test_ramps_at_rate(self):
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 20., p)
+      v0 = e.v_ease
+      e.step(25., 20., p, True, 0.5)
+      self.assertAlmostEqual(e.v_ease - v0, se.get_rate(p, 20.) * DT_MDL, places=6)
+
+  def test_plus_10_mph_is_a_ramp_not_a_step(self):
+    e = engaged(se.SetSpeedEase(), 20.)
+    v = e.step(20. + 10 * MPH, 20., P.standard, True, 0.)
+    self.assertLess(v - 20., 0.1)
+
+  def test_leash(self):
+    # car stuck (hill / pedal cap): v_ease stops at v_ego + rate * LEASH_S
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 20., p)
+      vs = run_steps(e, 400, 35., 20., p)
+      self.assertAlmostEqual(vs[-1], 20. + se.get_rate(p, 20.) * se.LEASH_S, places=6)
+      self.assertTrue(all(v <= 20. + se.get_rate(p, 20.) * se.LEASH_S + 1e-9 for v in vs))
+
+  def test_leash_after_constraint_released(self):
+    # held below the target (lead / curve), then released: the error handed to the planner is bounded, not the full gap
+    e = engaged(se.SetSpeedEase(), 18.)
+    run_steps(e, 200, 30., 18.)
+    self.assertLessEqual(e.v_ease - 18., se.get_rate(P.standard, 18.) * se.LEASH_S + 1e-9)
+
+  def test_down_is_immediate_for_a_hazard_target(self):
+    # a hazard down is NEVER eased: the target comes from something other than the driver's own set speed
+    # (a curve / SLA limit binds below it) or there is no set speed at all (a stop / forceDecel). v_set=None
+    # (the caller did not say) is the fail-safe: pass the target through, exactly as upstream.
+    e = engaged(se.SetSpeedEase(), 20.)
+    run_steps(e, 40, 30., 21.)
+    e.step(21., 21., P.standard, True, 0.5, v_set=21.)                     # seed the set-speed tracker
+    self.assertEqual(e.step(19., 21., P.standard, True, 0.5), 19.)        # v_set unknown -> pass through
+    e.step(21., 21., P.standard, True, 0.5, v_set=21.)
+    self.assertEqual(e.step(0., 21., P.standard, True, 0.5, v_set=0.), 0.)  # forceDecel: set speed is 0
+    e.step(21., 21., P.standard, True, 0.5, v_set=21.)
+    # a curve / SLA binds 2 m/s below the set speed: the drop the ease watches is 0, so nothing is eased
+    self.assertEqual(e.step(19., 21., P.standard, True, 0.5, v_set=21.), 19.)
+
+  def test_small_discretionary_down_drop_coasts(self):
+    # the owner's 5 mph DOWN press while cruising (the set speed IS the arbitrated target): hold the car's own
+    # speed, i.e. the cruise request is 0 (coast / engine braking), instead of the old -2.24 m/s^2 commanded decel
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 30., p)
+      e.step(30., 30., p, True, 0.5, v_set=30.)                           # settle the set speed at 30
+      self.assertEqual(e.step(30. - 5 * MPH, 30., p, True, 0.5, v_set=30. - 5 * MPH), 30.)
+    # ... and the held speed follows the car (a live coast, not a latch that lags or overshoots)
+    e = engaged(se.SetSpeedEase(), 30.)
+    e.step(30., 30., P.standard, True, 0.5, v_set=30.)
+    self.assertEqual(e.step(30. - 5 * MPH, 29., P.standard, True, 0.5, v_set=30. - 5 * MPH), 29.)
+    # ... and the latch releases once the car reaches the dropped target (no overshoot below it)
+    tgt = 30. - 5 * MPH
+    self.assertEqual(e.step(tgt, tgt, P.standard, True, 0.5, v_set=tgt), tgt)
+
+  def test_down_easing_is_a_small_drop_only(self):
+    # the boundary is the coast drop (DOWN_COAST_DROP), not a magic 5 mph: a drop at/below it coasts (one press),
+    # a bigger one (two presses) is past it and passes the target through, exactly as upstream
+    for drop_mph, coasts in ((2., True), (5., True), (10., False), (20., False)):
+      e = engaged(se.SetSpeedEase(), 30.)
+      e.step(30., 30., P.standard, True, 0.5, v_set=30.)
+      tgt = 30. - drop_mph * MPH
+      v = e.step(tgt, 30., P.standard, True, 0.5, v_set=tgt)
+      self.assertEqual(v, 30. if coasts else tgt, drop_mph)
+    self.assertLess(5 * MPH, se.DOWN_COAST_DROP)
+    self.assertLessEqual(se.DOWN_COAST_DROP, 10 * MPH)
+
+  def test_never_above_target(self):
+    e = engaged(se.SetSpeedEase(), 20.)
+    vs = run_steps(e, 500, 21., 20.9)
+    self.assertTrue(all(v <= 21. for v in vs))
+    self.assertEqual(vs[-1], 21.)
+
+  def test_never_below_current_speed(self):
+    # the car got faster than v_ease (downhill / driver nudge): v_ease follows, it never asks to slow down below target
+    e = engaged(se.SetSpeedEase(), 20.)
+    v = e.step(30., 24., P.standard, True, 0.)
+    self.assertGreaterEqual(v, 24.)
+    # car above the target: v_ease = target (cruise decel exactly as upstream)
+    v = e.step(22., 24., P.standard, True, 0.)
+    self.assertEqual(v, 22.)
+
+  def test_reset_when_inactive(self):
+    e = engaged(se.SetSpeedEase(), 20.)
+    run_steps(e, 30, 30., 20.)
+    self.assertGreater(e.v_ease, 20.)
+    v = e.step(30., 15., P.standard, False, 0.)
+    self.assertEqual(v, 30.)            # inactive: pass-through (upstream behaviour)
+    self.assertEqual(e.v_ease, 15.)     # ... with the ramp re-armed at the current speed
+    # re-engage at a stored higher set speed while moving: ramps from the current speed
+    v = e.step(30., 15., P.standard, True, 0.)
+    self.assertLess(v - 15., 0.1)
+
+  def test_first_update_starts_at_current_speed(self):
+    e = se.SetSpeedEase()
+    self.assertEqual(e.step(30., 20., P.standard, True, 0.), 20.)
+
+
+class TestBumpScale(OpenpilotTestCase):
+  """The UP rate is scaled by the SIZE of the raise (see the module doc)."""
+
+  def test_scale_shape_and_bounds(self):
+    # a +5 mph raise (the owner's increment) ramps at BUMP_MIN_SCALE; a +10 mph raise (2x the increment) is the
+    # full personality rate; in between is linear; the scale never exceeds 1.
+    self.assertAlmostEqual(se.bump_rate_scale(5 * MPH), se.BUMP_MIN_SCALE, places=6)
+    self.assertAlmostEqual(se.BUMP_MIN_SCALE, 0.5, places=6)
+    self.assertAlmostEqual(se.bump_rate_scale(se.BUMP_FULL), 1.0, places=6)
+    self.assertAlmostEqual(se.bump_rate_scale(10 * MPH), 1.0, places=6)          # 10 mph == BUMP_FULL
+    self.assertAlmostEqual(se.bump_rate_scale(2 * MPH), se.BUMP_MIN_SCALE, places=6)  # floor
+    self.assertAlmostEqual(se.bump_rate_scale(100 * MPH), 1.0, places=6)         # cap
+    mid = se.bump_rate_scale(7.5 * MPH)                                          # half way to BUMP_FULL
+    self.assertGreater(mid, se.BUMP_MIN_SCALE)
+    self.assertLess(mid, 1.0)
+
+  def test_5mph_bump_is_gentler_than_10mph_and_20mph(self):
+    # the owner's complaint: bumping max speed up 5 mph while cruising must be gentler than a bigger bump
+    for p in PERSONALITIES:
+      e5 = engaged(se.SetSpeedEase(), 30., p)
+      e10 = engaged(se.SetSpeedEase(), 30., p)
+      v5 = e5.step(30. + 5 * MPH, 30., p, True, 0.5)
+      v10 = e10.step(30. + 10 * MPH, 30., p, True, 0.5)
+      self.assertAlmostEqual(v5 - 30., se.get_rate(p, 30.) * se.BUMP_MIN_SCALE * DT_MDL, places=6)
+      self.assertAlmostEqual(v10 - 30., se.get_rate(p, 30.) * DT_MDL, places=6)
+      self.assertLess(v5 - 30., v10 - 30.)
+
+  def test_bump_latched_so_the_ramp_still_reaches(self):
+    # the rate is held constant for the whole ramp (latched raise), so a car that is actually accelerating still
+    # reaches the target in finite time -- the scale does NOT decay as the car closes the gap (no asymptotic crawl)
+    e = engaged(se.SetSpeedEase(), 30.)
+    target = 30. + 5 * MPH
+    v = 30.
+    for _ in range(int(20. / DT_MDL)):
+      v = e.step(target, float(v), P.standard, True, 0.5)     # the car tracks the request
+    self.assertAlmostEqual(v, target, places=6)
+    # at a fixed car speed the leash holds the request at v_ego + rate' * LEASH_S (rate' = the bump-scaled rate)
+    e = engaged(se.SetSpeedEase(), 30.)
+    vs = run_steps(e, 400, target, 30.)
+    self.assertAlmostEqual(vs[-1], 30. + se.get_rate(P.standard, 30.) * se.BUMP_MIN_SCALE * se.LEASH_S, places=6)
+
+  def test_bump_clears_so_a_later_small_bump_is_gentle_again(self):
+    # a +10 mph raise (full rate), caught up to; then a fresh +5 mph raise is gentle again (the latch cleared)
+    e = engaged(se.SetSpeedEase(), 30.)
+    v = 30.
+    for _ in range(int(20. / DT_MDL)):
+      v = e.step(30. + 10 * MPH, float(v), P.standard, True, 0.5)
+    e.step(30. + 10 * MPH, 30. + 10 * MPH, P.standard, True, 0.5)   # caught up: the latch clears
+    self.assertLessEqual(e._bump, se.RAMP_DONE_GAP)
+    assert e.v_ease is not None
+    v0 = e.v_ease
+    e.step(30. + 10 * MPH + 5 * MPH, 30. + 10 * MPH, P.standard, True, 0.5)
+    assert e.v_ease is not None
+    self.assertLess(e.v_ease - v0, 0.1)                        # the small bump is a fresh gentle one
+    self.assertAlmostEqual(e._bump, 5 * MPH, places=6)        # latched at the small raise
+
+
+class TestDownEase(OpenpilotTestCase):
+  """DOWN easing: a small discretionary set-speed drop coasts (see the module doc)."""
+
+  def test_boundary_is_the_coast_drop(self):
+    self.assertGreater(se.DOWN_COAST_DROP, 5 * MPH)          # the owner's one press coasts
+    self.assertLessEqual(se.DOWN_COAST_DROP, 10 * MPH)       # two presses do not
+    self.assertAlmostEqual(se.DOWN_COAST_DROP, se.DOWN_COAST_A * se.DOWN_COAST_S, places=9)
+
+  def test_only_when_the_target_is_the_set_speed(self):
+    # the SET SPEED drops by `drop` this tick; coast only if it is small AND the set speed ITSELF is the target
+    drop = 4 * MPH
+    tgt = 30. - drop
+    self.assertTrue(se.discretionary_down(tgt, 30., tgt, drop))
+    self.assertFalse(se.discretionary_down(tgt, 30., 30., 0.))               # a curve / SLA binds; the set speed did not move
+    self.assertFalse(se.discretionary_down(tgt, 30., None, drop))           # unknown set speed -> fail safe
+    self.assertFalse(se.discretionary_down(tgt, 30., 0., 0.))                # a stop / forceDecel (set speed 0)
+    self.assertFalse(se.discretionary_down(tgt, tgt, tgt, drop))            # the car already at / below the new target
+    self.assertFalse(se.discretionary_down(30. - 6 * MPH, 30., 30. - 6 * MPH, 6 * MPH))  # 6 mph: past the coast drop
+    self.assertFalse(se.discretionary_down(tgt, 30., tgt, 0.))              # no drop this tick (no edge)
+    self.assertFalse(se.discretionary_down(tgt, 30., tgt, -2 * MPH))        # the set speed ROSE
+
+  def test_personality_does_not_change_the_down_boundary(self):
+    drop = 4 * MPH
+    tgt = 30. - drop
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 30., p)
+      e.step(30., 30., p, True, 0.5, v_set=30.)
+      self.assertEqual(e.step(tgt, 30., p, True, 0.5, v_set=tgt), 30.)
+
+  def test_down_is_inactive_gated(self):
+    # disconnected / override: the target is passed through (upstream), no easing either way
+    e = engaged(se.SetSpeedEase(), 30.)
+    tgt = 30. - 2 * MPH
+    self.assertEqual(e.step(tgt, 30., P.standard, False, 0., v_set=tgt), tgt)
+    e2 = engaged(se.SetSpeedEase(), 30.)
+    e2.step(30., 30., P.standard, True, 0., v_set=30.)
+    self.assertEqual(e2.step(tgt, 30., P.standard, True, 0., merging=True, v_set=tgt), tgt)  # a merge passes through
+
+
+class TestLaunch(OpenpilotTestCase):
+  def test_launch_from_stop_not_eased(self):
+    e = se.SetSpeedEase()
+    self.assertEqual(e.step(20., 0., P.relaxed, True, 1.5), 20.)
+    # still launching while accelerating above LAUNCH_V
+    for v in np.arange(0.5, 15., 0.2):
+      self.assertEqual(e.step(20., float(v), P.relaxed, True, 1.0), 20.)
+    self.assertTrue(e.launching)
+
+  def test_launch_ends_near_target(self):
+    e = se.SetSpeedEase()
+    e.step(20., 0., P.relaxed, True, 1.5)
+    e.step(20., 20. - se.LAUNCH_DONE_MARGIN + 0.01, P.relaxed, True, 1.0)
+    self.assertFalse(e.launching)
+    e.step(25., 19.5, P.relaxed, True, 0.3)  # a later raise is eased
+    self.assertLess(e.v_ease, 20.)
+
+  def test_launch_ends_after_low_accel(self):
+    # launched behind a lead, settled at 12 m/s with the set speed at 30: the lead pulling away later is eased
+    e = se.SetSpeedEase()
+    e.step(30., 0., P.standard, True, 1.5)
+    n = int(round(se.LAUNCH_END_S / DT_MDL))
+    for _ in range(n - 1):
+      e.step(30., 12., P.standard, True, 0.0)
+    self.assertTrue(e.launching)
+    e.step(30., 12., P.standard, True, 0.0)
+    self.assertFalse(e.launching)
+    v = e.step(30., 12., P.standard, True, 1.0)
+    self.assertLess(v - 12., 0.1)
+
+  def test_low_accel_timer_needs_continuity(self):
+    e = se.SetSpeedEase()
+    e.step(30., 0., P.standard, True, 1.5)
+    n = int(round(se.LAUNCH_END_S / DT_MDL))
+    for i in range(3 * n):
+      e.step(30., 12., P.standard, True, 0.0 if i % n else 1.0)  # one strong sample per second resets the timer
+    self.assertTrue(e.launching)
+
+  def test_disengage_clears_launch(self):
+    e = se.SetSpeedEase()
+    e.step(30., 0., P.standard, True, 1.5)
+    e.step(30., 10., P.standard, False, 0.)
+    self.assertFalse(e.launching)
+    self.assertLess(e.step(30., 10., P.standard, True, 1.0) - 10., 0.1)
+
+
+class TestCruiseAccelBounds(OpenpilotTestCase):
+  """Through the REAL upstream get_cruise_accel: easing only ever lowers a positive request, never adds decel."""
+
+  def _target(self, e2e, v_cruise, v_ego):
+    CP = mock.Mock(steerRatio=15., wheelbase=2.7)
+    # dt large -> the jerk limit does not bind, this is the unclipped target_accel
+    return upstream_lp.get_cruise_accel(e2e, v_cruise, v_ego, 0., 0., CP, 100., 0., True)
+
+  def test_eased_request_between_min0_and_upstream(self):
+    rng = np.random.default_rng(0)
+    for _ in range(3000):
+      p = PERSONALITIES[rng.integers(3)]
+      v_ego = float(rng.uniform(3.5, 38.))
+      v_target = float(rng.uniform(0., 40.))
+      e = engaged(se.SetSpeedEase(), float(rng.uniform(3.5, 38.)), p)
+      for _ in range(int(rng.integers(0, 60))):
+        e.step(float(rng.uniform(0., 40.)), float(rng.uniform(3.5, 38.)), p, True, float(rng.uniform(-1, 1)))
+      v_ease = e.step(v_target, v_ego, p, True, 0.)
+      for e2e in (False, True):
+        up = self._target(e2e, v_target, v_ego)
+        eased = self._target(e2e, v_ease, v_ego)
+        self.assertLessEqual(eased, up + 1e-9)
+        self.assertGreaterEqual(eased, min(0., up) - 1e-9)
+
+
+HWY = 55 * MPH  # road_type_classifier.HIGHWAY_SPEED_THRESHOLD
+
+
+def ref(road_type='unknown', map_limit=0., map_valid=None, ahead=0., ahead_valid=None, ahead_dist=0., car=0., v_set=75 * MPH):
+  return se.merge_reference(road_type, map_limit, map_limit > 0. if map_valid is None else map_valid, ahead,
+                            ahead > 0. if ahead_valid is None else ahead_valid, ahead_dist, car, v_set)
+
+
+class TestMergeReference(OpenpilotTestCase):
+  """merge_reference: which signals say 'highway-class road' (merge gate) vs 'normal road' (ease) vs no data."""
+
+  def test_threshold_is_the_road_type_classifier_one(self):
+    from openpilot.sunnypilot.mapd.lib import road_type_classifier as rtc
+    self.assertEqual(se.HIGHWAY_SPEED_THRESHOLD, rtc.HIGHWAY_SPEED_THRESHOLD)
+
+  def test_highway_road_type(self):
+    for rt in ('highway', 'interstate'):
+      self.assertEqual(ref(rt, 70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+      self.assertEqual(ref(rt), (HWY, se.MERGE_DEFICIT))                  # highway without a limit: 55 mph floor
+
+  def test_highway_class_map_limit(self):
+    self.assertEqual(ref('unknown', 65 * MPH), (65 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', HWY), (HWY, se.MERGE_DEFICIT))           # inclusive at 55 mph, like the classifier
+    self.assertEqual(ref('unknown', 70 * MPH, map_valid=False), (75 * MPH, se.NODATA_DEFICIT))  # invalid limit = no data
+    self.assertEqual(ref('unknown', 70 * MPH, map_valid=False, v_set=40 * MPH), (0., 0.))
+
+  def test_car_limit(self):
+    # carStateSP.speedLimit (cluster / camera): 12f @686 and 134 @157 have no map way match but the car reads 70
+    self.assertEqual(ref('unknown', car=70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', 35 * MPH, car=70 * MPH), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('unknown', car=45 * MPH, v_set=75 * MPH), (0., 0.))  # a non-highway car limit: ease
+
+  def test_highway_limit_ahead(self):
+    # an on-ramp is often an unnamed OSM link without a limit: the highway's limit is the next one
+    self.assertEqual(ref(ahead=70 * MPH, ahead_dist=378.), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref(ahead=70 * MPH, ahead_dist=se.MERGE_AHEAD_DIST + 1., v_set=50 * MPH), (0., 0.))
+    self.assertEqual(ref(ahead=70 * MPH, ahead_valid=False, ahead_dist=100., v_set=50 * MPH), (0., 0.))
+    self.assertEqual(ref(ahead=45 * MPH, ahead_dist=100., v_set=50 * MPH), (0., 0.))
+
+  def test_ahead_limit_overrides_urban(self):
+    # approaching a highway from a city street / frontage road: a >= 55 mph limit within MERGE_AHEAD_DIST ahead wins
+    # over roadType urban (this is the on-ramp case; see the module doc). Only a highway-class one, and only in range.
+    self.assertEqual(ref('urban', 35 * MPH, ahead=70 * MPH, ahead_dist=100.), (70 * MPH, se.MERGE_DEFICIT))
+    self.assertEqual(ref('urban', 35 * MPH, ahead=70 * MPH, ahead_dist=se.MERGE_AHEAD_DIST + 1.), (0., 0.))
+    self.assertEqual(ref('urban', 35 * MPH, ahead=45 * MPH, ahead_dist=100.), (0., 0.))
+
+  def test_reference_capped_at_set_speed(self):
+    # driving 50 on a 70 mph highway, +10 to 60: reference 60, deficit 10 mph < MERGE_DEFICIT -> eased, not a merge
+    self.assertEqual(ref('highway', 70 * MPH, v_set=60 * MPH), (60 * MPH, se.MERGE_DEFICIT))
+    g = se.MergeGate()
+    self.assertFalse(g.update(*ref('highway', 70 * MPH, v_set=60 * MPH), 50 * MPH))
+
+  def test_highest_highway_evidence_wins(self):
+    self.assertEqual(ref('highway', 55 * MPH, car=65 * MPH, ahead=70 * MPH, ahead_dist=100.)[0], 70 * MPH)
+
+  def test_normal_road_never_merges(self):
+    for kw in ({'road_type': 'urban'}, {'map_limit': 45 * MPH}, {'car': 35 * MPH}, {'road_type': 'urban', 'map_limit': 50 * MPH}):
+      self.assertEqual(ref(v_set=80 * MPH, **kw), (0., 0.), kw)
+
+  def test_no_data_fails_safe_on_highway_class_target(self):
+    self.assertEqual(ref(v_set=75 * MPH), (75 * MPH, se.NODATA_DEFICIT))
+    self.assertEqual(ref(v_set=HWY), (HWY, se.NODATA_DEFICIT))
+    self.assertEqual(ref(v_set=50 * MPH), (0., 0.))
+    # roadType is a capnp enum on the car: compared as text
+    lm = messaging.new_message('liveMapDataSP').liveMapDataSP
+    lm.roadType = 'interstate'
+    self.assertEqual(ref(lm.roadType)[0], HWY)
+    # ... and the classifier's own return value (a raw int)
+    from openpilot.sunnypilot.mapd.lib.road_type_classifier import classify_road_type
+    self.assertEqual(ref(classify_road_type('I-94', 0.))[0], HWY)
+    self.assertEqual(ref(classify_road_type('Main Street', 0.), v_set=80 * MPH), (0., 0.))
+    self.assertEqual(se.road_type_name(99), 'unknown')
+
+  def test_deficits(self):
+    # a +10 mph discretionary bump must stay eased in both the map and the no-data case
+    self.assertGreater(se.MERGE_DEFICIT, 10 * MPH + se.MERGE_HYST)
+    self.assertGreater(se.NODATA_DEFICIT, se.MERGE_DEFICIT)
+
+
+class TestMergeGate(OpenpilotTestCase):
+  def test_enter_exit_hysteresis(self):
+    g = se.MergeGate()
+    r = 70 * MPH
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT))           # exactly at the edge: not merging
+    self.assertTrue(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT - 0.01))
+    self.assertTrue(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + se.MERGE_HYST - 0.01))  # inside the band
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + se.MERGE_HYST))
+    self.assertFalse(g.update(r, se.MERGE_DEFICIT, r - se.MERGE_DEFICIT + 0.5))      # no re-entry inside the band
+
+  def test_no_reference_clears(self):
+    # a ref that drops away holds the gate for MERGE_REF_HOLD_S before easing resumes (nit: ref-boundary debounce)
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(1.0 / DT_MDL)):           # > MERGE_REF_HOLD_S of no ref: well past the hold
+      g.update(0., 0., 10.)
+    self.assertFalse(g.update(0., 0., 10.))
+
+  def test_ref_boundary_debounce(self):
+    # a flapping ref (roadType / limit-valid dropping in and out) must not toggle `merging` tick-to-tick: a short gap
+    # (< MERGE_REF_HOLD_S) keeps the gate UP. Holding = suppress easing = upstream behaviour, the benign direction.
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(0.3 / DT_MDL)):           # 0.3 s < MERGE_REF_HOLD_S of no ref
+      self.assertTrue(g.update(0., 0., 10.))
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))  # a ref returning inside the hold keeps it up
+    self.assertTrue(g.merging)
+
+  def test_ref_debounce_expires_and_rearms(self):
+    g = se.MergeGate()
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
+    for _ in range(int(1.0 / DT_MDL)):           # > MERGE_REF_HOLD_S of no ref: the hold expires, easing resumes
+      g.update(0., 0., 10.)
+    self.assertFalse(g.update(0., 0., 10.))
+    self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))  # a fresh ref re-gates from the speed boundary
+
+  def test_reset_clears_the_gate(self):
+    # disengage (inactive) resets the gate: easing resumes, and the hold timer is not left running
+    e = se.SetSpeedEase()
+    sm = planner_sm(10., 120., car_limit=70 * MPH)
+    e.update(sm, 33., True, False, 0.)
+    self.assertTrue(e.merge_gate.merging)
+    e.update(sm, 33., True, True, 0.)                      # driver override -> inactive
+    self.assertFalse(e.merge_gate.merging)
+
+  def test_car_limit_staleness_is_documented(self):
+    # should-fix: carStateSP.speedLimit is a last-seen display with NO freshness channel. This pins the two facts a
+    # future maintainer must not lose: the capnp struct exposes a bare Float32 with no valid/age field, and the module
+    # documents staleness. (driveMode is a fork addition for the drive-mode-personality feature; it is a raw UInt8
+    # level too and carries no freshness channel either.)
+    import inspect
+    lm = messaging.new_message('carStateSP').carStateSP
+    fields = {f.proto.name for f in lm.schema.fields_list}
+    self.assertEqual(fields, {'speedLimit', 'driveMode'})
+    self.assertNotIn('valid', fields)         # no validity channel
+    self.assertNotIn('age', fields)           # no age/freshness channel
+    self.assertNotIn('timestamp', fields)
+    doc = inspect.getdoc(se)
+    self.assertIn('staleness', doc)
+    self.assertIn('last-seen', doc.lower())
+    self.assertIn('never adds acceleration', doc)
+
+
+class TestMergeStep(OpenpilotTestCase):
+  def test_merging_passes_target_through(self):
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 12., p)
+      self.assertEqual(e.step(31., 12., p, True, 0.5, merging=True), 31.)
+
+  def test_merge_exit_hands_over_at_the_leash(self):
+    # leaving the merge: v_ease continues from v_ego + rate * LEASH_S (no drop of the request to zero, no step to target)
+    for p in PERSONALITIES:
+      e = engaged(se.SetSpeedEase(), 12., p)
+      e.step(31., 22., p, True, 0.5, merging=True)
+      lim = 22. + se.get_rate(p, 22.) * se.LEASH_S
+      v = e.step(31., 22., p, True, 0.5, merging=False)
+      self.assertAlmostEqual(v, lim, places=6)
+      self.assertLess(v, 31.)
+
+  def test_merge_never_above_target(self):
+    e = engaged(se.SetSpeedEase(), 20.)
+    e.step(20.5, 20., P.standard, True, 0.5, merging=True)
+    self.assertLessEqual(e.v_ease, 20.5)
+
+  def test_down_coast_after_a_merge_hazard_still_passes_through(self):
+    # a small discretionary drop on the first tick AFTER a merge window: coast (set speed 20 -> 18, 2 m/s)
+    e = se.SetSpeedEase()
+    e.step(20., 12., P.relaxed, True, 0.5, v_set=20., merging=True)   # merge window: passes the target through
+    self.assertEqual(e.step(18., 20., P.relaxed, True, 0.5, v_set=18.), 20.)
+    # a hazard (the target binds below the set speed, the set speed did NOT move): passed through unchanged
+    e2 = se.SetSpeedEase()
+    e2.step(20., 12., P.relaxed, True, 0.5, v_set=20., merging=True)
+    self.assertEqual(e2.step(18., 20., P.relaxed, True, 0.5, v_set=20.), 18.)
+
+
+class TestMergeStateShared(OpenpilotTestCase):
+  """merge_state: one evaluation per tick, shared with the SCC-V exclusion (fork/scc.py)."""
+
+  def test_merge_state_returns_and_resets(self):
+    e = se.SetSpeedEase()
+    sm = planner_sm(13., 120., car_limit=70 * MPH)
+    self.assertTrue(e.merge_state(sm, 33., 13.))
+    self.assertTrue(e.merge_gate.merging)
+    # not in control (off) resets the gate
+    sm_off = planner_sm(13., 120., car_limit=70 * MPH, lcs=LongCtrlState.off)
+    self.assertFalse(e.merge_state(sm_off, 33., 13.))
+    self.assertFalse(e.merge_gate.merging)
+
+  def test_update_with_merging_skips_a_second_evaluation(self):
+    # the result is handed in: update must NOT advance the ref-boundary debounce again this tick
+    e = se.SetSpeedEase()
+    sm = planner_sm(10., 120., car_limit=70 * MPH)
+    with mock.patch.object(e.merge_gate, 'update_sm', wraps=e.merge_gate.update_sm) as up:
+      e.update(sm, 33., True, False, 0., 33., merging=True)
+      self.assertEqual(up.call_count, 0)
+      e.update(sm, 33., True, False, 0., 33., merging=False)
+      self.assertEqual(up.call_count, 0)
+      e.update(sm, 33., True, False, 0., 33.)            # merging=None -> evaluate here
+      self.assertEqual(up.call_count, 1)
+
+
+def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, lcs=LongCtrlState.pid, override=False,
+               lead=None, road_type=None, map_limit=0., car_limit=0., cur_lat=0., pred_lat=0.):
+  N = len(ModelConstants.T_IDXS)
+  md = messaging.new_message('modelV2').modelV2
+  md.position.x = [v_ego * t for t in ModelConstants.T_IDXS]
+  md.velocity.x = [v_ego] * N
+  md.orientationRate.z = [pred_lat] * N            # SCC-V max predicted lat accel = |orientationRate.z| * velocity.x
+  md.action.desiredAcceleration = 2.0
+  md.meta.disengagePredictions.gasPressProbs = [1.] * 6
+  cs = messaging.new_message('carState').carState
+  cs.vEgo = v_ego
+  cs.vCruise = v_cruise_kph
+  cs.vCruiseCluster = v_cruise_kph
+  cc = messaging.new_message('carControl').carControl
+  cc.enabled = True
+  cc.cruiseControl.override = override
+  cc.orientationNED = [0., 0., 0.]
+  ctl = messaging.new_message('controlsState').controlsState
+  ctl.longControlState = lcs
+  ctl.curvature = float(cur_lat / max(v_ego, 0.1) ** 2)  # SCC-V current lat accel = v^2 * |curvature|
+  sd = messaging.new_message('selfdriveState').selfdriveState
+  sd.enabled = True
+  sd.experimentalMode = experimental
+  sd.personality = personality
+  rs = messaging.new_message('radarState').radarState
+  if lead is not None:
+    rs.leadOne.present = True
+    rs.leadOne.dRel = lead[0]
+    rs.leadOne.vLead = lead[1]
+    rs.leadOne.modelProb = 1.
+    rs.leadOne.aLeadTau = 1.5
+  sm = {'modelV2': md, 'carState': cs, 'carControl': cc, 'controlsState': ctl, 'selfdriveState': sd, 'radarState': rs}
+  for w in ('liveMapDataSP', 'vehicleParameters', 'carStateSP', 'gpsLocation', 'gpsLocationExternal', 'selfdriveStateSP'):
+    sm[w] = getattr(messaging.new_message(w), w)
+  if road_type is not None:
+    sm['liveMapDataSP'].roadType = road_type
+  if map_limit > 0.:
+    sm['liveMapDataSP'].speedLimit = map_limit
+    sm['liveMapDataSP'].speedLimitValid = True
+  sm['carStateSP'].speedLimit = car_limit
+  return sm
+
+
+def make_planner():
+  from opendbc.car.honda.interface import CarInterface
+  from opendbc.car.honda.values import CAR
+  CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+  CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.HONDA_CIVIC)
+  return upstream_lp.LongitudinalPlanner(CP, CP_SP, init_v=20., init_a=0.)
+
+
+class TestUpstreamHooks(OpenpilotTestCase):
+  """The fork hooks these upstream members; a rename / signature change upstream must fail here."""
+
+  def test_pinned_signatures(self):
+    self.assertEqual(list(inspect.signature(upstream_lp.get_cruise_accel).parameters),
+                     ['e2e', 'v_cruise', 'v_ego', 'a_cruise_prev', 'angle_steers', 'CP', 'dt', 'accel_coast', 'allow_throttle', 'personality'])
+    self.assertEqual(list(inspect.signature(LongitudinalPlannerSP.update_targets).parameters),
+                     ['self', 'sm', 'v_ego', 'a_ego', 'v_cruise'])
+    src = inspect.getsource(upstream_lp.LongitudinalPlanner.update)
+    # the planner must feed update_targets' returned v_cruise into get_cruise_accel
+    self.assertIn('v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(', src)
+    self.assertIn('get_cruise_accel(is_e2e, v_cruise, v_ego', src)
+
+  def _run(self, planner, n, v_ego, v_cruise_kph, **kw):
+    for _ in range(n):
+      planner.update(planner_sm(v_ego, v_cruise_kph, **kw))
+
+  def test_planner_owns_ease(self):
+    self.assertIsInstance(make_planner().setspeed_ease, se.SetSpeedEase)
+
+  def test_end_to_end_bump_is_eased(self):
+    # +10 mph at 45 mph through the REAL LongitudinalPlanner: the cruise candidate stays near the personality rate
+    # (upstream: the ceiling within ~1 s). ACC and e2e.
+    v = 45 * MPH
+    kph = 55 * 1.609344
+    for exp in (False, True):
+      for p in PERSONALITIES:
+        planner = make_planner()
+        self._run(planner, 5, v, 45 * 1.609344, personality=p, experimental=exp)
+        self._run(planner, 40, v, kph, personality=p, experimental=exp)  # 2 s after the press, car not moving (worst case)
+        self.assertLessEqual(planner.a_cruise, se.get_rate(p, v) * se.LEASH_S + 1e-6, (exp, p))
+        self.assertGreater(planner.a_cruise, 0.2)
+        # vTarget published to longitudinalPlanSP stays the raw target
+        self.assertAlmostEqual(planner.output_v_target, kph / 3.6, places=4)
+
+  def test_eased_with_far_lead(self):
+    # a lead far ahead and faster (not binding) must not switch the easing off: +10 mph at 45 mph stays eased
+    v = 45 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 45 * 1.609344, lead=(150., v + 3.))
+    self._run(planner, 40, v, 55 * 1.609344, lead=(150., v + 3.))
+    self.assertLessEqual(planner.a_cruise, se.get_rate(P.standard, v) * se.LEASH_S + 1e-6)
+    self.assertLess(planner.output_a_target, float(upstream_lp.get_max_accel(v)) - 0.2)
+
+  def test_lead_braking_identical_on_same_input(self):
+    # Same input sequence to two real planners (eased / hook bypassed): cruising at 45 mph, +15 mph press, then a slow
+    # lead cuts in close and the car must slow. Whenever the plan comes from the lead (MPC) or asks to slow, the eased
+    # planner's output must equal the upstream one: easing never touches braking / lead-follow decel.
+    v = 45 * MPH
+    for exp in (False, True):
+      eased, stock = make_planner(), make_planner()
+      stock.setspeed_ease.update = lambda sm, v_target, *a: v_target
+      seq = [planner_sm(v, 45 * 1.609344, experimental=exp) for _ in range(10)]
+      seq += [planner_sm(v, 60 * 1.609344, experimental=exp) for _ in range(40)]
+      seq += [planner_sm(v, 60 * 1.609344, experimental=exp, lead=(18. + 0.2 * i, 40 * MPH)) for i in range(60)]
+      n_lead = 0
+      for sm in seq:
+        eased.update(sm)
+        stock.update(sm)
+        if sm['radarState'].leadOne.present and stock.output_a_target < 0.:
+          n_lead += 1
+          self.assertAlmostEqual(eased.output_a_target, stock.output_a_target, places=2, msg=f'exp={exp}')
+          self.assertNotEqual(str(eased.mpc.source), 'cruise')
+        self.assertLessEqual(eased.output_a_target, stock.output_a_target + 1e-3)
+      self.assertGreater(n_lead, 30)  # the lead phase really braked
+
+  def test_end_to_end_control_without_ease(self):
+    # positive control for the test above: with the hook bypassed the same input reaches the upstream ceiling
+    v = 45 * MPH
+    planner = make_planner()
+    planner.setspeed_ease.update = lambda sm, v_target, *a: v_target
+    self._run(planner, 5, v, 45 * 1.609344, personality=P.relaxed)
+    self._run(planner, 40, v, 55 * 1.609344, personality=P.relaxed)
+    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, P.relaxed)), places=3)
+
+  def test_end_to_end_big_down_passes_through(self):
+    # 45 mph, set 45 -> 20 mph: a 25 mph drop is past the coast budget, so it passes straight through (as upstream)
+    v = 45 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 45 * 1.609344)
+    self._run(planner, 1, v, 20 * 1.609344)
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease, 20 * 1.609344 / 3.6, places=4)  # vCruise is float32
+
+  def test_end_to_end_small_down_coasts(self):
+    # 60 mph, set 60 -> 55 mph (the owner's one press): the ease holds the car's own speed, so the cruise
+    # candidate is ~0 (coast / engine braking) instead of the old -1.2 m/s^2 (the v_cruise - v_ego was -2.24)
+    v = 60 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 60 * 1.609344)
+    self._run(planner, 40, v, 55 * 1.609344)
+    self.assertFalse(planner.setspeed_ease.merging)
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease, v, places=3)   # held at the car
+    self.assertAlmostEqual(planner.a_cruise, 0., places=6)              # a coast, not a brake
+    # the same 10 mph (two presses) drop is past the coast budget: it passes through (a real decel)
+    planner = make_planner()
+    self._run(planner, 5, v, 60 * 1.609344)
+    self._run(planner, 40, v, 50 * 1.609344)
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease, 50 * 1.609344 / 3.6, places=4)
+    self.assertLess(planner.a_cruise, -0.5)
+
+  def test_end_to_end_bump_size_orders_the_request(self):
+    # +5 mph at 60 mph must ask for less than +10 mph at 60 mph (the owner: a +5 bump is still too quick)
+    v = 60 * MPH
+    out = {}
+    for bump in (5, 10):
+      planner = make_planner()
+      self._run(planner, 5, v, 60 * 1.609344)
+      self._run(planner, 40, v, (60 + bump) * 1.609344)
+      out[bump] = planner.a_cruise
+    self.assertLess(out[5], out[10])
+    self.assertLessEqual(out[5], se.get_rate(P.standard, v) * se.BUMP_MIN_SCALE * se.LEASH_S + 1e-6)
+
+  def test_end_to_end_forcedecel_passes_through(self):
+    # forceDecel (a stop): the planner gets the target straight through, v_ease == 0 (never eased)
+    v = 45 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 45 * 1.609344)
+    self._run(planner, 20, v, 45 * 1.609344)
+    for _ in range(5):
+      sm = planner_sm(v, 45 * 1.609344)
+      sm['controlsState'].forceDecel = True
+      planner.update(sm)
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease, 0., places=6)
+
+  def test_end_to_end_inactive_states(self):
+    v = 45 * MPH
+    for kw in ({'lcs': LongCtrlState.off}, {'override': True}):
+      planner = make_planner()
+      self._run(planner, 5, v, 45 * 1.609344)
+      self._run(planner, 20, v, 65 * 1.609344, **kw)
+      self.assertAlmostEqual(planner.setspeed_ease.v_ease, v, places=4, msg=str(kw))
+      # while not in control the planner gets the raw target (upstream behaviour)
+      v_out, _ = planner.update_targets(planner_sm(v, 65 * 1.609344, **kw), v, 0., 65 * 1.609344 / 3.6)
+      self.assertAlmostEqual(v_out, 65 * 1.609344 / 3.6, places=4, msg=str(kw))
+
+  def test_launch_end_uses_plan_accel(self):
+    # the hook passes the planner's previous output accel (a_ego arg of update_targets) as a_plan
+    planner = make_planner()
+    with mock.patch.object(planner.setspeed_ease, 'update', wraps=planner.setspeed_ease.update) as up:
+      planner.output_a_target = 0.77
+      planner.update(planner_sm(20., 100.))
+      self.assertAlmostEqual(up.call_args.args[4], 0.77, places=5)
+
+  def test_diagnostics_event_on_ramp_edges(self):
+    e = se.SetSpeedEase()
+    with mock.patch.object(se.cloudlog, 'event') as ev:
+      e.update(planner_sm(20., 72.), 20., True, False, 0.)
+      ev.assert_not_called()
+      e.update(planner_sm(20., 108.), 30., True, False, 0.)
+      e.update(planner_sm(20., 108.), 30., True, False, 0.)
+      self.assertEqual(ev.call_count, 1)
+      self.assertEqual(ev.call_args.args[0], 'setspeed_ease')
+      self.assertTrue(ev.call_args.kwargs['ramping'])
+      self.assertEqual(ev.call_args.kwargs['personality'], int(P.standard))
+      e.update(planner_sm(20., 72.), 20., True, False, 0.)
+      self.assertEqual(ev.call_count, 2)
+      self.assertFalse(ev.call_args.kwargs['ramping'])
+
+  def test_end_to_end_onramp_not_eased(self):
+    # on-ramp (12f @686 shape): 30 mph, set 75 mph, the car reads a 70 mph limit (no map way match): upstream ceiling
+    v = 30 * MPH
+    for road in ({'car_limit': 70 * MPH}, {'road_type': 'highway', 'map_limit': 70 * MPH}, {}):
+      for p in PERSONALITIES:
+        planner = make_planner()
+        self._run(planner, 5, v, 30 * 1.609344, personality=p, **road)
+        self._run(planner, 40, v, 75 * 1.609344, personality=p, **road)
+        self.assertTrue(planner.setspeed_ease.merging, (road, p))
+        self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, p)), places=3, msg=str((road, p)))
+
+  def test_end_to_end_bump_on_normal_road_still_eased(self):
+    # +10 mph at 45 mph on an urban 45 mph road, and +10 mph at 65 mph on a 70 mph highway: eased (discretionary)
+    for v_mph, road in ((45, {'road_type': 'urban', 'map_limit': 45 * MPH}), (65, {'road_type': 'highway', 'map_limit': 70 * MPH}),
+                        (45, {}), (50, {'road_type': 'highway', 'map_limit': 70 * MPH})):
+      planner = make_planner()
+      v = v_mph * MPH
+      self._run(planner, 5, v, v_mph * 1.609344, personality=P.relaxed, **road)
+      self._run(planner, 40, v, (v_mph + 10) * 1.609344, personality=P.relaxed, **road)
+      self.assertFalse(planner.setspeed_ease.merging, road)
+      self.assertLessEqual(planner.a_cruise, se.get_rate(P.relaxed, v) * se.LEASH_S + 1e-6, road)
+
+  def test_end_to_end_override_resets_ramp(self):
+    # mid-ramp the driver presses the gas to 25 m/s: the planner gets the raw target and v_ease re-arms at vEgo;
+    # after the release the ramp restarts from the (new) current speed, not from where it was
+    v = 45 * MPH
+    planner = make_planner()
+    self._run(planner, 5, v, 45 * 1.609344)
+    self._run(planner, 20, v, 65 * 1.609344)
+    self.assertGreater(planner.setspeed_ease.v_ease, v)
+    self._run(planner, 5, 25., 65 * 1.609344, override=True)
+    self.assertEqual(planner.setspeed_ease.v_ease, 25.)
+    v_out, _ = planner.update_targets(planner_sm(25., 65 * 1.609344, override=True), 25., 0., 65 * 1.609344 / 3.6)
+    self.assertAlmostEqual(v_out, 65 * 1.609344 / 3.6, places=4)
+    self._run(planner, 1, 25., 65 * 1.609344)
+    tgt = 65 * 1.609344 / 3.6
+    self.assertAlmostEqual(planner.setspeed_ease.v_ease,
+                           25. + se.get_rate(P.standard, 25.) * se.bump_rate_scale(tgt - 25.) * DT_MDL, places=4)
+
+  def test_diagnostics_event_on_merge_edges(self):
+    e = se.SetSpeedEase()
+    with mock.patch.object(se.cloudlog, 'event') as ev:
+      e.update(planner_sm(13., 120., car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertTrue(ev.call_args.kwargs['merging'])
+      e.update(planner_sm(13., 120., car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertEqual(ev.call_count, 1)
+      e.update(planner_sm(13., 120., lcs=LongCtrlState.off, car_limit=70 * MPH), 33., True, False, 0.)
+      self.assertFalse(e.merge_gate.merging)   # inactive clears the gate
+
+  def test_merge_survives_a_lower_arbitrated_target(self):
+    # on the ramp an SCC curve target (arbitrated v_target) dips to 15 m/s while the set speed stays 75 mph: the gate
+    # keys off the SET speed, stays merging, and passes the (lower) arbitrated target through unchanged
+    e = se.SetSpeedEase()
+    sm = planner_sm(12., 75 * 1.609344, car_limit=70 * MPH)
+    self.assertEqual(e.update(sm, 33., True, False, 0.5, 33.), 33.)
+    self.assertTrue(e.merging)
+    self.assertEqual(e.update(sm, 15., True, False, 0.5, 33.), 15.)
+    self.assertTrue(e.merging)
+    # without the set speed (default) the arbitrated target is the cap: 15 m/s is no merge -> eased
+    e2 = se.SetSpeedEase()
+    e2.update(sm, 33., True, False, 0.5)
+    self.assertLess(e2.update(sm, 15., True, False, 0.5), 15.)
+    self.assertFalse(e2.merging)
+
+  def test_hook_passes_the_set_speed(self):
+    planner = make_planner()
+    with mock.patch.object(planner.setspeed_ease, 'update', wraps=planner.setspeed_ease.update) as up:
+      planner.update(planner_sm(20., 100.))
+      self.assertAlmostEqual(up.call_args.args[5], 100. / 3.6, places=3)
+
+  def test_end_to_end_sccv_excluded_during_a_merge_window(self):
+    # through the REAL planner: on an on-ramp merge window a (sustained-prediction) SCC-V must not bind the plan
+    Params().put_bool("SmartCruiseControlVision", True, block=True)
+    v = 30 * MPH
+    n = int(round(fscc.VISION_ENTER_PRED_HOLD_S / DT_MDL)) + 6
+    planner = make_planner()
+    for _ in range(n):
+      planner.update(planner_sm(v, 75 * 1.609344, car_limit=70 * MPH, cur_lat=0.3, pred_lat=2.0))
+    self.assertTrue(planner.setspeed_ease.merging)
+    self.assertEqual(planner.scc.vision.state, VisionState.entering)   # it WOULD bind on prediction alone
+    self.assertTrue(planner.scc.vision.merge_excluded)
+    self.assertNotEqual(str(planner.source), 'sccVision')
+    # the same inputs with the merge gate NOT open: SCC-V binds (control), so the exclusion is what changed it
+    p2 = make_planner()
+    for _ in range(n):
+      p2.update(planner_sm(v, 30 * 1.609344, cur_lat=0.3, pred_lat=2.0))
+    self.assertFalse(p2.setspeed_ease.merging)
+    self.assertEqual(p2.scc.vision.state, VisionState.entering)
+    self.assertFalse(p2.scc.vision.merge_excluded)

@@ -131,6 +131,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     excessiveActuation @96;
     bigModelLoading @100;
     bigModelFailed @102;
+    driveModePersonalityBlock @104;  # fork: drive mode N/N-Custom blocks openpilot longitudinal (no new engage + disengage)
 
     lowBatteryDEPRECATED @40;
     soundsUnavailableDEPRECATED @47;

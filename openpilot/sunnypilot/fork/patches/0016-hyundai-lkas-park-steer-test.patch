@@ -1,0 +1,1072 @@
+From 357b37914bec8d09e225894e68e3b66655afd717 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 00:18:28 -0500
+Subject: [PATCH] hyundai: TEST-ONLY parked LKAS11 steering sweep, safety bit
+ 512 (LKAS_PARK_TEST)
+
+Panda-enforced parked steering-torque probe for the 2022 Elantra N. openpilot's lateral is gated off below 0.3 m/s
+(controlsd standstill gate; Hyundai has no steerAtStandstill), so a runner (car-features/steer-test/steer_park_test.py)
+sends LKAS11 itself with openpilot stopped and panda is the only enforcer. Inert unless bit 512 is armed by the runner;
+non-SCC ICE only; never with openpilot longitudinal, the pedal, FCA11 long or the FCA11 test bits.
+- TX list = LKAS11 alone (check_relay kept); the camera's LKAS11 is blocked only while panda transmitted an accepted
+  frame within 100 ms AND would accept the next one (parked, inside the cap) - otherwise forwarded on its next frame.
+- Every frame: gear P/N equal to the arm's first gear, every wheel <= 12 raw (0.375 km/h), gear+wheel fresh, <= 60 s
+  after the arm. Actuating frames: |torque| <= 384, ActToi with torque, +3/-7 per frame (zero crossing <= 3),
+  112 per 250 ms, every input (MDPS12/WHL_SPD11/LVR12/SAS11/EMS16) seen and fresh, no gas, no latched cut.
+- Latched cut until re-arm: MDPS12 Def/ToiUnavail/ToiFlt/FailStat/SErr, |StrTq| > 5 Nm, |SAS_Angle| > 85 deg, gas,
+  wheel motion, gear change. A rejected frame resets the rate reference to 0.
+- SAS11 RX check is 6 bytes (measured on the car, route 131: 35868/35868, ~600k over routes 131/133/134; the DBC says 5).
+Safety tests: TestHyundaiNonSCCLkasParkTestSafety (C==Python constants, unset bit byte-identical to normal non-SCC).
+---
+ opendbc/safety/modes/hyundai.h           | 280 ++++++++++-
+ opendbc/safety/modes/hyundai_canfd.h     |   1 +
+ opendbc/safety/modes/hyundai_common.h    |  20 +
+ opendbc/safety/tests/test_hyundai.py     | 592 ++++++++++++++++++++++-
+ opendbc/sunnypilot/car/hyundai/values.py |  17 +-
+ 5 files changed, 906 insertions(+), 4 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index ebfad9a7..6e97f3bf 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -355,6 +355,217 @@ static void hyundai_fca11_rolling_rx(const CANPacket_t *msg) {
+   }
+ }
+ 
++// ******************** TEST-ONLY parked LKAS11 steering sweep (HYUNDAI_PARAM_SP_LKAS_PARK_TEST, bit 512) ********************
++// Armed only by car-features/steer-test/steer_park_test.py (openpilot stopped, raw 0xdf + 0xdc). openpilot's own lateral
++// can never steer here (controlsd gates latActive below 0.3 m/s; Hyundai has no steerAtStandstill), so the runner sends
++// LKAS11 itself and panda is the ONLY enforcer. TX list = LKAS11 alone. Every ACTUATING frame (torque != 0 or
++// CF_Lkas_ActToi = 1) needs the parked window; a PASSIVE frame (torque 0, ActToi 0) is the clean idle shape and is
++// accepted until the per-arm time cap, so the runner can release without a source switch. Constants that the runner
++// mirrors must equal the HYUNDAI_LKAS_PARK_* values in opendbc/sunnypilot/car/hyundai/values.py (unit tests pin them).
++#define HYUNDAI_LKAS_PARK_MAX_TORQUE 384       // = STEER_MAX (CarControllerParams), never more
++#define HYUNDAI_LKAS_PARK_RATE_UP 3            // per accepted frame, magnitude growth (= STEER_DELTA_UP)
++#define HYUNDAI_LKAS_PARK_RATE_DOWN 7          // per accepted frame, magnitude decay (= STEER_DELTA_DOWN)
++#define HYUNDAI_LKAS_PARK_RT_DELTA 112         // real-time bound per 250 ms, same as the normal Hyundai limits
++#define HYUNDAI_LKAS_PARK_RT_INTERVAL_US 250000U
++#define HYUNDAI_LKAS_PARK_MAX_ARM_US 60000000U // hard cap: 60 s after the arm (init); then EVERY 0x340 is refused
++#define HYUNDAI_LKAS_PARK_RX_MAX_AGE_US 100000U  // every window input fresh within 100 ms of each actuating frame
++#define HYUNDAI_LKAS_PARK_TX_STALE_US 100000U  // camera LKAS11 forwarded again 100 ms after our last accepted frame
++#define HYUNDAI_LKAS_PARK_WHEEL_MAX 12U        // raw WHL_SPD11 (0.03125 km/h): EVERY wheel <= 0.375 km/h (STANDSTILL_THRSLD)
++#define HYUNDAI_LKAS_PARK_MAX_ANGLE 850        // raw SAS_Angle (0.1 deg): |angle| > 85 deg latches the cut
++#define HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ 500    // raw CR_Mdps_StrTq (0.01 Nm): |tq| > 5.00 Nm latches the cut
++#define HYUNDAI_LKAS_PARK_GEAR_P 0U            // LVR12 CF_Lvr_Gear
++#define HYUNDAI_LKAS_PARK_GEAR_N 6U
++
++// SAS11 is 6 bytes on this car (route 131: 35868/35868 frames; ~600k across routes 131/133/134, all 6 bytes), NOT the
++// DBC's 5: a 5-byte check never matches
++#define HYUNDAI_LKAS_PARK_SAS_ADDR_CHECK \
++  {.msg = {{0x2B0, 0, 6, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++
++enum {
++  HYUNDAI_PARK_SEEN_MDPS = 1,
++  HYUNDAI_PARK_SEEN_SPEED = 2,
++  HYUNDAI_PARK_SEEN_GEAR = 4,
++  HYUNDAI_PARK_SEEN_ANGLE = 8,
++  HYUNDAI_PARK_SEEN_GAS = 16,
++  HYUNDAI_PARK_SEEN_ALL = 31,
++};
++static bool hyundai_lkas_park_cut;             // LATCHED: only passive frames until the next init (re-arm)
++static uint32_t hyundai_lkas_park_seen;        // HYUNDAI_PARK_SEEN_* since this arm
++static uint32_t hyundai_lkas_park_ts_arm;      // init time (the 60 s cap runs from here)
++static uint32_t hyundai_lkas_park_ts_mdps;
++static uint32_t hyundai_lkas_park_ts_speed;
++static uint32_t hyundai_lkas_park_ts_gear;
++static uint32_t hyundai_lkas_park_ts_angle;
++static uint32_t hyundai_lkas_park_ts_gas;
++static uint32_t hyundai_lkas_park_gear_ref;    // gear at the first LVR12 of this arm (must be P or N, must not change)
++static uint32_t hyundai_lkas_park_gear;        // latest LVR12 gear
++static uint32_t hyundai_lkas_park_wheel_max;   // latest WHL_SPD11, fastest wheel (raw)
++static bool hyundai_lkas_park_tx_seen;         // an accepted 0x340 since this arm ...
++static uint32_t hyundai_lkas_park_ts_tx;       // ... last one at
++static int hyundai_lkas_park_torque_last;      // last ACCEPTED torque (rate reference)
++static int hyundai_lkas_park_rt_last;          // real-time reference torque
++static uint32_t hyundai_lkas_park_ts_rt;       // ... set at
++
++static void hyundai_lkas_park_reset(void) {
++  hyundai_lkas_park_cut = false;
++  hyundai_lkas_park_seen = 0U;
++  hyundai_lkas_park_ts_arm = microsecond_timer_get();
++  hyundai_lkas_park_ts_mdps = 0U;
++  hyundai_lkas_park_ts_speed = 0U;
++  hyundai_lkas_park_ts_gear = 0U;
++  hyundai_lkas_park_ts_angle = 0U;
++  hyundai_lkas_park_ts_gas = 0U;
++  hyundai_lkas_park_gear_ref = 0xFFU;
++  hyundai_lkas_park_gear = 0xFFU;
++  hyundai_lkas_park_wheel_max = 0xFFFFU;
++  hyundai_lkas_park_tx_seen = false;
++  hyundai_lkas_park_ts_tx = 0U;
++  hyundai_lkas_park_torque_last = 0;
++  hyundai_lkas_park_rt_last = 0;
++  hyundai_lkas_park_ts_rt = hyundai_lkas_park_ts_arm;
++}
++
++static bool hyundai_lkas_park_capped(uint32_t ts) {
++  return safety_get_ts_elapsed(ts, hyundai_lkas_park_ts_arm) > HYUNDAI_LKAS_PARK_MAX_ARM_US;
++}
++
++// Called at the END of hyundai_rx_hook for valid, RX-checked bus-0 frames while armed. Records the window inputs and
++// LATCHES the cut on: any MDPS12 fault/unavailable bit (Def, ToiUnavail, ToiFlt, FailStat, SErr), |driver torque| over
++// the limit, any wheel above standstill, a gear that is not P/N or differs from the arm's first gear, |angle| over the
++// limit, or the driver's gas. A cut never clears inside the armed session (re-arm = the next init).
++static void hyundai_lkas_park_rx(const CANPacket_t *msg) {
++  uint32_t ts = microsecond_timer_get();
++  bool cut = false;
++  if (msg->bus == 0U) {
++    if (msg->addr == 0x251U) {
++      bool fault = GET_BIT(msg, 11U) || GET_BIT(msg, 12U) || GET_BIT(msg, 14U) || GET_BIT(msg, 15U) || GET_BIT(msg, 37U);
++      uint32_t str_tq_raw = GET_BYTES(msg, 5, 2) & 0xFFFU;  // CR_Mdps_StrTq 40|12, 0.01 Nm, offset -20.48
++      int str_tq = (int)str_tq_raw - 2048;
++      cut = fault || (SAFETY_ABS(str_tq) > HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ);
++      hyundai_lkas_park_ts_mdps = ts;
++      hyundai_lkas_park_seen |= HYUNDAI_PARK_SEEN_MDPS;
++    }
++    if (msg->addr == 0x386U) {
++      uint32_t fl = GET_BYTES(msg, 0, 2) & 0x3FFFU;
++      uint32_t fr = GET_BYTES(msg, 2, 2) & 0x3FFFU;
++      uint32_t rl = GET_BYTES(msg, 4, 2) & 0x3FFFU;
++      uint32_t rr = GET_BYTES(msg, 6, 2) & 0x3FFFU;
++      hyundai_lkas_park_wheel_max = SAFETY_MAX(SAFETY_MAX(fl, fr), SAFETY_MAX(rl, rr));
++      cut = cut || (hyundai_lkas_park_wheel_max > HYUNDAI_LKAS_PARK_WHEEL_MAX);
++      hyundai_lkas_park_ts_speed = ts;
++      hyundai_lkas_park_seen |= HYUNDAI_PARK_SEEN_SPEED;
++    }
++    if (msg->addr == 0x367U) {
++      uint32_t gear = msg->data[4] & 0xFU;  // CF_Lvr_Gear 32|4
++      if (hyundai_lkas_park_gear_ref == 0xFFU) {
++        hyundai_lkas_park_gear_ref = gear;
++      }
++      hyundai_lkas_park_gear = gear;
++      cut = cut || ((gear != HYUNDAI_LKAS_PARK_GEAR_P) && (gear != HYUNDAI_LKAS_PARK_GEAR_N)) || (gear != hyundai_lkas_park_gear_ref);
++      hyundai_lkas_park_ts_gear = ts;
++      hyundai_lkas_park_seen |= HYUNDAI_PARK_SEEN_GEAR;
++    }
++    if (msg->addr == 0x2B0U) {
++      int angle = (int)(int16_t)(uint16_t)GET_BYTES(msg, 0, 2);  // SAS_Angle 0|16 signed, 0.1 deg
++      cut = cut || (SAFETY_ABS(angle) > HYUNDAI_LKAS_PARK_MAX_ANGLE);
++      hyundai_lkas_park_ts_angle = ts;
++      hyundai_lkas_park_seen |= HYUNDAI_PARK_SEEN_ANGLE;
++    }
++    if (msg->addr == 0x260U) {
++      hyundai_lkas_park_ts_gas = ts;
++      hyundai_lkas_park_seen |= HYUNDAI_PARK_SEEN_GAS;
++    }
++  }
++  if (cut || gas_pressed) {
++    hyundai_lkas_park_cut = true;
++  }
++}
++
++static bool hyundai_lkas_park_fresh(uint32_t ts, uint32_t ts_last) {
++  return safety_get_ts_elapsed(ts, ts_last) <= HYUNDAI_LKAS_PARK_RX_MAX_AGE_US;
++}
++
++// The parked window for every actuating frame: every input seen this arm and fresh, not cut. The cut conditions
++// themselves are latched at RX time (a frame can never race them: rx and tx hooks run in the same context).
++static bool hyundai_lkas_park_window_ok(uint32_t ts) {
++  bool ok = (hyundai_lkas_park_seen == (uint32_t)HYUNDAI_PARK_SEEN_ALL) && !hyundai_lkas_park_cut;
++  ok = ok && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_mdps) && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_speed);
++  ok = ok && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_gear) && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_angle);
++  ok = ok && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_gas) && !gas_pressed;
++  return ok;
++}
++
++// Rate law of opendbc apply_driver_steer_torque_limits (no driver term): growth <= +3, decay <= 7 per accepted frame,
++// zero crossing in at most 3 per frame; plus the normal real-time bound.
++static bool hyundai_lkas_park_rate_ok(int torque, uint32_t ts) {
++  int last = hyundai_lkas_park_torque_last;
++  int hi;
++  int lo;
++  if (last > 0) {
++    hi = last + HYUNDAI_LKAS_PARK_RATE_UP;
++    lo = SAFETY_MAX(last - HYUNDAI_LKAS_PARK_RATE_DOWN, -HYUNDAI_LKAS_PARK_RATE_UP);
++  } else {
++    hi = SAFETY_MIN(last + HYUNDAI_LKAS_PARK_RATE_DOWN, HYUNDAI_LKAS_PARK_RATE_UP);
++    lo = last - HYUNDAI_LKAS_PARK_RATE_UP;
++  }
++  bool ok = (torque <= hi) && (torque >= lo);
++  if (safety_get_ts_elapsed(ts, hyundai_lkas_park_ts_rt) > HYUNDAI_LKAS_PARK_RT_INTERVAL_US) {
++    hyundai_lkas_park_rt_last = last;
++    hyundai_lkas_park_ts_rt = ts;
++  }
++  int rt_hi = SAFETY_MAX(hyundai_lkas_park_rt_last, 0) + HYUNDAI_LKAS_PARK_RT_DELTA;
++  int rt_lo = SAFETY_MIN(hyundai_lkas_park_rt_last, 0) - HYUNDAI_LKAS_PARK_RT_DELTA;
++  ok = ok && (torque <= rt_hi) && (torque >= rt_lo);
++  return ok;
++}
++
++// Parked right now (EVERY frame, passive included): wheel + gear seen this arm and fresh, the latest wheel sample at
++// standstill, the latest gear P/N and equal to the arm's first gear. Not latched (the cut latch only gates actuation),
++// so after a firmware cut the runner can keep the idle stream going until it disarms - no LKAS11 gap.
++static bool hyundai_lkas_park_parked(uint32_t ts) {
++  const uint32_t need = (uint32_t)HYUNDAI_PARK_SEEN_SPEED | (uint32_t)HYUNDAI_PARK_SEEN_GEAR;
++  bool ok = ((hyundai_lkas_park_seen & need) == need);
++  ok = ok && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_speed) && hyundai_lkas_park_fresh(ts, hyundai_lkas_park_ts_gear);
++  ok = ok && (hyundai_lkas_park_wheel_max <= HYUNDAI_LKAS_PARK_WHEEL_MAX);
++  ok = ok && ((hyundai_lkas_park_gear == HYUNDAI_LKAS_PARK_GEAR_P) || (hyundai_lkas_park_gear == HYUNDAI_LKAS_PARK_GEAR_N));
++  ok = ok && (hyundai_lkas_park_gear == hyundai_lkas_park_gear_ref);
++  return ok;
++}
++
++// LKAS11 TX rule in the parked test mode. PASSIVE frame = torque 0 and CF_Lkas_ActToi 0 (the idle shape openpilot
++// itself sends when not steering): needs only the parked state and the time cap, and is exempt from the rate law (an
++// immediate release to zero is the fail-safe direction - exactly what openpilot does on any disengage). ACTUATING
++// frame (torque != 0 or ActToi = 1): additionally the full window (no latched cut, every input seen and fresh, no gas),
++// |torque| <= 384, ActToi set whenever torque != 0, and the +3/-7 rate law plus the real-time bound.
++static bool hyundai_lkas_park_tx(const CANPacket_t *msg) {
++  uint32_t ts = microsecond_timer_get();
++  uint32_t torque_raw = (GET_BYTES(msg, 0, 4) >> 16) & 0x7FFU;  // CR_Lkas_StrToqReq 16|11, offset -1024
++  int torque = (int)torque_raw - 1024;
++  bool steer_req = GET_BIT(msg, 27U);                                 // CF_Lkas_ActToi
++  bool actuation = (torque != 0) || steer_req;
++
++  bool violation = hyundai_lkas_park_capped(ts) || !hyundai_lkas_park_parked(ts);
++  if (actuation && !violation) {
++    violation = (SAFETY_ABS(torque) > HYUNDAI_LKAS_PARK_MAX_TORQUE) || ((torque != 0) && !steer_req);
++    violation = violation || !hyundai_lkas_park_window_ok(ts);
++    violation = violation || !hyundai_lkas_park_rate_ok(torque, ts);
++  }
++  if (!violation && actuation) {
++    hyundai_lkas_park_torque_last = torque;
++  } else {
++    // passive frame, or ANY rejected frame: the rate reference drops to zero (as steer_torque_cmd_checks does on a
++    // violation), so after a refusal the runner must ramp up from zero again - never resume from the old level
++    hyundai_lkas_park_torque_last = 0;
++    hyundai_lkas_park_rt_last = 0;
++    hyundai_lkas_park_ts_rt = ts;
++  }
++  if (!violation) {
++    hyundai_lkas_park_tx_seen = true;
++    hyundai_lkas_park_ts_tx = ts;
++  }
++  return !violation;
++}
++
+ // Rolling mode only: the camera's 0x38D (bus 2 -> 0) is blocked ONLY while panda is actively transmitting it (an accepted
+ // 0x38D within HYUNDAI_FCA11_ROLL_TX_STALE_US) and the camera has not requested actuation. Before our first frame, after
+ // we stop, or after a real camera request, the camera's own FCA11 reaches the ESC again within one camera period.
+@@ -373,6 +584,31 @@ static bool hyundai_fwd_hook(int bus_num, int addr) {
+     block = hyundai_fca11_long_tx_seen && !hyundai_fca11_long_camera_owns &&
+             (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_fca11_long_ts_tx) <= HYUNDAI_FCA11_LONG_TX_STALE_US);
+   }
++  if (hyundai_lkas_park_test && (bus_num == 2) && (addr == 0x340)) {
++    // parked steering test: the camera's LKAS11 is blocked ONLY while panda transmitted an accepted 0x340 within
++    // TX_STALE (never two LKAS11 sources at the MDPS) AND panda would still accept our next frame (parked, inside the
++    // cap). Before our first frame and after runner death / disarm the camera is back within ~100 ms; the moment the
++    // car leaves park (gear, wheel, stale input) or the 60 s cap expires - i.e. the moment panda starts REFUSING our
++    // frames - the camera is forwarded on its very next frame, so the MDPS is never left without LKAS11.
++    //
++    // INVARIANT: this block deliberately mirrors the PASSIVE TX-accept predicate (parked && !capped), NOT the actuating
++    // one (which additionally needs window_ok / !cut). The runner always maintains a passive floor (torque 0 / ActToi 0
++    // frames during the run and for the 0.3 s release tail after any abort, until it disarms), and a latched cut bars
++    // ACTUATING frames only - a passive frame is still accepted while parked and inside the cap. So "panda is taking our
++    // frames right now" == parked && !capped, which is exactly when the camera must stay off. Adding !cut / window_ok
++    // here would clear the block the instant a cut latches while the runner is still flowing ACCEPTED passive frames,
++    // forwarding the camera alongside us: two LKAS11 sources at the MDPS for up to the release tail, the exact hazard
++    // this mode forbids (harness invariant I4). The cost of keeping it is bounded and benign: while a cut is latched the
++    // MDPS sees a <= ~20 ms LKAS11 gap (our actuating frame refused, the runner reflows accepted passive frames on its
++    // next tick; the runner's own rejected-frame abort fires within that tick) - zero-source at standstill, well under
++    // the harness's 50 ms gap allowance. Camera resume stays guaranteed by !parked, !capped and TX_STALE, so the block
++    // can never wedge. Keep I4 in mind: it holds only while the runner's max inter-frame gap stays < TX_STALE (100 ms);
++    // if the fallback latency ever drifts past that, I4 breaks even with this predicate.
++    uint32_t now = microsecond_timer_get();
++    block = hyundai_lkas_park_tx_seen &&
++            (safety_get_ts_elapsed(now, hyundai_lkas_park_ts_tx) <= HYUNDAI_LKAS_PARK_TX_STALE_US) &&
++            !hyundai_lkas_park_capped(now) && hyundai_lkas_park_parked(now);
++  }
+   return block;
+ }
+ 
+@@ -643,6 +879,10 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+     hyundai_fca11_long_rx(msg);
+   }
+ 
++  if (hyundai_lkas_park_test) {
++    hyundai_lkas_park_rx(msg);
++  }
++
+   hyundai_common_reset_acc_main_on_mismatches();
+ }
+ 
+@@ -827,8 +1067,13 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+                                         hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT :
+                                         cn7_ramp ? HYUNDAI_STEERING_LIMITS_CN7_RAMP : HYUNDAI_STEERING_LIMITS;
+ 
+-    if (steer_torque_cmd_checks(desired_torque, steer_req, limits)) {
++    if (hyundai_lkas_park_test) {
++      // TEST-ONLY parked sweep (bit 512): openpilot is stopped and controls_allowed plays no part; panda's own parked
++      // rules (hyundai_lkas_park_tx) are the only enforcer. The normal path below is untouched when the bit is unset.
++      tx = hyundai_lkas_park_tx(msg);
++    } else if (steer_torque_cmd_checks(desired_torque, steer_req, limits)) {
+       tx = false;
++    } else {
+     }
+   }
+ 
+@@ -947,10 +1192,19 @@ static safety_config hyundai_init(uint16_t param) {
+     {0x38D, 0, 8, .check_relay = true, .disable_static_blocking = true},  // FCA11 Bus 0, see hyundai_fwd_hook
+   };
+ 
++  // TEST-ONLY parked LKAS11 sweep (bit 512): LKAS11 ALONE. check_relay stays true (a bus-0 0x340 from the car is still
++  // a relay fault), but the camera's copy is blocked DYNAMICALLY (hyundai_fwd_hook): forwarded until panda transmits,
++  // and again within 100 ms after panda stops. LFAHDA_MFC (0x485), CLU11, the pedal and every SCC/FCA message are NOT
++  // transmittable; the camera's 0x485 keeps forwarding.
++  static const CanMsg HYUNDAI_LKAS_PARK_TX_MSGS[] = {
++    {0x340, 0, 8, .check_relay = true, .disable_static_blocking = true},  // LKAS11 Bus 0, see hyundai_fwd_hook
++  };
++
+   hyundai_common_init(param);
+   hyundai_legacy = false;
+   hyundai_fca11_rolling_reset();
+   hyundai_fca11_long_reset();
++  hyundai_lkas_park_reset();
+ 
+   safety_config ret;
+   if (hyundai_longitudinal) {
+@@ -1132,8 +1386,29 @@ static safety_config hyundai_init(uint16_t param) {
+       HYUNDAI_LDA_BUTTON_ADDR_CHECK
+     };
+ 
++    // parked LKAS11 sweep: gear (LVR12) + steering angle (SAS11) join the RX checks so their lag/validity is policed
++    static RxCheck hyundai_non_scc_lkas_park_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_LKAS_PARK_SAS_ADDR_CHECK
++    };
++
++    static RxCheck hyundai_non_scc_lkas_park_lda_button_addr_checks[] = {
++      HYUNDAI_COMMON_RX_CHECKS(false)
++      HYUNDAI_FCA11_ROLL_GEAR_ADDR_CHECK
++      HYUNDAI_LKAS_PARK_SAS_ADDR_CHECK
++      HYUNDAI_LDA_BUTTON_ADDR_CHECK
++    };
++
+     SET_TX_MSGS(HYUNDAI_TX_MSGS, ret);
+-    if (hyundai_fca11_brake_test) {  // hyundai_common_init: non-SCC ICE only, never with any openpilot longitudinal
++    if (hyundai_lkas_park_test) {  // hyundai_common_init: non-SCC ICE only, no longitudinal, no pedal, no FCA11 bits
++      SET_TX_MSGS(HYUNDAI_LKAS_PARK_TX_MSGS, ret);
++      if (hyundai_has_lda_button) {
++        SET_RX_CHECKS(hyundai_non_scc_lkas_park_lda_button_addr_checks, ret);
++      } else {
++        SET_RX_CHECKS(hyundai_non_scc_lkas_park_addr_checks, ret);
++      }
++    } else if (hyundai_fca11_brake_test) {  // hyundai_common_init: non-SCC ICE only, never with any openpilot longitudinal
+       SET_TX_MSGS(HYUNDAI_FCA11_TEST_TX_MSGS, ret);
+       if (hyundai_fca11_rolling_test) {
+         SET_TX_MSGS(HYUNDAI_FCA11_ROLL_TX_MSGS, ret);
+@@ -1239,6 +1514,7 @@ static safety_config hyundai_legacy_init(uint16_t param) {
+   hyundai_fca11_brake_test = false;
+   hyundai_fca11_rolling_test = false;
+   hyundai_fca11_long = false;
++  hyundai_lkas_park_test = false;
+   hyundai_camera_scc = false;
+   return BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
+ }
+diff --git a/opendbc/safety/modes/hyundai_canfd.h b/opendbc/safety/modes/hyundai_canfd.h
+index bb68d623..d7ae97cb 100644
+--- a/opendbc/safety/modes/hyundai_canfd.h
++++ b/opendbc/safety/modes/hyundai_canfd.h
+@@ -277,6 +277,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
+   hyundai_fca11_brake_test = false;  // FCA11 brake test is CAN (non-SCC) only
+   hyundai_fca11_rolling_test = false;
+   hyundai_fca11_long = false;  // FCA11 long braking is CAN (non-SCC ICE + pedal) only
++  hyundai_lkas_park_test = false;  // parked LKAS11 sweep is CAN (non-SCC ICE) only
+ 
+   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
+   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index 508090f5..c8ec6499 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -27,6 +27,7 @@ enum {
+   HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64,  // TEST-ONLY: parked FCA11 (0x38D) brake-injection research, see hyundai.h
+   HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST = 128,  // TEST-ONLY: extends 64 to a low-speed rolling window (needs 64), see hyundai.h
+   HYUNDAI_PARAM_SP_FCA11_LONG = 256,  // PRODUCTION (toggle-gated): FCA11 decel on top of the gas interceptor, see hyundai.h
++  HYUNDAI_PARAM_SP_LKAS_PARK_TEST = 512,  // TEST-ONLY: parked LKAS11 (0x340) steering-torque sweep, see hyundai.h
+   HYUNDAI_PARAM_SP_CN7_STEER_RAMP = 1024,  // Elantra N (CN7 non-SCC): LKAS11 torque rate-up 4/frame instead of 3, see hyundai.h
+ };
+ 
+@@ -107,6 +108,15 @@ bool hyundai_fca11_rolling_test = false;
+ extern bool hyundai_fca11_long;
+ bool hyundai_fca11_long = false;
+ 
++// TEST-ONLY, NOT FOR ROAD USE (HYUNDAI_PARAM_SP_LKAS_PARK_TEST, bit 512). Parked steering-torque sweep: armed ONLY by the
++// steer-test runner (raw 0xdf/0xdc, openpilot stopped). While armed the ONLY transmittable message is LKAS11 (0x340),
++// and only while the car is parked (gear P or N, every wheel at standstill, inputs fresh), within a 60 s cap per arm,
++// with |torque| <= 384 and the +3/-7 per-frame rate law enforced by panda itself; any MDPS12 fault bit, driver torque,
++// gas, wheel motion, gear change or the cap LATCHES a cut until the next init. Non-SCC ICE only, never with any
++// openpilot longitudinal mode or the FCA11 test/long bits. Rules and per-arm state: hyundai.h (hyundai_lkas_park_*).
++extern bool hyundai_lkas_park_test;
++bool hyundai_lkas_park_test = false;
++
+ // Gas interceptor only: factory (conventional) cruise MAIN armed, EMS16 CRUISE_LAMP_M. The factory cruise can only engage
+ // while MAIN is armed, and openpilot never sends CLU11 in this mode (no CANCEL to fight it), so pedal-long is locked out
+ // while it is armed: controls_allowed is cleared and no button may grant it (fail closed, never two speed controllers).
+@@ -410,6 +420,16 @@ void hyundai_common_init(uint16_t param) {
+   // rolling extension: only on top of an armed bit 64 (so non-SCC ICE, no openpilot longitudinal, no pedal)
+   hyundai_fca11_rolling_test = hyundai_fca11_brake_test && GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_FCA11_ROLLING_TEST);
+ 
++  // parked LKAS11 sweep (TEST-ONLY, bit 512): non-SCC ICE, no openpilot longitudinal, never together with the FCA11
++  // test bits (64/128 win: one test mode at a time). Like the FCA11 test it removes the pedal (no 0x200/0x700 TX) and
++  // therefore FCA11 long (bit 256, which needs the pedal) as well.
++  hyundai_lkas_park_test = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_LKAS_PARK_TEST) && non_scc_ice_no_long &&
++                           !hyundai_fca11_brake_test;
++  if (hyundai_lkas_park_test) {
++    hyundai_gas_interceptor = false;
++    hyundai_gas_interceptor_remapped = false;
++  }
++
+   // PRODUCTION FCA11 long braking (bit 256) rides ON TOP of the gas interceptor: it needs the pedal active
+   // (non-SCC ICE, no SCC-replacement longitudinal) and is mutually exclusive with the TEST bits (64/128), which
+   // take over FCA11 for runner-driven research with openpilot disengaged. While armed, panda polices FCA11 decel
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index c3b05e2b..1b63b32e 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -22,7 +22,9 @@ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_DBC,
+ 
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_FCA11_TEST_MAX_DEC, HYUNDAI_FCA11_ROLL_MAX_DEC, \
+   HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH, HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH, HYUNDAI_FCA11_LONG_MAX_DEC, \
+-  HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, HYUNDAI_FCA11_LONG_RATE_STEP
++  HYUNDAI_FCA11_LONG_MIN_SPEED_KPH, HYUNDAI_FCA11_LONG_RATE_STEP, HYUNDAI_LKAS_PARK_MAX_TORQUE, HYUNDAI_LKAS_PARK_RATE_UP, \
++  HYUNDAI_LKAS_PARK_RATE_DOWN, HYUNDAI_LKAS_PARK_MAX_ARM_S, HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW, HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG, \
++  HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+ 
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+@@ -3001,5 +3003,593 @@ class TestHyundaiNonSCCSafety_HEV_EV(TestHyundaiSafety):
+     return self.packer.make_can_msg_safety(self.GAS_MSG[0], 0, values, fix_checksum=checksum)
+ 
+ 
++@parameterized_class(LDA_BUTTON)
++class TestHyundaiNonSCCLkasParkTestSafety(TestHyundaiNonSCCSafety):
++  """
++    TEST-ONLY parked LKAS11 steering sweep (HyundaiSafetyFlagsSP.LKAS_PARK_TEST, bit 512) on a non-SCC ICE car.
++    TX = LKAS11 ONLY (check_relay, DYNAMIC camera blocking). Passive frames (torque 0, ActToi 0) need only the parked
++    state + the 60 s cap; actuating frames need the full window (every input seen + fresh, no latched cut, no gas),
++    |torque| <= 384, ActToi with torque, and the +3/-7 rate law + 112/250 ms real-time bound - independent of
++    controls_allowed (openpilot is stopped). setUp puts the car PARKED (gear P, wheels 0, all inputs fresh).
++  """
++  TX_MSGS = [[0x340, 0]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x340,)}
++  FWD_BLACKLISTED_ADDRS = {}  # dynamic: see test_camera_lkas_*
++  T0 = 1_000_000
++  cnt_lvr = 0
++
++  @classmethod
++  def setUpClass(cls):
++    if cls.__name__ == "TestHyundaiNonSCCLkasParkTestSafety":
++      cls.safety = None
++      raise unittest.SkipTest
++
++  def setUp(self):
++    self.packer = CANPackerSafety("hyundai_can_generated")
++    self.safety = libsafety_py.libsafety
++    # arm at T0 WITHOUT a second set_safety_hooks after init_tests (that would reset safety_mode_cnt and mute the relay
++    # check, see test_relay_check_kept); init_tests zeroes the timer, so put it back to the arm time
++    self.safety.set_timer(self.T0)
++    self.safety.set_current_safety_param_sp(self._test_sp())
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++    self.safety.init_tests()
++    self.safety.set_timer(self.T0)
++    self._park()
++
++  def _test_sp(self) -> int:
++    return HyundaiSafetyFlagsSP.NON_SCC | HyundaiSafetyFlagsSP.LKAS_PARK_TEST | self.SAFETY_PARAM_SP
++
++  # inherited MADS checks assume a fresh init (no prior parked traffic): run them from a fresh arm
++  def test_mads_button_not_engaged_without_press(self):
++    self._rearm()
++    super().test_mads_button_not_engaged_without_press()
++
++  def test_enable_control_allowed_with_manual_mads_button_state(self):
++    self._rearm()
++    super().test_enable_control_allowed_with_manual_mads_button_state()
++
++  def test_button_sends(self):
++    # CLU11 is NOT in this mode's TX list: no button frame of any kind, whatever controls_allowed / cruise state
++    for ca in (False, True):
++      self.safety.set_controls_allowed(ca)
++      for btn in (Buttons.NONE, Buttons.RESUME, Buttons.SET, Buttons.CANCEL):
++        self.assertFalse(self._tx(self._button_msg(btn)), (ca, btn))
++
++  def _rearm(self, sp=None, t=None):
++    # a fresh arm = a new 0xdc: set_safety_hooks re-runs hyundai_init (clears the cut, the clock and all evidence)
++    self.safety.set_timer(self.T0 if t is None else t)
++    self.safety.set_current_safety_param_sp(self._test_sp() if sp is None else sp)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++
++  # --- messages ---
++  def _gear_msg(self, gear):
++    return self.packer.make_can_msg_safety("LVR12", 0, {"CF_Lvr_Gear": gear})
++
++  def _wheel_msg(self, fl, fr=None, rl=None, rr=None):
++    vals = {"FL": fl, "FR": fl if fr is None else fr, "RL": fl if rl is None else rl, "RR": fl if rr is None else rr}
++    values = {"WHL_SPD_%s" % k: v * 0.03125 for k, v in vals.items()}
++    values["WHL_SPD_AliveCounter_LSB"] = (self.cnt_speed % 16) & 0x3
++    values["WHL_SPD_AliveCounter_MSB"] = (self.cnt_speed % 16) >> 2
++    self.__class__.cnt_speed += 1
++    return self.packer.make_can_msg_safety("WHL_SPD11", 0, values, fix_checksum=checksum)
++
++  def _sas_msg(self, angle_deg):
++    # SAS11 is 6 bytes on the car (the DBC says 5): pad, exactly as the real frame arrives
++    dat = bytearray(self.packer.make_can_msg("SAS11", 0, {"SAS_Angle": angle_deg})[1]) + b"\x00"
++    return libsafety_py.make_CANPacket(0x2B0, 0, bytes(dat[:6]))
++
++  def _mdps12(self, **kw):
++    values = {"CR_Mdps_StrColTq": 0, "CR_Mdps_StrTq": 0.0, "CR_Mdps_OutTq": 0.0}
++    values.update(kw)
++    return self.packer.make_can_msg_safety("MDPS12", 0, values)
++
++  def _park(self, gear=0, wheel=0, angle=0.0, **mdps):
++    self.assertTrue(self._rx(self._user_brake_msg(False)))
++    self.assertTrue(self._rx(self._user_gas_msg(0)))
++    self.assertTrue(self._rx(self._gear_msg(gear)))
++    self.assertTrue(self._rx(self._wheel_msg(wheel)))
++    self.assertTrue(self._rx(self._sas_msg(angle)))
++    self.assertTrue(self._rx(self._mdps12(**mdps)))
++
++  def _lkas(self, torque, steer_req=None):
++    if steer_req is None:
++      steer_req = 1 if torque != 0 else 0
++    return self._torque_cmd_msg(torque, steer_req=steer_req)
++
++  def _ramp(self, target, step=None):
++    # walk the accepted reference to `target` inside the rate law; every frame must pass
++    cur = 0
++    step = HYUNDAI_LKAS_PARK_RATE_UP if step is None else step
++    t = self.safety.get_current_safety_param()  # unused: keep timer untouched (rt window may roll)
++    while cur != target:
++      cur = cur + max(-step, min(step, target - cur))
++      self.assertTrue(self._tx(self._lkas(cur)), cur)
++    return cur
++
++  # *** constants: C == Python ***
++
++  def test_c_python_constants_match(self):
++    self.assertEqual(HyundaiSafetyFlagsSP.LKAS_PARK_TEST, 512)
++    with open(HYUNDAI_COMMON_H) as f:
++      self.assertRegex(f.read(), r"HYUNDAI_PARAM_SP_LKAS_PARK_TEST\s*=\s*512\b")
++    self.assertEqual(HYUNDAI_LKAS_PARK_MAX_TORQUE, _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_MAX_TORQUE"))
++    self.assertEqual(HYUNDAI_LKAS_PARK_RATE_UP, _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_RATE_UP"))
++    self.assertEqual(HYUNDAI_LKAS_PARK_RATE_DOWN, _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_RATE_DOWN"))
++    self.assertEqual(int(HYUNDAI_LKAS_PARK_MAX_ARM_S * 1e6), _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_MAX_ARM_US"))
++    self.assertEqual(HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW, _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_WHEEL_MAX"))
++    self.assertEqual(int(HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG * 10), _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_MAX_ANGLE"))
++    self.assertEqual(int(HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM * 100), _c_define(HYUNDAI_H, "HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ"))
++    # the panda limits equal the car-layer limits the real carcontroller uses for this platform
++    from opendbc.car.hyundai.values import CarControllerParams, CAR
++    from opendbc.car.structs import CarParams as CP_
++    cp = CP_(carFingerprint=CAR.HYUNDAI_ELANTRA_2022_NON_SCC)
++    ccp = CarControllerParams(cp)
++    # STEER_MAX and the decay rate are the same everywhere (the CN7 ramp only changes rate-UP, and it keeps 384).
++    self.assertEqual(ccp.STEER_MAX, HYUNDAI_LKAS_PARK_MAX_TORQUE)
++    self.assertEqual(ccp.STEER_DELTA_DOWN, HYUNDAI_LKAS_PARK_RATE_DOWN)
++    # The parked sweep has its OWN +3/-7 law (HYUNDAI_LKAS_PARK_RATE_UP, pinned against hyundai.h above). It is NOT the
++    # car-layer STEER_DELTA_UP: the normal driving path for this platform carries the CN7_STEER_RAMP, so ccp's rate-up is
++    # 4 here. The park mode deliberately keeps +3 (its own contract, reviewed) and does not adopt the ramp.
++    self.assertEqual(ccp.STEER_DELTA_UP, 4)  # CN7_STEER_RAMP (patch 0015): normal driving only
++    self.assertNotEqual(ccp.STEER_DELTA_UP, HYUNDAI_LKAS_PARK_RATE_UP)
++
++  # *** armed: accepts ***
++
++  def test_armed_accepts_ramp_both_directions(self):
++    for sign in (1, -1):
++      with self.subTest(sign=sign):
++        self._rearm()
++        self._park()
++        self.assertTrue(self._tx(self._lkas(0)))
++        cur = 0
++        for _ in range(17):  # 0 -> 51 in 17 frames (inside 112/250 ms)
++          cur += 3 * sign
++          self.assertTrue(self._tx(self._lkas(cur)), cur)
++        self.assertTrue(self._tx(self._lkas(cur - 7 * sign)))  # decay 7
++        self.assertTrue(self._tx(self._lkas(0)))               # immediate passive release
++
++  def test_independent_of_controls_allowed(self):
++    for ca in (False, True):
++      with self.subTest(controls_allowed=ca):
++        self._rearm()
++        self._park()
++        self.safety.set_controls_allowed(ca)
++        self.assertTrue(self._tx(self._lkas(3)))
++
++  def test_full_ladder_to_384_accepted(self):
++    # the runner's ladder cadence: +3 per 10 ms frame -> 0..384 in 128 frames (1.28 s), each step inside 112/250 ms
++    t = self.T0
++    cur = 0
++    while cur < HYUNDAI_LKAS_PARK_MAX_TORQUE:
++      t += 10_000
++      self.safety.set_timer(t)
++      self._park()
++      cur = min(cur + 3, HYUNDAI_LKAS_PARK_MAX_TORQUE)
++      self.assertTrue(self._tx(self._lkas(cur)), cur)
++    self.assertEqual(cur, 384)
++    t += 10_000
++    self.safety.set_timer(t)
++    self._park()
++    self.assertTrue(self._tx(self._lkas(384)))  # hold
++
++  def test_gear_n_accepted(self):
++    self._rearm()
++    self._park(gear=6)
++    self.assertTrue(self._tx(self._lkas(3)))
++
++  # *** unset: rejects exactly like normal non-SCC ***
++
++  def _assert_normal(self):
++    # normal behavior: camera LKAS11 statically blocked, openpilot steering requires controls_allowed
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x485))
++    self.safety.set_controls_allowed(False)
++    self.assertFalse(self._tx(self._lkas(3)))
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertTrue(self._tx(common.make_msg(0, 0x485, 4)))
++
++  def test_unset_bit_is_normal_mode(self):
++    self._rearm(sp=HyundaiSafetyFlagsSP.NON_SCC | self.SAFETY_PARAM_SP)
++    self._park()
++    self._assert_normal()
++
++  def test_ignored_without_non_scc(self):
++    self._rearm(sp=HyundaiSafetyFlagsSP.LKAS_PARK_TEST | self.SAFETY_PARAM_SP)
++    self._park()
++    self._assert_normal()
++
++  def test_ignored_with_fca11_test_bit(self):
++    # one test mode at a time: the FCA11 test bit wins, LKAS11 not transmittable at all
++    self._rearm(sp=self._test_sp() | HyundaiSafetyFlagsSP.FCA11_BRAKE_TEST)
++    self._park()
++    self.assertFalse(self._tx(self._lkas(0)))
++    self.assertFalse(self._tx(self._lkas(3)))
++
++  def test_overrides_gas_interceptor(self):
++    for dialect in (0, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED):
++      for extra in (0, HyundaiSafetyFlagsSP.FCA11_LONG):
++        with self.subTest(dialect=dialect, extra=extra):
++          self._rearm(sp=self._test_sp() | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | dialect | extra)
++          self._park()
++          self.safety.set_controls_allowed(True)
++          self.assertTrue(self._tx(self._lkas(3)))
++          for addr in (0x200, 0x700, 0x38D, 0x485, 0x4F1):
++            self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
++          # the driver's gas (EMS16, not the pedal sensor) must still be the gas source and still cut
++          self._rx(self._user_gas_msg(1))
++          self.assertFalse(self._tx(self._lkas(6)))
++          self._rx(self._user_gas_msg(0))
++          self.assertFalse(self._tx(self._lkas(3)))
++
++  def test_ignored_on_unsupported_cars(self):
++    for param in (HyundaiSafetyFlags.EV_GAS, HyundaiSafetyFlags.HYBRID_GAS, HyundaiSafetyFlags.FCEV_GAS,
++                  HyundaiSafetyFlags.CAMERA_SCC, HyundaiSafetyFlags.LONG):
++      with self.subTest(param=param):
++        self.safety.set_current_safety_param_sp(self._test_sp())
++        self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, param)
++        self.safety.set_controls_allowed(False)
++        self._park()
++        self.assertFalse(self._tx(self._lkas(3)))
++    for mode in (CarParams.SafetyModel.hyundaiLegacy, CarParams.SafetyModel.hyundaiCanfd):
++      with self.subTest(mode=mode):
++        self.safety.set_current_safety_param_sp(self._test_sp())
++        self.safety.set_safety_hooks(mode, 0)
++        self.safety.set_controls_allowed(False)
++        self.assertFalse(self._tx(self._lkas(3)))
++    # legacy shares hyundai_tx_hook: with the bit set it must still be the NORMAL controls_allowed steering rule
++    # (not parked: the park rules would refuse both frames below)
++    self.safety.set_current_safety_param_sp(self._test_sp())
++    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiLegacy, 0)
++    self.safety.set_controls_allowed(True)
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertTrue(self._tx(self._lkas(3)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))   # legacy: camera LKAS11 statically blocked as always
++
++  # *** TX list / forwarding ***
++
++  def test_tx_list_only_lkas11(self):
++    self.safety.set_controls_allowed(True)
++    for addr in (0x485, 0x4F1, 0x38D, 0x483, 0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x7D0, 0x200, 0x700):
++      self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
++
++  def test_relay_check_kept(self):
++    self._rx(common.make_msg(0, 0x340, 8))
++    self.assertTrue(self.safety.get_relay_malfunction())
++
++  def test_camera_lkas_forwarded_until_we_transmit(self):
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))     # armed, not transmitting: camera owns LKAS11
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x485))     # LFAHDA always the camera's
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x485))
++    self.safety.set_timer(self.T0 + 100_000)
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++    self.safety.set_timer(self.T0 + 100_001)
++    self._park()                                                    # inputs fresh: only TX staleness can hand back
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))     # runner silent > 100 ms: camera back
++
++  def test_rejected_tx_does_not_block_camera(self):
++    self.assertFalse(self._tx(self._lkas(HYUNDAI_LKAS_PARK_MAX_TORQUE + 1)))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))
++
++  def test_camera_back_immediately_when_not_parked(self):
++    # the moment panda would refuse our next frame (car left park / input stale / cap) the camera's LKAS11 is forwarded
++    # on its very next frame - the MDPS is never left without LKAS11 for the 100 ms stale window
++    cases = {"wheel": lambda: self._rx(self._wheel_msg(HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW + 1)),
++             "gear_d": lambda: self._rx(self._gear_msg(5)),
++             "gear_change": lambda: self._rx(self._gear_msg(6)),
++             "stale": lambda: self.safety.set_timer(self.T0 + 100_001)}
++    for name, f in cases.items():
++      with self.subTest(case=name):
++        self._rearm()
++        self._park()
++        self.assertTrue(self._tx(self._lkas(0)))
++        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++        f()
++        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))
++
++  def test_camera_back_at_time_cap(self):
++    cap_us = int(HYUNDAI_LKAS_PARK_MAX_ARM_S * 1e6)
++    self.safety.set_timer(self.T0 + cap_us)
++    self._park()
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++    self.safety.set_timer(self.T0 + cap_us + 1)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))
++
++  def test_latched_cut_keeps_blocking_while_passive_flows(self):
++    # a cut only gates ACTUATION: the passive stream keeps replacing the camera (no source flip-flop at the MDPS)
++    self.assertTrue(self._tx(self._lkas(3)))
++    self._rx(self._mdps12(CF_Mdps_ToiFlt=1))
++    self._park()
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x340))
++
++  # *** torque / rate law ***
++
++  def test_torque_clamp(self):
++    for torque in (385, 400, 1023, -385, -1024):
++      with self.subTest(torque=torque):
++        self._rearm()
++        self._park()
++        self.assertFalse(self._tx(self._lkas(torque)))
++
++  def test_torque_clamp_at_the_limit(self):
++    # 384 -> 385 is a legal +1 step: only the clamp can refuse it (both signs)
++    for sign in (1, -1):
++      with self.subTest(sign=sign):
++        t = self.T0
++        self._rearm()
++        self._park()
++        cur = 0
++        while abs(cur) < HYUNDAI_LKAS_PARK_MAX_TORQUE:
++          t += 10_000
++          self.safety.set_timer(t)
++          self._park()
++          cur = sign * min(abs(cur) + 3, HYUNDAI_LKAS_PARK_MAX_TORQUE)
++          self.assertTrue(self._tx(self._lkas(cur)), cur)
++        t += 10_000
++        self.safety.set_timer(t)
++        self._park()
++        self.assertFalse(self._tx(self._lkas(sign * (HYUNDAI_LKAS_PARK_MAX_TORQUE + 1))))
++
++  def test_steer_req_required_with_torque(self):
++    self.assertFalse(self._tx(self._lkas(3, steer_req=0)))
++    self.assertTrue(self._tx(self._lkas(0, steer_req=1)))   # ActToi with zero torque: actuating, in window: ok
++    self.assertTrue(self._tx(self._lkas(3, steer_req=1)))
++
++  def test_rate_up_limit(self):
++    for sign in (1, -1):
++      for step, ok in ((3, True), (4, False), (50, False)):
++        with self.subTest(sign=sign, step=step):
++          self._rearm()
++          self._park()
++          self.assertEqual(ok, self._tx(self._lkas(step * sign)))
++          if ok:
++            self.assertEqual(ok, self._tx(self._lkas(2 * step * sign)))
++
++  def test_rate_up_from_nonzero_reference(self):
++    # growth is +3 per frame from ANY reference, not only from zero (both signs)
++    for sign in (1, -1):
++      for step, ok in ((3, True), (4, False)):
++        with self.subTest(sign=sign, step=step):
++          self._rearm()
++          self._park()
++          self._ramp(30 * sign)
++          self.assertEqual(ok, self._tx(self._lkas((30 + step) * sign)))
++
++  def test_rate_down_limit(self):
++    for sign in (1, -1):
++      for drop, ok in ((7, True), (8, False)):
++        with self.subTest(sign=sign, drop=drop):
++          self._rearm()
++          self._park()
++          self._ramp(30 * sign)
++          self.assertEqual(ok, self._tx(self._lkas((30 - drop) * sign)))
++
++  def test_zero_crossing_limited(self):
++    self._ramp(6)
++    self.assertFalse(self._tx(self._lkas(-4)))   # 6 -> -4 skips the +/-3 crossing bound
++    self._rearm(); self._park()
++    self._ramp(3)
++    self.assertTrue(self._tx(self._lkas(-3)))    # 3 -> -3: lo = max(3-7, -3) = -3
++
++  def test_realtime_limit(self):
++    # 112 per 250 ms: 38 frames of +3 (=114) inside one window is refused at the 38th
++    t = self.T0
++    for i in range(1, 38):
++      t += 1000
++      self.safety.set_timer(t)
++      self._park()
++      self.assertTrue(self._tx(self._lkas(3 * i)), i)
++    t += 1000
++    self.safety.set_timer(t)
++    self._park()
++    self.assertFalse(self._tx(self._lkas(3 * 38)))
++
++  def test_rejection_resets_reference(self):
++    self._ramp(30)
++    self.assertFalse(self._tx(self._lkas(40)))   # rejected
++    self.assertFalse(self._tx(self._lkas(30)))   # cannot resume at the old level ...
++    self.assertTrue(self._tx(self._lkas(3)))     # ... must ramp from zero again
++
++  def test_passive_release_resets_reference(self):
++    self._ramp(30)
++    self.assertTrue(self._tx(self._lkas(0)))
++    self.assertFalse(self._tx(self._lkas(6)))
++    self.assertTrue(self._tx(self._lkas(3)))
++
++  # *** parked state (every frame) ***
++
++  def test_wheel_motion_blocks_every_frame(self):
++    for i in range(4):
++      for raw, ok in ((HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW, True), (HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW + 1, False)):
++        with self.subTest(wheel=i, raw=raw):
++          self._rearm()
++          self._park()
++          w = [0, 0, 0, 0]
++          w[i] = raw
++          self._rx(self._wheel_msg(*w))
++          self.assertEqual(ok, self._tx(self._lkas(3)))
++          self.assertEqual(ok, self._tx(self._lkas(0)))   # passive too: never transmit while moving
++
++  def test_gear_rules(self):
++    for gear in (4, 5, 7, 8, 12):
++      with self.subTest(gear=gear):
++        self._rearm()
++        self._park(gear=gear)
++        self.assertFalse(self._tx(self._lkas(0)))
++        self.assertFalse(self._tx(self._lkas(3)))
++
++  def test_gear_change_p_to_n_refused(self):
++    # the arm's FIRST gear is the reference: P then N inside one arm is a change (re-arm per gear)
++    self.assertTrue(self._tx(self._lkas(3)))
++    self._rx(self._gear_msg(6))
++    self.assertFalse(self._tx(self._lkas(0)))
++    self.assertFalse(self._tx(self._lkas(3)))
++    self._rx(self._gear_msg(0))
++    self.assertTrue(self._tx(self._lkas(0)))     # back in the reference gear: passive ok ...
++    self.assertFalse(self._tx(self._lkas(3)))    # ... actuation latched off
++
++  def test_needs_every_input_seen(self):
++    feeds = {"gear": lambda: self._rx(self._gear_msg(0)), "speed": lambda: self._rx(self._wheel_msg(0)),
++             "angle": lambda: self._rx(self._sas_msg(0)), "mdps": lambda: self._rx(self._mdps12()),
++             "gas": lambda: self._rx(self._user_gas_msg(0))}
++    for missing in feeds:
++      with self.subTest(missing=missing):
++        self._rearm(t=50_000)  # near-zero timer: a never-seen input's ts=0 looks FRESH, only the seen-mask blocks it
++        for name, f in feeds.items():
++          if name != missing:
++            f()
++        self.assertFalse(self._tx(self._lkas(3)))
++
++  def test_stale_input_blocks(self):
++    feeds = {"gear": lambda: self._rx(self._gear_msg(0)), "speed": lambda: self._rx(self._wheel_msg(0)),
++             "angle": lambda: self._rx(self._sas_msg(0)), "mdps": lambda: self._rx(self._mdps12()),
++             "gas": lambda: self._rx(self._user_gas_msg(0))}
++    for stale in feeds:
++      with self.subTest(stale=stale):
++        self._rearm()
++        self._park()
++        self.safety.set_timer(self.T0 + 100_000)
++        self.assertTrue(self._tx(self._lkas(3)))   # exactly 100 ms: fresh
++        self.safety.set_timer(self.T0 + 100_001)
++        for name, f in feeds.items():
++          if name != stale:
++            f()
++        self.assertFalse(self._tx(self._lkas(3)))
++        feeds[stale]()
++        self.assertTrue(self._tx(self._lkas(3)))   # not latched: freshness restored -> ok (from the reset reference)
++
++  # *** latched cut ***
++
++  def _assert_cut_latched(self):
++    self.assertFalse(self._tx(self._lkas(3)))
++    self._park()                                   # conditions fully restored ...
++    self.assertFalse(self._tx(self._lkas(3)))      # ... still cut
++    self.assertFalse(self._tx(self._lkas(0, steer_req=1)))
++    self.assertTrue(self._tx(self._lkas(0)))       # the passive stream may continue (no LKAS11 gap at the MDPS)
++    self._rearm()
++    self._park()
++    self.assertTrue(self._tx(self._lkas(3)))       # a fresh arm starts un-cut
++
++  def test_cut_on_mdps_fault_bits(self):
++    for sig in ("CF_Mdps_Def", "CF_Mdps_ToiUnavail", "CF_Mdps_ToiFlt", "CF_Mdps_FailStat", "CF_Mdps_SErr"):
++      with self.subTest(sig=sig):
++        self._rearm()
++        self._park()
++        self.assertTrue(self._tx(self._lkas(3)))
++        self._rx(self._mdps12(**{sig: 1}))
++        self._assert_cut_latched()
++
++  def test_toi_active_is_not_a_fault(self):
++    self._rx(self._mdps12(CF_Mdps_ToiActive=1, CR_Mdps_OutTq=10.0))
++    self.assertTrue(self._tx(self._lkas(3)))
++
++  def test_cut_on_driver_torque(self):
++    lim = HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM
++    for tq, cut in ((lim, False), (-lim, False), (lim + 0.02, True), (-(lim + 0.02), True)):
++      with self.subTest(tq=tq):
++        self._rearm()
++        self._park()
++        self._rx(self._mdps12(CR_Mdps_StrTq=tq))
++        if cut:
++          self._assert_cut_latched()
++        else:
++          self.assertTrue(self._tx(self._lkas(3)))
++
++  def test_cut_on_angle(self):
++    lim = HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG
++    for ang, cut in ((lim, False), (-lim, False), (lim + 0.1, True), (-(lim + 0.1), True)):
++      with self.subTest(ang=ang):
++        self._rearm()
++        self._park()
++        self._rx(self._sas_msg(ang))
++        if cut:
++          self._assert_cut_latched()
++        else:
++          self.assertTrue(self._tx(self._lkas(3)))
++
++  def test_cut_on_gas(self):
++    self._rx(self._user_gas_msg(1))
++    self.assertFalse(self._tx(self._lkas(3)))
++    self._rx(self._user_gas_msg(0))
++    self._assert_cut_latched()
++
++  def test_cut_on_wheel_motion_latches(self):
++    self._rx(self._wheel_msg(HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW + 1))
++    self._rx(self._wheel_msg(0))
++    self._assert_cut_latched()
++
++  def test_cut_on_gear_leave(self):
++    for gear in (5, 7):
++      with self.subTest(gear=gear):
++        self._rearm()
++        self._park()
++        self._rx(self._gear_msg(gear))
++        self._rx(self._gear_msg(0))
++        self._assert_cut_latched()
++
++  # *** time cap ***
++
++  def test_time_cap(self):
++    cap_us = int(HYUNDAI_LKAS_PARK_MAX_ARM_S * 1e6)
++    self.safety.set_timer(self.T0 + cap_us)
++    self._park()
++    self.assertTrue(self._tx(self._lkas(3)))     # exactly 60 s: allowed
++    self.safety.set_timer(self.T0 + cap_us + 1)
++    self._park()
++    self.assertFalse(self._tx(self._lkas(0)))    # past the cap: EVERY frame refused, passive too
++    self.assertFalse(self._tx(self._lkas(3)))
++    self.safety.set_timer(self.T0 + cap_us + 100_002)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x340))  # camera owns LKAS11 again
++    self._rearm(t=self.T0 + cap_us + 200_000)
++    self._park()
++    self.assertTrue(self._tx(self._lkas(3)))     # re-arm restarts the clock
++
++  def test_brake_is_not_a_cut(self):
++    # parked with the foot on the brake is the normal test posture: never cut on brake
++    self._rx(self._user_brake_msg(True))
++    self.assertTrue(self._tx(self._lkas(3)))
++
++  # Inherited torque-steering suites assume the NORMAL controls_allowed / driver-limit semantics, which this mode
++  # replaces by its own parked rules (covered above: clamp, rate up/down, crossing, real-time, steer_req, latches).
++  @unittest.skip("parked LKAS rules replace the controls_allowed steering suite (see test_rate_*/test_torque_clamp)")
++  def test_steer_safety_check(self):
++    pass
++
++  @unittest.skip("parked LKAS rules replace the controls_allowed steering suite")
++  def test_non_realtime_limit_up(self):
++    pass
++
++  @unittest.skip("parked LKAS rules replace the controls_allowed steering suite")
++  def test_non_realtime_limit_down(self):
++    pass
++
++  @unittest.skip("parked LKAS rules replace the controls_allowed steering suite")
++  def test_against_torque_driver(self):
++    pass
++
++  @unittest.skip("parked LKAS rules replace the controls_allowed steering suite (see test_realtime_limit)")
++  def test_realtime_limits(self):
++    pass
++
++  @unittest.skip("parked LKAS: torque requires CF_Lkas_ActToi, no steer-req cut tolerance (test_steer_req_required_with_torque)")
++  def test_steer_req_bit(self):
++    pass
++
++  @unittest.skip("parked LKAS: no steer-req cut tolerance")
++  def test_steer_req_bit_frames(self):
++    pass
++
++  @unittest.skip("parked LKAS: no steer-req cut tolerance")
++  def test_steer_req_bit_multi_invalid(self):
++    pass
++
++  @unittest.skip("parked LKAS: no steer-req cut tolerance")
++  def test_steer_req_bit_realtime(self):
++    pass
++
++
+ if __name__ == "__main__":
+   unittest.main()
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index bf84610c..b19652cb 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -33,9 +33,16 @@ class HyundaiSafetyFlagsSP:
+   # period), a 2.5 s actuation budget with a 3 s cooldown, and an immediate camera hand-back. C mirror:
+   # HYUNDAI_PARAM_SP_FCA11_LONG.
+   FCA11_LONG = 256
++  # TEST-ONLY, NOT FOR ROAD USE: parked LKAS11 (0x340) steering-torque sweep, armed only by the steer-test runner with
++  # openpilot stopped. Panda honors it only on non-SCC ICE without openpilot longitudinal and never together with the
++  # FCA11 test bits; while armed LKAS11 is the ONLY transmittable message, only parked (gear P/N, every wheel at
++  # standstill, fresh inputs), |torque| <= HYUNDAI_LKAS_PARK_MAX_TORQUE with the +3/-7 rate law, a 60 s cap per arm and
++  # a latched cut on any MDPS12 fault bit / driver torque / gas / motion / gear change / angle. No car-layer code sets
++  # it. C mirror: HYUNDAI_PARAM_SP_LKAS_PARK_TEST.
++  LKAS_PARK_TEST = 512
+   # Elantra N (HYUNDAI_ELANTRA_2022_NON_SCC) only: panda allows LKAS11 torque rate-up 4/frame (default 3); STEER_MAX stays
+   # 384. C mirror: HYUNDAI_PARAM_SP_CN7_STEER_RAMP. Must match CarControllerParams.STEER_DELTA_UP for that platform.
+-  # Next free SP bit: 256 is FCA11_LONG (patch 0014), 512 is steer-test's unshipped LKAS_PARK_TEST; both must coexist.
++  # Both are test/car-layer SP bits on distinct flags: 512 LKAS_PARK_TEST (unshipped, this file) and 1024 CN7_STEER_RAMP.
+   CN7_STEER_RAMP = 1024
+ 
+ 
+@@ -58,6 +65,14 @@ HYUNDAI_FCA11_LONG_MAX_DEC = 30
+ HYUNDAI_FCA11_LONG_MIN_SPEED_KPH = 9
+ # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
+ HYUNDAI_FCA11_LONG_RATE_STEP = 4
++# *** TEST-ONLY parked LKAS11 sweep (LKAS_PARK_TEST) constants; unit tests pin each against safety/modes/hyundai.h ***
++HYUNDAI_LKAS_PARK_MAX_TORQUE = 384      # = CarControllerParams STEER_MAX
++HYUNDAI_LKAS_PARK_RATE_UP = 3           # = STEER_DELTA_UP
++HYUNDAI_LKAS_PARK_RATE_DOWN = 7         # = STEER_DELTA_DOWN
++HYUNDAI_LKAS_PARK_MAX_ARM_S = 60.0      # per-arm hard cap (C: HYUNDAI_LKAS_PARK_MAX_ARM_US)
++HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW = 12    # every wheel <= 12 raw (0.375 km/h)
++HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG = 85.0  # |SAS_Angle| above this latches the firmware cut
++HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM = 5.0  # |CR_Mdps_StrTq| above this latches the firmware cut
+ 
+ 
+ class HyundaiFlagsSP(IntFlag):
+-- 
+2.55.0
+

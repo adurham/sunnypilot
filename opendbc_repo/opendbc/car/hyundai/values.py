@@ -56,6 +56,13 @@ class CarControllerParams:
     else:
       self.STEER_MAX = 384
 
+    # CN7 Elantra N (non-SCC port): faster torque ramp-up only, ceiling unchanged. Logged EPS output (MDPS12 CR_Mdps_OutTq)
+    # saturates near a 270-300 command, so a higher STEER_MAX buys ~nothing; the measurable loss in sharp low-speed turns
+    # is the 3/frame ramp (0 -> 270 takes 0.9 s). 4 is the largest rate the panda real-time check (112 / 250 ms) permits.
+    # Panda mirror: HyundaiSafetyFlagsSP.CN7_STEER_RAMP (set in interface.py for this platform only).
+    if CP.carFingerprint == CAR.HYUNDAI_ELANTRA_2022_NON_SCC:
+      self.STEER_DELTA_UP = 4
+
 
 class HyundaiSafetyFlags(IntFlag):
   EV_GAS = 1

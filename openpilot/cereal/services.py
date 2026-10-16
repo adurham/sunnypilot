@@ -93,6 +93,26 @@ _services: dict[str, tuple] = {
   "carStateSP": (True, 100., 10),
   "liveMapDataSP": (True, 1., 1),
   "modelDataV2SP": (True, 20., None, QueueSize.BIG),
+
+  # offload shadow services (device-side return-path reframe, INTERFACES §7): the remote (Mac)
+  # model's outputs are republished here, NOT under the real modelV2/cameraOdometry/... names, so
+  # a second publisher never fights the device's own modeld. Registered so msgq/pub gets the
+  # right segment size and the topic exists for raw subscribers.
+  #
+  # PM decision 2026-10-07 (verified live on the Mac): the §7 arbitration hook reads these
+  # topics with a RAW msgq socket (msgq.sub_sock(name, segment_size=SERVICE_LIST[name].queue_size)
+  # -> receive() -> messaging.log_from_bytes()), which was proven end-to-end: a PubMaster on
+  # 'offloadModelV2' sends a real modelV2 Event and a raw subscriber receives it (224 bytes,
+  # which()='modelV2'). No capnp/Event.union member is needed while every consumer is raw-msgq
+  # OR is the arbitration hook itself. ONLY a cereal SubMaster([...]) subscription would need an
+  # Event.union member (SubMaster does new_message(name); a union member alone is not enough ->
+  # also add a SERVICE_LIST entry, which exists here). Add the members only if a future consumer
+  # insists on SubMaster; the C++ bridge and loggerd never see these names.
+  "offloadModelV2": (False, 20., None, QueueSize.BIG),
+  "offloadCameraOdometry": (False, 20., None, QueueSize.SMALL),
+  "offloadDrivingModelData": (False, 20., None, QueueSize.SMALL),
+  "offloadModelDataV2SP": (False, 20., None, QueueSize.BIG),
+
   "liveLocationKalman": (True, 20.),
 
   # debug

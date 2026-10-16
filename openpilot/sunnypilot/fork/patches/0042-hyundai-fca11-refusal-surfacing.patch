@@ -1,0 +1,683 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index ee567550..b79885ce 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -17,7 +17,7 @@ from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_MSG, DRIVE_MODE
+ from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PauseResumeTracker
+ from opendbc.sunnypilot.car.hyundai.wheel_consent import WheelConsentDetector, WheelGesture
+-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
++from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HYUNDAI_FCA11_PEDAL_STATE_OK
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+ 
+@@ -35,6 +35,13 @@ class CarStateExt:
+     # GAS_SENSOR STATE, 0 = NO_FAULT. Read by GasInterceptorCarController.create_gas_command (this CarState instance is
+     # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
+     self.interceptor_state = 0
++    # 0042 v3: True if ANY 0x701 frame in this CarState window carried a fault STATE (not in
++    # HYUNDAI_FCA11_PEDAL_STATE_OK). The panda latches its fail-closed pedal fault on EVERY frame
++    # (safety/modes/hyundai.h:962-963), but the CANParser `vl` view keeps only the LAST value per update, so a
++    # single fault frame sandwiched between accepted states (route 156's boot handshake, STATE [5, 3, 5]) is
++    # invisible to interceptor_state. This carries the all-frames verdict so the Fca11LongBrake pedal latch mirrors
++    # the panda's per-frame faulting. Published on THIS object, exactly like interceptor_state / fca11_unavailable.
++    self.interceptor_fault_seen = False
+     self.pedal_fault_monitor = PedalFaultMonitor()
+     # fork: FCA11 long braking (HyundaiFca11Brake) inputs the controller reads off CS: the freshest raw bus-2 camera
+     # 0x38D frame (t_nanos, dat) for the byte-exact mirror, and the "now" the freshness check compares it against
+@@ -150,6 +157,12 @@ class CarStateExt:
+       # driver intervention must stay visible for the post-drive analysis. The panda independently cuts
+       # on its own live gas_pressed, so nothing is hidden from it.
+       self.interceptor_state = int(cp_gas.vl[sensor_msg]["STATE"])
++      # 0042 v3: the panda faults on the pedal STATE of EVERY 0x701 frame, but `vl` above holds only the LAST value
++      # of the window, so a single fault frame sandwiched between accepted states (route 156's boot [5, 3, 5]) never
++      # reaches interceptor_state. Read the all-values view (`vl_all`) so the car-layer latch is panda-equivalent:
++      # True if any frame in the window is a fault, False when the window carried no 0x701 frame.
++      state_frames = cp_gas.vl_all[sensor_msg].get("STATE", []) if sensor_msg in cp_gas.vl_all else []
++      self.interceptor_fault_seen = any(int(s) not in HYUNDAI_FCA11_PEDAL_STATE_OK for s in state_frames)
+       # pedal fault the clear frames could not recover (set by the controller on the previous frame): standard cruise
+       # fault -> immediate disengage + alert, so the driver knows openpilot no longer has throttle authority
+       if self.pedal_fault_monitor.escalated:
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index b14f6d46..a4a20127 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -60,7 +60,8 @@ from opendbc.car import structs
+ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car.hyundai import cal_mode
+-from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP)
++from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP,
++                                                   HYUNDAI_FCA11_PEDAL_STATE_OK)
+ from opendbc.sunnypilot.car.hyundai import fca11_log
+ 
+ FCA11_ADDR = 0x38D
+@@ -151,6 +152,16 @@ FCA11_NORESPONSE_CMD_STABLE_S = 0.62
+ # alert on for a whole drive. (It also clears immediately on driver brake / disengage / gear != D / gas.)
+ FCA11_BRAKE_NOW_CLEAR_S = 2.0
+ 
++# *** 0042 (B): echo-based refusal surfacing ***
++# The panda's fail-closed cut latches (hyundai_fca11_long_cut / driver_cut) can refuse a SUSTAINED wall of our
++# actuating frames for the rest of an ignition, and that failure was otherwise SILENT (route 156: 3143/3143 actuating
++# frames refused, no driver alert). The car layer sees the pandad echo of every 0x38D it sends (src 128 = accepted by
++# the TX hook, src 192 = REJECTED). Count CONSECUTIVE refused ACTUATING echoes while braking; a streak this long
++# (~3 x the 20 ms 50 Hz send slot = ~60 ms) is a wall, not a transient, and sets the surfaced _refused_cut. An
++# ACCEPTED actuating echo (src 128) means the wall is gone: reset + self-heal. No send suppression rides on this -
++# refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with zero deadlock.
++FCA11_REFUSED_STREAK_CUT = 3
++
+ # 0040: per-episode logger. One compact JSON line per braking episode to /data/fca11-log/episodes.jsonl (see fca11_log
+ # for the schema, the fields and the reasoning). Inert (no accumulation, no I/O) unless enabled.
+ FCA11_LOG_ENABLED = os.environ.get("FCA11_LOG_DIR", "") != "0"
+@@ -462,11 +473,14 @@ class Fca11LongBrake:
+     self.affine_gain = affine_gain_enabled(CP_SP)
+     self.braking = False               # an FCA11 actuating frame was sent THIS frame
+     self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
+-    # G9b: split the cut the way the panda does. _driver_cut (brake/gas/gear != D) re-arms on the resume
+-    # edge but clears on the first clean engaged frame; _hard_cut (camera hand-back / pedal fault) is not
+-    # re-armed. blocked_until_resume is their OR, so every existing consumer is unchanged.
++    # G9b/0042: split the cut the way the panda does. _driver_cut (brake / gear != D) re-arms on the resume
++    # edge but clears on the first clean engaged frame; _hard_cut (camera hand-back) and _pedal_cut (pedal
++    # fault, 0042) are fail-closed and NOT re-armed. 0042 v2: blocked_until_resume is the DRIVER+CAMERA cut
++    # only - the pedal mirror is ALERT-ONLY and never gates a send (a pre-arm over-latch must never fabricate
++    # a brake loss); see update() for the full reasoning.
+     self._driver_cut = False
+     self._hard_cut = False
++    self._pedal_cut = False            # 0042: the panda's hyundai_interceptor_pedal_fault, latched (see update())
+     self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+     # 0040: the single low-speed hand-over alert (below the old 12 km/h floor) is DELETED - it is now false. Replaced
+     # by three owner-approved alerts (steady yellow / steady yellow / persistent red), all state read by the
+@@ -491,11 +505,17 @@ class Fca11LongBrake:
+     # clear it (it just ages out), and gas is NOT part of _driver_cut any more.
+     self._gas_release_frame: int | None = None
+     self._gas_prev = False
+-    # 0030 (D1-b): the panda's camera-owns / pedal-fault hand-back (hyundai_fca11_long_cut) is fail-closed for the
+-    # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed and that latch is set the panda will
+-    # refuse EVERY actuating frame for the whole drive. Today that failure is silent (the driver sees openpilot plan
+-    # stops it cannot execute). This mirrors the panda state the car layer CAN observe (_hard_cut); CarStateExt
+-    # publishes it as CarStateSP.fca11Unavailable for the superproject to raise a persistent driver alert.
++    # 0030 (D1-b) / 0042: surface the fail-closed loss. The panda's hyundai_fca11_long_cut is fail-closed for the
++    # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed it refuses EVERY actuating frame for
++    # the whole drive - and that failure was otherwise SILENT (the driver just sees openpilot plan stops it cannot
++    # execute; route 156 lost ALL braking this way). The car layer mirrors the two panda latch SOURCES as separate
++    # flags: _hard_cut = the CAMERA hand-back (a bus-2 camera request), _pedal_cut = a PEDAL FAULT (0042); both are
++    # fail-closed and NOT re-armed. _refused_cut is the ECHO-CONFIRMED wall (B): the panda's own verdict on our
++    # in-flight frames, so even a latch the Python mirror cannot see still surfaces. CarStateExt publishes the OR as
++    # CarStateSP.fca11Unavailable; the superproject raises a persistent driver alert from it.
++    # 0042 v2: this flag is KNOW + ALERT only - it drives NO send gate (see blocked_until_resume below). While it is
++    # set, the three 0040/0041 braking alerts are SUPPRESSED in _alerts() (they all assume we are actually braking):
++    # the dedicated unavailability alert supersedes them.
+     self.fca11_unavailable = False
+     # 0030 (D2-iii): echo-confirmation of the passive close frame. The panda only CLOSES its FCA11-long episode on an
+     # ACCEPTED passive 0x38D (hyundai.h:1027-1030); if the close frame was REFUSED (engage/disengage edge), the
+@@ -506,6 +526,11 @@ class Fca11LongBrake:
+     self._pending_echo_frame = -1              # controller frame at which it was emitted
+     self._echo_rejected = False               # that frame came back 192 (never closed the episode)
+     self._echo_wired = False                  # observe_echo has been called
++    # 0042 (B): the echo-confirmed refusal wall. `_refused_streak` counts CONSECUTIVE refused ACTUATING echoes while
++    # braking; at FCA11_REFUSED_STREAK_CUT it sets `_refused_cut` (surfaced via fca11_unavailable). An ACCEPTED
++    # actuating echo resets the streak and self-heals the flag (the wall is gone). No send gating rides on this.
++    self._refused_streak = 0
++    self._refused_cut = False
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+     self._sent_this_episode = False
+@@ -556,9 +581,10 @@ class Fca11LongBrake:
+     # layer commands through zero and holds at a stop. See the FCA11_SUPERVISE_KPH block above.
+     # pedal STATE 0 = NO_FAULT only. 4 STARTUP / 5 TIMEOUT are boot states the panda also accepts,
+     # but from openpilot's side a pedal that has never taken a command must not be mixed with a
+-    # brake. 1 BAD_CHECKSUM / 2 SEND / 3 SCE / 6 INVALID are faults -> never brake.
++    # brake. 1 BAD_CHECKSUM / 2 SEND / 3 SCE / 6 INVALID are faults -> never brake. 0042: the accepted
++    # set is the shared HYUNDAI_FCA11_PEDAL_STATE_OK mirror (one source of truth with the panda + the latch).
+     state = int(getattr(CS, "interceptor_state", 0))
+-    if state not in (0, 4, 5):
++    if state not in HYUNDAI_FCA11_PEDAL_STATE_OK:
+       return False, "pedal_fault"
+     if CS.out.gearShifter != structs.CarState.GearShifter.drive:
+       return False, "gear_not_d"
+@@ -676,6 +702,17 @@ class Fca11LongBrake:
+     self.supervise_stop = bool(self.braking and v_kph <= FCA11_SUPERVISE_KPH)
+     self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or standstill))
+     self.low_speed_alert = self.supervise_stop   # alias
++    # 0042 v2: while FCA11-long is UNAVAILABLE (the panda refuses every actuating frame for the rest of the
++    # ignition: camera hand-back / pedal-fault latch / echo-confirmed refusal wall), the three 0040/0041 alerts
++    # above are MISLEADING - they all assume we are actually braking and delivering decel. The dedicated
++    # "FCA11 Braking Unavailable" permanent alert supersedes them, so force them off; they re-arm normally on
++    # their own conditions once availability returns (fca11_unavailable clears on an accepted actuating echo).
++    if self.fca11_unavailable:
++      self.supervise_stop = False
++      self.stop_complete = False
++      self.brake_now = False
++      self.brake_now_reason = ""
++      self.low_speed_alert = False
+ 
+   def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
+     """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
+@@ -723,6 +760,29 @@ class Fca11LongBrake:
+     # episode log - the firmware's verdict is the ground truth on whether the ESC was ever asked.
+     if self.log.enabled and self.braking:
+       self.log.note_panda_refusal(sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0))
++    # 0042 (B): echo-based refusal surfacing. The panda's verdict on our in-flight frames is the ground truth. A
++    # REFUSED ACTUATING echo (src 192) while braking extends the consecutive streak; an ACCEPTED ACTUATING echo
++    # (src 128) means the panda is taking our frames again, so reset the streak and self-heal the wall flag. At
++    # FCA11_REFUSED_STREAK_CUT consecutive refusals the wall is surfaced via fca11_unavailable. NO send suppression
++    # rides on this: refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with
++    # zero deadlock. (A refused PASSIVE close frame is the separate re-owe path below, not counted here.)
++    refused = sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0)
++    accepted = sum(1 for src, dat in echoes if int(src) == 128 and len(dat) == 8 and dat[1] != 0)
++    if accepted:
++      # An ACCEPTED ACTUATING echo (src 128, len 8, dat[1]!=0) is PROOF the panda is NOT latched: it accepted a
++      # frame that only goes out while FCA11-long is armed AND its cut is clear. So it resets the refusal streak,
++      # clears _refused_cut (the wall is gone) AND clears _pedal_cut (the pedal-fault latch cannot be live if the
++      # panda is accepting our actuating frames). 0042 v2: this is the mirror's PROOF-BASED SELF-HEAL - the only
++      # thing that clears _pedal_cut, and why a pre-arm over-latch (route 155) self-corrects at the first accepted
++      # actuating echo instead of holding a phantom alert all drive. A PASSIVE accepted echo (dat[1]==0) is NOT
++      # proof (150709 passive frames flowed on route 156 WITH the cut latched) and must not heal anything.
++      self._refused_streak = 0
++      self._refused_cut = False
++      self._pedal_cut = False
++    elif refused and self.braking:
++      self._refused_streak += refused
++      if self._refused_streak >= FCA11_REFUSED_STREAK_CUT:
++        self._refused_cut = True
+     if self._pending_echo is None:
+       return
+     pending = self._pending_echo
+@@ -776,11 +836,17 @@ class Fca11LongBrake:
+       # G7: likewise no owed close frame survives a disable (a re-arm is a clean panda episode too).
+       self._release_pending = False
+       self._cal_frames = 0
+-      # G9b: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
++      # G9b/0042: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
+       self._driver_cut = False
+       self._hard_cut = False
++      self._pedal_cut = False
+       self._rearm_pending = False
+       self.blocked_until_resume = False
++      # 0042: and nothing is UNAVAILABLE while the feature is off (the surfaced flag is the OR of the cut sources).
++      self.fca11_unavailable = False
++      # 0042 (B): clear the echo-confirmed refusal wall too.
++      self._refused_streak = 0
++      self._refused_cut = False
+       self._cal_active = False
+       # 0038: no gas hold-off state either.
+       self._gas_release_frame = None
+@@ -806,8 +872,8 @@ class Fca11LongBrake:
+     # 0038: GAS is deliberately NOT part of _driver_cut any more (owner requires a gas press never lock out future
+     # braking). It is enforced per-frame in fca11_ok below plus the elapsed-frame hold-off. The DRIVER latch
+     # (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut (brake / gear != D): it re-arms on the resume
+-    # edge but clears only on the first clean engaged frame. The CAMERA hand-back and a pedal fault go to _hard_cut,
+-    # which matches the panda's hyundai_fca11_long_cut and is NOT re-armed.
++    # edge but clears only on the first clean engaged frame. The CAMERA hand-back goes to _hard_cut; a pedal FAULT
++    # goes to _pedal_cut (0042). Both mirror the panda's hyundai_fca11_long_cut and are NOT re-armed.
+     driver_cut = (bool(CS.out.brakePressed) or
+                   CS.out.gearShifter != structs.CarState.GearShifter.drive)
+     if CC.longActive and driver_cut:
+@@ -824,8 +890,29 @@ class Fca11LongBrake:
+     # wall for the remaining ~16 min of the ignition (1983 refused actuating frames, all three 20@90 cal reps).
+     if cam is not None and camera_requesting(cam[1]):
+       self._hard_cut = True
++    # 0042 (A): latch the PEDAL FAULT exactly like the panda. The panda computes pedal_state = (data[4] >> 4) & 0xF
++    # from ANY 0x701 frame and sets hyundai_interceptor_pedal_fault = state not in {0,4,5} (hyundai.h:962-963), which
++    # hyundai_fca11_long_rx folds into hyundai_fca11_long_cut on ANY rx frame regardless of engagement/arm and only
++    # hyundai_init clears it (hyundai.h:369-371). CS.interceptor_state is that same nibble (carstate_ext.py reads the
++    # DBC STATE of GAS_SENSOR_R), so latching it here is EXACT panda equivalence: any frame, no longActive gate,
++    # sticky against a clean pedal state and a resume edge (this instance's lifetime); the ONLY thing that clears it is the
++    # proof-based heal in observe_echo (an accepted ACTUATING echo), or the end of the ignition.
++    # 0042 v3: the panda faults on EVERY 0x701 frame, but the CANParser `vl` view keeps only the LAST value of the
++    # window - so a single fault frame sandwiched between accepted states (route 156's boot handshake, STATE [5, 3, 5])
++    # is invisible to CS.interceptor_state (its last value is an accepted 5). CS.interceptor_fault_seen carries the
++    # all-frames verdict from carstate_ext.py (vl_all), so the latch is panda-equivalent on the real path too.
++    pedal_state = int(getattr(CS, "interceptor_state", 0))
++    if pedal_state not in HYUNDAI_FCA11_PEDAL_STATE_OK or bool(getattr(CS, "interceptor_fault_seen", False)):
++      self._pedal_cut = True
+     if not engaged:
+       self._rearm_pending = False
++    # 0042 v2: SEND GATE vs ALERT. blocked_until_resume stays the DRIVER+CAMERA cut ONLY - the pedal mirror
++    # (_pedal_cut) must NEVER gate a send. The car-layer mirror has no per-frame ARM gate (its arm is the constant
++    # `enabled`), so on route 155 it over-latches on a pre-arm STATE=1 blip the deployed panda never saw; letting
++    # that fabricate a `blocked_until_resume` would invent a brake loss and suppress every send for the rest of the
++    # ignition. Refused sends are inert (they never reach the car), so keeping ours LIVE preserves the ground truth
++    # + the echo evidence, and there is no deadlock. _pedal_cut (and _refused_cut) only drive fca11_unavailable:
++    # KNOW + ALERT (and the alert-state suppression in _alerts()), never control.
+     self.blocked_until_resume = self._driver_cut or self._hard_cut
+     # 0038: track the driver's gas RELEASE edge (for the elapsed-frame hold-off). CS.out.gasPressed is the driver's
+     # physical pedal (the panda's gas source is the interceptor sensor, not our throttle command). On the frame the
+@@ -834,9 +921,10 @@ class Fca11LongBrake:
+     if self._gas_prev and not gas_now:
+       self._gas_release_frame = frame
+     self._gas_prev = gas_now
+-    # 0030 (D1-b): surface the hand-back. _hard_cut == the panda's hyundai_fca11_long_cut (camera owns / pedal fault)
+-    # and is NOT re-armed, so while it is set FCA11-long braking is unavailable for the rest of this ignition.
+-    self.fca11_unavailable = bool(self.enabled and self._hard_cut)
++    # 0042: surface the fail-closed loss. _hard_cut (camera hand-back) and _pedal_cut (pedal fault) are the two
++    # hyundai_fca11_long_cut latch sources; _refused_cut (B) is the echo-confirmed refusal wall. Any of them means
++    # the panda refuses every actuating frame for the rest of this ignition, so FCA11-long braking is unavailable.
++    self.fca11_unavailable = bool(self.enabled and (self._hard_cut or self._pedal_cut or self._refused_cut))
+ 
+     # 0040: this frame's speed (km/h); the alert state machine + logger both read it.
+     v_kph_now = float(CS.out.vEgo) * 3.6
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 641e21db..9c429dde 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -167,7 +167,8 @@ class TestMirrorFrame(unittest.TestCase):
+ class _CS:
+   """Minimal CarState double: the only attributes Fca11LongBrake reads."""
+   def __init__(self, v_ego=20.0, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
+-               state=0, cam=None, now=0, lead_closing=False, a_ego=0.0, standstill=False, wheel_min_kph=None):
++               state=0, cam=None, now=0, lead_closing=False, a_ego=0.0, standstill=False, wheel_min_kph=None,
++               fault_seen=False):
+     self.out = structs.CarState()
+     self.out.vEgo = v_ego
+     self.out.gearShifter = gear
+@@ -176,6 +177,9 @@ class _CS:
+     self.out.aEgo = a_ego
+     self.out.standstill = standstill
+     self.interceptor_state = state
++    # 0042 v3: the any-frame pedal-fault verdict carstate_ext.py publishes (vl_all). Defaults False so every
++    # pre-v3 test double keeps its meaning (last-value only); the sandwich cases set it explicitly.
++    self.interceptor_fault_seen = fault_seen
+     self.fca11_cam_frame = cam
+     self.fca11_now_nanos = now
+     self.fca11_lead_closing = lead_closing
+@@ -2371,5 +2375,304 @@ class Test0041AffineGain(unittest.TestCase):
+     self.assertEqual(4, max(decs2), "above the band the affine level applies")
+ 
+ 
++# ============================================================================================
++# 0042: fail-closed pedal-fault latch (A) + echo-based refusal surfacing (B)
++# ============================================================================================
++
++class _RefusalBrakeMixin:
++  def _brake(self, fca11=True):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = fca11
++    cp_sp.enableGasInterceptor = True
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cc(self, accel=-2.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  @staticmethod
++  def _act(dec=9):
++    """A plausible ACTUATING 0x38D payload: 8 bytes with CR_VSM_DecCmd (byte 1) nonzero."""
++    return bytes([0x00, dec] + [0] * 6)
++
++
++class TestFca11PedalCutLatch(_RefusalBrakeMixin, unittest.TestCase):
++  """0042 (A): the car layer mirrors the panda's fail-closed pedal-fault latch EXACTLY.
++
++  The panda computes pedal_state = (data[4] >> 4) & 0xF on ANY 0x701 frame and, when it is not in {0,4,5}, sets
++  hyundai_interceptor_pedal_fault, which hyundai_fca11_long_rx folds into hyundai_fca11_long_cut on ANY rx frame
++  (NO engagement/arm gate) and only hyundai_init clears (hyundai.h:962-963 + 369-371). Any state outside {0,4,5}
++  therefore latches FCA11 off for the ignition - even a SINGLE frame, even while longActive is False. RED before
++  the fix: the old code took a pedal fault only through the per-frame window and never latched it.
++
++  0042 v2: the mirror is ALERT-ONLY. It NEVER gates a send (blocked_until_resume stays _driver_cut or _hard_cut
++  only): the car layer has no per-frame ARM gate, so a pre-arm over-latch must not fabricate a brake loss. It only
++  drives fca11_unavailable (KNOW + ALERT) and suppresses the three braking alerts while unavailable. A PROOF-BASED
++  self-heal clears it at the first accepted ACTUATING echo (see TestFca11PedalCutHeal).
++  """
++
++  def test_accepted_state_set_is_pinned_to_the_panda(self):
++    # the shared mirror is exactly the panda's accepted set (state != 0 && != 4 && != 5 -> fault)
++    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_PEDAL_STATE_OK
++    self.assertEqual((0, 4, 5), tuple(HYUNDAI_FCA11_PEDAL_STATE_OK))
++    self.assertIs(fl.HYUNDAI_FCA11_PEDAL_STATE_OK, HYUNDAI_FCA11_PEDAL_STATE_OK)
++
++  def test_single_fault_frame_latches_even_when_not_long_active(self):
++    # ONE fault frame (in any of the five fault states) latches the mirror, even with longActive False. 0042 v2:
++    # the latch is ALERT-ONLY - it surfaces fca11Unavailable but does NOT set blocked_until_resume and does NOT
++    # suppress sends. A later hard ask on a healthy pedal STILL emits an actuating frame (refused sends are inert,
++    # so keeping ours live preserves the ground truth + echo evidence). FALSIFIABLE: on the v1 tree
++    # blocked_until_resume was True here and no actuating frame left the car layer.
++    for st in (1, 2, 3, 6):
++      b = self._brake()
++      b.update(self._cc(-2.0, long_active=False), _CS(state=st, cam=_cam()), 0)
++      self.assertTrue(b._pedal_cut, st)
++      self.assertTrue(b.fca11_unavailable, st)          # surfaced -> fca11Unavailable -> driver alert
++      self.assertFalse(b.blocked_until_resume, st)      # 0042 v2: the pedal mirror never gates sends
++      out = [x for f in range(1, 40) for x in b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), f)
++             if fl._get_bits(x.dat, 8, 8) > 0]
++      self.assertTrue(out, st)
++      self.assertTrue(b.braking, st)
++      self.assertTrue(b._pedal_cut, st)                 # still latched (sticky: a clean state does not clear it)
++
++  def test_no_latch_on_accepted_states(self):
++    for st in (0, 4, 5):
++      b = self._brake()
++      self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 0), st)
++      self.assertTrue(b.braking, st)
++      self.assertFalse(b._pedal_cut, st)
++      self.assertFalse(b.fca11_unavailable, st)
++      self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 2), st)
++
++  def test_sandwich_window_latches_via_the_any_frame_flag(self):
++    """0042 v3: route 156's boot handshake was THREE 0x701 frames in ONE parse window, STATE [5, 3, 5]. The CANParser
++    `vl` view keeps only the LAST value (an accepted 5), so a mirror reading `interceptor_state` alone MISSES it -
++    but the panda faults on EVERY frame (hyundai.h:962-963). carstate_ext.py publishes the all-frames verdict as
++    `CS.interceptor_fault_seen` (vl_all); the latch reads it, so a single in-window fault frame is caught exactly as
++    the panda does. FALSIFIABLE: on the v2 tree (latch reads `interceptor_state` only) this is NOT latched."""
++    b = self._brake()
++    b.update(self._cc(-2.0, long_active=False), _CS(state=5, fault_seen=True, cam=_cam()), 0)
++    self.assertTrue(b._pedal_cut, "a fault frame inside an otherwise-accepted window must latch")
++    self.assertTrue(b.fca11_unavailable)
++    self.assertFalse(b.blocked_until_resume, "still alert-only: the flag never gates a send")
++    # it is sticky: a later CLEAN window does not clear it (only the proof-based heal in observe_echo does)
++    b.update(self._cc(-2.0), _CS(state=0, fault_seen=False, cam=_cam()), 2)
++    self.assertTrue(b._pedal_cut)
++    self.assertTrue(b.fca11_unavailable)
++
++  def test_clean_window_does_not_latch_via_the_flag(self):
++    """A window with no fault frame (flag False) and a last state in {0,4,5} does NOT latch - the all-frames path
++    must not over-latch on a clean window, and the clean window brakes normally."""
++    for st in (0, 4, 5):
++      b = self._brake()
++      sent = b.update(self._cc(-2.0), _CS(state=st, fault_seen=False, cam=_cam()), 0)
++      self.assertFalse(b._pedal_cut, st)
++      self.assertFalse(b.fca11_unavailable, st)
++      self.assertTrue(sent, st)
++      self.assertTrue(b.braking, st)
++
++  def test_latch_is_not_rearmed_by_a_resume_edge(self):
++    # unlike _driver_cut, the pedal latch is FAIL-CLOSED: a disengage/re-engage resume edge does NOT clear it
++    # (matches hyundai_fca11_long_cut, which only hyundai_init clears). 0042 v2: not being re-armed also does NOT
++    # gate sends - the mirror stays alert-only.
++    b = self._brake()
++    b.update(self._cc(-2.0, long_active=False), _CS(state=3, cam=_cam()), 0)
++    self.assertTrue(b._pedal_cut)
++    b.update(self._cc(-2.0, engaged=False), _CS(state=0, cam=_cam()), 1)
++    b.update(self._cc(-2.0, engaged=True), _CS(state=0, cam=_cam()), 2)
++    out = [x for f in range(3, 80) for x in b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), f)
++           if fl._get_bits(x.dat, 8, 8) > 0]
++    self.assertTrue(out, "the pedal latch is alert-only: sends are NOT gated")
++    self.assertTrue(b._pedal_cut, "still fail-closed (a resume edge does not re-arm it)")
++    self.assertFalse(b.blocked_until_resume)
++    self.assertTrue(b.fca11_unavailable)
++
++  def test_latch_stays_after_the_state_returns_to_zero(self):
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(state=3, cam=_cam()), 0)
++    self.assertTrue(b._pedal_cut)
++    sent = []
++    for f in range(1, 200):
++      sent += [x for x in b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), f)
++               if fl._get_bits(x.dat, 8, 8) > 0]
++    self.assertTrue(b._pedal_cut)
++    self.assertTrue(b.fca11_unavailable)
++    self.assertFalse(b.blocked_until_resume, "alert-only: the sticky latch does not gate sends")
++    self.assertTrue(sent, "sends keep flowing while the latch is set")
++
++  def test_accepted_actuating_echo_heals_the_pedal_latch(self):
++    """0042 v2 PROOF-BASED self-heal: an accepted ACTUATING echo (src 128, len 8, dat[1]!=0) proves the panda is
++    NOT latched (it accepted a frame that only goes out while armed AND cut-clear) -> it clears _pedal_cut (and
++    _refused_cut / the streak). A new fault frame then RE-LATCHES normally (the heal is not a permanent re-arm)."""
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(state=1, cam=_cam()), 0)      # one fault frame latches the mirror
++    self.assertTrue(b._pedal_cut)
++    b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), 2)
++    self.assertTrue(b.fca11_unavailable)
++    self.assertFalse(b._refused_cut)
++    b.observe_echo([(128, self._act())])                       # accepted ACTUATING frame: proof the panda is clear
++    self.assertFalse(b._pedal_cut, "an accepted actuating echo must heal the pedal latch")
++    self.assertEqual(0, b._refused_streak)
++    self.assertFalse(b._refused_cut)
++    b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), 4)      # recompute fca11_unavailable
++    self.assertFalse(b.fca11_unavailable, "healed -> no longer unavailable")
++    # a NEW fault frame re-latches (the heal only cleared the stale over-latch)
++    b.update(self._cc(-2.0), _CS(state=3, cam=_cam()), 6)
++    self.assertTrue(b._pedal_cut)
++    self.assertTrue(b.fca11_unavailable)
++
++  def test_accepted_passive_echo_does_not_heal(self):
++    """0042 v2: a PASSIVE accepted echo (dat[1]==0) is NOT proof - on route 156 all 150709 passive frames flowed
++    WITH the panda's cut latched. Only an accepted ACTUATING echo heals."""
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(state=3, cam=_cam()), 0)
++    self.assertTrue(b._pedal_cut)
++    for _ in range(5):
++      b.observe_echo([(128, bytes([0] * 8))])                  # accepted PASSIVE close (CR_VSM_DecCmd 0)
++    self.assertTrue(b._pedal_cut, "a passive accepted echo must NOT heal the pedal latch")
++    b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), 2)
++    self.assertTrue(b.fca11_unavailable)
++    # and a REFUSED actuating echo (src 192) certainly does not heal it either
++    b.observe_echo([(192, self._act())])
++    self.assertTrue(b._pedal_cut)
++
++  def test_unavailable_suppresses_the_three_braking_alerts(self):
++    """0042 v2: while fca11_unavailable is set the three 0040/0041 alerts are misleading (they all assume we are
++    braking and delivering decel), so _alerts() forces superviseStop / stopComplete / brakeNow all False even when
++    their trigger conditions hold. CONTROL: the same drive without the latch raises all three."""
++    import time as _t
++
++    def open_hold_and_trigger(b, start=0):
++      """Braking standstill hold (supervise + stop-complete conditions), then a moving non-response frame
++      (brakeNow condition). Returns (supervise_seen, stop_complete_seen, brake_now_after)."""
++      sv = sc = False
++      for f in range(start, start + 6):
++        b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0), f)
++        sv = sv or b.supervise_stop
++        sc = sc or b.stop_complete
++      b._noresp_since = _t.monotonic() - 1.0
++      b._noresp_cmd_since = _t.monotonic() - 1.0
++      b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), start + 6)
++      return sv, sc, b.brake_now
++
++    # CONTROL: no latch -> supervise + stop-complete fire at the hold, brakeNow after the forced non-response
++    b0 = self._brake()
++    sv0, sc0, bn0 = open_hold_and_trigger(b0)
++    self.assertTrue(sv0 and sc0 and bn0, f"control: all three alert conditions must hold ({sv0},{sc0},{bn0})")
++    # LATCHED pedal mirror: fca11_unavailable -> ALL THREE suppressed even though the conditions hold
++    bl = self._brake()
++    bl.update(self._cc(-2.0, long_active=False), _CS(state=3, cam=_cam()), 0)
++    self.assertTrue(bl._pedal_cut)
++    sv, sc, bn = open_hold_and_trigger(bl, start=1)
++    self.assertTrue(bl.braking, "the mirror keeps sending, so the alert conditions genuinely hold")
++    self.assertTrue(bl.fca11_unavailable)
++    self.assertFalse(sv, "superviseStop must be suppressed while unavailable")
++    self.assertFalse(sc, "stopComplete must be suppressed while unavailable")
++    self.assertFalse(bn, "brakeNow must be suppressed while unavailable")
++    self.assertEqual("", bl.brake_now_reason)
++
++
++class TestFca11RefusedCutSurfacing(_RefusalBrakeMixin, unittest.TestCase):
++  """0042 (B): the echo-confirmed refusal wall. Consecutive REFUSED actuating echoes (src 192) while braking latch
++  _refused_cut at FCA11_REFUSED_STREAK_CUT; an ACCEPTED actuating echo (src 128) resets + self-heals. Surfaced via
++  fca11_unavailable. No send suppression rides on this path. RED before the fix: no refusal path into the flag.
++  """
++
++  def test_streak_trips_at_three_refusals(self):
++    self.assertEqual(3, fl.FCA11_REFUSED_STREAK_CUT)
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)          # brake episode opens (self.braking True)
++    self.assertTrue(b.braking)
++    self.assertFalse(b._refused_cut)
++    b.observe_echo([(192, self._act())])                  # streak 1
++    self.assertFalse(b._refused_cut)
++    b.observe_echo([(192, self._act())])                  # streak 2 -> still under the cut
++    self.assertFalse(b._refused_cut)
++    b.observe_echo([(192, self._act())])                  # streak 3 -> TRIP
++    self.assertTrue(b._refused_cut)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 2)          # recompute fca11_unavailable
++    self.assertTrue(b.fca11_unavailable)
++    # ... and the flag does NOT suppress sends (ground truth stays live)
++    self.assertTrue(b.braking)
++
++  def test_does_not_trip_at_two_refusals(self):
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    b.observe_echo([(192, self._act())])
++    b.observe_echo([(192, self._act())])
++    self.assertFalse(b._refused_cut)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 2)
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_accepted_echo_resets_and_self_heals(self):
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    for _ in range(3):
++      b.observe_echo([(192, self._act())])
++    self.assertTrue(b._refused_cut)
++    b.observe_echo([(128, self._act())])                  # the panda accepts our actuating frame again
++    self.assertFalse(b._refused_cut)
++    self.assertEqual(0, b._refused_streak)
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 2)
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_refusals_counted_only_while_braking(self):
++    # a refused actuating echo while NOT braking must not extend the streak (only our live brake frames count)
++    b = self._brake()
++    self.assertFalse(b.braking)
++    for _ in range(5):
++      b.observe_echo([(192, self._act())])
++    self.assertEqual(0, b._refused_streak)
++    self.assertFalse(b._refused_cut)
++
++  def test_passive_and_short_echoes_are_not_counted(self):
++    # only ACTUATING (dat[1] != 0, len 8) refused echoes count; a refused PASSIVE close frame / a short frame does not
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    for _ in range(6):
++      b.observe_echo([(192, bytes([0] * 8))])            # passive (DecCmd 0)
++      b.observe_echo([(192, b"\x00\x09")])               # short
++    self.assertEqual(0, b._refused_streak)
++    self.assertFalse(b._refused_cut)
++
++  def test_burst_counts_each_refused_frame(self):
++    # a burst of refused actuating frames in one tick counts each one toward the streak
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    b.observe_echo([(192, self._act()), (192, self._act()), (192, self._act())])
++    self.assertTrue(b._refused_cut)
++
++
++class TestFca11RefusalNotEnabledReset(_RefusalBrakeMixin, unittest.TestCase):
++  """0042: a feature-off frame RESETS the pedal-fault latch and the echo-refusal wall state (a disable is a clean
++  start, matching the panda's hyundai_init)."""
++
++  def test_disabled_frame_clears_all_0042_state(self):
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(state=3, cam=_cam()), 0)     # pedal latch sets
++    self.assertTrue(b._pedal_cut)
++    b.enabled = False                                        # the toggle goes off
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 1)
++    self.assertFalse(b._pedal_cut)
++    self.assertFalse(b.blocked_until_resume)
++    self.assertEqual(0, b._refused_streak)
++    self.assertFalse(b._refused_cut)
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_disabled_frame_clears_the_refusal_wall(self):
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    for _ in range(3):
++      b.observe_echo([(192, self._act())])
++    self.assertTrue(b._refused_cut)
++    b.enabled = False
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 1)
++    self.assertFalse(b._refused_cut)
++    self.assertEqual(0, b._refused_streak)
++
++
+ if __name__ == "__main__":
+   unittest.main()
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 498819a1..4aedf7c7 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -143,6 +143,72 @@ class TestCarStateDialect:
+     assert not ret.gasPressed
+ 
+ 
++class TestPedalFaultAnyFrame:
++  """0042 v3: the panda faults on the pedal STATE of EVERY 0x701 frame (hyundai.h:962-963), but CarState's CANParser
++  `vl` view holds only the LAST value of a parse window, so a single fault frame sandwiched between accepted states
++  (route 156's boot handshake, STATE [5, 3, 5]) is invisible to `interceptor_state`. CarStateExt publishes the
++  all-frames verdict from `vl_all` as `interceptor_fault_seen`, which Fca11LongBrake latches on. This drives the
++  REAL CarInterface.update -> CarState -> CarStateExt path with three 0x701 frames in ONE tick."""
++
++  def test_sandwich_window_sets_the_flag_but_not_the_sampled_state(self):
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    CI = CarInterface(CP, CP_SP)
++    t = 0
++    for i in range(6):                                   # a few clean single-frame windows first
++      t += int(0.02e9)
++      CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, i, 0), 0)])])
++    assert CI.CS.interceptor_state == 0 and CI.CS.interceptor_fault_seen is False
++    # ONE tick with THREE 0x701 frames: STATE [5, 3, 5] (the route-156 boot handshake)
++    t += int(0.02e9)
++    CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, i, s), 0) for i, s in enumerate((5, 3, 5))])])
++    assert CI.CS.interceptor_state == 5            # `vl` = the LAST value, an ACCEPTED state (blind to the fault)
++    assert CI.CS.interceptor_fault_seen is True    # `vl_all` = ANY frame: the panda's per-frame verdict
++    # the flag is per-window (NOT sticky): the next clean window clears it. The LATCH it feeds is what is sticky.
++    t += int(0.02e9)
++    CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, 0, 0), 0)])])
++    assert CI.CS.interceptor_fault_seen is False
++    assert CI.CS.interceptor_state == 0
++
++  def test_sandwich_across_several_pandad_packets_in_one_card_step(self):
++    """card.py (state_update) drains EVERY pandad packet queued since the last 100 Hz step with
++    drain_sock_raw(wait_for_one=True) and hands them ALL to one CarInterface.update call. CANParser `vl` keeps only the
++    last value of that whole call; `vl_all` accumulates every frame of every packet. So the fault must be seen when the
++    three 0x701 frames of [5, 3, 5] arrive as THREE separate packets of ONE step (not just three frames in one packet)."""
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    CI = CarInterface(CP, CP_SP)
++    t, n = 0, 0
++    for _ in range(6):
++      t += int(0.02e9)
++      CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, n, 0), 0)])])
++      n += 1
++    assert CI.CS.interceptor_fault_seen is False
++    packets = []
++    for s in (5, 3, 5):                                   # three packets, 5 ms apart, ONE update call
++      t += int(0.005e9)
++      packets.append((t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, n, s), 0)]))
++      n += 1
++    CI.update(packets)
++    assert CI.CS.interceptor_state == 5                   # last value of the whole call: accepted
++    assert CI.CS.interceptor_fault_seen is True           # every frame of every packet: the fault is seen
++    # the very next single-packet step is clean again (the flag is per-call, not sticky)
++    t += int(0.02e9)
++    CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, n, 0), 0)])])
++    assert CI.CS.interceptor_fault_seen is False
++
++  def test_no_pedal_frames_window_keeps_the_flag_false(self):
++    # a window that carries no 0x701 frame at all must not fault (empty list -> any([]) == False)
++    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
++    CI = CarInterface(CP, CP_SP)
++    t = 0
++    for i in range(4):
++      t += int(0.02e9)
++      CI.update([(t, [(*_sensor_frame_state(gi.REMAPPED_IDS, 0, i, 3), 0)])])   # one fault frame latches the source
++    assert CI.CS.interceptor_fault_seen is True
++    t += int(0.02e9)
++    CI.update([(t, [])])                                 # no frames this window
++    assert CI.CS.interceptor_fault_seen is False
++
++
+ class TestThresholds:
+   def test_c_and_python_threshold_match(self):
+     assert _c_define(HYUNDAI_H, "HYUNDAI_GAS_INTERCEPTOR_THRESHOLD") == gi.HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index 8e89fe89..18eab03d 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -71,6 +71,13 @@ HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US = 500000   # 0.5 s
+ # 0038: panda host-liveness (heartbeat) watchdog: no fresh host TX frame for this long -> refuse actuation. Must equal
+ # HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US in safety/modes/hyundai.h.
+ HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US = 500000   # 0.5 s
++# 0042: the pedal STATE nibble values the panda treats as NON-fault: 0 NO_FAULT, 4 STARTUP, 5 TIMEOUT (DBC
++# ``VAL_ 1793 STATE``; safety/modes/hyundai.h: ``pedal_state != 0 && pedal_state != 4 && pedal_state != 5`` -> fault).
++# Any other value (1 BAD_CHECKSUM, 2 SEND, 3 SCE, 6 INVALID, ...) is a fault the panda LATCHES into
++# ``hyundai_fca11_long_cut`` on ANY rx frame, cleared only by ``hyundai_init`` (the fail-closed re-arm-by-ignition).
++# The car layer mirrors the accepted set here (ONE source of truth) for BOTH its per-frame pedal gate and the 0042
++# fail-closed latch, so Python and the panda cannot drift apart. Unit test pins {0, 4, 5}.
++HYUNDAI_FCA11_PEDAL_STATE_OK = (0, 4, 5)
+ # *** TEST-ONLY parked LKAS11 sweep (LKAS_PARK_TEST) constants; unit tests pin each against safety/modes/hyundai.h ***
+ HYUNDAI_LKAS_PARK_MAX_TORQUE = 384      # = CarControllerParams STEER_MAX
+ HYUNDAI_LKAS_PARK_RATE_UP = 3           # = STEER_DELTA_UP

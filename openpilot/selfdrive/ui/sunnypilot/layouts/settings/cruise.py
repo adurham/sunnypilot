@@ -8,6 +8,7 @@ from enum import IntEnum
 
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.cruise_sub_layouts.speed_limit_settings import SpeedLimitSettingsLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.sunnypilot.fork.cruise_prefs import sync_toggle
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp, simple_button_item_sp
 from openpilot.system.ui.widgets import Widget
@@ -148,14 +149,14 @@ class CruiseLayout(Widget):
         self.scc_v_toggle.action_item.set_enabled(True)
         self.scc_m_toggle.action_item.set_enabled(True)
       else:
-        ui_state.params.remove("CustomAccIncrementsEnabled")
-        ui_state.params.remove("DynamicExperimentalControl")
-        ui_state.params.remove("SmartCruiseControlVision")
-        ui_state.params.remove("SmartCruiseControlMap")
-        self.custom_acc_toggle.action_item.set_enabled(False)
-        self.dec_toggle.action_item.set_enabled(False)
-        self.scc_v_toggle.action_item.set_enabled(False)
-        self.scc_m_toggle.action_item.set_enabled(False)
+        # fork #30: disable the toggles but KEEP the stored prefs, and show the stored value so
+        # the screen always matches the param even while greyed out.
+        for item, key in ((self.custom_acc_toggle, "CustomAccIncrementsEnabled"),
+                          (self.dec_toggle, "DynamicExperimentalControl"),
+                          (self.scc_v_toggle, "SmartCruiseControlVision"),
+                          (self.scc_m_toggle, "SmartCruiseControlMap")):
+          item.action_item.set_enabled(False)
+          sync_toggle(ui_state.params, key, item)
 
     else:
       has_icbm = has_long = False
@@ -177,7 +178,8 @@ class CruiseLayout(Widget):
       else:
         new_custom_acc_desc = tr(ACC_NOLONG_DESCRIPTION)
         show_custom_acc_desc = True
-        self.custom_acc_toggle.action_item.set_state(False)
+        # fork #30: keep showing the STORED value so the screen matches the param while unavailable
+        sync_toggle(ui_state.params, "CustomAccIncrementsEnabled", self.custom_acc_toggle)
 
     if self.custom_acc_toggle.description != new_custom_acc_desc:
       self.custom_acc_toggle.set_description(new_custom_acc_desc)

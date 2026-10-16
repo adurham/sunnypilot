@@ -1,0 +1,478 @@
+From 0000033000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Thu, 8 Oct 2026 11:30:00 -0500
+Subject: [PATCH] hyundai: FCA11-long CAL driver consent -- "tap to fire" (0033)
+
+The 0029/0031/0032 cal sequencer arms a rep on engaged + no lead + near-straight + no rear-quarter
+blind spot. But when those conditions align the car brakes ITSELF, uninitiated: a 2.2 s scripted
+brake hold starts with no action by the owner. The reference-model review ranked DRIVER-CONSENT-
+PER-REP the #1 mitigation for the rear-approach risk (the mirror is a 100+ m rear sensor): it
+converts an uninitiated robot brake into a driver-INITIATED one.
+
+0033 adds a driver-consent gate to ``CalSequencer``. Consent is SEPARATE, ADDITIVE and
+FAIL-CLOSED: it can only ADD a pending/skip, never remove any existing veto (production gates, the
+0031 budget mirror, the 0032 blind-spot veto all still apply on every frame).
+
+  * ``conditions.consent_mode`` (or a top-level ``consent`` object) selects the policy:
+      - ``off``  -- today's fully-autonomous behaviour. DEFAULT (backward compat). The ONLY
+                    tap-free mode.
+      - ``all``  -- every rep needs a tap.
+      - ``high`` -- only reps at/above ``consent.min_level_lsb`` (default 22 = 0.22 g) need a tap.
+    A MISSING mode is ``off``; a PRESENT-but-unrecognised mode coerces to ``all`` (strictest
+    non-off), so a typo can never silently re-enable autonomous actuation.
+  * When a rep is DUE and all conditions pass and consent is required, the sequencer does NOT
+    actuate: it PARKS the rep (``state.pending``) and writes ``/data/fca11-cal/pending.json``
+    (ADVISORY, for the superproject mici prompt). While a rep is parked the sequencer actuates
+    NOTHING.
+  * The tap is a FRESH, rep-bound ``/data/fca11-cal/consent.json`` = {rep_id, ts, accept}. The
+    sequencer consumes it and fires ONLY if it is <= 2 s fresh, bound to THIS rep_id, accepted, AND
+    every condition (incl. the 0032 blind-spot veto) and the 0031 budget STILL hold at the moment
+    of the tap. Absent / malformed / stale / mismatched / non-accepted -> NEVER actuates.
+  * The pending prompt EXPIRES after ``consent.timeout_s`` (default 8 s) if untouched and the rep
+    is retried later (after a re-prompt hold-off). An explicit dismiss (accept=false) skips the rep
+    for the rest of the session.
+  * The consent channel: the ``pending.json`` / ``consent.json`` FILE pair (car layer <-> UI over
+    /data), NOT a cereal/capnp field. Rationale: the car layer (card.py) runs in its own process and
+    the cal sequencer state lives entirely in the file-based plan model already; a capnp field would
+    couple four more files (custom.capnp, opendbc structs, card.py, helpers.py) into a schema change
+    for a signal that is UI-only, per-prompt, and inherently ephemeral. The file route keeps the
+    WHOLE cal feature in one place (cal_mode.py + /data/fca11-cal/) and keeps the fail-closed
+    argument local and auditable. The UI also does not need a cereal subscription: it stats two
+    small files (throttled) and never blocks rendering.
+
+Python-only: no safety/ file, no panda change -> the panda FIRMWARE BYTES ARE UNCHANGED (no
+reflash). Inert when cal mode is off (the sequencer is never reached); ``consent_mode=off`` is
+byte-identical to the 0032 behaviour.
+
+---
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index 3c060280..7d6f23dc 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -63,6 +63,33 @@ GATE + SAFETY
+ * NO NEW AUTHORITY: the command envelope (<= 30 LSB, Warn=3 actuating shape, 50 Hz window, the
+   same camera-mirror bytes) is a strict subset of what the production planner can already command.
+ 
++DRIVER CONSENT -- "TAP TO FIRE" (patch 0033)
++--------------------------------------------
++A rep is a real, 2.2 s scripted brake on a live road. The reference-model review ranked
++DRIVER-CONSENT-PER-REP the #1 mitigation for the rear-approach risk: it converts an uninitiated
++robot brake into a driver-INITIATED one. Consent is ADDITIVE and never weakens any existing veto
++(the production gates, the 0031 budget mirror, the 0032 blind-spot veto): it can only ADD a pending
++state and a tap requirement, never remove one.
++
++``conditions.consent_mode`` (or a top-level ``consent`` object) selects the policy:
++  * ``off``  -- today's fully-autonomous behaviour. DEFAULT for backward compatibility. This is the
++                ONLY mode that actuates without a tap.
++  * ``all``  -- every rep needs a tap.
++  * ``high`` -- only reps at/above ``consent.min_level_lsb`` (default 22 = 0.22 g) need a tap; the
++                lower-g reps stay automatic.
++A MISSING mode is ``off`` (compat); a PRESENT-but-unrecognised mode coerces to ``all`` (the strictest
++non-off mode), so a typo can never silently re-enable autonomous actuation (fail-closed).
++
++When a rep is DUE and every condition passes and consent is required for it, the sequencer does NOT
++actuate: it PARKS the rep (``pending``) and writes ``/data/fca11-cal/pending.json`` for the UI to show
++a prompt. The owner taps; the UI writes ``/data/fca11-cal/consent.json`` = {rep_id, ts, accept}. The
++sequencer consumes that file and, ONLY if it is FRESH (<= 2 s), bound to THIS rep_id, and accepted,
++RE-VERIFIES every condition (and the budget) at the instant of the tap and then fires. Anything else
++-- absent, malformed, stale, mismatched, non-accepted -- NEVER actuates. A parked rep EXPIRES after
++``consent.timeout_s`` (default 8 s) if untouched and is retried later; an explicit dismiss (accept =
++false) is honoured for the rest of the session. The pending file is ADVISORY (it only drives the
++prompt); the consent file is the sole authority and it is fail-closed.
++
+ FILES (all under ``/data/fca11-cal/``; the module never touches anything else)
+ ------------------------------------------------------------------------------
+ * ``plan.json``      -- written ONCE (per revision) by the operator. The immutable matrix.
+@@ -102,6 +129,18 @@ CAL_HOLD_MARGIN_FRAMES = 10       # extra slack on top of a rep's hold (quantisa
+ CAL_BLINDSPOT_HOLDOFF_FRAMES = 500   # default 5.0 s @ 100 Hz -- the FCA11_LONG-style constant
+                                     # (plan override ``conditions.blindspot_holdoff_s`` wins)
+ 
++# --- defaults (all overridable in plan.json)
++
++# --- 0033: driver consent ("tap to fire"). A rep is a real 2.2 s scripted brake on a live road; the
++# review ranked driver-consent-per-rep the #1 mitigation for the rear-approach risk. Consent is a
++# SEPARATE, ADDITIVE gate: it can only ADD a pending/skip, never remove a veto. FAIL-CLOSED by
++# construction -- "off" (the compat default) is the ONLY mode that actuates without a tap, and a
++# present-but-unrecognised mode coerces to the strictest non-off mode ("all").
++CONSENT_OFF = "off"
++CONSENT_ALL = "all"
++CONSENT_HIGH = "high"
++CONSENT_MODES = (CONSENT_OFF, CONSENT_ALL, CONSENT_HIGH)
++
+ # --- defaults (all overridable in plan.json)
+ DEFAULT_TTL_S = 900.0              # a plan is inert if not refreshed/valid within this many seconds of "now"
+ DEFAULT_EXPIRES_DAYS = 30.0        # optional plan expiry
+@@ -117,6 +156,14 @@ DEFAULT_RECOVERY_S = 3.5           # >= the panda's 3 s cooldown + margin, befor
+ # the veto (one-way information; absence of the key must not silently disable a safety addition).
+ DEFAULT_BLINDSPOT_VETO = True      # skip a rep while either rear-quarter blind-spot bit is set
+ DEFAULT_BLINDSPOT_HOLDOFF_S = 5.0  # hold the veto this long after the last SET sample
++# 0033 consent defaults. mode "off" = the backward-compatible autonomous behaviour; min_level_lsb 22
++# (0.22 g) = at/above this a rep is "high-g" and (in "high" mode) needs a tap; timeout_s 8 s bounds how
++# long a prompt waits before it is dropped. A tap is honoured only within CONSENT_FRESHNESS_S (2 s) of
++# its own timestamp, so a STALE file can never fire a later rep.
++DEFAULT_CONSENT_MODE = CONSENT_OFF
++DEFAULT_CONSENT_MIN_LEVEL_LSB = 22
++DEFAULT_CONSENT_TIMEOUT_S = 8.0
++CONSENT_FRESHNESS_S = 2.0
+ PLAN_HINT_TTL_S = 300.0            # a plan older than this is "stale": refuse to start a NEW rep
+ 
+ CAL_DIR = "/data/fca11-cal"
+@@ -167,6 +214,43 @@ def _to_bool(v, default):
+   return default
+ 
+ 
++def _to_consent_mode(v, default=CONSENT_OFF):
++  """0033 consent-mode coercion. A MISSING mode -> ``default`` ("off", the compat behaviour). A
++  PRESENT but unrecognised mode -> ``all`` (the strictest non-off mode): a typo must never silently
++  re-enable autonomous actuation. Fail-closed in one direction only."""
++  if v is None:
++    return default
++  s = str(v).strip().lower()
++  if s in CONSENT_MODES:
++    return s
++  return CONSENT_ALL
++
++
++def _to_consent_min_level(v, default):
++  """0033 min-level coercion. MISSING -> ``default`` (22). PRESENT but unparseable -> 0, i.e. in
++  ``high`` mode EVERY rep needs a tap (the strictest reading): a broken value must not let sub-22
++  reps slip through tap-free."""
++  if v is None:
++    return default
++  try:
++    return int(v)
++  except (TypeError, ValueError):
++    return 0
++
++
++def consent_opts(cond: dict, obj: dict) -> dict:
++  """0033 consent config. Reads the top-level ``consent`` object if present, else the flat keys in
++  ``conditions`` (``consent_mode`` / ``consent_min_level_lsb`` / ``consent_timeout_s``)."""
++  top = obj.get("consent") if isinstance(obj.get("consent"), dict) else {}
++  return {
++    "consent_mode": _to_consent_mode(top.get("mode", cond.get("consent_mode")), DEFAULT_CONSENT_MODE),
++    "consent_min_level_lsb": _to_consent_min_level(top.get("min_level_lsb", cond.get("consent_min_level_lsb")),
++                                                   DEFAULT_CONSENT_MIN_LEVEL_LSB),
++    "consent_timeout_s": _to_float(top.get("timeout_s", cond.get("consent_timeout_s")),
++                                   DEFAULT_CONSENT_TIMEOUT_S),
++  }
++
++
+ def _fca11_budget_predicate(hold_s: float, in_budget: bool, budget_start: int, budget_end: int,
+                             frame: int) -> tuple[bool, str]:
+   """THE 0031 ARMED-ONLY-IF-PROVABLY-FULL PREDICATE. ``m`` are the car layer's panda budget mirror
+@@ -263,6 +347,8 @@ def parse_plan(obj) -> tuple[list[CalRep], dict] | None:
+     # not an explicit false (incl. a missing key) leaves the veto ON. Hold-off seconds -> frames.
+     "blindspot_veto": _to_bool(cond.get("blindspot_veto"), DEFAULT_BLINDSPOT_VETO),
+     "blindspot_holdoff_s": _to_float(cond.get("blindspot_holdoff_s"), DEFAULT_BLINDSPOT_HOLDOFF_S),
++    # 0033 consent (tap-to-fire). Fail-closed: missing mode -> "off"; unrecognised -> "all".
++    **consent_opts(cond, obj),
+   }
+   return reps, opts
+ 
+@@ -355,6 +441,19 @@ class CalSequencer:
+     self._blindspot_last_set = -1
+     self._blindspot_vetoed = False   # True if the veto is what blocked arming on the last tick
+     self._last_pid = ""              # 0032: last plan_id seen, to reset the hold-off on a new revision
++    # ---- 0033: driver consent ("tap to fire") ------------------------------------------
++    # ``_pending`` is the rep parked awaiting a tap (or None). ``_consent_skip`` is the set of rep ids
++    # the owner DISMISSED this session (never re-prompted until the next session). ``_consent_rerprompt_
++    # after`` gates re-prompting an EXPIRED rep so it is not asked on every tick.
++    self._pending: CalRep | None = None
++    self._pending_since = -1
++    self._pending_seq = -1            # the prompt's sequence number (bind a tap to THIS prompt)
++    self._consent_plan_id = ""        # the plan_id the parked prompt belongs to (bind a tap to it)
++    self._consent_state = "idle"      # idle | pending | firing | expired | dismissed | refused | ...
++    self._consent_reason = ""
++    self._consent_seq = 0             # bumped when a NEW prompt is parked (the UI's change key)
++    self._consent_skip: set[str] = set()
++    self._consent_rerprompt_after: dict[str, int] = {}
+ 
+   # ------------------------------------------------------------------ config
+   def set_phases(self, phases) -> None:
+@@ -377,6 +476,15 @@ class CalSequencer:
+     # 0032: a new session clears the blind-spot hold-off window (like the rest of the run state).
+     self._blindspot_last_set = -1
+     self._blindspot_vetoed = False
++    # 0033: a new drive clears the consent run state (prompts, dismissals, re-prompt gates).
++    self._pending = None
++    self._pending_since = -1
++    self._pending_seq = -1
++    self._consent_plan_id = ""
++    self._consent_state = "idle"
++    self._consent_reason = ""
++    self._consent_skip = set()
++    self._consent_rerprompt_after = {}
+ 
+   # ------------------------------------------------------------------ 0031 budget gate
+   def set_budget_mirror(self, in_budget: bool, budget_start: int, budget_end: int) -> None:
+@@ -425,6 +533,15 @@ class CalSequencer:
+       self._last_pid = self.pid
+       self._blindspot_last_set = -1
+       self._blindspot_vetoed = False
++      # 0033: a new plan revision resets the consent run state too (fresh prompts, no stale skips).
++      self._pending = None
++      self._pending_since = -1
++      self._pending_seq = -1
++      self._consent_plan_id = ""
++      self._consent_state = "idle"
++      self._consent_reason = ""
++      self._consent_skip = set()
++      self._consent_rerprompt_after = {}
+     # expiry (absolute) + issued_at staleness (relative)
+     expires_at = self.opts.get("expires_at")
+     if expires_at is not None and now_wall > expires_at:
+@@ -546,6 +663,179 @@ class CalSequencer:
+     self._blindspot_vetoed = False
+     return True
+ 
++  # ------------------------------------------------------------------ 0033 consent
++  def consent_required(self, rep: CalRep) -> bool:
++    """0033: does THIS rep need a driver tap before it may actuate? ``off`` never does (the autonomous,
++    backward-compatible path -- the ONLY tap-free mode). ``all`` always does. ``high`` only for reps
++    at/above ``consent.min_level_lsb``. Anything that reaches here that is not exactly ``off`` can only
++    ADD a requirement, never remove one (fail-closed)."""
++    mode = self.opts.get("consent_mode", DEFAULT_CONSENT_MODE)
++    if mode == CONSENT_OFF:
++      return False
++    if mode == CONSENT_ALL:
++      return True
++    return int(rep.level_lsb) >= int(self.opts.get("consent_min_level_lsb", DEFAULT_CONSENT_MIN_LEVEL_LSB))
++
++  @property
++  def pending(self) -> bool:
++    """0033: True while a rep is parked awaiting a driver tap."""
++    return self._pending is not None
++
++  @property
++  def pending_rep_id(self):
++    return self._pending.id if self._pending is not None else None
++
++  @property
++  def pending_level_lsb(self) -> int:
++    return int(self._pending.level_lsb) if self._pending is not None else 0
++
++  def _pending_path(self) -> str:
++    return os.path.join(self.dir, "pending.json")
++
++  def _tap_path(self) -> str:
++    return os.path.join(self.dir, "consent.json")
++
++  def _write_pending(self, active: bool) -> None:
++    """Publish the (ADVISORY) prompt state for the UI. Not in the actuation path -- the UI may read it
++    late or not at all; the consent FILE below is the only thing that can fire a rep. ``seq`` uniquely
++    identifies THIS prompt (bumped on every park) and must be echoed by the tap."""
++    rep = self._pending
++    live = bool(active and rep is not None)
++    doc = {"pending": live,
++           "rep_id": (rep.id if live else None),
++           "level_lsb": (int(rep.level_lsb) if live else 0),
++           "level_g": (round(int(rep.level_lsb) * 0.01, 2) if live else 0.0),
++           "band_kph": (float(rep.band_kph) if live else 0.0),
++           "seq": self._pending_seq if live else -1,
++           "plan_id": (self.pid if live else ""),
++           "ts": round(time.time(), 3)}
++    _write_json_atomic(self._pending_path(), doc)
++
++  def _clear_tap_file(self) -> None:
++    try:
++      os.remove(self._tap_path())
++    except OSError:
++      pass
++
++  def _read_tap(self) -> tuple[bool, str]:
++    """(accepted, reason) from the UI's consent file. FAIL-CLOSED: absent / malformed / mismatched
++    (rep OR plan OR prompt-seq) / non-accepted / stale / untimestamped -> (False, reason). Never
++    raises, never actuates on doubt. ``accept`` must be a REAL bool True (not 1/"true"/truthy)."""
++    pending = self._pending
++    if pending is None:
++      return False, "no_pending"
++    obj = _read_json(self._tap_path())
++    if not isinstance(obj, dict):
++      return False, "absent_or_malformed"
++    if obj.get("rep_id") != pending.id:
++      return False, "rep_mismatch"
++    if obj.get("plan_id") != self.pid:
++      return False, "plan_mismatch"
++    if obj.get("seq") != self._pending_seq:
++      return False, "seq_mismatch"
++    accept = obj.get("accept")
++    if accept is False:
++      return False, "not_accepted"              # an EXPLICIT dismiss (accept:false)
++    if not (type(accept) is bool and accept is True):
++      return False, "bad_accept"                # present but not a real bool True -> keep waiting
++    ts = _to_float(obj.get("ts"), None)
++    if ts is None:
++      return False, "no_ts"
++    if abs(time.time() - ts) > CONSENT_FRESHNESS_S:
++      return False, "stale"
++    return True, "accepted"
++
++  def _start_rep(self, rep: CalRep, frame: int, now_wall: float, consent: bool = False) -> None:
++    """Arm ``rep``: command its level NOW (the brake enters on the panda-rate ramp, a clean step).
++    Shared by the autonomous pick path and the 0033 accepted-tap path, so the two never drift."""
++    self._active = rep
++    self._rep_saw_budget = False
++    self.level_lsb = rep.level_lsb
++    self.active_actuation = True
++    self._on_start = frame
++    self._release_frame = -1
++    self._block_reason = "active"
++    rec = {"event": "rep_start", "rep": rep.id, "plan_id": self.pid, "session": self._session,
++           "band_kph": rep.band_kph, "level_lsb": rep.level_lsb, "phase": rep.phase,
++           "direction": self._direction(), "ts": round(now_wall, 3)}
++    if consent:
++      rec["consent"] = True
++    self._append_log(rec)
++
++  def _park_pending(self, rep: CalRep, frame: int, now_wall: float) -> None:
++    self._pending = rep
++    self._pending_since = frame
++    self._consent_seq += 1
++    self._pending_seq = self._consent_seq      # THIS prompt's identity (the UI change key + tap bind)
++    self._consent_plan_id = self.pid
++    self._consent_state = "pending"
++    self._consent_reason = "awaiting_tap"
++    # delete any leftover tap BEFORE publishing the prompt, so an old tap can never satisfy this one
++    # (and the UI can never respond to the new prompt with a write this deletion would then eat).
++    self._clear_tap_file()
++    self._write_pending(True)
++    self._append_log({"event": "consent_pending", "rep": rep.id, "plan_id": self.pid,
++                      "level_lsb": rep.level_lsb, "band_kph": rep.band_kph,
++                      "session": self._session, "ts": round(now_wall, 3)})
++
++  def _drop_pending(self, reason: str) -> None:
++    rep = self._pending
++    self._pending = None
++    self._pending_since = -1
++    self._consent_state = reason
++    self._consent_reason = reason
++    self._write_pending(False)
++    if rep is not None:
++      self._append_log({"event": "consent_" + reason, "rep": rep.id, "plan_id": self.pid,
++                        "session": self._session, "ts": round(time.time(), 3)})
++
++  def _tick_pending(self, CC, CS, frame: int) -> None:
++    """0033: resolve a parked pending rep. FIRE only on a fresh, rep+plan+seq-bound, accepted tap
++    whose conditions+budget STILL hold at the instant of the tap; otherwise DROP (expire / dismiss /
++    lapse / refuse). Called only while ``self._pending is not None``, and NEVER lets a malformed file
++    take the 100 Hz car loop down (fail-closed)."""
++    pending = self._pending
++    if pending is None:
++      return
++    try:
++      timeout_f = int(round(self.opts.get("consent_timeout_s", DEFAULT_CONSENT_TIMEOUT_S) * 100.0))
++      if timeout_f > 0 and (frame - self._pending_since) >= timeout_f:
++        self._drop_pending("expired")           # untouched -> skip, retried later (after a hold-off)
++        self._consent_rerprompt_after[pending.id] = frame + max(timeout_f, 1)
++        return
++      # RE-VERIFY at the instant of the tap: a condition that lapsed while the prompt was up (a lead
++      # closed, entered a turn, disengaged, or -- 0032 -- a rear blind-spot bit appeared) DROPS the
++      # prompt. Never fire on a stale world.
++      cond_ok, cond_why = self._conditions_ok(CC, CS)
++      if not cond_ok:
++        self._drop_pending("lapsed")
++        self._consent_reason = "lapsed:" + cond_why
++        return
++      accepted, why = self._read_tap()
++      if not accepted:
++        if why == "not_accepted":               # an explicit DISMISS -> skip this rep this session
++          self._consent_skip.add(pending.id)
++          self._drop_pending("dismissed")
++          return
++        self._consent_reason = why              # absent / stale / mismatched -> keep waiting
++        return
++      can, bwhy = self.budget_can_arm(pending.hold_s, frame)
++      if not can:
++        self._drop_pending("budget_at_tap")     # never fire a rep the panda would refuse for budget
++        self._consent_reason = bwhy
++        return
++      # FIRE: arm exactly like the autonomous START path (shared helper -> no drift).
++      rep = pending
++      self._pending = None
++      self._pending_since = -1
++      self._consent_state = "firing"
++      self._consent_reason = "accepted"
++      self._clear_tap_file()
++      self._write_pending(False)
++      self._start_rep(rep, frame, time.time(), consent=True)
++    except Exception:  # noqa: BLE001 - a malformed file must never crash the car loop; fail closed
++      self._drop_pending("error")
++
+   def _conditions_ok(self, CC, CS) -> tuple[bool, str]:
+     if not (bool(CC.enabled) and bool(CC.longActive)):
+       return False, "not_engaged"
+@@ -613,8 +903,18 @@ class CalSequencer:
+     # ---- if no rep is active: pick the next due one ------------------------------------------------
+     if self._active is None:
+       self.active_actuation = False
++      # 0033: a parked consent rep whose plan/file lapsed is dropped (fail-closed) -- never actuate a
++      # rep whose authorising plan is gone, tap or no tap.
++      if self._pending is not None and not self.plan_valid:
++        self._drop_pending("plan_lapsed")
+       if not self.plan_valid:
+         return
++      # 0033: an outstanding PENDING rep is resolved FIRST and EXCLUSIVELY. While one is parked the
++      # sequencer actuates NOTHING (a brake firing while the owner reads a prompt is exactly the
++      # surprise consent exists to remove). Tap / dismiss / expiry all resolve here.
++      if self._pending is not None:
++        self._tick_pending(CC, CS, frame)
++        return
+       if self.is_done:
+         self._block_reason = "done"
+         return
+@@ -631,6 +931,8 @@ class CalSequencer:
+       for rep in self._enabled_reps():
+         if self._is_complete(rep):
+           continue
++        if rep.id in self._consent_skip:          # 0033: dismissed this session -> never re-prompt
++          continue
+         if not self._band_ready(rep.band_kph):
+           continue
+         can, why = self.budget_can_arm(rep.hold_s, frame)
+@@ -638,22 +940,22 @@ class CalSequencer:
+           blocked_by_budget = True
+           self._last_budget_reason = why
+           continue
++        # 0033: a rep that requires consent is PARKED (published for the UI), never armed. A rep whose
++        # prompt just expired waits out its re-prompt hold-off so it is not asked on every tick.
++        if self.consent_required(rep):
++          if frame < self._consent_rerprompt_after.get(rep.id, -1):
++            self._block_reason = "consent_holdoff"
++            continue
++          self._park_pending(rep, frame, now_wall)
++          self._block_reason = "pending_consent"
++          return
+         pick = rep
+         break
+       if pick is None:
+         self._block_reason = "budget_block" if blocked_by_budget else "band_not_ready"
+         return
+       # START the rep: command the level NOW. The brake enters on the panda-rate ramp (a clean step).
+-      self._active = pick
+-      self._rep_saw_budget = False
+-      self.level_lsb = pick.level_lsb
+-      self.active_actuation = True
+-      self._on_start = frame
+-      self._release_frame = -1
+-      self._block_reason = "active"
+-      self._append_log({"event": "rep_start", "rep": pick.id, "plan_id": self.pid, "session": self._session,
+-                        "band_kph": pick.band_kph, "level_lsb": pick.level_lsb, "phase": pick.phase,
+-                        "direction": self._direction(), "ts": round(now_wall, 3)})
++      self._start_rep(pick, frame, now_wall, consent=False)
+       return
+ 
+     # ---- a rep is active: hold, then release + recovery --------------------------------------------
+@@ -744,4 +1046,12 @@ class CalSequencer:
+       "blindspot_veto": bool(self.opts.get("blindspot_veto", DEFAULT_BLINDSPOT_VETO)),
+       "blindspot_holdoff_s": self.opts.get("blindspot_holdoff_s", DEFAULT_BLINDSPOT_HOLDOFF_S),
+       "blindspot_is_vetoing": self._blindspot_vetoed,
++      # 0033 consent diagnostics. ``consent_mode`` is the configured policy; ``consent_pending``
++      # reports whether a rep is parked awaiting a tap right now.
++      "consent_mode": self.opts.get("consent_mode", DEFAULT_CONSENT_MODE),
++      "consent_min_level_lsb": self.opts.get("consent_min_level_lsb", DEFAULT_CONSENT_MIN_LEVEL_LSB),
++      "consent_timeout_s": self.opts.get("consent_timeout_s", DEFAULT_CONSENT_TIMEOUT_S),
++      "consent_pending": self._pending is not None,
++      "consent_state": self._consent_state,
++      "consent_reason": self._consent_reason,
+     }

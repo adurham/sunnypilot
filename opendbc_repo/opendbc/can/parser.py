@@ -152,6 +152,10 @@ class CANParser:
     self.can_invalid_cnt: int = CAN_INVALID_CNT
     self.last_nonempty_nanos: int = 0
     self._last_update_nanos: int = 0
+    # fork: opt-in raw-frame capture (hyundai FCA11 long braking mirrors the camera's 0x38D byte-for-byte, so the
+    # car layer needs the raw bytes, not just the decoded signals). Empty = no cost in the hot loop.
+    self.capture_addrs: set[int] = set()
+    self.captured: dict[int, tuple[int, bytes]] = {}
 
   def _add_message(self, name_or_addr: str | int, freq: int | None = None) -> None:
     if isinstance(name_or_addr, numbers.Number):
@@ -230,6 +234,9 @@ class CANParser:
         if src != self.bus:
           continue
         bus_empty = False
+        if self.capture_addrs and address in self.capture_addrs:
+          # fork: keep the newest raw frame for the mirrored-address consumers (FCA11 long braking)
+          self.captured[address] = (t, bytes(dat))
         state = self.message_states.get(address)
         if state is None or len(dat) > 64:
           continue

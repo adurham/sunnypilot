@@ -96,6 +96,33 @@ class RadarInterfaceBase(ABC):
     return None
 
 
+def collect_fca11_echoes(can_packets) -> list[tuple[int, bytes]]:
+  """0030 (D2-iii): the pandad echo of our own 0x38D frames, as (src, dat) pairs.
+
+  src 128 = the panda ACCEPTED/forwarded the frame, 192 = it was REJECTED by the TX hook. FCA11-long uses
+  this to confirm its passive close frame really CLOSED the panda episode, and re-owes it if refused
+  (fca11_long.observe_echo).
+
+  WHY THIS IS A NAMED FUNCTION (not an inline comprehension): ``can_capnp_to_list`` in
+  openpilot/selfdrive/pandad/pandad_api_impl.py yields ``(logMonoTime, [(address, data, src), ...])`` --
+  the frames are plain TUPLES. An earlier revision of this code did ``c.address`` on them, which raised
+  AttributeError and crash-looped card on the first CAN frame in the field (the car showed "Unknown
+  Vehicle Variant" because card never got far enough to fingerprint). Keeping the shape handling in ONE
+  named, unit-tested place is the fix; the fork's offline harnesses pass CanData objects with the same
+  three fields, so both shapes are accepted.
+  """
+  echoes: list[tuple[int, bytes]] = []
+  for _t, frames in can_packets:
+    for c in frames:
+      if isinstance(c, tuple):
+        addr, dat, src = int(c[0]), bytes(c[1]), int(c[2])
+      else:
+        addr, dat, src = int(c.address), bytes(c.dat), int(c.src)
+      if addr == 0x38D and src in (128, 192):
+        echoes.append((src, dat))
+  return echoes
+
+
 class CarInterfaceBase(ABC, CarInterfaceBaseSP):
   CarState: type['CarStateBase']
   CarController: type['CarControllerBase']
@@ -264,6 +291,12 @@ class CarInterfaceBase(ABC, CarInterfaceBaseSP):
     tune.torque.steeringAngleDeadzoneDeg = steering_angle_deadzone_deg
 
   def update(self, can_packets: list[tuple[int, list[CanData]]]) -> tuple[structs.CarState, structs.CarStateSP]:
+    # 0030 (D2-iii): the car layer's view of the pandad echo of every host 0x38D we transmit (src 128 = accepted,
+    # 192 = REJECTED by the panda TX hook). FCA11-long reads it to confirm that its passive close frame really
+    # CLOSED the panda episode, re-owing it if refused (fca11_long.observe_echo). Gated on the feature so the
+    # hot loop pays nothing when it is off; a plain list attribute, never a capnp field.
+    if self.CP_SP.fca11Brake:
+      self.CS.fca11_echoes = collect_fca11_echoes(can_packets)
     # parse can
     for cp in self.can_parsers.values():
       if cp is not None:

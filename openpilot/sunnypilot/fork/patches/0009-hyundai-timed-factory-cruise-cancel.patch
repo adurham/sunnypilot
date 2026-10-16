@@ -1,0 +1,1028 @@
+From 4c7aa557765523117604b08a8a188f3939281d2e Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 15:45:45 -0500
+Subject: [PATCH] hyundai: gas interceptor: panda-timed factory-cruise CANCEL
+ safety net + review fixes (echo guard, fresh lamp, inter-attempt lamp
+ confirmation)
+
+Cumulative opendbc diff cc592f1c..2258c35a (3 commits, one patch file):
+  032ded0d hyundai: gas interceptor: panda-timed factory-cruise CANCEL safety net (CLU11 only from firmware, after a cluster frame)
+  84143056 hyundai: gas interceptor: timed cancel review fixes (echo guard, fresh-lamp + inter-attempt lamp confirmation)
+  2258c35a hyundai: gas interceptor: timed cancel: lamp-confirmation test covers attempts 2 and 3 (no carry-over)
+
+  hyundai: gas interceptor: panda-timed factory-cruise CANCEL safety net (CLU11 only from firmware, after a cluster frame)
+
+  If the factory cruise becomes ACTIVE (EMS16 CRUISE_LAMP_S) while openpilot longitudinal is engaged (controls_allowed
+  and heartbeat), panda builds and sends CLU11 CruiseSwState=4 frames itself, each queued while a cluster CLU11 is being
+  received (19.8 ms before the cluster's next one): cluster payload, button 4, AliveCnt1 = cluster+1, ParityBit1
+  recomputed. 4 attempts x 3 frames, >=400 ms apart, >=15 ms rate cap, 12-frame cap, 2 s give-up, stop on lamp off,
+  abort on a driver SET/RES/pause press, skip MAIN-held / bad-parity frames, none while braking. CLU11 stays out of
+  the USB TX allowlist; the MAIN lockout (long dropped) is unchanged. Tests: libsafety can_send recorder + 20 tests.
+
+  openpilot side: carstate_ext mirrors the episode; factory cruise still on 2.5 s after it rose under engaged long ->
+  accFaulted (audible 'Cruise Fault' immediate disable), cleared when the factory cruise is off.
+
+  integration-3: + TestHyundaiNonSCCFCA11{BrakeTest,RollingTest}Safety::test_test_bit_overrides_timed_factory_cancel
+  (bits 64 / 64+128 with GAS_INTERCEPTOR, both dialects: 0 self-TX CLU11; positive control pedal-only = 12).
+
+  hyundai: gas interceptor: timed cancel review fixes (echo guard, fresh-lamp + inter-attempt lamp confirmation)
+
+  Review change #1: hyundai_fc_cancel_cluster_frame ignores packets with returned != 0 (panda's TX echo), with the
+  invariant documented: only a frame the cluster put on the bus may trigger or be copied. Test: echoed frames (plain and
+  CANCEL payloads, RX-valid) never trigger, the next real frame does.
+
+  Review change #2: the RX-IRQ -> can_send -> TX ring -> process_can call path is documented on the function, and a
+  libsafety test floods the USB TX path (pedal, LKAS11, CLU11) through a whole episode: the firmware frames are
+  identical (bytes, order, times), >= 15 ms apart, 4 x 3. The board TX ring/FIFO is not modelled (road checklist).
+
+  Toggle-back margin (routes 11c/123/127/128): EMS16 period 10.000 ms; lamp falls <= 150.5 ms after the frame the ECM
+  acted on (44/45 <= 50.5 ms); ECM torque request drops <= 99.7 ms before the lamp. Every frame now needs a fresh lamp
+  (EMS16 <= 30 ms old, CRUISE_LAMP_S = 1), and a later attempt needs 2 EMS16 with CRUISE_LAMP_S = 1 received >= 250 ms
+  after the previous attempt's last frame. Tests: stale lamp, confirmation counting, late lamp fall (10-395 ms) never
+  retried.
+
+  hyundai: gas interceptor: timed cancel: lamp-confirmation test covers attempts 2 and 3 (no carry-over)
+
+  Confirmations collected before an attempt must not count for the next one; the test now runs the 1-of-2 / 2-of-2
+  confirmation check before attempt 2 AND attempt 3, killing a 'confirmation not reset after an attempt' mutant.
+---
+ opendbc/safety/modes/hyundai.h                |  12 +-
+ opendbc/safety/modes/hyundai_common.h         | 203 ++++++++
+ .../safety/tests/libsafety/libsafety_py.py    |   5 +
+ opendbc/safety/tests/libsafety/safety.c       |  50 ++
+ opendbc/safety/tests/test_hyundai.py          | 480 ++++++++++++++++++
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  27 +
+ .../car/hyundai/tests/test_gas_interceptor.py |  46 ++
+ 7 files changed, 821 insertions(+), 2 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 6ef85834..d64bdb3c 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -393,6 +393,10 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+ 
+     // ACC steering wheel buttons
+     if (msg->addr == 0x4F1U) {
++      if (hyundai_gas_interceptor) {
++        // timed factory-cruise cancel: the bus is idle right after this cluster frame (hyundai_common.h)
++        hyundai_fc_cancel_cluster_frame(msg);
++      }
+       int cruise_button = msg->data[0] & 0x7U;
+       bool main_button = GET_BIT(msg, 3U);
+       hyundai_common_cruise_buttons_check(cruise_button, main_button);
+@@ -444,7 +448,10 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+     if ((msg->addr == 0x260U) && hyundai_non_scc && !hyundai_ev_gas_signal && !hyundai_hybrid_gas_signal) {
+       if (hyundai_gas_interceptor) {
+         // CRUISE_LAMP_M = factory cruise MAIN armed. Pedal-long does not use it as its main switch. Instead it is a
+-        // lockout: the factory cruise can only engage while armed, and openpilot never cancels it in this mode.
++        // lockout: the factory cruise can only engage while armed. openpilot itself never sends CLU11 in this mode.
++        // Safety net: factory cruise ACTIVE while openpilot long is engaged -> panda's own timed CANCEL (hyundai_common.h).
++        // Evaluated BEFORE the lockout below clears controls_allowed on this same frame.
++        hyundai_fc_cancel_ems16(GET_BIT(msg, 26U));
+         hyundai_factory_main_on = GET_BIT(msg, 25U);
+         // factory cruise active (CRUISE_LAMP_S, implies MAIN armed): also a lockout, belt and braces
+         if (hyundai_factory_main_on || GET_BIT(msg, 26U)) {
+@@ -595,7 +602,8 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+   }
+ 
+   // BUTTONS: used for resume spamming and cruise cancellation
+-  // (gas interceptor: CLU11 is not in the TX allowlist at all; same-ID frames collide with the cluster's own CLU11)
++  // (gas interceptor: CLU11 is not in the TX allowlist at all, so openpilot/USB can never send one; the only CLU11 in
++  // this mode is panda's own timed CANCEL, built and policed in hyundai_common.h, which does not pass through here)
+   if ((msg->addr == 0x4F1U) && !hyundai_longitudinal) {
+     int button = msg->data[0] & 0x7U;
+ 
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index b9ece943..06cb5585 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -113,6 +113,208 @@ static bool hyundai_setres_brake_seen;       // gas interceptor: brake was press
+ static bool hyundai_pause_armed;             // the current/last press will resume on its debounced release
+ static uint8_t hyundai_pause_released_cnt;   // consecutive NONE samples since the button was last 4
+ 
++// ********** Gas interceptor: timed factory-cruise CANCEL (the ONLY CLU11 this panda ever transmits in pedal mode) **********
++// Safety net for the MAIN lockout: if the factory (non-adaptive) cruise reports ACTIVE (EMS16 CRUISE_LAMP_S) while
++// openpilot longitudinal is engaged (controls_allowed AND the openpilot heartbeat says engaged), panda cancels it with
++// CLU11 (0x4F1) CF_Clu_CruiseSwState = 4 frames that it builds and transmits ITSELF, from the bus-0 RX path:
++//  * Timing: one frame, queued synchronously while a CLUSTER CLU11 is being received (rx hook), i.e. right after that
++//    frame's EOF. The cluster sends CLU11 every 19.8 ms, so its next frame is ~19.8 ms away and the two can never contend
++//    for the same arbitration slot (routes 11c/123: every bus error, bus-off and pedal SCE onset came from our old,
++//    unsynchronised CLU11 frames arbitrating together with the cluster's). No RX of a cluster CLU11 -> no TX, ever.
++//  * Payload: the cluster's frame just received, with ONLY the button field set to 4, CF_Clu_AliveCnt1 = cluster + 1 and
++//    CF_Clu_ParityBit1 recomputed over the final payload (the old create_clu11 copied the cluster's parity after
++//    rewriting the counter: 1998/3983 of its frames on 11c had a wrong parity bit).
++//  * Schedule: up to 4 attempts of 3 frames (a 3-sample press, like the driver's; odd because CruiseSwState 4 is a
++//    pause/resume TOGGLE on this ECM; one well-formed frame is NOT enough on the logs), at most ONE frame per cluster
++//    frame, >= 400 ms between attempts to watch CRUISE_LAMP_S, at most 12 frames, >= 15 ms apart, stop on the
++//    first EMS16 with CRUISE_LAMP_S = 0, give up 2 s after the trigger (openpilot raises an audible alert).
++//    Every frame needs FRESH positive evidence that the factory cruise is still on: the latest bus-0 EMS16 (10 ms period)
++//    is <= 30 ms old and says CRUISE_LAMP_S = 1. A later attempt additionally needs >= 2 EMS16 frames with
++//    CRUISE_LAMP_S = 1 received >= 250 ms after the previous attempt's last frame (lamp confirmation). Toggle-back margin
++//    (integration-3b-report.md, routes 11c/123/127/128): the lamp falls <= 150.5 ms after the frame the ECM acted on
++//    (44/45 <= 50.5 ms), and the ECM's torque request drops <= 99.7 ms before the lamp, so the confirmation can only
++//    complete while the cruise is still really on. Inside one attempt, frames 2-3 (+19.8 / +39.6 ms) may still land
++//    after the ECM acted on frame 1: unavoidable for a press shape, and the same exposure as a driver's 3-frame press.
++//    On the logs no 4 alone ever re-engaged the cruise sooner than 1.74 s after it went off (331 trailing frames 0-995 ms
++//    after a fall: 0 re-engagements without a driver SET/RES). A driver
++//    SET/RES/pause press on the cluster aborts it (the driver is operating the factory cruise himself); frames with
++//    MAIN held are skipped. No frame while the brake is pressed (the ECM cancels on the brake itself).
++//  * Not reachable over USB: 0x4F1 is not in the pedal-mode TX allowlist, so openpilot can't send CLU11 at all.
++// The lockout itself is unchanged: controls_allowed is still cleared on the same EMS16 (two speed controllers never run
++// together), so the trigger is evaluated on that EMS16 frame BEFORE the lockout clears it.
++#define HYUNDAI_FC_CANCEL_BUTTON 4U
++#define HYUNDAI_FC_CANCEL_WINDOW_US 2000000U       // give up this long after the trigger
++#define HYUNDAI_FC_CANCEL_MIN_GAP_US 15000U        // hard rate cap: never two frames closer than this (cluster: 19.8 ms)
++#define HYUNDAI_FC_CANCEL_ATTEMPT_GAP_US 400000U   // between attempts: > worst lamp lag (150.5 ms) + 2 confirmations, << 1.74 s
++#define HYUNDAI_FC_CANCEL_LAMP_LAG_US 250000U      // lamp confirmation samples count only this long after an attempt
++#define HYUNDAI_FC_CANCEL_LAMP_CONFIRM 2U          // EMS16 samples with CRUISE_LAMP_S = 1 needed before the next attempt
++#define HYUNDAI_FC_CANCEL_LAMP_FRESH_US 30000U     // the latest EMS16 (10 ms period) must be this recent for every frame
++#define HYUNDAI_FC_CANCEL_ATTEMPTS 4U
++#define HYUNDAI_FC_CANCEL_FRAMES_PER_ATTEMPT 3U    // odd (toggle), = a short driver press (3 frames of 4, ~60 ms)
++#define HYUNDAI_FC_CANCEL_MAX_FRAMES 12U           // == ATTEMPTS * FRAMES_PER_ATTEMPT (independent hard cap)
++
++// provided by the panda board (board/drivers/can_common.h); libsafety provides recording stubs
++void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook);
++void can_set_checksum(CANPacket_t *packet);
++
++static bool hyundai_fc_active;                // EMS16 CRUISE_LAMP_S, latest bus-0 sample
++static bool hyundai_fc_cancel_armed;          // a cancel episode is running
++static bool hyundai_fc_cancel_done;           // episode over (gave up / aborted): no new one until CRUISE_LAMP_S falls
++static uint32_t hyundai_fc_cancel_start_ts;   // trigger time
++static uint32_t hyundai_fc_cancel_next_us;    // earliest TX, microseconds after the trigger (attempt gap)
++static uint32_t hyundai_fc_cancel_last_tx_ts;
++static uint8_t hyundai_fc_cancel_attempt;
++static uint8_t hyundai_fc_cancel_attempt_frames;
++static uint8_t hyundai_fc_cancel_frames;      // frames transmitted this episode
++static uint32_t hyundai_fc_ems16_ts;          // time of the latest bus-0 EMS16 (lamp freshness)
++static uint8_t hyundai_fc_cancel_confirm;     // CRUISE_LAMP_S = 1 samples >= LAMP_LAG after the last attempt
++
++static void hyundai_fc_cancel_reset(void) {
++  hyundai_fc_active = false;
++  hyundai_fc_cancel_armed = false;
++  hyundai_fc_cancel_done = false;
++  hyundai_fc_cancel_start_ts = 0U;
++  hyundai_fc_cancel_next_us = 0U;
++  hyundai_fc_cancel_last_tx_ts = 0U;
++  hyundai_fc_cancel_attempt = 0U;
++  hyundai_fc_cancel_attempt_frames = 0U;
++  hyundai_fc_cancel_frames = 0U;
++  hyundai_fc_ems16_ts = 0U;
++  hyundai_fc_cancel_confirm = 0U;
++}
++
++// CF_Clu_ParityBit1 (bit 5) = parity over CF_Clu_CruiseSwState (bits 0-2) + CF_Clu_CruiseSwMain (bit 3) +
++// CF_Clu_AliveCnt1 (byte 3 bits 4-7): bit5 == popcount(those 8 bits) % 2. Holds for 174557/174557 cluster frames on
++// routes 11c/123/128 (CF_Clu_SldMainSW, bit 4, was 0 in all of them; frames with it set are never copied).
++static uint8_t hyundai_clu11_parity(uint8_t byte0, uint8_t byte3) {
++  uint8_t bits = (uint8_t)((byte0 & 0x0FU) | (byte3 & 0xF0U));
++  uint8_t n = 0U;
++  for (uint8_t i = 0U; i < 8U; i++) {
++    n += (uint8_t)((bits >> i) & 1U);
++  }
++  return (uint8_t)(n & 1U);
++}
++
++// TX policy for the firmware-built frame (the only CLU11 source in pedal mode). Every condition is re-checked on the
++// final packet, independent of how it was built.
++static bool hyundai_fc_cancel_tx_allowed(const CANPacket_t *pkt, const CANPacket_t *cluster) {
++  bool ok = hyundai_gas_interceptor && hyundai_fc_cancel_armed && hyundai_fc_active && !relay_malfunction;
++  ok = ok && (pkt->addr == 0x4F1U) && (pkt->bus == 0U) && (pkt->extended == 0U) && (pkt->fd == 0U) && (GET_LEN(pkt) == 4U);
++  ok = ok && ((pkt->data[0] & 0x1FU) == HYUNDAI_FC_CANCEL_BUTTON);  // CANCEL, MAIN 0, SldMainSW 0
++  ok = ok && (((pkt->data[0] >> 5) & 1U) == hyundai_clu11_parity(pkt->data[0], pkt->data[3]));
++  ok = ok && ((pkt->data[3] >> 4) == (((cluster->data[3] >> 4) + 1U) & 0xFU));
++  ok = ok && ((pkt->data[0] & 0xC0U) == (cluster->data[0] & 0xC0U)) && (pkt->data[1] == cluster->data[1]) &&
++            (pkt->data[2] == cluster->data[2]) && ((pkt->data[3] & 0x0FU) == (cluster->data[3] & 0x0FU));
++  return ok;
++}
++
++// EMS16 (bus 0), gas interceptor only. Must run BEFORE the MAIN/active lockout clears controls_allowed.
++static void hyundai_fc_cancel_ems16(bool factory_active) {
++  uint32_t ts = microsecond_timer_get();
++  if (!factory_active) {
++    // factory cruise off: success (or never needed). Re-arm.
++    hyundai_fc_cancel_armed = false;
++    hyundai_fc_cancel_done = false;
++  } else if (!hyundai_fc_cancel_armed && !hyundai_fc_cancel_done && controls_allowed && heartbeat_engaged) {
++    hyundai_fc_cancel_armed = true;
++    hyundai_fc_cancel_start_ts = ts;
++    hyundai_fc_cancel_next_us = 0U;
++    hyundai_fc_cancel_attempt = 0U;
++    hyundai_fc_cancel_attempt_frames = 0U;
++    hyundai_fc_cancel_frames = 0U;
++    hyundai_fc_cancel_confirm = 0U;
++  } else if (hyundai_fc_cancel_armed && (safety_get_ts_elapsed(ts, hyundai_fc_cancel_start_ts) >= HYUNDAI_FC_CANCEL_WINDOW_US)) {
++    hyundai_fc_cancel_armed = false;  // give up (openpilot alerts on its own: CRUISE_LAMP_S still on)
++    hyundai_fc_cancel_done = true;
++  } else if (hyundai_fc_cancel_armed && (hyundai_fc_cancel_attempt > 0U) && (hyundai_fc_cancel_attempt_frames == 0U) &&
++             (safety_get_ts_elapsed(ts, hyundai_fc_cancel_last_tx_ts) >= HYUNDAI_FC_CANCEL_LAMP_LAG_US) &&
++             (hyundai_fc_cancel_confirm < HYUNDAI_FC_CANCEL_LAMP_CONFIRM)) {
++    // still on well after the last attempt could have shown on the lamp: confirmation sample for the next attempt
++    hyundai_fc_cancel_confirm += 1U;
++  } else {
++  }
++  hyundai_fc_ems16_ts = ts;
++  hyundai_fc_active = factory_active;
++}
++
++// cluster CLU11 just received on bus 0 (gas interceptor only): the only place a CLU11 is ever transmitted.
++// INVARIANT: only a frame the cluster put on the bus may trigger (and be copied into) a CANCEL; our own transmitted
++// frame must never feed back into this function. Today that holds without the guard below: the panda board's TX echo
++// (process_can, returned = 1) goes only to the USB rx queue, never through safety_rx_hook, and FDCAN does not loop a
++// self-transmitted frame into the RX FIFO (can_loopback defaults to false). The guard makes it hold by construction, so
++// a future board/harness change that routes echoes or loopback frames through the RX hook can't make panda answer its
++// own CANCEL with another one (a self-sustaining loop of a pause/resume toggle).
++//
++// Call path (board/drivers/fdcan.h): FDCANx_IT0 IRQ -> can_rx() -> safety_rx_hook() -> hyundai_rx_hook() -> here ->
++// can_send(skip_tx_hook) -> can_push() onto the bus-0 TX ring (ENTER_CRITICAL) -> process_can(0) (ENTER_CRITICAL) moves
++// at most ONE ring element into the FDCAN TX FIFO if it has room, else returns; the TX-FIFO-empty IRQ (IT1) drains the
++// rest. The ring is FIFO, shared with USB-sent pedal/LKAS frames, so our frame keeps its order relative to those but can
++// wait behind them: worst-case latency is the ring backlog at that moment, not the 30-400 us of an idle ring. A frame
++// that waits longer than one cluster period (19.8 ms) loses the collision-free slot; the 15 ms rate cap is measured
++// from queue time, not wire time. Road checklist: integration-3b-report.md (TX latency under USB load).
++static void hyundai_fc_cancel_cluster_frame(const CANPacket_t *msg) {
++  if (hyundai_fc_cancel_armed && (msg->returned == 0U)) {
++    uint32_t ts = microsecond_timer_get();
++    uint32_t elapsed = safety_get_ts_elapsed(ts, hyundai_fc_cancel_start_ts);
++    bool driver_cruise_button = ((msg->data[0] & 0x07U) != 0U);  // CruiseSwState: SET / RES / pause-resume
++    bool driver_main_button = ((msg->data[0] & 0x18U) != 0U);    // CruiseSwMain / SldMainSW
++    if (!hyundai_fc_active) {
++      hyundai_fc_cancel_armed = false;
++    } else if ((elapsed >= HYUNDAI_FC_CANCEL_WINDOW_US) || driver_cruise_button) {
++      // window over, or the driver is operating the factory cruise himself (his own pause/resume press is a toggle
++      // too: never interleave ours with it). Done until CRUISE_LAMP_S falls.
++      hyundai_fc_cancel_armed = false;
++      hyundai_fc_cancel_done = true;
++    } else {
++      // MAIN held (e.g. the MAIN press that made the lamp come on): never copy it, wait for a released frame
++      // only a bus-0 CLU11 from the cluster (the RX whitelist already guarantees this; checked again here)
++      bool send = (msg->addr == 0x4F1U) && (msg->bus == 0U) && (GET_LEN(msg) == 4U) && !driver_main_button &&
++                  !brake_pressed && (elapsed >= hyundai_fc_cancel_next_us) &&
++                  (hyundai_fc_cancel_attempt < HYUNDAI_FC_CANCEL_ATTEMPTS) &&
++                  (hyundai_fc_cancel_frames < HYUNDAI_FC_CANCEL_MAX_FRAMES) &&
++                  (((msg->data[0] >> 5) & 1U) == hyundai_clu11_parity(msg->data[0], msg->data[3]));
++      // fresh lamp: CRUISE_LAMP_S = 1 (checked above) from an EMS16 at most LAMP_FRESH old; a stale lamp skips this
++      // cluster frame (no abort), so a lost EMS16 can never let a frame through on old information
++      send = send && (safety_get_ts_elapsed(ts, hyundai_fc_ems16_ts) <= HYUNDAI_FC_CANCEL_LAMP_FRESH_US);
++      // a new attempt only after the lamp confirmed (twice, after LAMP_LAG) that the previous one did not cancel
++      send = send && ((hyundai_fc_cancel_attempt == 0U) || (hyundai_fc_cancel_attempt_frames > 0U) ||
++                      (hyundai_fc_cancel_confirm >= HYUNDAI_FC_CANCEL_LAMP_CONFIRM));
++      if (send && (hyundai_fc_cancel_frames > 0U)) {
++        send = safety_get_ts_elapsed(ts, hyundai_fc_cancel_last_tx_ts) >= HYUNDAI_FC_CANCEL_MIN_GAP_US;
++      }
++      if (send) {
++        CANPacket_t pkt;
++        pkt.fd = 0U;
++        pkt.returned = 0U;
++        pkt.rejected = 0U;
++        pkt.extended = 0U;
++        pkt.addr = 0x4F1U;
++        pkt.bus = 0U;
++        pkt.data_len_code = msg->data_len_code;
++        uint8_t counter = (uint8_t)(((msg->data[3] >> 4) + 1U) & 0xFU);
++        pkt.data[0] = (uint8_t)((msg->data[0] & 0xC0U) | HYUNDAI_FC_CANCEL_BUTTON);
++        pkt.data[1] = msg->data[1];
++        pkt.data[2] = msg->data[2];
++        pkt.data[3] = (uint8_t)((uint8_t)(counter << 4) | (msg->data[3] & 0x0FU));
++        pkt.data[0] |= (uint8_t)(hyundai_clu11_parity(pkt.data[0], pkt.data[3]) << 5);
++        if (hyundai_fc_cancel_tx_allowed(&pkt, msg)) {
++          can_set_checksum(&pkt);
++          can_send(&pkt, 0U, true);  // policy enforced right above; CLU11 is deliberately not in the TX allowlist
++          hyundai_fc_cancel_frames += 1U;
++          hyundai_fc_cancel_attempt_frames += 1U;
++          hyundai_fc_cancel_last_tx_ts = ts;
++          if (hyundai_fc_cancel_attempt_frames >= HYUNDAI_FC_CANCEL_FRAMES_PER_ATTEMPT) {
++            hyundai_fc_cancel_attempt += 1U;
++            hyundai_fc_cancel_attempt_frames = 0U;
++            hyundai_fc_cancel_confirm = 0U;
++            hyundai_fc_cancel_next_us = elapsed + HYUNDAI_FC_CANCEL_ATTEMPT_GAP_US;
++          }
++        }
++      }
++    }
++  }
++}
++
+ static uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
+ 
+ static bool main_button_prev;
+@@ -149,6 +351,7 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_pause_armed = false;
+   hyundai_setres_brake_seen = false;
+   hyundai_pause_released_cnt = HYUNDAI_PAUSE_RELEASE_SAMPLES;
++  hyundai_fc_cancel_reset();
+   acc_main_on_prev = false;
+   acc_main_on_tx = false;
+   acc_main_on_mismatches = 0U;
+diff --git a/opendbc/safety/tests/libsafety/libsafety_py.py b/opendbc/safety/tests/libsafety/libsafety_py.py
+index b4e03d46..13814b4c 100644
+--- a/opendbc/safety/tests/libsafety/libsafety_py.py
++++ b/opendbc/safety/tests/libsafety/libsafety_py.py
+@@ -145,6 +145,11 @@ void set_heartbeat_engaged_mads(bool c);
+ void mads_heartbeat_engaged_check(void);
+ void set_steering_disengage(bool c);
+ int get_gas_interceptor_prev(void);
++
++int get_self_tx_count(void);
++void clear_self_tx(void);
++uint32_t get_self_tx(int i, CANPacket_t *out, int *bus, bool *skip_tx_hook);
++void set_heartbeat_engaged(bool c);
+ """)
+ 
+ class LibSafety:
+diff --git a/opendbc/safety/tests/libsafety/safety.c b/opendbc/safety/tests/libsafety/safety.c
+index 89a2b04a..324ad108 100644
+--- a/opendbc/safety/tests/libsafety/safety.c
++++ b/opendbc/safety/tests/libsafety/safety.c
+@@ -13,6 +13,53 @@ uint32_t microsecond_timer_get(void) {
+ #include "opendbc/safety/safety.h"
+ #include "opendbc/safety/ignition.h"
+ 
++// *** board stand-ins for safety code that transmits by itself (Hyundai gas-interceptor timed factory-cruise cancel).
++// On the panda these are board/drivers/can_common.h. Here every packet is recorded with the timer value at queue time.
++#define TEST_TX_LOG_SIZE 64
++static CANPacket_t test_tx_log[TEST_TX_LOG_SIZE];
++static uint32_t test_tx_log_ts[TEST_TX_LOG_SIZE];
++static int test_tx_log_bus[TEST_TX_LOG_SIZE];
++static bool test_tx_log_skip_hook[TEST_TX_LOG_SIZE];
++static int test_tx_log_len = 0;
++
++void can_set_checksum(CANPacket_t *packet) {
++  packet->checksum = 0U;
++}
++
++void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook) {
++  if (test_tx_log_len < TEST_TX_LOG_SIZE) {
++    test_tx_log[test_tx_log_len] = *to_push;
++    test_tx_log_ts[test_tx_log_len] = timer_cnt;
++    test_tx_log_bus[test_tx_log_len] = bus_number;
++    test_tx_log_skip_hook[test_tx_log_len] = skip_tx_hook;
++  }
++  test_tx_log_len++;
++}
++
++int get_self_tx_count(void) {
++  return test_tx_log_len;
++}
++
++void clear_self_tx(void) {
++  test_tx_log_len = 0;
++}
++
++// copies packet i into *out; returns its queue timestamp (us) or 0xFFFFFFFF if out of range
++uint32_t get_self_tx(int i, CANPacket_t *out, int *bus, bool *skip_tx_hook) {
++  uint32_t ret = 0xFFFFFFFFU;
++  if ((i >= 0) && (i < test_tx_log_len) && (i < TEST_TX_LOG_SIZE)) {
++    *out = test_tx_log[i];
++    *bus = test_tx_log_bus[i];
++    *skip_tx_hook = test_tx_log_skip_hook[i];
++    ret = test_tx_log_ts[i];
++  }
++  return ret;
++}
++
++void set_heartbeat_engaged(bool c) {
++  heartbeat_engaged = c;
++}
++
+ void safety_tick_current_safety_config() {
+   safety_tick(&current_safety_config);
+ }
+@@ -341,4 +388,7 @@ void init_tests(void){
+   mads_button_press = MADS_BUTTON_UNAVAILABLE;
+   heartbeat_engaged_mads = false;
+   heartbeat_engaged_mads_mismatches = 0U;
++
++  heartbeat_engaged = false;
++  test_tx_log_len = 0;
+ }
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 9507f300..6cd5decd 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env python3
+ from opendbc.testing import parameterized_class
++import os
+ import random
++import re
+ import unittest
+ 
+ from opendbc.car.hyundai.values import HyundaiSafetyFlags
+@@ -25,6 +27,25 @@ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+ GAS_ON = 0.1
+ 
++HYUNDAI_COMMON_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai_common.h")
++
++
++def fc_cancel_episode(safety, rx, ems16, clu_raw, brake_msg, period_us=19800, n=150):
++  """Engaged long (panda grant + heartbeat), then the factory cruise comes on and stays on for n cluster frames.
++  Returns the number of CLU11 frames panda transmitted by itself. Shared by the non-pedal / test-mode inertness tests."""
++  safety.set_timer(1_000_000)
++  rx(brake_msg(False))
++  safety.set_controls_allowed(True)
++  safety.set_heartbeat_engaged(True)
++  safety.clear_self_tx()
++  for k in range(n):
++    t = 2_000_000 + k * period_us
++    safety.set_timer(t)
++    rx(ems16(True, True))
++    safety.set_timer(t + 10_000)
++    rx(clu_raw(k & 0xF))
++  return safety.get_self_tx_count()
++
+ # LDA button availability
+ LDA_BUTTON = [
+   {"SAFETY_PARAM_SP": HyundaiSafetyFlagsSP.DEFAULT},
+@@ -126,6 +147,24 @@ class TestHyundaiSafety(HyundaiButtonBase, common.CarSafetyTest, common.DriverTo
+     self.__class__.cnt_button += 1
+     return self.packer.make_can_msg_safety("CLU11", bus, values)
+ 
++  def test_fc_cancel_never_outside_pedal_mode(self):
++    # the timed factory-cruise CANCEL exists only in gas-interceptor mode: every other Hyundai mode (stock, SCC long,
++    # camera SCC, legacy, non-SCC without pedal, the FCA11 brake test) never transmits a CLU11 by itself
++    # (init_tests() resets current_safety_param_sp, so the mode is identified by the test class)
++    if isinstance(self, GasInterceptorSafetyTest):
++      raise unittest.SkipTest("pedal mode: covered by the test_fc_cancel_* tests")
++
++    def ems16(main, active):
++      values = {"CRUISE_LAMP_M": main, "CRUISE_LAMP_S": active, "AliveCounter": self.cnt_gas % 4}
++      self.__class__.cnt_gas += 1
++      return self.packer.make_can_msg_safety("EMS16", 0, values, fix_checksum=checksum)
++
++    def clu_raw(counter):
++      par = bin(counter).count("1") & 1
++      return libsafety_py.make_CANPacket(0x4F1, 0, bytes([par << 5, 0x7A, 0x00, (counter << 4) | 1]))
++
++    self.assertEqual(0, fc_cancel_episode(self.safety, self._rx, ems16, clu_raw, self._user_brake_msg))
++
+   def _user_gas_msg(self, gas):
+     values = {"CF_Ems_AclAct": gas, "AliveCounter": self.cnt_gas % 4}
+     self.__class__.cnt_gas += 1
+@@ -1119,6 +1158,420 @@ class TestHyundaiNonSCCGasInterceptorSafety(GasInterceptorSafetyTest, TestHyunda
+     for addr in (0x420, 0x421, 0x50A, 0x389, 0x4A2, 0x38D, 0x483, 0x7D0):
+       self.assertFalse(self._tx(common.make_msg(0, addr, 8)), f"{addr=:#x}")
+ 
++  # *** timed factory-cruise CANCEL: panda's own CLU11, only right after a cluster CLU11, only while factory cruise is
++  # active under an engaged openpilot longitudinal (hyundai_common.h hyundai_fc_cancel_*) ***
++
++  FC_PERIOD_US = 19800  # cluster CLU11 period on routes 11c/123/127/128
++
++  def _clu_raw(self, button=0, main=0, counter=None, b0_hi=0x00, b1=0x7A, b2=0x00, b3_lo=0x1, good_parity=True):
++    """A CLUSTER CLU11 with the real byte layout (route 128: e.g. 00 00 7a 01): CruiseSwState bits 0-2, CruiseSwMain bit 3,
++    ParityBit1 bit 5 (parity over bits 0-3 + AliveCnt1), VanzDecimal bits 6-7, Vanz bytes 1-2, AliveCnt1 byte 3 hi."""
++    if counter is None:
++      counter = self.__class__.cnt_button & 0xF
++      self.__class__.cnt_button += 1
++    b0 = (b0_hi & 0xC0) | (button & 7) | ((main & 1) << 3)
++    par = (bin(b0 & 0xF).count("1") + bin(counter).count("1")) & 1
++    b0 |= (par ^ (0 if good_parity else 1)) << 5
++    return libsafety_py.make_CANPacket(0x4F1, 0, bytes([b0, b1, b2, (counter << 4) | b3_lo]))
++
++  def _self_tx(self):
++    out = []
++    for i in range(self.safety.get_self_tx_count()):
++      pkt = libsafety_py.ffi.new("CANPacket_t *")
++      bus = libsafety_py.ffi.new("int *")
++      skip = libsafety_py.ffi.new("bool *")
++      ts = self.safety.get_self_tx(i, pkt, bus, skip)
++      out.append({"ts": ts, "addr": pkt[0].addr, "bus": bus[0], "skip_hook": skip[0], "len": pkt[0].data_len_code,
++                  "dat": bytes(pkt[0].data[0:4]), "pkt_bus": pkt[0].bus, "extended": pkt[0].extended, "fd": pkt[0].fd})
++    return out
++
++  def _fc_drive(self, n_frames, t0, active=True, engaged=True, main=None, brake=False, button=0, cl_main=0,
++                stop_after=None, every_ems=True):
++    """Simulate the bus: cluster CLU11 every 19.8 ms, EMS16 (factory cruise lamp) every 10 ms. Returns the cluster frames
++    sent (raw bytes, time). active: bool or callable(t_us) -> bool."""
++    sent = []
++    main = active if main is None else main
++    for k in range(n_frames):
++      t = t0 + k * self.FC_PERIOD_US
++      is_active = active(t) if callable(active) else active
++      if every_ems:
++        self.safety.set_timer(t)
++        self._rx(self._ems16(main=main or is_active, active=is_active))
++      self.safety.set_timer(t + 5000)
++      if brake:
++        self._rx(self._user_brake_msg(True))
++      self.safety.set_timer(t + 9900)
++      if every_ems:
++        self._rx(self._ems16(main=main or is_active, active=is_active))
++      self.safety.set_timer(t + 10000)
++      msg = self._clu_raw(button=button, main=cl_main)
++      sent.append((t + 10000, bytes(msg[0].data[0:4])))
++      self._rx(msg)
++      if stop_after is not None and self.safety.get_self_tx_count() >= stop_after:
++        break
++    return sent
++
++  def _fc_engage(self, t=1_000_000):
++    """openpilot longitudinal engaged (panda grant + heartbeat), factory cruise off, brake released"""
++    self.safety.set_timer(t)
++    self._rx(self._user_brake_msg(False))
++    self._rx(self._ems16())
++    self.safety.set_controls_allowed(True)
++    self.safety.set_heartbeat_engaged(True)
++    self.safety.clear_self_tx()
++
++  def test_fc_cancel_parity_matches_real_cluster_frames(self):
++    # guards the test helper AND documents the rule: these are real cluster CLU11 payloads from routes 128/123/11c
++    for hexs in ("00007a01", "e12e7a01", "22007a01", "24327a01", "c12e7a11", "012f7a21", "c1327a41", "84347a41",
++                 "e1327a51", "e4347a51", "22387a61", "24407e61", "682e7a61", "c44c7e71", "882e7a71", "684d7a91",
++                 "04377ab1", "c84c7eb1", "e84c7ec1"):
++      d = bytes.fromhex(hexs)
++      msg = self._clu_raw(button=d[0] & 7, main=(d[0] >> 3) & 1, counter=d[3] >> 4, b0_hi=d[0] & 0xC0, b1=d[1], b2=d[2],
++                          b3_lo=d[3] & 0xF)
++      self.assertEqual(hexs, bytes(msg[0].data[0:4]).hex())
++
++  def test_fc_cancel_trigger_and_payload(self):
++    self._fc_engage()
++    sent = self._fc_drive(3, 2_000_000)
++    tx = self._self_tx()
++    self.assertEqual(3, len(tx))  # one 3-frame attempt
++    for f, (t_cl, cl) in zip(tx, sent, strict=True):
++      # timing: queued synchronously with the reception of a cluster frame, never at any other time
++      self.assertEqual(t_cl, f["ts"])
++      self.assertEqual((0x4F1, 0, 0, 0, 0), (f["addr"], f["bus"], f["pkt_bus"], f["extended"], f["fd"]))
++      self.assertEqual(4, f["len"])  # DLC 4
++      self.assertTrue(f["skip_hook"])
++      d = f["dat"]
++      self.assertEqual(4, d[0] & 0x7)                       # CF_Clu_CruiseSwState = CANCEL
++      self.assertEqual(0, (d[0] >> 3) & 0x3)                # CruiseSwMain, SldMainSW = 0
++      self.assertEqual(cl[0] & 0xC0, d[0] & 0xC0)           # VanzDecimal copied
++      self.assertEqual(cl[1:3], d[1:3])                     # Vanz / unit / detent / rheostat copied
++      self.assertEqual(cl[3] & 0xF, d[3] & 0xF)             # CluInfo / AmpInfo copied
++      self.assertEqual(((cl[3] >> 4) + 1) & 0xF, d[3] >> 4)  # AliveCnt1 = cluster + 1
++      par = (bin(d[0] & 0xF).count("1") + bin(d[3] >> 4).count("1")) & 1
++      self.assertEqual(par, (d[0] >> 5) & 1)                # parity recomputed over the FINAL payload
++    # the lockout is unchanged: openpilot longitudinal is dropped on the same EMS16 frame
++    self.assertFalse(self.safety.get_controls_allowed())
++
++  def test_fc_cancel_parity_all_counters(self):
++    # counter wrap 15 -> 0 and the parity of every counter value, with both VanzDecimal patterns
++    for b0_hi in (0x00, 0xC0):
++      for c in range(16):
++        self.setUp()
++        self._fc_engage()
++        self._rx(self._ems16(main=True, active=True))
++        self.safety.set_timer(1_010_000)
++        self._rx(self._clu_raw(counter=c, b0_hi=b0_hi))
++        tx = self._self_tx()
++        self.assertEqual(1, len(tx), c)
++        d = tx[0]["dat"]
++        self.assertEqual((c + 1) & 0xF, d[3] >> 4)
++        self.assertEqual((bin(d[0] & 0xF).count("1") + bin(d[3] >> 4).count("1")) & 1, (d[0] >> 5) & 1, c)
++
++  def test_fc_cancel_needs_engaged_long(self):
++    # never transmits unless openpilot longitudinal is engaged when the factory cruise comes on
++    for controls_allowed, heartbeat in ((False, False), (False, True), (True, False)):
++      self.setUp()
++      self._fc_engage()
++      self.safety.set_controls_allowed(controls_allowed)
++      self.safety.set_heartbeat_engaged(heartbeat)
++      self._fc_drive(150, 2_000_000)
++      self.assertEqual(0, self.safety.get_self_tx_count(), (controls_allowed, heartbeat))
++
++  def test_fc_cancel_main_armed_first_never_triggers(self):
++    # MAIN armed while engaged -> lockout drops long -> a later factory engagement (driver's own SET) is NOT fought
++    self._fc_engage()
++    self.safety.set_timer(1_500_000)
++    self._rx(self._ems16(main=True))
++    self.assertFalse(self.safety.get_controls_allowed())
++    self._fc_drive(150, 2_000_000, active=True, main=True)
++    self.assertEqual(0, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_no_tx_without_cluster_frame(self):
++    # the timing gate: EMS16 / brake / pedal traffic alone never produces a CLU11, however long the factory cruise is on
++    self._fc_engage()
++    for k in range(150):  # 1.5 s of factory cruise, inside the 2 s window
++      self.safety.set_timer(2_000_000 + k * 10_000)
++      self._rx(self._ems16(main=True, active=True))
++      self._rx(self._interceptor_user_gas(0))
++      self._rx(self._user_brake_msg(False))
++      self._rx(self._speed_msg(500))
++    self.assertEqual(0, self.safety.get_self_tx_count())
++    # a cluster frame within the window: exactly one frame, at that frame's time
++    self.safety.set_timer(3_505_000)
++    self._rx(self._clu_raw())
++    self.assertEqual([3_505_000], [f["ts"] for f in self._self_tx()])
++
++  def test_fc_cancel_one_frame_per_cluster_frame_and_rate_cap(self):
++    self._fc_engage()
++    self._rx(self._ems16(main=True, active=True))
++    # a burst of cluster frames 1 ms apart (not a real cluster; e.g. a replayed/duplicated frame): rate cap 15 ms
++    for k in range(40):
++      self.safety.set_timer(1_100_000 + k * 1000)
++      if k % 10 == 0:
++        self._rx(self._ems16(main=True, active=True))  # EMS16 every 10 ms: the lamp stays fresh
++      self._rx(self._clu_raw())
++    ts = [f["ts"] for f in self._self_tx()]
++    self.assertGreater(len(ts), 1)
++    self.assertTrue(all(b - a >= 15000 for a, b in zip(ts, ts[1:], strict=False)), ts)
++    # and never more than one frame per received cluster frame
++    self.assertEqual(len(ts), len(set(ts)))
++
++  def test_fc_cancel_schedule_and_give_up(self):
++    # factory cruise never goes off: 4 attempts x 3 frames, >= 400 ms apart, nothing after 2 s, no re-trigger
++    self._fc_engage()
++    self._fc_drive(300, 2_000_000)  # ~6 s
++    tx = self._self_tx()
++    self.assertEqual(12, len(tx))
++    ts = [f["ts"] - tx[0]["ts"] for f in tx]
++    self.assertLess(ts[-1], 2_000_000)
++    groups = [ts[i:i + 3] for i in range(0, 12, 3)]
++    for g in groups:
++      self.assertEqual([self.FC_PERIOD_US, self.FC_PERIOD_US], [b - a for a, b in zip(g, g[1:], strict=False)], g)
++    for a, b in zip(groups, groups[1:], strict=False):
++      self.assertGreaterEqual(b[0] - a[-1], 400_000)
++    # re-engaging openpilot while the same factory episode is still on does not restart it (bounded per episode)
++    self.safety.set_controls_allowed(True)
++    self.safety.set_heartbeat_engaged(True)
++    self._fc_drive(100, 9_000_000)
++    self.assertEqual(12, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_window_closes_at_2s(self):
++    # long gaps between cluster frames (cluster offline): nothing is sent once 2 s have passed since the trigger
++    self._fc_engage()
++    self.safety.set_timer(2_000_000)
++    self._rx(self._ems16(main=True, active=True))
++    self.safety.set_timer(2_000_000 + 1_999_990)
++    self._rx(self._ems16(main=True, active=True))  # fresh lamp (EMS16 is 100 Hz; only the cluster is offline)
++    self.safety.set_timer(2_000_000 + 1_999_999)
++    self._rx(self._clu_raw())
++    self.assertEqual(1, self.safety.get_self_tx_count())
++    for t in (2_000_000, 2_400_000):
++      self.safety.set_timer(2_000_000 + t - 5)
++      self._rx(self._ems16(main=True, active=True))
++      self.safety.set_timer(2_000_000 + t)
++      self._rx(self._clu_raw())
++    self.assertEqual(1, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_stops_when_factory_cruise_off(self):
++    # success: CRUISE_LAMP_S falls after the first frame -> no further frame, ever (4 is a toggle: never send it again)
++    self._fc_engage()
++    t_off = 2_000_000 + 15_000  # the EMS16 frames before the 2nd cluster frame report CRUISE_LAMP_S = 0
++    self._fc_drive(200, 2_000_000, active=lambda t: t < t_off, main=True)
++    self.assertEqual(1, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_rearms_for_a_new_episode(self):
++    self._fc_engage()
++    self._fc_drive(2, 2_000_000, active=True, main=True)
++    n1 = self.safety.get_self_tx_count()
++    self.assertEqual(2, n1)
++    # the factory cruise goes off (episode over), openpilot is engaged again (driver), then the factory cruise comes on
++    # again: a new episode with a fresh 3-frame attempt
++    self.safety.set_timer(2_100_000)
++    self._rx(self._ems16(main=True, active=False))
++    self.safety.set_controls_allowed(True)
++    self.safety.set_heartbeat_engaged(True)
++    self._fc_drive(3, 3_000_000, active=True, main=True)
++    self.assertEqual(n1 + 3, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_driver_button_aborts(self):
++    # the driver presses SET/RES/pause (CruiseSwState != 0): he is operating the factory cruise himself -> stop for good
++    for btn in (Buttons.RESUME, Buttons.SET, Buttons.CANCEL):
++      self.setUp()
++      self._fc_engage()
++      self._rx(self._ems16(main=True, active=True))
++      self.safety.set_timer(1_010_000)
++      self._rx(self._clu_raw(button=btn))
++      self._fc_drive(150, 2_000_000)
++      self.assertEqual(0, self.safety.get_self_tx_count(), btn)
++
++  def test_fc_cancel_main_held_frames_skipped(self):
++    # cluster frames with MAIN held are never copied (no TX on them); a released frame afterwards is used
++    self._fc_engage()
++    self._rx(self._ems16(main=True, active=True))
++    for k in range(3):
++      self.safety.set_timer(1_010_000 + k * self.FC_PERIOD_US)
++      self._rx(self._clu_raw(main=1))
++    self.assertEqual(0, self.safety.get_self_tx_count())
++    self.safety.set_timer(1_195_000)
++    self._rx(self._ems16(main=True, active=True))
++    self.safety.set_timer(1_200_000)
++    self._rx(self._clu_raw())
++    tx = self._self_tx()
++    self.assertEqual(1, len(tx))
++    self.assertEqual(0, (tx[0]["dat"][0] >> 3) & 1)
++
++  def test_fc_cancel_bad_parity_cluster_frame_not_copied(self):
++    self._fc_engage()
++    self._rx(self._ems16(main=True, active=True))
++    self.safety.set_timer(1_010_000)
++    self._rx(self._clu_raw(good_parity=False))
++    self.assertEqual(0, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_not_while_braking(self):
++    self._fc_engage()
++    self._rx(self._ems16(main=True, active=True))
++    self._fc_drive(20, 2_000_000, brake=True)
++    self.assertEqual(0, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_not_on_other_bus(self):
++    self._fc_engage()
++    self._rx(self._ems16(main=True, active=True))
++    for bus in (1, 2):
++      self.safety.set_timer(1_010_000 + bus * self.FC_PERIOD_US)
++      msg = self._clu_raw()
++      msg[0].bus = bus
++      self._rx(msg)
++    self.assertEqual(0, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_usb_clu11_still_rejected(self):
++    # the firmware path does not open CLU11 to openpilot: every USB CLU11 is still blocked, in every state, incl. while
++    # a cancel episode is running and with a perfectly formed CANCEL copied from the firmware's own frame
++    self._fc_engage()
++    self._fc_drive(3, 2_000_000)
++    own = self._self_tx()[0]["dat"]
++    self.assertFalse(self._tx(libsafety_py.make_CANPacket(0x4F1, 0, own)))
++    for btn in range(8):
++      for controls_allowed in (False, True):
++        self.safety.set_controls_allowed(controls_allowed)
++        self.assertFalse(self._tx(self._button_msg(btn)), btn)
++        self.assertFalse(self._tx(self._button_msg(btn, bus=2)), btn)
++
++  def test_fc_cancel_inert_without_factory_cruise(self):
++    # normal pedal-long driving with buttons, brake, gas: zero CLU11 frames
++    self._fc_engage()
++    for k in range(500):
++      self.safety.set_timer(2_000_000 + k * 10_000)
++      self._rx(self._ems16())
++      if k % 2 == 0:
++        self._rx(self._clu_raw(button=(Buttons.SET if k % 100 < 6 else 0)))
++      self._rx(self._interceptor_user_gas(0x1000 if k % 70 < 5 else 0))
++    self.assertEqual(0, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_tx_echo_never_triggers(self):
++    # review change #1: a CLU11 with returned = 1 (panda's own TX echo) is never treated as a cluster frame, whatever its
++    # payload: neither a plain cluster-like frame (would be copied -> TX) nor a CANCEL like the firmware's own (would
++    # otherwise abort the episode as a "driver press"). The next real frame (returned = 0) does trigger: positive
++    # control, so the zero is the guard, not a dead stimulus. Counters stay consecutive so the RX counter check passes.
++    self._fc_engage()
++    self._fc_drive(1, 2_000_000)
++    self.assertEqual(1, self.safety.get_self_tx_count())
++    own = self._self_tx()[0]["dat"]
++    c = (own[3] >> 4) & 0xF  # the firmware frame's counter: the cluster's next frame repeats it
++    for k in range(30):  # 30 x 39.6 ms ~ 1.2 s: covers the 400 ms attempt gap + lamp confirmation, echoes only
++      t = 2_100_000 + k * 2 * self.FC_PERIOD_US
++      for j, button in enumerate((0, Buttons.CANCEL)):
++        self.safety.set_timer(t + j * self.FC_PERIOD_US)
++        self._rx(self._ems16(main=True, active=True))
++        echo = self._clu_raw(button=button, counter=c)
++        echo[0].returned = 1
++        self.assertTrue(self._rx(echo))  # a valid frame for the RX checks: only the guard keeps it out
++        c = (c + 1) & 0xF
++    self.assertEqual(1, self.safety.get_self_tx_count())
++    self.safety.set_timer(2_100_000 + 60 * self.FC_PERIOD_US)
++    self._rx(self._ems16(main=True, active=True))
++    self._rx(self._clu_raw(counter=c))
++    self.assertEqual(2, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_tx_flood_keeps_order_and_rate(self):
++    # review change #2 (what libsafety can model): openpilot floods the TX path (pedal command + LKAS11 + CLU11 attempts
++    # over USB, 10 per cluster frame) during a whole cancel episode. The firmware's frames are byte-identical, in the
++    # same order and at the same times as without the flood, >= 15 ms apart, 4 x 3, and no USB frame is ever recorded
++    # as a self-TX (they go through safety_tx_hook, never can_send). The board's TX ring/FIFO is NOT modelled here:
++    # see the call-path comment on hyundai_fc_cancel_cluster_frame and the road checklist.
++    def episode(flood):
++      self.setUp()
++      self._fc_engage()
++      for k in range(150):
++        t = 2_000_000 + k * self.FC_PERIOD_US
++        for sub in (0, 9900):
++          self.safety.set_timer(t + sub)
++          self._rx(self._ems16(main=True, active=True))
++          if flood:
++            for _ in range(5):
++              self._tx(self._interceptor_gas_cmd(0))
++              self._tx(self._torque_cmd_msg(0, 0))
++              self._tx(self._button_msg(Buttons.CANCEL))
++        self.safety.set_timer(t + 10000)
++        self._rx(self._clu_raw(counter=k & 0xF))
++      return [(f["ts"], f["dat"]) for f in self._self_tx()]
++
++    quiet, flooded = episode(False), episode(True)
++    self.assertEqual(12, len(quiet))
++    self.assertEqual(quiet, flooded)
++    ts = [t for t, _ in flooded]
++    self.assertEqual(sorted(ts), ts)
++    self.assertTrue(all(b - a >= 15000 for a, b in zip(ts, ts[1:], strict=False)))
++    self.assertEqual([((d[3] >> 4) - 1) & 0xF for _, d in flooded], [((t - 2_010_000) // self.FC_PERIOD_US) & 0xF for t in ts])
++
++  def test_fc_cancel_stale_lamp_no_frame(self):
++    # every frame needs a fresh CRUISE_LAMP_S = 1: an EMS16 at most 30 ms old (EMS16 is 10 ms; worst log gap 36 ms is
++    # rlog USB batching, not bus time). A stale lamp skips the cluster frame; the next fresh one is used.
++    for age, sent in ((30_000, 1), (30_001, 0), (100_000, 0)):
++      self.setUp()
++      self._fc_engage()
++      self.safety.set_timer(2_000_000)
++      self._rx(self._ems16(main=True, active=True))
++      self.safety.set_timer(2_000_000 + age)
++      self._rx(self._clu_raw())
++      self.assertEqual(sent, self.safety.get_self_tx_count(), age)
++    self.safety.set_timer(2_200_000)
++    self._rx(self._ems16(main=True, active=True))
++    self.safety.set_timer(2_210_000)
++    self._rx(self._clu_raw())
++    self.assertEqual(1, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_next_attempt_needs_lamp_confirmation(self):
++    # toggle-back guard: a further attempt only after >= 2 EMS16 with CRUISE_LAMP_S = 1 received >= 250 ms after the
++    # previous attempt's last frame (worst lamp lag on the logs: 150.5 ms). Samples inside the 250 ms do not count, and
++    # confirmations from before an attempt never carry over to the next one (checked for attempts 2 and 3).
++    self._fc_engage()
++    self._fc_drive(3, 2_000_000)
++    self.assertEqual(3, self.safety.get_self_tx_count())
++    for n in (3, 6):
++      lt = self._self_tx()[-1]["ts"]
++      for k in range(1, 25):  # lamp still on, every 10 ms, but only up to 240 ms after the attempt
++        self.safety.set_timer(lt + k * 10_000)
++        self._rx(self._ems16(main=True, active=True))
++      for t, ems in ((420_000, True), (425_000, False), (430_000, True), (435_000, False)):
++        self.safety.set_timer(lt + t)
++        self._rx(self._ems16(main=True, active=True) if ems else self._clu_raw())
++        if t == 425_000:
++          self.assertEqual(n, self.safety.get_self_tx_count())  # 1 confirmation only
++      self.assertEqual(n + 1, self.safety.get_self_tx_count())   # 2 confirmations: the next attempt starts
++      self.assertEqual(lt + 435_000, self._self_tx()[-1]["ts"])
++      for k in (1, 2):  # finish this attempt (3 frames), lamp fresh
++        self.safety.set_timer(lt + 435_000 + k * self.FC_PERIOD_US - 5000)
++        self._rx(self._ems16(main=True, active=True))
++        self.safety.set_timer(lt + 435_000 + k * self.FC_PERIOD_US)
++        self._rx(self._clu_raw())
++      self.assertEqual(n + 3, self.safety.get_self_tx_count())
++
++  def test_fc_cancel_late_lamp_fall_never_retried(self):
++    # the ECM acted on attempt 1 but the lamp only says so late: up to the worst lag on the logs (150.5 ms) and well
++    # beyond, up to just before attempt 2 would go. With the real bus (EMS16 10 ms, cluster 19.8 ms) not one frame
++    # follows the lamp fall, and no 2nd attempt is ever started.
++    for lag_us in (10_000, 150_500, 260_000, 395_000):
++      self.setUp()
++      self._fc_engage()
++      self._fc_drive(3, 2_000_000)
++      lt = self._self_tx()[-1]["ts"]
++      self._fc_drive(100, lt + 10_000, active=lambda t, lt=lt, lag_us=lag_us: t < lt + lag_us, main=True)
++      self.assertEqual(3, self.safety.get_self_tx_count(), lag_us)
++
++  def test_fc_cancel_timing_constants(self):
++    # pinned: 2 s give-up window, 15 ms rate cap (< the 19.8 ms cluster period, so one frame per cluster frame),
++    # 400 ms between attempts (> the 352 ms worst ECM reaction seen to a driver pause press), 4 x 3 frames
++    hc = open(HYUNDAI_COMMON_H).read()
++    for name, val in (("HYUNDAI_FC_CANCEL_WINDOW_US", 2000000), ("HYUNDAI_FC_CANCEL_MIN_GAP_US", 15000),
++                      ("HYUNDAI_FC_CANCEL_ATTEMPT_GAP_US", 400000), ("HYUNDAI_FC_CANCEL_ATTEMPTS", 4),
++                      ("HYUNDAI_FC_CANCEL_MAX_FRAMES", 12), ("HYUNDAI_FC_CANCEL_BUTTON", 4),
++                      ("HYUNDAI_FC_CANCEL_FRAMES_PER_ATTEMPT", 3), ("HYUNDAI_FC_CANCEL_LAMP_LAG_US", 250000),
++                      ("HYUNDAI_FC_CANCEL_LAMP_CONFIRM", 2), ("HYUNDAI_FC_CANCEL_LAMP_FRESH_US", 30000)):
++      m = re.search(rf"#define\s+{name}\s+(\d+)U", hc)
++      self.assertIsNotNone(m, name)
++      self.assertEqual(val, int(m.group(1)), name)
++
+ 
+ @parameterized_class(LDA_BUTTON)
+ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+@@ -1325,6 +1778,33 @@ class TestHyundaiNonSCCFCA11BrakeTestSafety(TestHyundaiNonSCCSafety):
+         # the test brake path itself is unchanged
+         self.assertTrue(self._tx(self._brake_cmd(1)))
+ 
++  def test_test_bit_overrides_timed_factory_cancel(self):
++    # integration (timed factory-cruise cancel + FCA11 test modes): with the test bit(s) AND GAS_INTERCEPTOR set (both
++    # dialects), panda never transmits a CLU11 by itself. Positive control: the identical episode with the pedal alone
++    # (no test bits) does transmit, so the zero is the test bit's gating, not a dead stimulus.
++    def ems16(main, active):
++      values = {"CRUISE_LAMP_M": main, "CRUISE_LAMP_S": active, "AliveCounter": self.cnt_gas % 4}
++      self.__class__.cnt_gas += 1
++      return self.packer.make_can_msg_safety("EMS16", 0, values, fix_checksum=checksum)
++
++    def clu_raw(counter):
++      par = bin(counter).count("1") & 1
++      return libsafety_py.make_CANPacket(0x4F1, 0, bytes([par << 5, 0x7A, 0x00, (counter << 4) | 1]))
++
++    test_bits = self._test_sp() & ~HyundaiSafetyFlagsSP.NON_SCC
++    for dialect in (0, HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED):
++      for bits in (test_bits, 0):
++        with self.subTest(dialect=dialect, test_bits=bits):
++          self.safety.set_current_safety_param_sp(self._test_sp() & ~test_bits | bits | HyundaiSafetyFlagsSP.GAS_INTERCEPTOR | dialect)
++          self.safety.set_safety_hooks(CarParams.SafetyModel.hyundai, 0)
++          self.safety.init_tests()
++          n = fc_cancel_episode(self.safety, self._rx, ems16, clu_raw, self._user_brake_msg)
++          if bits:
++            self.assertEqual(0, n)
++            self.assertFalse(self._tx(clu_raw(1)))  # USB CLU11 other than cancel-only is still policed
++          else:
++            self.assertEqual(12, n)  # positive control: pedal mode, 4 attempts x 3 frames
++
+   # *** mode gating: honored only when armed (bit + non-SCC ICE + no hyundai_longitudinal) ***
+ 
+   def _assert_not_armed(self):
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 2cd301bf..33f3035c 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -17,6 +17,10 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+ 
++# panda gives up its timed factory-cruise CANCEL 2 s after the trigger (HYUNDAI_FC_CANCEL_WINDOW_US, hyundai_common.h);
++# openpilot alerts 0.5 s later (CarState runs at 100 Hz), so a cancel that lands on the last attempt never alerts
++FACTORY_CANCEL_GIVE_UP_FRAMES = 250
++
+ 
+ class CarStateExt:
+   def __init__(self, CP, CP_SP):
+@@ -37,6 +41,11 @@ class CarStateExt:
+     self.setres_brake_seen = False
+     self.setres_prev = 0
+     self.setres_engage_blocked = False
++    # factory cruise came on while openpilot long was engaged: panda's timed CANCEL (safety/modes/hyundai_common.h) is
++    # trying to turn it off. Still on after FACTORY_CANCEL_GIVE_UP_FRAMES -> accFaulted (audible immediate disable)
++    self.factory_cancel_frames = 0          # CarState frames since CRUISE_LAMP_S rose under engaged long; 0 = none
++    self.factory_cancel_failed = False
++    self.factory_active_prev = False
+ 
+   def update_speed_limit(self, cp, cp_cam) -> float:
+     speed_limit = 0
+@@ -115,6 +124,24 @@ class CarStateExt:
+       ret.cruiseState.available = True
+       ret.cruiseState.nonAdaptive = factory_main or ret.cruiseState.enabled
+ 
++      # Mirror of panda's timed factory-cruise CANCEL (hyundai_fc_cancel_*): it starts when CRUISE_LAMP_S rises while
++      # openpilot long is engaged and gives up after HYUNDAI_FC_CANCEL_WINDOW_US (2 s). If the factory cruise is still
++      # on FACTORY_CANCEL_GIVE_UP_FRAMES after the rise, openpilot raises accFaulted: an audible immediate-disable
++      # ("Cruise Fault"), held until the factory cruise is off. The lockout above has already dropped longitudinal.
++      factory_active = bool(ret.cruiseState.enabled)
++      if factory_active and not self.factory_active_prev and self.pedal_long_engaged:
++        self.factory_cancel_frames = 1
++      elif factory_active and self.factory_cancel_frames > 0:
++        self.factory_cancel_frames += 1
++      elif not factory_active:
++        self.factory_cancel_frames = 0
++        self.factory_cancel_failed = False
++      if self.factory_cancel_frames > FACTORY_CANCEL_GIVE_UP_FRAMES:
++        self.factory_cancel_failed = True
++      self.factory_active_prev = factory_active
++      if self.factory_cancel_failed:
++        ret.accFaulted = True
++
+       # pause/resume (CF_Clu_CruiseSwState 4): replaces the plain cancel mapping. See pause_resume.py.
+       pause_events = self.pause_resume.update(cp.vl_all["CLU11"]["CF_Clu_CruiseSwState"], self.pedal_long_engaged,
+                                               ret.brakePressed, ret.gasPressed, factory_main)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 40eeab03..9bbb8764 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -725,6 +725,52 @@ class TestFactoryMainLockout:
+       assert ret.cruiseState.available == main
+ 
+ 
++class TestFactoryCancelGiveUp:
++  """openpilot side of panda's timed factory-cruise CANCEL: if CRUISE_LAMP_S rose while long was engaged and is still on
++  after panda's 2 s window (+0.5 s), CarState.accFaulted -> audible immediate disable; never otherwise."""
++  def test_window_matches_panda(self):
++    from opendbc.sunnypilot.car.hyundai.carstate_ext import FACTORY_CANCEL_GIVE_UP_FRAMES
++    window_us = _c_define(HYUNDAI_COMMON_H, "HYUNDAI_FC_CANCEL_WINDOW_US")
++    assert FACTORY_CANCEL_GIVE_UP_FRAMES * DT_CTRL * 1e6 > window_us
++    assert FACTORY_CANCEL_GIVE_UP_FRAMES * DT_CTRL * 1e6 <= window_us + 1e6  # alert within 1 s of panda giving up
++
++  def _rise_while_engaged(self):
++    car = _Car()
++    car.run(10)
++    car.engaged = True
++    return car
++
++  def test_cancel_lands_no_fault(self):
++    car = self._rise_while_engaged()
++    rets = car.run(50, main=True, active=True)   # 1 s on, then the cancel lands
++    car.engaged = False
++    rets += car.run(200, main=True)
++    assert not any(r.accFaulted for r in rets)
++
++  def test_cancel_fails_faults_after_window(self):
++    car = self._rise_while_engaged()
++    rets = car.run(120, main=True, active=True)  # 2.4 s
++    assert not any(r.accFaulted for r in rets)
++    car.engaged = False                          # (the lockout disengaged openpilot right away)
++    rets = car.run(20, main=True, active=True)   # -> 2.8 s
++    assert rets[-1].accFaulted
++    # held while the factory cruise stays on, cleared once it is off
++    assert all(r.accFaulted for r in car.run(50, main=True, active=True))
++    rets = car.run(5, main=True)
++    assert not rets[-1].accFaulted
++
++  def test_not_engaged_never_faults(self):
++    # the driver using the factory cruise himself (openpilot long off): panda doesn't cancel, openpilot never faults
++    car = _Car()
++    rets = car.run(10) + car.run(300, main=True, active=True)
++    assert not any(r.accFaulted for r in rets)
++
++  def test_main_only_never_faults(self):
++    car = self._rise_while_engaged()
++    rets = car.run(300, main=True)
++    assert not any(r.accFaulted for r in rets)
++
++
+ class TestPauseResumeButton:
+   def _disengaged_after_brake(self):
+     car = _Car()
+-- 
+2.55.0
+

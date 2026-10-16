@@ -1,0 +1,116 @@
+From 850f5edbd29f9ec861b20c1423d7f5a937f6e8d3 Mon Sep 17 00:00:00 2001
+From: Adam Durham <adn@x>
+Date: Thu, 8 Oct 2026 15:54:43 -0500
+Subject: [PATCH] hyundai: FCA11 cal - record 'ok' only if the hold actually
+ braked (0036)
+
+Route 151: three cal reps (r2-stair-up-24/20/30) were logged outcome=ok but sent ZERO actuating 0x38D frames - a
+gas press while engaged had latched the car-layer driver cut (G9b, by design), every frame of the hold was vetoed,
+and the sequencer's only abort check was the (now deleted) 0031 budget predicate. progress.json therefore reported
+done reps that delivered nothing to fit, and completion keys on rep id, so they would never re-run.
+
+CalSequencer now remembers whether Fca11LongBrake actually commanded braking during the rep (CS._fca11_braking_now,
+already published before every tick). At the end of the recovery window the rep is recorded 'ok' only if it did;
+otherwise 'no_brake', which is not a completed outcome, so the rep is retried on a later opportunity.
+
+Python-only, cal-mode-only: no safety, no production braking path. Kept separate from 0035 so the 0035 replay
+attribution stays clean. Test: test_0036_rep_vetoed_end_to_end_is_no_brake_not_ok (red on 0035, green here).
+---
+ opendbc/sunnypilot/car/hyundai/cal_mode.py    | 11 +++++-
+ .../car/hyundai/tests/test_fca11_long.py      | 37 +++++++++++++++++++
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+index 56deb4c..16f8b37 100644
+--- a/opendbc/sunnypilot/car/hyundai/cal_mode.py
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -409,6 +409,7 @@ class CalSequencer:
+     self._active: CalRep | None = None
+     self._hold_frames = 0
+     self._on_start = -1          # frame the current rep's actuation opened on
++    self._rep_braked = False     # 0036: the brake actually commanded an actuating frame during this rep's hold
+     self._release_frame = -1     # frame braking last went False
+     self._last_outcome = ""
+     self._vetoed = False         # a production veto suppressed a frame of the current hold
+@@ -755,6 +756,7 @@ class CalSequencer:
+     """Arm ``rep``: command its level NOW (the brake enters on the panda-rate ramp, a clean step).
+     Shared by the autonomous pick path and the 0033 accepted-tap path, so the two never drift."""
+     self._active = rep
++    self._rep_braked = False
+     self.level_lsb = rep.level_lsb
+     self.active_actuation = True
+     self._on_start = frame
+@@ -990,6 +992,11 @@ class CalSequencer:
+       self._block_reason = "blindspot" if cond_why == "blindspot" else "conditions_lapsed"
+       return
+     # 0035: the 0031 mid-hold budget abort is gone with the budget (there is no cooldown to arm into).
++    # 0036: remember whether the brake actually COMMANDED an actuating frame for this rep. Fca11LongBrake.update
++    # publishes CS._fca11_braking_now (its `braking` flag) before every tick; a hold that a production veto
++    # suppressed end to end (e.g. a driver-cut latch from a gas press) never sets it.
++    if bool(getattr(CS, "_fca11_braking_now", False)):
++      self._rep_braked = True
+     if (frame - self._on_start) < int(round(self._active.hold_s * 100.0)):
+       # an optional MID-HOLD STEP-DOWN (the partial-release test): drop the command to level2 once
+       # switch_at_s of the hold has elapsed. A downward step is emitted immediately.
+@@ -1004,7 +1011,9 @@ class CalSequencer:
+       self._release_frame = frame
+     recov = int(round(self.opts.get("recovery_s", DEFAULT_RECOVERY_S) * 100.0))
+     if (frame - self._release_frame) >= recov and self._band_ready(self._active.band_kph):
+-      self._finish("ok", frame)
++      # 0036: 'ok' ONLY if the hold actually commanded braking. A rep whose every frame was vetoed delivered
++      # nothing to fit: record it as 'no_brake' (not complete -> it is retried), never as a done rep.
++      self._finish("ok" if self._rep_braked else "no_brake", frame)
+ 
+   def _finish(self, outcome: str, frame: int) -> None:
+     rep = self._active
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 6012c28..362c735 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -1542,6 +1542,43 @@ class TestCalModeActuation(unittest.TestCase):
+       self.assertEqual("watchdog", json.load(open(os.path.join(d, "progress.json")))["reps"]["r0"]["outcome"])
+       self.assertFalse(trace[-1][1], "and it is not re-armed this session")
+ 
++  # *** 0036: a rep that commanded NO braking is never recorded 'ok' ***
++
++  def test_0036_rep_vetoed_end_to_end_is_no_brake_not_ok(self):
++    """Route 151: r2-stair-up-24/20/30 were logged 'ok' with ZERO actuating frames (a gas press had latched the
++    car-layer driver cut). A rep whose whole hold is vetoed must be recorded 'no_brake' (not complete, retried),
++    and a rep that did brake is still 'ok'. RED on 0035: the vetoed rep is recorded 'ok'."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 24, 1.0)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      b.update(cc, cs, 0)                                                # engage edge consumed on a clean frame
++      b.update(cc, _CalCS(v_ego=60 / 3.6, cam=_cam(), gas=True), 1)     # gas press while engaged -> driver cut
++      self.assertTrue(b.blocked_until_resume)                           # latched, no resume edge to re-arm it
++      sent = []
++      for f in range(2, 1200):
++        sent += [fl._get_bits(x.dat, 8, 8) for x in b.update(cc, cs, f)]
++        pj = os.path.join(d, "progress.json")
++        if os.path.exists(pj) and json.load(open(pj)).get("reps", {}).get("r0"):
++          break
++      self.assertEqual([], [x for x in sent if x > 0], "the latch vetoed every frame of the hold")
++      rec = json.load(open(os.path.join(d, "progress.json")))["reps"]["r0"]
++      self.assertEqual("no_brake", rec["outcome"])
++      self.assertFalse(b.cal_seq._is_complete(b.cal_seq.plan[0]), "a no_brake rep is NOT done; it is retried")
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 24, 1.0)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 1200):
++        b.update(cc, cs, f)
++      self.assertEqual("ok", json.load(open(os.path.join(d, "progress.json")))["reps"]["r0"]["outcome"])
++
+   def test_lead_condition_skips_the_high_level_rep(self):
+     """A high-level rep (>= 20 LSB) is skipped while a lead is close; the sequencer waits."""
+     with tempfile.TemporaryDirectory() as d:
+-- 
+2.54.0 (Apple Git-157)
+

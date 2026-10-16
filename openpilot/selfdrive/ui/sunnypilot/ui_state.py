@@ -10,6 +10,7 @@ from openpilot.cereal import messaging, log, custom
 from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_active_source
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
 from openpilot.system.ui.lib.application import gui_app
@@ -221,10 +222,11 @@ class UIStateSP:
       self.params.remove("LateralJerkTorqueController")
       self.params.remove("AlphaLongitudinalEnabled")
 
-    # No longitudinal control: no experimental mode or DEC
+    # No longitudinal control: the toggles are disabled, but the owner's stored prefs are KEPT
+    # (fork #30) — the consumers only act when longitudinal is active, so nothing reads them here.
     if not has_long:
-      self.params.remove("ExperimentalMode")
-      self.params.remove("DynamicExperimentalControl")
+      remove_unless_preserved(self.params, "ExperimentalMode")
+      remove_unless_preserved(self.params, "DynamicExperimentalControl")
 
     # ICBM: clear if not available or if full longitudinal control is active
     if self.CP_SP is not None:
@@ -235,11 +237,11 @@ class UIStateSP:
       self.params.remove("IntelligentCruiseButtonManagement")
       self.has_icbm = False
 
-    # Cruise features requiring longitudinal or ICBM
+    # Cruise features requiring longitudinal or ICBM: the toggles are disabled, but the stored
+    # prefs are KEPT (fork #30).
     if not (has_long or self.has_icbm):
-      self.params.remove("CustomAccIncrementsEnabled")
-      self.params.remove("SmartCruiseControlVision")
-      self.params.remove("SmartCruiseControlMap")
+      for key in ("CustomAccIncrementsEnabled", "SmartCruiseControlVision", "SmartCruiseControlMap"):
+        remove_unless_preserved(self.params, key)
 
 
 class DeviceSP:

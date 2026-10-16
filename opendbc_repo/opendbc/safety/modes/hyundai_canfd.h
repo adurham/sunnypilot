@@ -272,6 +272,12 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x160, 0, 16, .check_relay = (longitudinal)}, /* ADRV_0x160 */ \
 
   hyundai_common_init(param);
+  hyundai_gas_interceptor = false;  // gas interceptor is only supported on CAN (non-SCC ICE) cars
+  hyundai_gas_interceptor_remapped = false;
+  hyundai_fca11_brake_test = false;  // FCA11 brake test is CAN (non-SCC) only
+  hyundai_fca11_rolling_test = false;
+  hyundai_fca11_long = false;  // FCA11 long braking is CAN (non-SCC ICE + pedal) only
+  hyundai_lkas_park_test = false;  // parked LKAS11 sweep is CAN (non-SCC ICE) only
 
   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);

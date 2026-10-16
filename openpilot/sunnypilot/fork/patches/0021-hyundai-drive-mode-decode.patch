@@ -1,0 +1,439 @@
+From 6e4f6a768d37315e15e531dbdb27efa04d6f799b Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 6 Oct 2026 18:52:54 -0500
+Subject: [PATCH] hyundai: drive-mode decode (CLU13 CF_Clu_DriveMode) ->
+ CarStateSP.driveMode + personality mapping
+
+The cluster broadcasts the current drive mode on CLU13 (0x50C) byte5 HIGH nibble; add it as a
+first-class DBC signal and expose it to the control layer.
+
+- DBC (opendbc/dbc/generator/hyundai/hyundai_can.dbc): new signal CF_Clu_DriveMode 44|4 (bits 44-47
+  were undefined; no collision with CF_Clu_EcoDriveInf 40|3 or CF_Clu_IsaMainSW 43|1) with the mode
+  values documented; CM_ notes that on CN7 the EcoDriveInf low nibble carries the N-custom slot and
+  that MDPS11 CF_Mdps_CurrMode is a steering-mode level (0 normal / 1 sport / 3 N), not an alive
+  counter; VAL_ for CF_Mdps_CurrMode. Decode from route 00000147 (car-features/0x4a0-decode.md).
+- drive_mode.py: pure mapping DriveModeResult (1 normal -> standard, 2 eco -> relaxed, 3 sport ->
+  aggressive, 6/7 N-custom/N -> BLOCK, else UNKNOWN) and a one-source-frame debouncer.
+- carstate_ext.py: read CLU13 CF_Clu_DriveMode off the C-CAN parser (vl_all, debounced one frame) into
+  the new CarStateSP.driveMode (capnp + structs.py mirror, coupled pair like speedLimit).
+
+Additive only; no opendbc/safety and no panda changes (no firmware impact).
+---
+ opendbc/car/structs.py                        |   3 +
+ opendbc/dbc/generator/hyundai/hyundai_can.dbc |   5 +
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  12 ++
+ opendbc/sunnypilot/car/hyundai/drive_mode.py  | 131 ++++++++++++
+ .../car/hyundai/tests/test_drive_mode.py      | 188 ++++++++++++++++++
+ 5 files changed, 339 insertions(+)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/drive_mode.py
+ create mode 100644 opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
+
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 87c5d905..e72167ba 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -170,3 +170,6 @@ class CarControlSP:
+ @auto_dataclass
+ class CarStateSP:
+   speedLimit: float = auto_field()
++  # fork (adurham): raw CLU13 CF_Clu_DriveMode (44|4) — the current drive mode (1 normal / 2 eco /
++  # 3 sport / 6 N-custom / 7 N), debounced one frame. 0 = not decoded / unknown. See drive_mode.py.
++  driveMode: int = auto_field()
+\ No newline at end of file
+diff --git a/opendbc/dbc/generator/hyundai/hyundai_can.dbc b/opendbc/dbc/generator/hyundai/hyundai_can.dbc
+index b147f22f..ac4b6dd6 100644
+--- a/opendbc/dbc/generator/hyundai/hyundai_can.dbc
++++ b/opendbc/dbc/generator/hyundai/hyundai_can.dbc
+@@ -1374,6 +1374,7 @@ BO_ 1292 CLU13: 8 CLU
+  SG_ CF_Clu_SWL_Stat : 36|3@1+ (1.0,0.0) [0.0|7.0] ""  ACU,EMS
+  SG_ CF_Clu_ActiveEcoSW : 39|1@1+ (1.0,0.0) [0.0|1.0] ""  DATC,EMS,TCU
+  SG_ CF_Clu_EcoDriveInf : 40|3@1+ (1.0,0.0) [0.0|7.0] ""  CUBIS,EMS,IAP,IBOX
++ SG_ CF_Clu_DriveMode : 44|4@1+ (1.0,0.0) [0.0|15.0] ""  XXX
+  SG_ CF_Clu_IsaMainSW : 43|1@1+ (1.0,0.0) [0.0|1.0] ""  EMS
+  SG_ CF_Clu_LdwsLkasSW : 56|1@1+ (1.0,0.0) [0.0|1.0] ""  LDWS_LKAS
+  SG_ CF_Clu_AltLStatus : 59|1@1+ (1.0,0.0) [0.0|1.0] ""  BCM,DATC,EMS
+@@ -1679,9 +1680,13 @@ CM_ 512 "Contains signal with gear shifter. Used by fuel cell hydrogen-powered (
+ CM_ SG_ 871 CF_Lvr_IsgState "Idle Stop and Go";
+ CM_ SG_ 1056 SCCInfoDisplay "Goes to 1 for a second while transitioning from Cruise Control to No Message";
+ CM_ SG_ 1348 SpeedLim_Nav_Clu "Speed limit displayed on Nav, Cluster and HUD";
++CM_ SG_ 1292 CF_Clu_DriveMode "Current drive mode: 1 Normal, 2 Eco, 3 Sport, 6 N Custom, 7 N. Bits 44-47 were undefined; decode from route 00000147 (car-features/0x4a0-decode.md).";
++CM_ SG_ 1292 CF_Clu_EcoDriveInf "On CN7 (Elantra N) this low nibble carries the N Custom slot (0 not N Custom, 1 slot 1, 2 slot 2) when CF_Clu_DriveMode=6.";
++CM_ SG_ 897 CF_Mdps_CurrMode "MDPS steering mode: 0 Normal, 1 Sport, 3 N. Corroborates the CLU13 drive mode; NOT an alive counter (that is CF_Mdps_AliveCnt).";
+ 
+ VAL_ 274 CUR_GR 1 "D" 2 "D" 3 "D" 4 "D" 5 "D" 6 "D" 7 "D" 8 "D" 14 "R" 0 "P";
+ VAL_ 512 HYDROGEN_GEAR_SHIFTER 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";
++VAL_ 897 CF_Mdps_CurrMode 0 "Normal" 1 "Sport" 3 "N";
+ VAL_ 871 CF_Lvr_IsgState 0 "enabled" 1 "activated" 2 "unknown" 3 "disabled";
+ VAL_ 871 CF_Lvr_Gear 12 "T" 4 "S" 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";
+ VAL_ 882 Elect_Gear_Shifter 4 "S" 5 "D" 8 "S" 6 "N" 7 "R" 0 "P";
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index f68e52a6..0d18a8e9 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -12,6 +12,7 @@ from opendbc.can.parser import CANParser
+ from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
+                                                          PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids
++from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_MSG, DRIVE_MODE_SIGNAL, DriveModeDebouncer
+ from opendbc.sunnypilot.car.hyundai.fca11_long import FCA11_ADDR
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PauseResumeTracker
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+@@ -49,6 +50,16 @@ class CarStateExt:
+     self.factory_cancel_frames = 0          # CarState frames since CRUISE_LAMP_S rose under engaged long; 0 = none
+     self.factory_cancel_failed = False
+     self.factory_active_prev = False
++    # fork (adurham): CLU13 CF_Clu_DriveMode debounce (one frame) + last published raw value. The superproject reads
++    # the published raw off CarStateSP.driveMode and maps it to a personality / a longitudinal block.
++    self.drive_mode_debouncer = DriveModeDebouncer()
++    self.drive_mode = 0
++
++  def update_drive_mode(self, cp) -> int:
++    """Read CLU13 CF_Clu_DriveMode off the C-CAN parser (debounced one source frame). Absent -> unknown (0)."""
++    frames = cp.vl_all[DRIVE_MODE_MSG].get(DRIVE_MODE_SIGNAL, []) if DRIVE_MODE_MSG in cp.vl_all else []
++    self.drive_mode = self.drive_mode_debouncer.update(frames)
++    return self.drive_mode
+ 
+   def update_speed_limit(self, cp, cp_cam) -> float:
+     speed_limit = 0
+@@ -163,6 +174,7 @@ class CarStateExt:
+       ret.buttonEvents = kept + pause_events
+ 
+     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_conv
++    ret_sp.driveMode = self.update_drive_mode(cp)
+ 
+   def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
+                        speed_factor: float) -> None:
+diff --git a/opendbc/sunnypilot/car/hyundai/drive_mode.py b/opendbc/sunnypilot/car/hyundai/drive_mode.py
+new file mode 100644
+index 00000000..41126126
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/drive_mode.py
+@@ -0,0 +1,131 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Fork (adurham): CN7 Elantra N drive-mode decode -> openpilot personality / longitudinal gate.
++
++The cluster broadcasts the current drive mode on CLU13 (0x50C) byte 5 HIGH nibble (DBC signal
++``CF_Clu_DriveMode``, 44|4, 10 Hz on C-CAN). The decode (car-features/0x4a0-decode.md, route 00000147;
++cross-checked against 0x4A0 b2 bits 17-19, 0x2FC b7>>5 and MDPS11 CF_Mdps_CurrMode on 19/19 changes) is:
++
++    1 = NORMAL   2 = ECO   3 = SPORT   6 = N-CUSTOM (slot in the CLU13 b5 low nibble)   7 = N
++
++This module owns the two pure, offline-testable pieces of the feature:
++
++* ``map_drive_mode``: one drive-mode value -> the action the superproject should take
++  (a ``DriveModeResult``: an openpilot ``LongitudinalPersonality`` int for NORMAL/ECO/SPORT, ``BLOCK``
++  for N / N-CUSTOM, or ``UNKNOWN`` for anything else / a signal that is absent).
++* ``DriveModeDebouncer``: a one-frame debounce so a single-frame transient cannot change the mode.
++
++Nothing here touches CAN, params, or selfdrived — it is deliberately pure so it can be unit-tested
++without a car.
++"""
++
++from enum import IntEnum
++
++# CLU13 CF_Clu_DriveMode raw values (10 Hz, C-CAN). 0 and every value outside this set mean
++# "not decoded / absent / unknown" and must never force a personality or block engagement.
++DRIVE_MODE_NORMAL = 1
++DRIVE_MODE_ECO = 2
++DRIVE_MODE_SPORT = 3
++DRIVE_MODE_N_CUSTOM = 6
++DRIVE_MODE_N = 7
++
++DRIVE_MODE_SIGNAL = "CF_Clu_DriveMode"
++DRIVE_MODE_MSG = "CLU13"
++
++# One extra SOURCE frame of confirmation: a value must be seen on this many consecutive CLU13 frames
++# before it is published. A single-frame transient is dropped; a real mode change (held for seconds)
++# lands one frame (100 ms at 10 Hz) later. Counting source frames (not 100 Hz CarState ticks) is what
++# makes this a true "one frame" debounce of the 10 Hz signal.
++DRIVE_MODE_DEBOUNCE_FRAMES = 2
++
++
++class DriveModeResult(IntEnum):
++  """
++  Outcome of mapping a drive-mode value.
++
++  The non-negative members are exactly ``log.LongitudinalPersonality`` (aggressive=0, standard=1,
++  relaxed=2), so a caller can do ``if result >= 0: personality = int(result)``. The negative members
++  are the two non-personality outcomes.
++  """
++  BLOCK = -2       # N / N-CUSTOM: block openpilot longitudinal, leave lateral alone
++  UNKNOWN = -1     # absent / unrecognized -> do nothing (never force, never block)
++  AGGRESSIVE = 0   # SPORT
++  STANDARD = 1     # NORMAL
++  RELAXED = 2      # ECO
++
++
++# NORMAL -> standard, ECO -> relaxed, SPORT -> aggressive. N / N-CUSTOM -> BLOCK. Everything else ->
++# UNKNOWN. A plain table so the mapping is auditable at a glance.
++DRIVE_MODE_TO_RESULT: dict[int, DriveModeResult] = {
++  DRIVE_MODE_NORMAL: DriveModeResult.STANDARD,
++  DRIVE_MODE_ECO: DriveModeResult.RELAXED,
++  DRIVE_MODE_SPORT: DriveModeResult.AGGRESSIVE,
++  DRIVE_MODE_N: DriveModeResult.BLOCK,
++  DRIVE_MODE_N_CUSTOM: DriveModeResult.BLOCK,
++}
++
++
++def _as_mode(raw) -> int | None:
++  """Strict int coercion: integral numbers only (1.0 ok, 1.5 / True / "1" / junk -> None)."""
++  if isinstance(raw, bool):
++    return None
++  try:
++    value = int(raw)
++  except (TypeError, ValueError):
++    return None
++  return value if value == raw else None
++
++
++def map_drive_mode(raw_mode: int) -> DriveModeResult:
++  """
++  Pure mapping: a raw ``CF_Clu_DriveMode`` value -> a ``DriveModeResult``.
++
++  Unknown / absent (0, 4, 5, 8..15, junk, None-ish) -> ``UNKNOWN`` (the caller must do nothing). This
++  function never mutates state and never returns a personality for a value it does not recognise, so
++  the "unknown -> leave untouched" rule holds by construction.
++  """
++  value = _as_mode(raw_mode)
++  if value is None:
++    return DriveModeResult.UNKNOWN
++  return DRIVE_MODE_TO_RESULT.get(value, DriveModeResult.UNKNOWN)
++
++
++class DriveModeDebouncer:
++  """
++  One-source-frame debounce for the raw drive-mode value.
++
++  ``update(frames)`` is fed the CLU13 frame values parsed since the last call (oldest..newest; an empty
++  list when no frame arrived this tick) and returns the currently-published raw value. A new value is
++  published only after it has been observed on ``hold_frames`` consecutive source frames, so a
++  single-frame transient is dropped while a sustained change lands one frame late. The published value
++  starts at ``unknown`` (0) until a value is confirmed.
++  """
++
++  def __init__(self, hold_frames: int = DRIVE_MODE_DEBOUNCE_FRAMES):
++    self.hold_frames = max(1, int(hold_frames))
++    self.unknown = 0
++    self._candidate = self.unknown
++    self._count = 0
++    self._out = self.unknown
++
++  def update(self, frames) -> int:
++    if isinstance(frames, (int, float)):
++      frames = [frames]
++    for raw in frames:
++      value = _as_mode(raw)
++      if value is None:
++        value = self.unknown
++
++      if value == self._candidate:
++        self._count += 1
++      else:
++        self._candidate = value
++        self._count = 1
++
++      if self._count >= self.hold_frames:
++        self._out = self._candidate
++    return self._out
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
+new file mode 100644
+index 00000000..9193bce7
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_drive_mode.py
+@@ -0,0 +1,188 @@
++"""
++CN7 Elantra N drive-mode decode + mapping (adurham fork).
++
++Covers:
++  * the DBC signal ``CF_Clu_DriveMode`` (CLU13 0x50C, 44|4) parses out of a real CANParser and
++    decodes each mode value, and the DBC VAL_/comment additions are present (no collision with the
++    existing CLU13 signals);
++  * ``map_drive_mode`` (mode -> personality | BLOCK | UNKNOWN), including unknown/absent values;
++  * ``DriveModeDebouncer`` (one-frame debounce, transient rejection, sustained change, unknown hold);
++  * the CarStateExt wiring (vl_all -> debounced CarStateSP.driveMode), end to end through a CANParser.
++"""
++import pytest
++
++from opendbc.can import CANPacker, CANParser
++from opendbc.can.dbc import DBC
++from opendbc.sunnypilot.car.hyundai import drive_mode as dm
++from opendbc.sunnypilot.car.hyundai import carstate_ext
++
++PACKER = CANPacker("hyundai_can_generated")
++BUS = 0          # CLU13 is on C-CAN (src 0)
++CLU13_DBC = "hyundai_can_generated"
++
++
++def _parser():
++  return CANParser(CLU13_DBC, [("CLU13", 10)], BUS)
++
++
++def _generated_dbc_path():
++  from opendbc import get_generated_dbcs
++  import tempfile, os
++  p = os.path.join(tempfile.mkdtemp(), "hyundai_can_generated.dbc")
++  with open(p, "w") as f:
++    f.write(get_generated_dbcs()["hyundai_can_generated"])
++  return DBC(p)
++
++
++class TestDbcSignal:
++  def test_signal_present_and_layout(self):
++    d = _generated_dbc_path()
++    msg = d.name_to_msg["CLU13"]
++    sig = next(s for s in msg.sigs.values() if s.name == "CF_Clu_DriveMode")
++    assert (sig.msb, sig.lsb, sig.size) == (47, 44, 4)
++
++  def test_no_collision_with_existing_clu13_signals(self):
++    d = _generated_dbc_path()
++    msg = d.name_to_msg["CLU13"]
++    # EcoDriveInf (the N-custom slot on CN7) is untouched at 40|3
++    eco = next(s for s in msg.sigs.values() if s.name == "CF_Clu_EcoDriveInf")
++    assert (eco.msb, eco.lsb, eco.size) == (42, 40, 3)
++    # IsaMainSW at 43|1 (bit 43) is still intact and does not overlap the new nibble (44-47)
++    isa = next(s for s in msg.sigs.values() if s.name == "CF_Clu_IsaMainSW")
++    assert (isa.msb, isa.lsb, isa.size) == (43, 43, 1)
++
++  def test_val_table_labels(self):
++    from opendbc import get_generated_dbcs
++    import tempfile, os
++    p = os.path.join(tempfile.mkdtemp(), "hyundai_can_generated.dbc")
++    with open(p, "w") as f:
++      f.write(get_generated_dbcs()["hyundai_can_generated"])
++    c = open(p).read()
++    assert 'VAL_ 897 CF_Mdps_CurrMode 0 "Normal" 1 "Sport" 3 "N";' in c
++    assert "CF_Clu_DriveMode" in c
++
++  @pytest.mark.parametrize("mode,raw", [(1, 0x10), (2, 0x20), (3, 0x30), (6, 0x60), (7, 0x70),
++                                        (6, 0x61), (6, 0x62)])
++  def test_parser_decodes_each_mode(self, mode, raw):
++    pk = _parser()
++    dat = bytearray(8)
++    dat[5] = raw
++    pk.update([(0, [(0x50C, bytes(dat), BUS)])])
++    assert pk.vl["CLU13"]["CF_Clu_DriveMode"] == mode
++
++
++class TestMapDriveMode:
++  @pytest.mark.parametrize("mode,expected", [
++    (1, dm.DriveModeResult.STANDARD),
++    (2, dm.DriveModeResult.RELAXED),
++    (3, dm.DriveModeResult.AGGRESSIVE),
++    (6, dm.DriveModeResult.BLOCK),
++    (7, dm.DriveModeResult.BLOCK),
++  ])
++  def test_known_modes(self, mode, expected):
++    assert dm.map_drive_mode(mode) == expected
++
++  def test_nonnegative_results_are_personality_ints(self):
++    # non-negative results must be exactly log.LongitudinalPersonality (aggressive 0 / standard 1 / relaxed 2)
++    assert int(dm.DriveModeResult.AGGRESSIVE) == 0
++    assert int(dm.DriveModeResult.STANDARD) == 1
++    assert int(dm.DriveModeResult.RELAXED) == 2
++
++  @pytest.mark.parametrize("mode", [0, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, -1, 999, None, "junk", 1.5])
++  def test_unknown_modes_never_map(self, mode):
++    assert dm.map_drive_mode(mode) == dm.DriveModeResult.UNKNOWN
++
++  def test_block_and_unknown_are_negative(self):
++    assert dm.DriveModeResult.BLOCK < 0 and dm.DriveModeResult.UNKNOWN < 0
++
++  def test_mapping_table_is_closed(self):
++    # every value the table claims maps to a known result; nothing silently becomes a personality
++    for k, v in dm.DRIVE_MODE_TO_RESULT.items():
++      assert dm.map_drive_mode(k) == v
++
++
++class TestDebouncer:
++  def test_starts_unknown(self):
++    d = dm.DriveModeDebouncer()
++    assert d.update([]) == 0
++
++  def test_single_frame_transient_dropped(self):
++    d = dm.DriveModeDebouncer()
++    d.update([1, 1])           # NORMAL published
++    assert d.update([3]) == 1  # one SPORT frame -> still NORMAL
++    assert d.update([1]) == 1  # back to NORMAL
++
++  def test_requires_two_consecutive_source_frames(self):
++    d = dm.DriveModeDebouncer()
++    d.update([1, 1])
++    assert d.update([3]) == 1        # first SPORT frame -> not yet
++    assert d.update([3]) == 3        # second consecutive SPORT frame -> published
++    assert d.update([1]) == 3        # first NORMAL frame -> still SPORT
++    assert d.update([1]) == 1        # second NORMAL frame -> published
++
++  def test_change_within_a_single_tick(self):
++    # two SPORT frames parsed in ONE update (a 100 Hz tick spanning a 10 Hz frame) publishes SPORT
++    d = dm.DriveModeDebouncer()
++    d.update([1, 1])
++    assert d.update([3, 3]) == 3
++
++  def test_no_frames_keeps_last(self):
++    d = dm.DriveModeDebouncer()
++    d.update([2, 2])
++    assert d.update([]) == 2
++    assert d.update([]) == 2
++
++  def test_unknown_hold_from_start(self):
++    d = dm.DriveModeDebouncer()
++    assert d.update([0, 0]) == 0     # absent -> unknown, and it is held, not a mode
++
++  def test_block_mode_publishes(self):
++    d = dm.DriveModeDebouncer()
++    d.update([7, 7])
++    assert d.update([]) == 7
++    assert dm.map_drive_mode(d.update([7])) == dm.DriveModeResult.BLOCK
++
++  def test_publishes_after_n_frames_generic(self):
++    d = dm.DriveModeDebouncer(hold_frames=3)
++    assert d.update([2]) == 0
++    assert d.update([2]) == 0
++    assert d.update([2]) == 2
++
++
++class _ParserShim:
++  """Just enough to drive CarStateExt.update_drive_mode (vl_all like a CANParser)."""
++
++  def __init__(self, parser):
++    self.vl = parser.vl
++    self.vl_all = parser.vl_all
++
++
++class TestCarStateWiring:
++  def test_update_drive_mode_end_to_end(self):
++    pk = _parser()
++    shim = _ParserShim(pk)
++    ext = object.__new__(carstate_ext.CarStateExt)          # skip __init__ (needs CP/CP_SP)
++    ext.drive_mode = 0
++    ext.drive_mode_debouncer = dm.DriveModeDebouncer()
++
++    def tick(mode, slot=0, t=0):
++      dat = bytearray(8)
++      dat[5] = ((mode & 0xF) << 4) | (slot & 0xF)
++      pk.update([(t, [(0x50C, bytes(dat), BUS)])])
++      return ext.update_drive_mode(shim)
++
++    assert tick(1) == 0            # first NORMAL frame: not yet published
++    assert tick(1, t=100_000_000) == 1
++    assert tick(2, t=200_000_000) == 1   # ECO not yet published
++    assert tick(2, t=300_000_000) == 2
++    assert tick(7, t=400_000_000) == 2   # N not yet published
++    assert tick(7, t=500_000_000) == 7
++
++  def test_update_drive_mode_tolerates_absent_message(self):
++    # a parser that never saw CLU13 -> unknown, no exception
++    pk = _parser()
++    shim = _ParserShim(pk)
++    ext = object.__new__(carstate_ext.CarStateExt)
++    ext.drive_mode = 0
++    ext.drive_mode_debouncer = dm.DriveModeDebouncer()
++    assert ext.update_drive_mode(shim) == 0
+-- 
+2.55.0
+

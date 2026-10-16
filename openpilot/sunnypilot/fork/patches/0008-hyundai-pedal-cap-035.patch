@@ -1,0 +1,174 @@
+From 47c0ef73dd442e4c083e959fa860e43ee2b60b54 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Sun, 4 Oct 2026 01:09:59 -0500
+Subject: [PATCH] hyundai: gas interceptor cap 0.30 -> 0.35 (panda raw ceiling
+ A 1218 / B 612)
+
+Owner-approved (drive-128 buttons report section 5): the 0.30 cap bound on 21 % of no-lead on-ramp samples on routes
+127/128 and the driver merged at pedal 0.32-0.345. MAX_INTERCEPTOR_GAS 0.35; panda HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A/_B
+recomputed from the DBC scaling via the packer exactly as for 0.30: A 1218 / B 612 = 35.0 % of track-A travel, B on the
+measured track line B = 0.494*A + 10.5 (fit 612.3). Launch limit still 0.12 at standstill rising to the full cap, now
+reached exactly at 25 mph (the SET/RES engage floor) instead of 11.2 m/s. Tests pin the new raw pair, the track line,
+the 35 % travel and the launch ramp end point.
+---
+ opendbc/safety/modes/hyundai.h                | 11 ++++----
+ .../sunnypilot/car/hyundai/gas_interceptor.py | 20 +++++++++-----
+ .../car/hyundai/tests/test_gas_interceptor.py | 26 ++++++++++++-------
+ 3 files changed, 36 insertions(+), 21 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index c31358a2..6ef85834 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -241,11 +241,12 @@ static bool hyundai_fca11_rolling_window_ok(void) {
+ }
+ 
+ // Ceiling on openpilot's pedal command, raw DAC counts per track. Must equal the packed GAS_COMMAND / GAS_COMMAND2 at
+-// MAX_INTERCEPTOR_GAS (0.30 of pedal travel) in opendbc/sunnypilot/car/hyundai/gas_interceptor.py (a unit test pins
+-// both against the packer). Bench scaling: rest A=465/B=241, full A=2616/B=1284, so 0.30 -> A 1110 / B 559. Without
+-// this, any value up to full throttle passed as long as longitudinal was allowed.
+-#define HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A 1110U
+-#define HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_B 559U
++// MAX_INTERCEPTOR_GAS (0.35 of pedal travel) in opendbc/sunnypilot/car/hyundai/gas_interceptor.py (a unit test pins
++// both against the packer). Bench scaling: rest A=465/B=241, full A=2616/B=1284, so 0.35 -> A 1218 / B 612
++// (B on the measured line B = 0.494*A + 10.5). Without this, any value up to full throttle passed as long as
++// longitudinal was allowed.
++#define HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_A 1218U
++#define HYUNDAI_GAS_INTERCEPTOR_MAX_GAS_B 612U
+ 
+ static int hyundai_get_interceptor_gas(const CANPacket_t *msg) {
+   uint16_t val1 = (uint16_t)((uint16_t)msg->data[0] << 8U) | (uint16_t)msg->data[1];
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 2516fbec..cbe0b100 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -63,7 +63,8 @@ GAS_INTERCEPTOR_BUS_KEY = Bus.alt
+ HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
+ 
+ # Cap on openpilot's pedal command, fraction 0..1 of pedal travel (DBC scaling is bench-measured: 0 = rest, 1 = full
+-# press; 0.30 -> track A 1110 / track B 559 raw). Road-validated (route 00000123, drive-123 report): the old 0.15 cap
++# press; 0.35 -> track A 1218 / track B 612 raw, on the measured B = 0.494*A + 10.5 track line). Road-validated
++# (route 00000123, drive-123 report): the old 0.15 cap
+ # was the binding limit 51% of engaged time and could not hold speed on flat ground above ~22 m/s (measured hold
+ # command 0.124 at 20 m/s) or on a ~4% climb (speed fell 19.9 -> 17.1 m/s pinned at 0.15 while the planner asked for
+ # +1.0 m/s^2, unclipped command 0.37). 0.30 = the driver's own p90 pedal while driving this car (p99 0.33), the same
+@@ -74,7 +75,10 @@ HYUNDAI_GAS_INTERCEPTOR_THRESHOLD = 420
+ # ADC on GAS_SENSOR and applies max(driver, openpilot) only at its DAC output, so openpilot's command can't latch
+ # gas_pressed (verified against panda c076a9f2^:board/pedal/main.c). Bench gate: ramp the command to this cap with the
+ # foot off and confirm GAS_SENSOR does not move. test_gas_interceptor.py pins the DBC mapping in raw counts.
+-MAX_INTERCEPTOR_GAS = 0.30
++# Raised 0.30 -> 0.35 (owner-approved, drive-128 buttons report §5): on routes 127/128 the cap bound on 21 % of the
++# no-lead on-ramp samples and the driver's own merge pedal was 0.32-0.345 (p99 while driving 0.35). Panda ceiling moved
++# with it (A 1110/B 559 -> A 1218/B 612).
++MAX_INTERCEPTOR_GAS = 0.35
+ 
+ # SET/RES engage floor (car_specific.py raises belowEngageSpeed below it). NOT applied to the pause/resume button, and the
+ # pedal command is no longer cut below it once engaged (the old cut made a green-light resume impossible).
+@@ -94,15 +98,17 @@ PEDAL_SCALE = 0.36
+ HOLD_SPEED_OFFSET_BP = [0., 10., 15., 20., 25., 30., 35.]          # vEgo, m/s
+ HOLD_SPEED_OFFSET_V = [0., 0.10, 0.24, 0.34, 0.43, 0.49, 0.56]     # m/s^2 equivalent
+ 
+-# Low-speed ceiling on the command (openpilot side; panda keeps its flat 0.30 raw ceiling, it has no vEgo). The pedal is
++# Low-speed ceiling on the command (openpilot side; panda keeps its flat raw ceiling at the cap, it has no vEgo). The
++# pedal is
+ # far stronger at low speed (driver data 127+128, aEgo(+0.3 s) per unit pedal: 0-1 m/s 10.9, 1-3 13.2, 3-6 10.0,
+ # 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6 m/s^2,
+-# 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a 0.30 (~3 m/s^2) jump. Full 0.30 from 11.2 m/s.
+-LOW_SPEED_MAX_GAS_BP = [0., 5., 11.2]        # vEgo, m/s
+-LOW_SPEED_MAX_GAS_V = [0.12, 0.20, 0.30]     # pedal fraction
++# 0.20 at 5 m/s = ~1.3 m/s^2: a gentle green-light launch, never a full-cap (~3 m/s^2) jump. Full cap from 25 mph
++# (11.18 m/s).
++LOW_SPEED_MAX_GAS_BP = [0., 5., HYUNDAI_GAS_INTERCEPTOR_MIN_ENABLE_SPEED]  # vEgo, m/s (full cap at 25 mph)
++LOW_SPEED_MAX_GAS_V = [0.12, 0.20, MAX_INTERCEPTOR_GAS]     # pedal fraction
+ 
+ # Upward slew limit on the pedal command (fraction of travel per second); decreases are immediate. Raising the cap made
+-# the engage step (0 -> cap in one frame, seen 8x on route 00000123) twice as large; 0.75/s = 0 -> 0.30 in 0.4 s,
++# the engage step (0 -> cap in one frame, seen 8x on route 00000123) twice as large; 0.75/s = 0 -> 0.35 in 0.47 s,
+ # just above the driver's own p99 pedal rise rate on this car (0.62/s). Units: 100 Hz controller frames (DT_CTRL).
+ PEDAL_RATE_UP = 0.75
+ PEDAL_RATE_UP_PER_FRAME = PEDAL_RATE_UP * DT_CTRL
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 4ee6929f..40eeab03 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -16,6 +16,7 @@ import pytest
+ from opendbc.can import CANDefine, CANPacker
+ from opendbc.can.dbc import DBC
+ from opendbc.car import Bus, DT_CTRL, structs
++from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.car_helpers import interfaces
+ from opendbc.car.hyundai.values import CAR
+ from opendbc.sunnypilot.car import crc8_pedal, create_gas_interceptor_command
+@@ -166,11 +167,13 @@ class TestThresholds:
+ 
+   def test_max_gas_raw_ceiling(self):
+     # Pins the command scaling in raw DAC counts at the cap so it can't drift silently through a DBC/scale change.
+-    # Bench-measured scaling: 0.30 -> track A 1110, track B 559 (0.15 was A 788 / B 400).
++    # Bench-measured scaling: 0.35 -> track A 1218, track B 612 (0.30 was A 1110 / B 559, 0.15 was A 788 / B 400).
+     _, dat, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.MAX_INTERCEPTOR_GAS, 0)
+     track1, track2 = (dat[0] << 8) | dat[1], (dat[2] << 8) | dat[3]
+-    assert abs(track1 - 1110) <= 2 and abs(track2 - 559) <= 3
+-    assert 0. < gi.MAX_INTERCEPTOR_GAS <= 0.3
++    assert abs(track1 - 1218) <= 2 and abs(track2 - 612) <= 3
++    assert abs(track2 - (0.49413 * track1 + 10.45)) <= 3  # the cap pair sits on the car's measured A/B track line
++    assert abs((track1 - 465) / (2616 - 465) - 0.35) < 0.005  # 35 % of pedal travel on track A
++    assert 0. < gi.MAX_INTERCEPTOR_GAS <= 0.35
+ 
+   @pytest.mark.parametrize("pedal_ids", [gi.STANDARD_IDS, gi.REMAPPED_IDS], ids=["standard", "remapped"])
+   def test_c_max_gas_matches_python_cap(self, pedal_ids):
+@@ -241,6 +244,11 @@ class TestThresholds:
+     assert gi.get_pedal_command(5., 0.) == pytest.approx(0.12)
+     assert gi.get_pedal_command(5., 5.) == pytest.approx(0.20)
+     assert gi.get_pedal_command(5., 11.2) == pytest.approx(gi.MAX_INTERCEPTOR_GAS)
++    # the ramp reaches the full cap by 25 mph and never exceeds it
++    assert gi.LOW_SPEED_MAX_GAS_BP[-1] <= 25. * CV.MPH_TO_MS
++    assert gi.LOW_SPEED_MAX_GAS_V[-1] == gi.MAX_INTERCEPTOR_GAS
++    assert gi.get_pedal_command(5., 25. * CV.MPH_TO_MS) == pytest.approx(gi.MAX_INTERCEPTOR_GAS)
++    assert all(gi.get_pedal_command(5., v) <= gi.MAX_INTERCEPTOR_GAS for v in np.linspace(0., 40., 81))
+     assert gi.get_pedal_command(0.3, 0.) > 0.  # it does move off from a stop when the planner asks
+ 
+   def test_cap_has_authority_for_route_123_hill(self):
+@@ -263,7 +271,7 @@ class TestThresholds:
+     assert gi.rate_limit_pedal_command(0.1, 0.09) == pytest.approx(0.09 + step)
+     assert gi.rate_limit_pedal_command(0.1, 0.0999) == 0.1               # within one step: exact
+     assert gi.rate_limit_pedal_command(0., 0.3) == 0.                    # lift is immediate
+-    # 0 -> cap takes cap / rate seconds (0.4 s at 0.30 and 0.75/s)
++    # 0 -> cap takes cap / rate seconds (0.47 s at 0.35 and 0.75/s)
+     g, n = 0., 0
+     while g < gi.MAX_INTERCEPTOR_GAS:
+       g = gi.rate_limit_pedal_command(gi.MAX_INTERCEPTOR_GAS, g)
+@@ -525,7 +533,7 @@ class TestPedalFaultClearEndToEnd:
+   @pytest.mark.parametrize("pedal, ids", [(STD, gi.STANDARD_IDS), (REM, gi.REMAPPED_IDS)], ids=["standard", "remapped"])
+   def test_clear_frame_on_fault(self, pedal, ids):
+     CI, CC, CC_SP, ids = self._setup(ids, pedal)
+-    # 60 frames healthy (the engage ramp reaches the cap after 40), 20 faulted, 20 healthy
++    # 60 frames healthy (the engage ramp reaches the cap after 47), 20 faulted, 20 healthy
+     out = self._drive(CI, CC, CC_SP, ids, [0] * 60 + [3] * 20 + [0] * 20)
+     cmds = [(f, _cmd_fields(d)) for f, (d, _) in enumerate(out) if d is not None]
+     assert all(f % 2 == 0 for f, _ in cmds) and len(cmds) == 50
+@@ -536,9 +544,9 @@ class TestPedalFaultClearEndToEnd:
+     for f, (a, b, en, _) in cmds:
+       if f in zero:
+         assert (a, b, en) == (0, 0, 0)  # the firmware's clear frame: ENABLE=0, both tracks 0
+-      elif f >= 40:
++      elif f >= 48:
+         # commanding at the cap, also right after each clear frame (a clear doesn't restart the engage ramp)
+-        assert en == 1 and abs(a - 1110) <= 2
++        assert en == 1 and abs(a - 1218) <= 2
+     assert not any(acc for _, acc in out)
+     # every frame (incl. clears) has a valid pedal checksum
+     assert all(d[5] == crc8_pedal(d[:5]) for d, _ in out if d is not None)
+@@ -550,8 +558,8 @@ class TestPedalFaultClearEndToEnd:
+     # first frame is one rate step, not a step to the cap (old behaviour: 0 -> cap in one frame)
+     _, d1, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.PEDAL_RATE_UP_PER_FRAME, 0)
+     assert a[0] == (d1[0] << 8) | d1[1]
+-    assert all(y >= x for x, y in zip(a, a[1:], strict=False)) and abs(a[-1] - 1110) <= 2
+-    assert sum(abs(x - 1110) > 2 for x in a) == 20  # 40 frames (0.4 s) of ramp = 20 send slots
++    assert all(y >= x for x, y in zip(a, a[1:], strict=False)) and abs(a[-1] - 1218) <= 2
++    assert sum(abs(x - 1218) > 2 for x in a) == 23  # 0.47 s ramp: 23 send slots below the cap
+     # accel request drops to coast -> the very next frame is the zero frame
+     CC2 = structs.CarControl()
+     CC2.enabled = CC2.latActive = CC2.longActive = True
+-- 
+2.55.0
+

@@ -11,11 +11,13 @@ from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
-from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
+from openpilot.sunnypilot.fork.adaptive_follow import AdaptiveFollow, is_throttle_only
+from openpilot.sunnypilot.fork.scc import ForkSmartCruiseControl
+from openpilot.sunnypilot.fork.setspeed_ease import SetSpeedEase
 
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
@@ -26,12 +28,14 @@ class LongitudinalPlannerSP:
     self.events_sp = EventsSP()
     self.resolver = SpeedLimitResolver()
     self.dec = DynamicExperimentalController(CP, mpc)
-    self.scc = SmartCruiseControl()
+    self.scc = ForkSmartCruiseControl(is_throttle_only(CP, CP_SP))  # fork: SCC fixes + throttle-only guard (fork/scc.py)
     self.resolver = SpeedLimitResolver()
     self.sla = SpeedLimitAssist(CP, CP_SP)
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
+    self.adaptive_follow = AdaptiveFollow(is_throttle_only(CP, CP_SP))
+    self.setspeed_ease = SetSpeedEase()  # fork: gentler, personality-dependent chase of a raised target
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -43,6 +47,12 @@ class LongitudinalPlannerSP:
 
     return experimental_mode and self.dec.mode() == "blended"
 
+  def get_t_follow(self, sm: messaging.SubMaster, v_ego: float) -> float | None:
+    """Fork adaptive follow distance; None when the AdaptiveFollowDistance param is off (stock T_FOLLOW)."""
+    road_type = str(sm['liveMapDataSP'].roadType)  # unknown (enum default) until mapd publishes
+    lead = sm['radarState'].leadOne
+    return self.adaptive_follow.update(sm['selfdriveState'].personality, v_ego, road_type, lead.present, lead.vLead)
+
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']
     v_cruise_cluster_kph = min(CS.vCruiseCluster, V_CRUISE_MAX)
@@ -51,8 +61,9 @@ class LongitudinalPlannerSP:
     long_enabled = sm['carControl'].enabled
     long_override = sm['carControl'].cruiseControl.override
 
-    # Smart Cruise Control
-    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+    # Smart Cruise Control (evaluate the merge gate first so SCC-V can be excluded during a merge window)
+    merging = self.setspeed_ease.merge_state(sm, v_cruise, CS.vEgo)
+    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise, merging)
 
     # Speed Limit Resolver
     self.resolver.update(v_ego, sm)
@@ -71,7 +82,10 @@ class LongitudinalPlannerSP:
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
-    return self.output_v_target, self.output_a_target
+    # fork: personality-dependent ramp toward a higher target (fork/setspeed_ease.py); vTarget stays raw.
+    # `merging` was evaluated once this tick, above, and shared with the SCC-V exclusion.
+    v_cruise_eased = self.setspeed_ease.update(sm, self.output_v_target, long_enabled, long_override, a_ego, v_cruise, merging)
+    return v_cruise_eased, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.events_sp.clear()

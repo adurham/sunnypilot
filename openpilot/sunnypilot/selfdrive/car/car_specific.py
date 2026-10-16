@@ -24,7 +24,7 @@ class CarSpecificEventsSP:
 
     self.low_speed_alert = False
 
-  def update(self, CS: structs.CarState, events: Events):
+  def update(self, CS: structs.CarState, CS_SP: structs.CarStateSP, events: Events, long_active: bool):
     events_sp = EventsSP()
 
     if self.CP.brand == 'chrysler':
@@ -41,6 +41,42 @@ class CarSpecificEventsSP:
           self.low_speed_alert = True
       if self.low_speed_alert:
         events.add(EventName.belowSteerSpeed)
+
+    elif self.CP.brand == 'hyundai':
+      # fork: comma pedal longitudinal (accelerator only, no brakes), buttons-v3. There is NO engage floor any more
+      # (CP.minEnableSpeed = -1): the pause/resume press is the only on/off and engages at any speed incl. a standstill;
+      # the up/down arrows only change the set speed. So no belowEngageSpeed, no SET/RES refusal alert and no low-speed
+      # takeover warning. The driver remains the brake; any brake press disengages; the launch is throttle-limited
+      # (gas_interceptor.py LOW_SPEED_MAX_GAS).
+      if self.CP_SP.enableGasInterceptor:
+        # pause/resume with no set speed yet this drive engages at the current speed (cruise.py initialize_v_cruise),
+        # so selfdrived's 'Press Set to Engage' block (there is no SET-to-engage button in this mode) must not apply
+        if events.has(EventName.resumeBlocked):
+          events.remove(EventName.resumeBlocked)
+        # factory cruise MAIN armed: wrongCruiseMode locks pedal-long out, but MADS strips wrongCruiseMode too (route
+        # 00000128 @152.5-187.4 s: 35 s locked out, 13 button presses, no alert at all)
+        if CS.cruiseState.nonAdaptive:
+          events_sp.add(EventNameSP.pedalFactoryCruiseLockout)
+
+        # fork (0040): the three FCA11 braking alerts, raised from CarStateSP (the opendbc half, CarStateExt).
+        #   fca11SuperviseStop - steady YELLOW, braking below 15 km/h (a stop is being guided).
+        #   fca11StopComplete  - steady YELLOW at/near a stop while still holding (an explicit hand-off, NOT a cap:
+        #                        the command keeps flowing; it tells the driver to put a foot on the brake).
+        #   fca11BrakeNow      - persistent RED on ESC non-response or hold-lost; clears only on driver brake.
+        # The old hand-over alert ("FCA11: Take Over Below 12 km/h") is DELETED with the floors it warned about.
+        if self.CP_SP.fca11Brake:
+          if CS_SP.brakeNow:
+            events_sp.add(EventNameSP.fca11BrakeNow)
+          elif CS_SP.stopComplete:
+            events_sp.add(EventNameSP.fca11StopComplete)
+          elif CS_SP.superviseStop:
+            events_sp.add(EventNameSP.fca11SuperviseStop)
+
+        # fork (adurham), patch 0030: FCA11-long is unavailable for the rest of this ignition (the panda has
+        # handed FCA11 back to the camera / latched a pedal fault). Surfaced from CarStateSP.fca11Unavailable
+        # (the opendbc half, CarStateExt): without it, openpilot silently plans stops it cannot execute.
+        if self.CP_SP.fca11Brake and CS_SP.fca11Unavailable:
+          events_sp.add(EventNameSP.fca11Unavailable)
 
     elif self.CP.brand == 'toyota':
       if self.CP.openpilotLongitudinalControl:

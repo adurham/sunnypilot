@@ -1,0 +1,439 @@
+From 89de194567cfda9a67088a636790191900da71f1 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 12:10:03 -0500
+Subject: [PATCH] hyundai: FCA11-long driver cut re-arms on the first clean
+ frame after the resume grant (G9b, drive-14)
+
+The panda's G9 driver-input latch (hyundai_fca11_long_driver_cut) re-armed on the openpilot resume edge
+(controls_allowed rising), but it cleared the latch DIRECTLY on that edge and then re-set it in the SAME
+rx call whenever a driver input was still held at that instant. Granting controls in pedal mode needs the
+brake released (hyundai_common.h, hyundai_gas_interceptor_pause_button_check) but NOT the gas, so engaging
+with the foot still on the gas latched the cut for the whole engagement: on routes 0000014a/0000014b (build
+adurham/dev 37bf708bee) 7 of 16 engagements were granted with gas_raw > 420 (574/748/731/739...), the latch
+stayed latched for up to 24.7 s, closed hyundai_fca11_long_window_ok() and refused EVERY actuating FCA11
+frame - 753 of 755 refused frames on both drives, 7 dead episodes, only 37.5 % of braking frames reached
+the ESC. Python never latched (it only latches gas while longActive, and openpilot holds longActive False
+with the gas pressed), so the car layer believed the window was open and sent 116 frames the panda refused.
+
+Fix (state exactly what changed and why):
+  - on controls_allowed rising the edge now only ARMS a re-arm (hyundai_fca11_long_driver_cut_pending);
+  - each rx frame, a live driver input (brake / gas / gear != D) sets the latch as before; otherwise the
+    first CLEAN engaged frame clears the latch and consumes the pending re-arm;
+  - the SET is kept BEFORE the clear, so a driver input ON the grant frame still wins that frame;
+  - the clear is gated on controls_allowed ("after engaging"), so a clean frame while disengaged does not
+    re-arm and a cut carried across a mid-drive re-init still refuses until a genuine resume edge;
+  - an unconsumed pending re-arm is dropped on any disengage, so a re-arm must be earned inside the same
+    engagement;
+  - pedal-fault and camera-owns stay in hyundai_fca11_long_cut, hard-latched for the whole arm (unchanged).
+
+Semantics: the gate that re-arms the latch is LEVEL-triggered on the live driver input at the grant. A gas
+reading that has ALREADY fallen below the threshold is not re-latched - it re-arms on the first clean frame
+(matching stock Hyundai SCC override behaviour: the override ends when the pedal is released, not when the
+car re-engages). A pedal still over threshold keeps re-latching every frame, exactly as today. Brake, gear
+and camera cuts are untouched in severity: the live window still carries !brake_pressed && !gas_pressed &&
+gear D on every actuating frame, so the driver always cuts the CURRENT episode immediately.
+
+Python mirror (opendbc/sunnypilot/car/hyundai/fca11_long.py): the car layer must be a strict subset of the
+panda. blocked_until_resume is split into _driver_cut (brake/gas/gear; re-arms on the CC.enabled rising edge,
+clears on the first clean engaged frame) and _hard_cut (camera hand-back / pedal fault; not re-armed), OR'd
+back into blocked_until_resume so every consumer is unchanged.
+
+Tests (test_hyundai.py, class TestHyundaiFca11LongSafety; test_fca11_long.py, class TestG9bDriverCutRearm):
+  panda: test_driver_input_released_within_the_engagement_rearms_gas (the drive-14 root cause: engage with
+  the gas held, release mid-engagement -> accepted from the release frame), the amended
+  test_driver_input_on_the_grant_frame_still_cuts_then_rearms_on_release (refused on the held frame,
+  accepted on the first clean frame), test_engage_with_gas_still_held_is_refused,
+  test_engage_with_brake_held_is_refused, test_engage_with_gear_not_d_is_refused,
+  test_camera_owns_hard_latched_across_gas_release; the G9 R7-B set (override->resume->ACCEPTED per source,
+  the mid-drive-re-init discriminator, pedal-fault/camera-owns survive resume) still passes.
+  FALSIFIABLE CONTRAST: test_driver_input_released_within_the_engagement_rearms_gas,
+  test_driver_input_on_the_grant_frame_still_cuts_then_rearms_on_release and
+  test_engage_with_gear_not_d_is_refused FAIL on the shipped rule (base + 0022..0026) and PASS here;
+  the four required "must stay refused" conditions pass on BOTH rules.
+  python: 6 mirror tests (rearm on gas-just-released, gas-still-held stays latched, gear re-arm, camera hard,
+  no auto-resume without an edge, disengage abandons a pending re-arm); 4 FAIL on the shipped car layer.
+
+Firmware: this is a COMPILED-C change (hyundai.h is in the panda safety core), so CI will rebuild and
+re-sign the H7 to a NEW binary (series sha changes -> FW_NEEDED=true). Flashing is a separate, explicit
+owner decision and this patch does not change the shipped device build (dev 37bf708bee stays as-is).
+---
+ opendbc/safety/modes/hyundai.h                |  40 +++++--
+ opendbc/safety/tests/test_hyundai.py          |  94 ++++++++++++++--
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  |  38 +++++--
+ .../car/hyundai/tests/test_fca11_long.py      | 104 ++++++++++++++++++
+ 4 files changed, 251 insertions(+), 25 deletions(-)
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index b813b6f5..b7eab91e 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -178,8 +178,12 @@ static int hyundai_fca11_long_dec_last;       // last ACCEPTED CR_VSM_DecCmd (ra
+ // G9 (R7-B): the DRIVER-INPUT cut (brake / gas / gear != D) is kept in its own latch so it can re-arm on the
+ // openpilot resume edge (controls_allowed rising), mirroring the car layer's blocked_until_resume. The camera
+ // hand-back and the pedal-fault cut stay in hyundai_fca11_long_cut, latched for the whole arm (fail-closed).
+-static bool hyundai_fca11_long_driver_cut;    // LATCHED until the next openpilot RESUME edge (not the next init)
++static bool hyundai_fca11_long_driver_cut;    // LATCHED until the first CLEAN frame after the next openpilot RESUME edge
+ static bool hyundai_fca11_long_controls_prev; // resume-edge tracker (controls_allowed prev sample)
++// G9b (drive-14): the resume edge only ARMS the re-arm; the latch clears on the first CLEAN frame after the grant.
++// A driver input merely HELD at the grant (the drive-14 case: engage with the foot still on the gas) therefore keeps
++// the latch for that frame but stops barring actuation the moment it is actually released.
++static bool hyundai_fca11_long_driver_cut_pending;
+ 
+ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_cut = false;
+@@ -193,6 +197,10 @@ static void hyundai_fca11_long_reset(void) {
+   // on the init-time controls_allowed = false invariant holding forever.
+   hyundai_fca11_long_driver_cut = true;
+   hyundai_fca11_long_controls_prev = controls_allowed;
++  // G9b: no resume edge has been OBSERVED yet, so no re-arm is pending. A cut carried across the re-init (driver
++  // physically holding a pedal / the gear out of D) therefore stays latched, exactly like the G9 rule: only a
++  // genuine controls_allowed rising edge this arm observed may arm its clearing.
++  hyundai_fca11_long_driver_cut_pending = false;
+   hyundai_fca11_long_seen = 0U;
+   hyundai_fca11_long_gear_d = false;
+   hyundai_fca11_long_speed_min = 0U;
+@@ -252,17 +260,18 @@ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+     }
+   }
+ 
+-  // G9 (R7-B): the DRIVER-INPUT latch re-arms on the openpilot RESUME edge (controls_allowed rising), mirroring the
+-  // car layer's blocked_until_resume. This is the same "driver's pedal always wins, cut the CURRENT episode" model,
+-  // but a latch set while openpilot was NOT engaged (brake-to-shift-out-of-Park, a gas tap before the first engage)
+-  // re-arms as soon as openpilot actually takes control, instead of barring FCA11 for the whole ignition cycle. The
+-  // clear runs BEFORE the set below so a driver input on the grant frame itself still cuts (driver wins). Safe
+-  // because granting controls in pedal mode needs the brake released (hyundai_common.h
+-  // hyundai_gas_interceptor_pause_button_check) and every actuating frame is re-checked against the LIVE
+-  // !brake_pressed && !gas_pressed && gear D window (hyundai_fca11_long_window_ok).
++  // G9b (drive-14): the DRIVER-INPUT latch re-arms on the openpilot RESUME edge (controls_allowed rising, mirroring
++  // the car layer's blocked_until_resume) - but only CLEARS on the first CLEAN frame after that grant. G9 cleared the
++  // latch directly on the edge and then re-set it in the SAME call whenever a driver input was still held at that
++  // instant, so engaging with the foot still on the gas (the drive-14 failure: gas_raw 574 > 420 for the first 80 ms
++  // of a 24.7 s engagement) latched the cut for the whole episode and refused all 117 braking frames. Here the edge
++  // only ARMS pending; the held input keeps the latch this frame, and the first frame with no input clears it. Any
++  // driver input still cuts the CURRENT episode immediately, and every actuating frame is re-checked against the LIVE
++  // !brake_pressed && !gas_pressed && gear D window (hyundai_fca11_long_window_ok). The clear runs AFTER the set so
++  // driver wins on any frame carrying an input.
+   bool controls_rising = controls_allowed && !hyundai_fca11_long_controls_prev;
+   if (controls_rising) {
+-    hyundai_fca11_long_driver_cut = false;
++    hyundai_fca11_long_driver_cut_pending = true;
+   }
+ 
+   bool driver_cut = brake_pressed || gas_pressed;
+@@ -271,6 +280,17 @@ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+   }
+   if (driver_cut) {
+     hyundai_fca11_long_driver_cut = true;
++  } else if (hyundai_fca11_long_driver_cut_pending && controls_allowed) {
++    // first CLEAN frame of the episode: the driver input that set the latch is gone, so the new engagement starts
++    // fresh. Gated on controls_allowed ("after engaging"): a clean frame while disengaged does not re-arm, so a cut
++    // held across a mid-drive re-init still refuses until a genuine resume edge (G9 item 2).
++    hyundai_fca11_long_driver_cut = false;
++    hyundai_fca11_long_driver_cut_pending = false;
++  } else {
++  }
++  // a disengage abandons any armed-but-unused re-arm: it must be consumed by a clean frame of the SAME engagement.
++  if (!controls_allowed) {
++    hyundai_fca11_long_driver_cut_pending = false;
+   }
+   // Pedal FAULT stays hard-latched for the whole arm in hyundai_fca11_long_cut (see hyundai_rx_hook): the pedal is
+   // passing through with no throttle authority, which a resume press must not paper over.
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 40d9ec91..cf920f86 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -2536,7 +2536,9 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     pedal path stays fully active. Actuating FCA11 is legal only inside the window (gear D, no pedal, every wheel
+     above 9 km/h raw 288, fresh inputs, no cut), capped at 0.30 g, rate-limited, on a 2.5 s budget / 3 s cooldown,
+     camera request hands back the same frame. A DRIVER-INPUT cut (brake / gas / gear != D) re-arms on the next
+-    openpilot RESUME edge (controls_allowed rising, mirroring the car layer's blocked_until_resume); a pedal
++    openpilot RESUME edge (controls_allowed rising, mirroring the car layer's blocked_until_resume) but CLEARS only
++    on the first CLEAN frame after that grant (G9b): an input merely HELD at the grant (the drive-14 engage-with-foot-
++    on-gas) keeps the latch for that frame and stops barring actuation the moment it is actually released. A pedal
+     fault and a camera request LATCH until the next init.
+   """
+   # pedal list + FCA11 (check_relay, dynamic blocking via hyundai_fwd_hook). NO CLU11: the pedal TX list has none.
+@@ -2944,16 +2946,92 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+     self.assertFalse(self._tx(self._brake_cmd(1)))    # still latched
+ 
+-  def test_driver_input_on_the_grant_frame_still_cuts(self):
+-    """T5: the clear runs BEFORE the set, so a driver brake on the very frame the resume edge fires re-latches
+-    (driver wins). Kills a re-ordering of the clear after the set."""
++  def test_driver_input_on_the_grant_frame_still_cuts_then_rearms_on_release(self):
++    """T5 (G9b, drive-14): the SET runs BEFORE the clear, so a driver input ON the grant frame re-latches (driver
++    wins that frame). The frame AFTER the input is released is CLEAN and — because the resume edge already armed
++    the re-arm — it is ACCEPTED: an input merely HELD at the grant must not bar FCA11 for the whole engagement
++    (the drive-14 bug: 117 refused frames). On the shipped rule AND on plain G9 the frame after the release stays
++    refused, so this is the falsifiable contrast for the clear-on-first-clean-frame behaviour.
++    """
+     self._rearm()
+     self._disengage_frame()
+     self._rx(self._user_brake_msg(True))               # brake held while disengaged -> driver cut
+-    self._engage(True, True)                           # grant
+-    self._rx(self._user_brake_msg(True))               # grant frame CARRYING the brake
+-    self._feed_clean_window_inputs()                   # release it, no new edge
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # must stay refused
++    self._engage(True, True)                          # grant
++    self._rx(self._user_brake_msg(True))              # grant frame CARRYING the brake: driver wins THIS frame
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # refused while the brake is actually held
++    self._feed_clean_window_inputs()                  # release it, no new edge
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # G9b: first CLEAN frame after the grant -> re-armed
++
++  def test_driver_input_released_within_the_engagement_rearms_gas(self):
++    """G9b, the drive-14 root cause in miniature: engage with the driver's foot still on the gas (0x201 pedal,
++    gas_pressed), the gas falls below threshold ~80 ms later, and FCA11 must brake from that first clean frame —
++    NOT be refused for the whole engagement. On the shipped rule and on plain G9 the latch set on the grant frame
++    (gas still over threshold) never clears, so every actuating frame in the window is refused.
++    """
++    self._rearm()
++    self._disengage_frame()
++    self._rx(self._interceptor_user_gas(0x1000))      # driver gas over threshold while disengaged -> driver cut
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._engage(True, True)                          # grant with the foot STILL on the gas
++    self._rx(self._interceptor_user_gas(0x1000))      # grant frame CARRYING the held gas: driver wins THIS frame
++    self.assertFalse(self._tx(self._brake_cmd(1)))     # refused while the gas is actually held
++    # the gas falls below threshold (still inside the same engagement, no new rising edge) and the window is clean
++    self._feed_clean_window_inputs()
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # G9b: first CLEAN frame -> accepted
++
++  def test_engage_with_gas_still_held_is_refused(self):
++    """G9b required regression: engage with the gas STILL over threshold and KEEP it held -> every actuating frame
++    stays refused. The re-arm is level-triggered on the live input, so a pedal that never falls below the
++    threshold never re-arms (no auto-resume from a re-arm that was never earned).
++    """
++    self._rearm()
++    self._disengage_frame()
++    self._rx(self._interceptor_user_gas(0x1000))      # gas held while disengaged -> driver cut
++    self._engage(True, True)                          # grant with gas held
++    self._rx(self._interceptor_user_gas(0x1000))      # grant frame, gas still held
++    self.assertFalse(self._tx(self._brake_cmd(0)))
++    # window inputs clean EXCEPT the gas (still held): the re-arm must not fire
++    self._rx(self._user_brake_msg(False))
++    self._rx(self._user_gas_msg(0))
++    self._rx(self._gear_msg(5))
++    self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
++    self._rx(self._interceptor_user_gas(0x1000))      # still held
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused (live gas re-sets the latch every frame)
++
++  def test_engage_with_brake_held_is_refused(self):
++    """G9b required regression: engage with the brake still held -> refused, and refused for as long as it is
++    held (the live window also carries !brake_pressed, so this holds with or without the latch)."""
++    self._rearm()
++    self._disengage_frame()
++    self._rx(self._user_brake_msg(True))              # brake held while disengaged
++    self._engage(True, True)
++    self._rx(self._user_brake_msg(True))              # grant frame, brake still held -> refused
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self._rx(self._user_brake_msg(True))              # keep holding: still refused
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  def test_engage_with_gear_not_d_is_refused(self):
++    """G9b required regression: engage with the gear out of D -> refused; the gear cut re-arms only once the gear
++    is actually in D on a clean frame, and re-latches the moment it leaves D again."""
++    self._rearm()
++    self._disengage_frame()
++    self._rx(self._gear_msg(0))                       # Park while disengaged -> gear cut
++    self._engage(True, True)
++    self._rx(self._gear_msg(0))                       # grant frame, gear still P
++    self._feed_clean_window_inputs()                  # gear now D, everything clean -> first clean frame
++    self.assertTrue(self._tx(self._brake_cmd(1)))     # G9b: gear in D on a clean frame -> re-armed
++    self._rx(self._gear_msg(0))                       # shift back out of D: cut re-latches immediately
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++
++  def test_camera_owns_hard_latched_across_gas_release(self):
++    """G9b required: the camera hand-back is HARD-latched (separate state from the driver latch), so a clean frame
++    after a camera request must NOT re-arm it (rule 4 of the G9b review)."""
++    self._rearm()
++    self._disengage_frame()
++    self._rx(self._cam_fca11(CF_VSM_Warn=2))          # camera request -> hyundai_fca11_long_cut (hard)
++    self._engage(True, True)
++    self._feed_clean_window_inputs()                  # a fully clean frame, post-grant
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused: camera owns is not the driver latch
+ 
+   def test_grant_within_one_period_of_reinit_with_brake_held(self):
+     """T6 (post-init race, recommended by second-opinion review): a mid-drive re-init while the driver is
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 68bd7cd3..7764df74 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -290,6 +290,12 @@ class Fca11LongBrake:
+     self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
+     self.braking = False               # an FCA11 actuating frame was sent THIS frame
+     self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
++    # G9b: split the cut the way the panda does. _driver_cut (brake/gas/gear != D) re-arms on the resume
++    # edge but clears on the first clean engaged frame; _hard_cut (camera hand-back / pedal fault) is not
++    # re-armed. blocked_until_resume is their OR, so every existing consumer is unchanged.
++    self._driver_cut = False
++    self._hard_cut = False
++    self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+     self.low_speed_alert = False       # hand-over-before-the-floor warning (this frame)
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+@@ -371,23 +377,41 @@ class Fca11LongBrake:
+       self._in_budget = False
+       self._budget_end = -1
+       self._release_pending = False
++      # G9b: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
++      self._driver_cut = False
++      self._hard_cut = False
++      self._rearm_pending = False
++      self.blocked_until_resume = False
+       return sends
+ 
+     # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
+     # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
++    # G9b (drive-14): the resume edge only ARMS the re-arm; the driver latch clears on the first CLEAN
++    # frame after the grant, so an input merely HELD at the grant (engaging with the foot still on the
++    # gas: gasReleased mid-engagement) stops barring FCA11 the moment it is actually released instead
++    # of killing braking for the whole engagement (the panda refuses every frame otherwise).
+     engaged = bool(CC.enabled)
+     if engaged and not self._engaged_prev:
+-      self.blocked_until_resume = False
++      self._rearm_pending = True
+     self._engaged_prev = engaged
+ 
+-    # latch the cut on what the car layer CAN observe (camera request, driver pedal, gear):
+-    # braking stays off until the next deliberate re-engage, per the owner's no-auto-resume rule.
+-    if CC.longActive and (bool(CS.out.brakePressed) or bool(CS.out.gasPressed) or
+-                          CS.out.gearShifter != structs.CarState.GearShifter.drive):
+-      self.blocked_until_resume = True
++    # latch the cut on what the car layer CAN observe (camera request, driver pedal, gear).
++    # The DRIVER latch (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut: it re-arms on
++    # the resume edge but clears only on the first clean engaged frame. The CAMERA hand-back and a
++    # pedal fault go to _hard_cut, which matches the panda's hyundai_fca11_long_cut and is NOT re-armed.
++    driver_cut = (bool(CS.out.brakePressed) or bool(CS.out.gasPressed) or
++                  CS.out.gearShifter != structs.CarState.GearShifter.drive)
++    if CC.longActive and driver_cut:
++      self._driver_cut = True
++    elif self._rearm_pending and engaged:
++      self._driver_cut = False
++      self._rearm_pending = False
+     cam = getattr(CS, "fca11_cam_frame", None)
+     if CC.longActive and cam is not None and camera_requesting(cam[1]):
+-      self.blocked_until_resume = True
++      self._hard_cut = True
++    if not engaged:
++      self._rearm_pending = False
++    self.blocked_until_resume = self._driver_cut or self._hard_cut
+ 
+     self.low_speed_alert = self._alert(CS)
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 3ed6c649..dfb0f06c 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -597,6 +597,110 @@ class TestG8FrameContract(unittest.TestCase):
+       self.assertFalse(b.braking, f)
+ 
+ 
++class TestG9bDriverCutRearm(unittest.TestCase):
++  """G9b (drive-14): the panda's driver-cut latch re-arms on the resume edge but clears on the FIRST CLEAN frame
++  after the grant. The car layer must agree, or it claims a brake the panda will refuse (or hides one it allows).
++
++  Python sees the *derived* signals only (brakePressed / gasPressed / gearShifter / camera), so a held pedal that
++  falls below threshold appears as the SAME frame shape as a release: the clean frame is the first frame whose
++  driver_cut is False. The mirror is therefore "clear on the first frame the car layer sees as clean, after the
++  resume edge", which is exactly what the panda does with its live inputs.
++  """
++
++  def _brake(self, cp_sp):
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def _cp_sp(self):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    return cp_sp
++
++  def _cc(self, accel=-2.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def test_engage_with_gas_just_released_rearms(self):
++    """The drive-14 root cause: engaging with the foot still on the gas must clear the latch on the first clean
++    frame, not block braking for the whole engagement. Frame 0 is the resume edge with gasPressed still True (the
++    driver-cut sets); frame 2 is the first clean gasReleased frame (must clear and accept)."""
++    b = self._brake(self._cp_sp())
++    # a cut latched earlier (gas tap before the engage) — latch set, no braking
++    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
++    self.assertTrue(b._driver_cut)
++    # resume edge with the gas STILL pressed: the pending re-arm is armed but the held gas re-sets the latch
++    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)
++    self.assertTrue(b._driver_cut)
++    self.assertTrue(b.blocked_until_resume)
++    # first CLEAN frame (gasReleased): the latch clears and a hard ask brakes on the same frame
++    sends = b.update(self._cc(accel=-2.0), _CS(gas=False, cam=_cam()), 4)
++    self.assertFalse(b.blocked_until_resume)
++    self.assertFalse(b._driver_cut)
++    self.assertNotEqual([], sends)
++    self.assertTrue(b.braking)
++
++  def test_engage_with_gas_still_held_stays_latched(self):
++    """The re-arm is level-triggered: a pedal never released never re-arms (no auto-resume)."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
++    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)
++    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 4)   # still held
++    self.assertTrue(b.blocked_until_resume)
++    self.assertFalse(b.braking)
++
++  def test_gear_override_rearms_on_resume(self):
++    """Gear out of D latched before the engage clears on the first clean frame after the resume (G9 T1 parity)."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(engaged=False), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 0)
++    self.assertTrue(b._driver_cut)
++    b.update(self._cc(engaged=True), _CS(gear=structs.CarState.GearShifter.sport, cam=_cam()), 2)
++    self.assertTrue(b._driver_cut)                                   # grant frame still out of D
++    sends = b.update(self._cc(accel=-2.0), _CS(gear=structs.CarState.GearShifter.drive, cam=_cam()), 4)
++    self.assertFalse(b.blocked_until_resume)
++    self.assertNotEqual([], sends)
++
++  def test_camera_cut_is_hard_not_rearmed(self):
++    """The camera hand-back must NOT be re-armed by a clean frame (separate _hard_cut, mirroring the panda's
++    hard-latched hyundai_fca11_long_cut)."""
++    b = self._brake(self._cp_sp())
++    cam_req = (0, _real_camera_frame(warn=2))
++    b.update(self._cc(engaged=False), _CS(cam=cam_req), 0)
++    b.update(self._cc(engaged=True), _CS(cam=cam_req), 2)
++    b.update(self._cc(engaged=True), _CS(cam=cam_req), 4)            # still a clean *driver* frame
++    self.assertTrue(b._hard_cut)
++    self.assertTrue(b.blocked_until_resume)
++    # a fresh clean camera frame on a later tick still does not clear the hard latch
++    b.update(self._cc(engaged=True), _CS(cam=_cam()), 6)
++    self.assertTrue(b.blocked_until_resume)
++
++  def test_no_auto_resume_while_engaged_without_edge(self):
++    """A gas cut latched while ENGAGED, controls never dropping, must not clear by itself (no rising edge)."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(), _CS(cam=_cam()), 0)
++    self.assertTrue(b.braking)
++    b.update(self._cc(), _CS(gas=True, cam=_cam()), 2)
++    self.assertTrue(b.blocked_until_resume)
++    for f in range(4, 20):
++      b.update(self._cc(), _CS(gas=False, cam=_cam()), f)
++    self.assertTrue(b.blocked_until_resume)                         # never re-armed: no new resume edge
++
++  def test_disengage_abandons_a_pending_rearm(self):
++    """An armed re-arm that is never consumed by a clean engaged frame is dropped on the next disengage: a cut
++    held across a disengage must not slip through on a later clean frame without a fresh edge."""
++    b = self._brake(self._cp_sp())
++    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 0)
++    b.update(self._cc(engaged=True), _CS(gas=True, cam=_cam()), 2)   # edge armed, gas held -> not consumed
++    self.assertTrue(b._rearm_pending)
++    b.update(self._cc(engaged=False), _CS(gas=True, cam=_cam()), 4)  # disengage: abandon the pending re-arm
++    self.assertFalse(b._rearm_pending)
++    self.assertTrue(b._driver_cut)
++    b.update(self._cc(engaged=False), _CS(gas=False, cam=_cam()), 6)
++    self.assertTrue(b._driver_cut)                                  # clean but disengaged -> stays latched
++
++
+ class TestPersonalityStrength(unittest.TestCase):
+   """Personality-indexed FCA11-long decel cap: relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g (today's cap, max).
+ 
+-- 
+2.55.0
+

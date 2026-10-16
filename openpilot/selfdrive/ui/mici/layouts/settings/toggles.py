@@ -8,6 +8,7 @@ from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationCircleButt
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -122,13 +123,15 @@ class TogglesLayoutMici(NavScroller):
     if ui_state.CP is not None:
       if ui_state.has_longitudinal_control:
         self._experimental_btn.set_visible(True)
+        self._experimental_btn.set_enabled(True)
         self._personality_toggle.set_visible(True)
+        self._personality_toggle.set_enabled(True)
       else:
-        # no long for now
-        self._experimental_btn.set_visible(False)
-        self._experimental_btn.set_checked(False)
-        self._personality_toggle.set_visible(False)
-        ui_state.params.remove("ExperimentalMode")
+        # no long for now: grey the button (not hide it) and keep showing the STORED value, so the
+        # screen matches Qt and the owner can still see what he saved (fork #30).
+        self._experimental_btn.set_enabled(False)
+        self._personality_toggle.set_enabled(False)
+        remove_unless_preserved(ui_state.params, "ExperimentalMode")
 
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:

@@ -1,0 +1,1429 @@
+From a7166284ee4a004869ee4fbce49b3ab041594618 Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Wed, 7 Oct 2026 16:30:09 -0500
+Subject: [PATCH] hyundai: FCA11-long CAL command mode (0029) - scripted decel
+ levels through the full production envelope
+
+The one calibration drive that pins the ESC brake constants (BITE / K in FCA11_ESC_BITE /
+FCA11_ESC_K) needs the FCA11-long brake commanded at EXACT, scripted levels, independent of
+whatever the planner asks. Today FCA11-long only actuates when the PLANNER asks for braking, so
+there is no way to hold a clean 10 LSB step for a BITE fit.
+
+This adds a file-gated, AUTONOMOUS calibration mode that sets the SOURCE of the FCA11 decel command
+to an exact scripted level while every production gate stays on. Pure car-layer Python: no safety
+model, no firmware, no panda change (the panda polices every frame exactly as for the planner's
+asks).
+
+Single-switch model: the whole cal path lives INSIDE the `if not self.enabled: return` guard of
+Fca11LongBrake.update (self.enabled = CP_SP.fca11Brake and CP_SP.enableGasInterceptor). No separate
+cal param, no bypass: if the owner's HyundaiFca11Brake toggle is OFF the state/plan file alone can
+NEVER actuate, and turning the toggle off kills everyday FCA11 braking AND cal instantly.
+
+New opendbc/sunnypilot/car/hyundai/cal_mode.py: a CalSequencer state machine ticked at 100 Hz from
+the FCA11 update. It reads /data/fca11-cal/plan.json (the immutable rep matrix, written once) and
+executes due reps opportunistically - engaged + band stable + feet off + no lead within
+conditions.min_lead_m + near-straight (|v*yawRate| < turn_lat_max) - holding hold_s, then releasing
+through the production fade. Progress (/data/fca11-cal/progress.json) is keyed by rep id and
+persists across reboots; a new plan revision's NEW reps run, done reps never re-run. Self-
+terminating (done=true). Plan absent/malformed/expired/TTL-stale OR a malformed progress file ->
+INERT (byte-identical). A plan/file lapse MID-HOLD is an explicit veto (drops cal, production
+release closes the episode the same frame). status() exposes a pre-flight summary (toggle,
+plan validity, inert reason) for the operator, since the historic failure class here is silent
+config state.
+
+The scripted level acts as a FLOOR during a hold: dec_cmd = max(planner_ask, clamp(level, 2, 30)), so
+cal can only ADD braking and can never silence a harder planner ask (e.g. a lead cutting in). The
+level is clamped to the PANDA gate (HYUNDAI_FCA11_LONG_MAX_DEC = 30 LSB = 0.30 g), NOT the personality
+tier cap - cal must reach 0.30 g regardless of the feel dial, and 30 is the personality-agnostic
+firmware gate, so there is NO new authority. Entry is a CLEAN STEP through the existing
++HYUNDAI_FCA11_LONG_RATE_STEP (4 LSB) per SENT frame clamp (the fast panda-rate ramp, what the BITE
+fit needs); release goes through the production fade/passive path unchanged.
+
+Gas neutralization (REQUIRED): while a cal hold is active GasInterceptorCarController forces the
+commanded pedal to 0. Without it the planner (holding cruise throttle at the start of a hold, then
+seeing the car slow) commands gas, gas_pressed sets, and the panda's driver-cut latch cuts the very
+episode being measured. It replicates the production condition (when the planner asks brake it
+never gases) and can only REDUCE actuation; it is inert when cal is off. CarState still reports the
+driver's pedal HONESTLY (the bus pedal during a hold is the driver's own input) so a driver
+intervention stays visible in the logs. A same-frame gap between cal_active and the first dec_cmd
+frame is avoided by aligning the sequencer decision to the 50 Hz SEND slot.
+
+Every production veto still applies per frame: fca11_ok (engaged + heartbeat via the panda, gear D,
+speed floor, camera not owning, driver-cut latches clear, pedal not faulted), the budget 2.5 s +
+cooldown 3 s mirror, and the min-on/onset paths. A veto drops cal on the SAME frame.
+
+Tests (test_fca11_long.py, single-file run): +20 new tests in TestCalModeGate / TestCalModeActuation
+(plan absent/malformed/expired/TTL-zero -> inert; toggle OFF dominates a valid plan; level clamps to
+30 regardless of personality; entry is a clean +4/frame step then a flat plateau; release is the
+production passive frame; a driver cut cuts mid-hold; completion/reboot/revision idempotence; the
+per-drive cap; the conditions gate; gas neutralization only during a hold; cal actuates with NO
+planner ask). Whole file: 50 -> 70 passed. Falsifiable contrast: 13 of the 20 new tests FAIL on the
+28-tree (the cal car-layer path is absent) and pass here.
+
+Python-only, no opendbc/safety change (no firmware impact).
+---
+ opendbc/car/hyundai/carcontroller.py          |   3 +
+ opendbc/sunnypilot/car/hyundai/cal_mode.py    | 553 +++++++++++++++++
+ .../sunnypilot/car/hyundai/carstate_ext.py    |  10 +
+ opendbc/sunnypilot/car/hyundai/fca11_long.py  |  62 +-
+ .../sunnypilot/car/hyundai/gas_interceptor.py |  15 +-
+ .../car/hyundai/tests/test_fca11_long.py      | 578 ++++++++++++++++++
+ 6 files changed, 1217 insertions(+), 4 deletions(-)
+ create mode 100644 opendbc/sunnypilot/car/hyundai/cal_mode.py
+
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index 0927e8c5..b663ed75 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -110,6 +110,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     # fork: FCA11 long braking low-speed hand-over alert gate — a lead is present and still closing. Read by
+     # Fca11LongBrake._alert (via CS) to warn the driver below floor+margin, before the planner runs out of authority.
+     CS.fca11_lead_closing = bool(CC_SP.leadOne.status) and float(CC_SP.leadOne.vRel) < -0.5
++    # 0029 CAL: the lead's distance, for the cal sequencer's "no lead within min_lead_m" condition.
++    # None when there is no lead (the sequencer treats None as safe). Inert when cal is off.
++    CS.fca11_lead_drel_m = float(CC_SP.leadOne.dRel) if CC_SP.leadOne.status else None
+ 
+     can_sends = []
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/cal_mode.py b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+new file mode 100644
+index 00000000..fe1e5a59
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/cal_mode.py
+@@ -0,0 +1,553 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Fork (adurham): FCA11-long CALIBRATION command path (patch 0029
++``0029-hyundai-fca11-cal-command-mode``). NOT a road feature and NOT a second switch.
++
++WHAT THIS IS
++------------
++The one calibration drive that pins the ESC brake constants (BITE / K in
++``FCA11_ESC_BITE`` / ``FCA11_ESC_K``) needs the FCA11-long brake to be commanded at EXACT, scripted
++levels, independent of whatever the planner happens to ask. Today FCA11-long only actuates when the
++PLANNER asks for braking, so there is no way to hold a clean 10 LSB step for a BITE fit.
++
++This module replaces the *source* of the FCA11 decel command (normally the planner ask) with an exact
++level while every production gate stays on. It is a pure CAR-LAYER Python change: no safety model, no
++firmware, no panda change (the panda polices every frame exactly as it does for the planner's asks).
++
++THE SINGLE-SWITCH MODEL (owner directive)
++-----------------------------------------
++Cal mode is SUBORDINATE to the production FCA11 toggle. The whole cal path lives INSIDE the
++``if not self.enabled: return`` guard of ``Fca11LongBrake.update`` (``self.enabled = CP_SP.fca11Brake
++and CP_SP.enableGasInterceptor``). There is **no separate cal enable param and no bypass**: if the
++owner's ``HyundaiFca11Brake`` UI toggle is OFF, ``self.enabled`` is False, ``update`` returns
++byte-for-byte before the cal code is ever reached, and the state/plan file alone can NEVER actuate.
++The owner turns the FCA11 toggle off to kill the whole subsystem (everyday FCA11 braking AND cal)
++instantly, with no file cleanup. That is the intended single-switch model.
++
++AUTONOMOUS SEQUENCER (owner directive: "I don't need YOU arming it every time")
++------------------------------------------------------------------------------
++There is NO per-session external arming and no SSH/runner in the actuation path. After a ONE-TIME
++setup (deploy this patch, write ``/data/fca11-cal/plan.json`` once), acquisition is autonomous: a
++small state machine ticked from the car layer at 100 Hz reads the plan and executes due reps
++opportunistically, appending progress to ``/data/fca11-cal/``. The owner just drives; the FCA11
++toggle is the stop switch; progress persists across reboots and is self-terminating when the plan
++is complete. ``fca11_cal_runner.py`` (superproject) is only a ``--dry-run`` pacing validator and a
++read-only progress monitor -- it is NOT required for actuation.
++
++GATE + SAFETY
++-------------
++* Plan absent / malformed / expired / TTL stale / rev unknown  -> INERT (byte-identical behaviour).
++* The cal level is clamped to the PANDA gate ``HYUNDAI_FCA11_LONG_MAX_DEC`` (30 LSB = 0.30 g), NOT
++  the personality cap -- cal must reach 0.30 g regardless of the driver's feel dial. It is still
++  <= the panda's personality-agnostic gate, so NO new authority.
++* The +``HYUNDAI_FCA11_LONG_RATE_STEP`` (+4 LSB) per SENT frame limit is respected: a step to any
++  level enters through the panda-rate ramp (the production hard-ask-style clamp: each SENT frame
++  grows by at most +4 LSB over the last SENT frame). This yields the CLEAN STEP the BITE fit needs.
++* Every production veto still applies on every frame (see ``Fca11LongBrake.update``): the cal
++  episode is opened ONLY when ``fca11_ok()`` is True (engaged + heartbeat via the panda, gear D,
++  speed floor, camera not owning, driver-cut latches clear, pedal not faulted) and it is dropped
++  the instant any of them fires, exactly like a planner ask. The budget/cooldown mirror is
++  untouched, so cal never commands a frame the panda would refuse.
++* Release goes through the PRODUCTION release path unchanged (the fade, the passive frame) so the
++  release tests fit the shipped shaping.
++* GAS NEUTRALIZATION: while a cal hold is active the planner sees the car slowing and asks for
++  gas; a commanded gas press sets gas_pressed -> the panda's driver-cut latch fires and would cut
++  the very episode we are measuring. The brake sets ``CS.fca11_cal_active`` and
++  ``GasInterceptorCarController`` forces the commanded pedal to 0 while it is set -- replicating the
++  production condition (when the planner asks brake it never gases). It can only REDUCE actuation
++  (always safe) and it is inert when cal mode is off (the flag is False).
++* NO NEW AUTHORITY: the command envelope (<= 30 LSB, Warn=3 actuating shape, 50 Hz window, the
++  same camera-mirror bytes) is a strict subset of what the production planner can already command.
++
++FILES (all under ``/data/fca11-cal/``; the module never touches anything else)
++------------------------------------------------------------------------------
++* ``plan.json``      -- written ONCE (per revision) by the operator. The immutable matrix.
++* ``progress.json``  -- written by THIS module. Completed reps (idempotent across reboots).
++* ``reps.jsonl``     -- appended by THIS module. One JSON record per completed/interrupted rep.
++"""
++import hashlib
++import json
++import os
++import time
++
++# --- the exact constants the panda enforces for FCA11-long (values.py mirrors safety/modes/hyundai.h).
++# Duplicated here (not imported) so this module has no import cycle with fca11_long.py; the unit tests
++# pin them against the shipped values.
++CAL_MAX_LSB = 30           # HYUNDAI_FCA11_LONG_MAX_DEC: the PANDA gate (personality-agnostic)
++CAL_MIN_LSB = 2            # FCA11_DEC_ACTIVE_FLOOR: an episode never commands 0
++CAL_RATE_STEP_LSB = 4      # HYUNDAI_FCA11_LONG_RATE_STEP: +LSB per SENT frame ceiling
++
++# --- defaults (all overridable in plan.json)
++DEFAULT_TTL_S = 900.0              # a plan is inert if not refreshed/valid within this many seconds of "now"
++DEFAULT_EXPIRES_DAYS = 30.0        # optional plan expiry
++DEFAULT_PER_DRIVE_CAP = 15         # soft cap on reps per drive (<= 0 = unlimited)
++DEFAULT_MIN_LEAD_M = 60.0          # skip a rep when a lead is within this distance (closing or not)
++DEFAULT_TURN_LAT_MAX = 0.5         # m/s^2: |lateral accel| above this = not near-straight, skip
++DEFAULT_STRAIGHT_MIN_S = 2.0       # the straight condition must hold this long
++DEFAULT_BAND_TOL_KPH = 5.0         # band window half-width
++DEFAULT_BAND_STABLE_S = 5.0        # the band must be held this long before a rep may start
++DEFAULT_HOLD_S = 2.2               # hold length (budget 2.5 s minus margin)
++DEFAULT_RECOVERY_S = 3.5           # >= the panda's 3 s cooldown + margin, before the next rep
++PLAN_HINT_TTL_S = 300.0            # a plan older than this is "stale": refuse to start a NEW rep
++
++CAL_DIR = "/data/fca11-cal"
++CAL_PLAN = os.path.join(CAL_DIR, "plan.json")
++CAL_PROGRESS = os.path.join(CAL_DIR, "progress.json")
++CAL_REPS_LOG = os.path.join(CAL_DIR, "reps.jsonl")
++
++PHASE_STEPS = "steps"
++PHASE_STAIRCASE = "staircase"
++PHASE_RELEASES = "releases"
++PHASES = (PHASE_STEPS, PHASE_STAIRCASE, PHASE_RELEASES)
++
++_RELOAD_EVERY = 20          # re-read plan/progress at 5 Hz (100 Hz / 20), not every frame
++_STAT_EVERY = 5             # stat the plan file at 20 Hz
++
++
++def _to_float(v, default):
++  try:
++    x = float(v)
++  except (TypeError, ValueError):
++    return default
++  return x if x == x else default  # rejects NaN
++
++
++def _to_int(v, default):
++  try:
++    return int(v)
++  except (TypeError, ValueError):
++    return default
++
++
++def plan_id(obj: dict) -> str:
++  """Stable id over the rep matrix + revision. A NEW plan revision resets all progress, as required."""
++  reps = obj.get("reps") or []
++  key = json.dumps({"rev": obj.get("rev", 1), "reps": reps}, sort_keys=True, separators=(",", ":"))
++  return hashlib.sha256(key.encode()).hexdigest()[:16]
++
++
++class CalRep:
++  __slots__ = ("id", "band_kph", "level_lsb", "hold_s", "phase", "level2_lsb", "switch_at_s")
++
++  def __init__(self, rid: str, band_kph: float, level_lsb: int, hold_s: float, phase: str,
++               level2_lsb=None, switch_at_s=None):
++    self.id = rid
++    self.band_kph = band_kph
++    self.level_lsb = max(CAL_MIN_LSB, min(CAL_MAX_LSB, int(level_lsb)))
++    self.hold_s = hold_s
++    self.phase = phase
++    # optional MID-HOLD STEP (the contract's partial-release test, e.g. 0.20 -> 0.10 g): after
++    # switch_at_s into the hold the command drops to level2_lsb. A downward step emits immediately
++    # (the panda rate limit only bounds UPWARD growth), so it is a clean step-down.
++    self.level2_lsb = (max(CAL_MIN_LSB, min(CAL_MAX_LSB, int(level2_lsb))) if level2_lsb is not None else None)
++    self.switch_at_s = (_to_float(switch_at_s, None) if level2_lsb is not None else None)
++
++
++def parse_plan(obj) -> tuple[list[CalRep], dict] | None:
++  """Validate a plan dict -> (reps, opts). Returns None for anything malformed (caller stays INERT).
++
++  A plan with no usable reps is treated as malformed/complete and yields an EMPTY rep list, which is
++  inert. Never raises.
++  """
++  if not isinstance(obj, dict):
++    return None
++  reps_raw = obj.get("reps")
++  if reps_raw is None or not isinstance(reps_raw, list):
++    return None
++  reps: list[CalRep] = []
++  for i, r in enumerate(reps_raw):
++    if not isinstance(r, dict):
++      return None
++    band = _to_float(r.get("band_kph"), None)
++    level = _to_int(r.get("level_lsb"), None)
++    if band is None or level is None:
++      return None
++    phase = str(r.get("phase", PHASE_STEPS))
++    if phase not in PHASES:
++      phase = PHASE_STEPS
++    reps.append(CalRep(str(r.get("id", f"rep{i}")), band, level,
++                       _to_float(r.get("hold_s"), DEFAULT_HOLD_S), phase,
++                       level2_lsb=r.get("level2_lsb"), switch_at_s=r.get("switch_at_s")))
++  cond = obj.get("conditions") if isinstance(obj.get("conditions"), dict) else {}
++  opts = {
++    "ttl_s": _to_float(obj.get("ttl_s"), DEFAULT_TTL_S),
++    "expires_at": _to_float(obj.get("expires_at"), None),
++    "per_drive_cap": _to_int(obj.get("per_drive_cap"), DEFAULT_PER_DRIVE_CAP),
++    "min_lead_m": _to_float(cond.get("min_lead_m"), DEFAULT_MIN_LEAD_M),
++    "turn_lat_max": _to_float(cond.get("turn_lat_max"), DEFAULT_TURN_LAT_MAX),
++    "straight_min_s": _to_float(cond.get("straight_min_s"), DEFAULT_STRAIGHT_MIN_S),
++    "band_tol_kph": _to_float(cond.get("band_tol_kph"), DEFAULT_BAND_TOL_KPH),
++    "band_stable_s": _to_float(cond.get("band_stable_s"), DEFAULT_BAND_STABLE_S),
++    "recovery_s": _to_float(cond.get("recovery_s"), DEFAULT_RECOVERY_S),
++  }
++  return reps, opts
++
++
++def _read_json(path: str) -> dict | None:
++  try:
++    with open(path) as f:
++      return json.load(f)
++  except (OSError, ValueError):
++    return None
++
++
++def _write_json_atomic(path: str, doc: dict) -> None:
++  """Best-effort atomic write. A log/progress write must NEVER take card down."""
++  tmp = path + ".tmp"
++  try:
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(tmp, "w") as f:
++      json.dump(doc, f, sort_keys=True)
++    os.replace(tmp, path)
++  except OSError:
++    pass
++
++
++class CalSequencer:
++  """In-car cal state machine. Ticked once per 100 Hz controller frame from ``Fca11LongBrake.update``
++  (inside the ``enabled`` branch, so it is structurally dead when the FCA11 toggle is off).
++
++  Reads ``plan.json`` + ``progress.json``; decides which rep is due NOW (engaged + band stable + feet
++  off + no lead + near-straight + not expired + drive cap not hit); commands the level (the brake's
++  ``update`` consumes ``level_lsb``/``active_actuation``); on the hold elapsing it releases and, after
++  the cooldown + band recovery, records the rep and moves on. Progress keys on ``plan_id`` so a new
++  plan revision resets completion; a completed rep is never re-run.
++  """
++
++  def __init__(self, dir_path: str = CAL_DIR):
++    self.dir = dir_path
++    self.plan_path = os.path.join(dir_path, "plan.json")
++    self.progress_path = os.path.join(dir_path, "progress.json")
++    self.log_path = os.path.join(dir_path, "reps.jsonl")
++
++    # ---- public command surface consumed by Fca11LongBrake.update ----
++    self.active_actuation = False   # True while a cal hold should be commanded
++    self.level_lsb = 0              # the exact cal level (LSB)
++
++    # ---- plan / progress ----
++    self.plan: list[CalRep] = []
++    self.opts: dict = {}
++    self.pid = ""
++    self.plan_mtime = -1.0
++    self._plan_ok = False
++    self._done: dict = {}
++    self._loaded_at = -1e9
++    self._stat_at = -1e9
++
++    # ---- run state ----
++    self._phase_enabled: tuple[str, ...] = PHASES
++    self._frame = 0
++    self._session = 0            # bumped per process start (the per-drive cap counts within a session)
++    self._session_reps = 0
++    self._active: CalRep | None = None
++    self._hold_frames = 0
++    self._on_start = -1          # frame the current rep's actuation opened on
++    self._release_frame = -1     # frame braking last went False
++    self._last_outcome = ""
++    self._vetoed = False         # a production veto suppressed a frame of the current hold
++    self._band_since: dict[float, int] = {}
++    self._v_hist: list[tuple[int, float]] = []
++    self._lat_hist: list[tuple[int, float]] = []
++    self._yaw_hist: list[tuple[int, float]] = []
++    self._block_reason = "no_plan"
++    self._last_act_frame = -1
++
++  # ------------------------------------------------------------------ config
++  def set_phases(self, phases) -> None:
++    """Operator/test phase selector (``steps``/``staircase``/``releases``). Defaults to all."""
++    if not phases:
++      self._phase_enabled = PHASES
++      return
++    sel = tuple(p for p in PHASES if p in set(phases))
++    self._phase_enabled = sel if sel else PHASES
++
++  @property
++  def phases(self) -> tuple[str, ...]:
++    return self._phase_enabled
++
++  def mark_session(self, session: int) -> None:
++    """Called once per controller construction with a fresh process id, so ``per_drive_cap`` is
++    counted per drive (the superproject restarts card per drive)."""
++    self._session = int(session)
++    self._session_reps = 0
++
++  # ------------------------------------------------------------------ gate
++  def _reload_plan(self, now_wall: float, frame: int) -> None:
++    if frame - self._stat_at < _STAT_EVERY and self._loaded_at > 0:
++      return
++    self._stat_at = frame
++    try:
++      mt = os.stat(self.plan_path).st_mtime
++    except OSError:
++      mt = -1.0
++    if mt < 0:
++      self.plan, self.opts, self.pid, self._plan_ok = [], {}, "", False
++      self._block_reason = "no_plan"
++      return
++    self.plan_mtime = mt
++    if frame - self._loaded_at < _RELOAD_EVERY and self._plan_ok:
++      return
++    self._loaded_at = frame
++    obj = _read_json(self.plan_path)
++    parsed = parse_plan(obj) if obj is not None else None
++    if parsed is None:
++      self.plan, self.opts, self.pid, self._plan_ok = [], {}, "", False
++      self._block_reason = "malformed_plan"
++      return
++    self.plan, self.opts = parsed
++    self.pid = plan_id(obj)
++    # expiry (absolute) + issued_at staleness (relative)
++    expires_at = self.opts.get("expires_at")
++    if expires_at is not None and now_wall > expires_at:
++      self._plan_ok = False
++      self._block_reason = "plan_expired"
++      return
++    issued_at = _to_float(obj.get("issued_at"), now_wall)
++    ttl = self.opts.get("ttl_s", DEFAULT_TTL_S)
++    self._plan_ok = ttl > 0.0 and (now_wall - issued_at) <= ttl
++    if not self._plan_ok:
++      self._block_reason = "plan_stale_ttl"
++      return
++    self._block_reason = "plan_ok"
++    # Completion is keyed by REP ID (persisted globally in progress.json), NOT by plan revision: a
++    # reboot, or a new plan revision that re-lists an already-done rep, must NOT re-run it. A new
++    # revision's NEW rep ids run; to force a deliberate re-run, give the rep a new id (or clear
++    # progress.json). This is the idempotent gap-fill semantics (progress survives in /data/fca11-cal/).
++    # A MALFORMED (present-but-unparseable) progress file is treated as INERT, never as "no progress":
++    # silently ignoring it would re-run completed reps (a real hazard).
++    progress_present = os.path.exists(self.progress_path)
++    pr = _read_json(self.progress_path)
++    if pr is None and progress_present:
++      self._plan_ok = False
++      self._block_reason = "progress_malformed"
++      return
++    self._done = (pr or {}).get("reps") or {}
++
++  @property
++  def plan_valid(self) -> bool:
++    return self._plan_ok and len(self.plan) > 0
++
++  @property
++  def is_done(self) -> bool:
++    return self.plan_valid and all(self._is_complete(r) for r in self.plan if r.phase in self._phase_enabled)
++
++  # ------------------------------------------------------------------ helpers
++  def _is_complete(self, rep: CalRep) -> bool:
++    rec = self._done.get(rep.id)
++    return bool(rec) and rec.get("outcome") == "ok"
++
++  def _enabled_reps(self) -> list[CalRep]:
++    return [r for r in self.plan if r.phase in self._phase_enabled]
++
++  def _band_ready(self, band_kph: float) -> bool:
++    tol = self.opts.get("band_tol_kph", DEFAULT_BAND_TOL_KPH)
++    stable_s = self.opts.get("band_stable_s", DEFAULT_BAND_STABLE_S)
++    since = self._band_since.get(float(band_kph))
++    return since is not None and (self._frame - since) >= int(round(stable_s * 100.0))
++
++  def _update_band_window(self, v_kph: float) -> None:
++    tol = self.opts.get("band_tol_kph", DEFAULT_BAND_TOL_KPH)
++    bands = {float(r.band_kph) for r in self._enabled_reps() if not self._is_complete(r)}
++    for b in bands:
++      if abs(v_kph - b) <= tol:
++        self._band_since.setdefault(b, self._frame)
++      else:
++        self._band_since.pop(b, None)
++
++  def _straight_ok(self) -> bool:
++    """|lateral accel| under the limit, sustained. Lateral accel = v * yawRate (no grade/lateral model
++    needed); falls back to the steering-rate signal if yawRate is absent."""
++    lat_max = self.opts.get("turn_lat_max", DEFAULT_TURN_LAT_MAX)
++    min_s = self.opts.get("straight_min_s", DEFAULT_STRAIGHT_MIN_S)
++    need = int(round(min_s * 100.0))
++    if need <= 0:
++      return True
++    hist = [(f, a) for f, a in self._lat_hist if self._frame - f <= need]
++    if len(hist) < min(need, 50):
++      return False
++    return all(abs(a) <= lat_max for _, a in hist)
++
++  def _direction(self) -> str:
++    """Mean yaw-rate sign over the last ~2 s: sign convention (turning left = positive yaw) is not
++    pinned here; it is a per-driver label for out-and-back pairing and the ANALYSIS flips it if the
++    car's convention differs."""
++    hist = [y for f, y in self._yaw_hist if self._frame - f <= 200]
++    if not hist:
++      return "straight"
++    m = sum(hist) / len(hist)
++    if abs(m) < 1e-3:
++      return "straight"
++    return "left" if m > 0 else "right"
++
++  def _lead_ok(self, CS) -> bool:
++    d = getattr(CS, "fca11_lead_drel_m", None)
++    if d is None:
++      return True
++    return float(d) >= self.opts.get("min_lead_m", DEFAULT_MIN_LEAD_M)
++
++  def _conditions_ok(self, CC, CS) -> tuple[bool, str]:
++    if not (bool(CC.enabled) and bool(CC.longActive)):
++      return False, "not_engaged"
++    if not self._lead_ok(CS):
++      return False, "lead_close"
++    if not self._straight_ok():
++      return False, "not_straight"
++    return True, ""
++
++  # ------------------------------------------------------------------ record
++  def _append_log(self, rec: dict) -> None:
++    try:
++      os.makedirs(self.dir, exist_ok=True)
++      with open(self.log_path, "a") as f:
++        f.write(json.dumps(rec, sort_keys=True) + "\n")
++    except OSError:
++      pass
++
++  def _complete(self, rep: CalRep, outcome: str, hold_frames: int) -> None:
++    rec = {"outcome": outcome, "ts": round(time.time(), 3), "frame": self._frame,
++           "band_kph": rep.band_kph, "level_lsb": rep.level_lsb, "phase": rep.phase,
++           "direction": self._direction(), "hold_frames": int(hold_frames)}
++    self._done[rep.id] = rec
++    if outcome == "ok":
++      self._session_reps += 1
++    _write_json_atomic(self.progress_path, {"plan_id": self.pid, "reps": self._done,
++                                            "session": self._session, "updated": round(time.time(), 3)})
++    self._append_log({"event": "rep", "rep": rep.id, "plan_id": self.pid, "session": self._session, **rec})
++    if self.is_done:
++      _write_json_atomic(self.progress_path, {"plan_id": self.pid, "reps": self._done, "done": True,
++                                              "session": self._session, "updated": round(time.time(), 3)})
++      self._append_log({"event": "plan_done", "plan_id": self.pid, "ts": round(time.time(), 3)})
++
++  # ------------------------------------------------------------------ step
++  def tick(self, CC, CS, frame: int) -> None:
++    """One 100 Hz decision tick. Only ever called from the ``enabled`` branch of Fca11LongBrake.update."""
++    self._frame = frame
++    now_wall = time.time()
++
++    # sample the condition signals every frame (cheap; vEgo already on CS)
++    try:
++      v_kph = float(CS.out.vEgo) * 3.6
++    except (AttributeError, TypeError, ValueError):
++      v_kph = 0.0
++    self._v_hist.append((frame, v_kph))
++    while self._v_hist and frame - self._v_hist[0][0] > 300:
++      self._v_hist.pop(0)
++    try:
++      yaw = float(getattr(CS.out, "yawRate", 0.0))
++    except (TypeError, ValueError):
++      yaw = 0.0
++    lat = abs(v_kph * yaw / 3.6)   # |v[m/s] * yaw[rad/s]| = |a_lat|
++    self._lat_hist.append((frame, lat))
++    while self._lat_hist and frame - self._lat_hist[0][0] > 300:
++      self._lat_hist.pop(0)
++    self._yaw_hist.append((frame, yaw))
++    while self._yaw_hist and frame - self._yaw_hist[0][0] > 300:
++      self._yaw_hist.pop(0)
++
++    self._reload_plan(now_wall, frame)
++    self._update_band_window(v_kph)
++
++    # ---- if no rep is active: pick the next due one ------------------------------------------------
++    if self._active is None:
++      self.active_actuation = False
++      if not self.plan_valid:
++        return
++      if self.is_done:
++        self._block_reason = "done"
++        return
++      cap = self.opts.get("per_drive_cap", DEFAULT_PER_DRIVE_CAP)
++      if cap and cap > 0 and self._session_reps >= cap:
++        self._block_reason = "drive_cap"
++        return
++      if not self._conditions_ok(CC, CS)[0]:
++        self._block_reason = self._conditions_ok(CC, CS)[1]
++        return
++      pick = None
++      for rep in self._enabled_reps():
++        if self._is_complete(rep):
++          continue
++        if not self._band_ready(rep.band_kph):
++          continue
++        pick = rep
++        break
++      if pick is None:
++        self._block_reason = "band_not_ready"
++        return
++      # START the rep: command the level NOW. The brake enters on the panda-rate ramp (a clean step).
++      self._active = pick
++      self.level_lsb = pick.level_lsb
++      self.active_actuation = True
++      self._on_start = frame
++      self._release_frame = -1
++      self._block_reason = "active"
++      self._append_log({"event": "rep_start", "rep": pick.id, "plan_id": self.pid, "session": self._session,
++                        "band_kph": pick.band_kph, "level_lsb": pick.level_lsb, "phase": pick.phase,
++                        "direction": self._direction(), "ts": round(now_wall, 3)})
++      return
++
++    # ---- a rep is active: hold, then release + recovery --------------------------------------------
++    if not self.plan_valid:
++      # the plan/file lapsed MID-HOLD (deleted, expired, TTL fired, or a malformed progress write).
++      # Explicit veto: drop the cal; the brake's production release/fade path closes the episode on
++      # this same frame. This is the "plan unreadable mid-hold" path Fable flagged -- it is a VETO,
++      # not a silent continue.
++      self._active = None
++      self.active_actuation = False
++      self.level_lsb = 0
++      self._block_reason = "plan_lapsed_mid_rep"
++      return
++    if not self._conditions_ok(CC, CS)[0]:
++      # a condition lapsed mid-rep (a lead closed, entered a turn, or disengaged). Abandon the rep; the
++      # brake's own fca11_ok/fade path releases the episode. No record: the rep is simply retried when
++      # conditions return (reps are <= 2.2 s, so the cost is negligible and the log stays clean).
++      self._active = None
++      self.active_actuation = False
++      self.level_lsb = 0
++      self._block_reason = "conditions_lapsed"
++      return
++    if (frame - self._on_start) < int(round(self._active.hold_s * 100.0)):
++      # an optional MID-HOLD STEP-DOWN (the partial-release test): drop the command to level2 once
++      # switch_at_s of the hold has elapsed. A downward step is emitted immediately.
++      if self._active.level2_lsb is not None and self._active.switch_at_s is not None \
++         and (frame - self._on_start) >= int(round(self._active.switch_at_s * 100.0)):
++        self.level_lsb = self._active.level2_lsb
++      self.active_actuation = True
++      return
++    # hold elapsed: drop the cal ask (the brake's production fade/passive path releases the episode)
++    self.active_actuation = False
++    if self._release_frame < 0:
++      self._release_frame = frame
++    recov = int(round(self.opts.get("recovery_s", DEFAULT_RECOVERY_S) * 100.0))
++    if (frame - self._release_frame) >= recov and self._band_ready(self._active.band_kph):
++      self._finish("ok", frame)
++
++  def _finish(self, outcome: str, frame: int) -> None:
++    rep = self._active
++    self._active = None
++    self.active_actuation = False
++    self.level_lsb = 0
++    if rep is not None:
++      self._complete(rep, outcome, frame - self._on_start)
++
++  def status(self) -> dict:
++    """Pre-flight status (Fable item 2: the historic failure class is SILENT config state). The operator
++    reads this before a drive: toggle, plan validity/freshness, progress, and the current inert reason.
++    Read-only; never raises."""
++    done = self._done or {}
++    reps = self._enabled_reps()
++    return {
++      "plan_present": self.plan_mtime >= 0,
++      "plan_valid": self.plan_valid,
++      "plan_id": self.pid,
++      "inert_reason": self._block_reason,
++      "n_reps_total": len(reps),
++      "n_reps_done": sum(1 for r in reps if self._is_complete(r)),
++      "done": self.is_done,
++      "session_reps": self._session_reps,
++      "active_rep": self._active.id if self._active is not None else None,
++      "phases": list(self._phase_enabled),
++    }
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 0d18a8e9..ed22be6e 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -41,6 +41,11 @@ class CarStateExt:
+     self.fca11_cam_frame: tuple[int, bytes] | None = None
+     self.fca11_now_nanos: int = 0
+     self.fca11_lead_closing = False
++    # 0029 CAL command mode: the lead's distance (the cal sequencer skips a rep when a lead is within
++    # plan.conditions.min_lead_m), and the cal-hold flag the controller publishes so the gas
++    # neutralization below reads it. Both are inert (False / None) unless cal mode is running.
++    self.fca11_lead_drel_m: float | None = None
++    self.fca11_cal_active = False
+     # pause/resume button (gas interceptor only). pedal_long_engaged = CarControl.enabled, written by the CarController
+     # every frame (this CarState instance is the CS it receives), so it is the engagement state BEFORE a new press.
+     self.pause_resume = PauseResumeTracker()
+@@ -122,6 +127,11 @@ class CarStateExt:
+       cp_gas = can_parsers[GAS_INTERCEPTOR_BUS_KEY]
+       sensor_msg = get_interceptor_ids(self.CP_SP).sensor_msg  # GAS_SENSOR (0x201) or GAS_SENSOR_R (0x701)
+       ret.gasPressed = get_interceptor_gas(cp_gas, sensor_msg) > HYUNDAI_GAS_INTERCEPTOR_THRESHOLD
++      # 0029 CAL: during a scripted CAL hold the commanded pedal is forced to 0, so the bus pedal the
++      # car layer parses IS the driver's own input here. gasPressed is therefore left reporting the
++      # driver's pedal HONESTLY (not forced False): mid-hold the driver's foot is off (fca11_ok), and a
++      # driver intervention must stay visible for the post-drive analysis. The panda independently cuts
++      # on its own live gas_pressed, so nothing is hidden from it.
+       self.interceptor_state = int(cp_gas.vl[sensor_msg]["STATE"])
+       # pedal fault the clear frames could not recover (set by the controller on the previous frame): standard cruise
+       # fault -> immediate disengage + alert, so the driver knows openpilot no longer has throttle authority
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 7764df74..7a8925ad 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -55,11 +55,13 @@ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+   CR_FCA_Alive (35,4), FCA_RelativeVelocity (39,9), FCA_TimetoCollision (48,8),
+   CR_FCA_ChkSum (56,8).
+ """
++import os
+ from dataclasses import dataclass
+ 
+ from opendbc.car import structs
+ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.can_definitions import CanData
++from opendbc.sunnypilot.car.hyundai import cal_mode
+ from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_MIN_SPEED_KPH,
+                                                    HYUNDAI_FCA11_LONG_RATE_STEP)
+ 
+@@ -308,6 +310,17 @@ class Fca11LongBrake:
+     self._in_budget = False            # inside a continuous actuation episode (== the panda's act_active)
+     self._budget_end = -1              # frame at which the episode ended (cooldown runs from here)
+     self._release_pending = False      # a passive frame is owed (the braking true -> false edge)
++    # ---- 0029 CAL command mode (patch: 0029-hyundai-fca11-cal-command-mode) ----
++    # A file-gated, autonomous sequencer that can replace the SOURCE of the decel command (the planner
++    # ask) with an exact scripted level, WHILE every production gate stays on. Subordinate to the
++    # production toggle: it is only ever ticked from the `enabled` branch of update(). Inert (and
++    # byte-identical to the shipped behaviour) unless /data/fca11-cal/plan.json exists, parses, and is
++    # fresh. See cal_mode.py for the full design.
++    self.cal_seq = None
++    if self.enabled and os.environ.get("FCA11_CAL_DIR") != "0":
++      self.cal_seq = cal_mode.CalSequencer(os.environ.get("FCA11_CAL_DIR", cal_mode.CAL_DIR))
++      self.cal_seq.mark_session(os.getpid())
++    self._cal_active = False           # this frame is a CAL hold (drives the gas neutralization)
+ 
+   # ---- window ----
+ 
+@@ -382,8 +395,13 @@ class Fca11LongBrake:
+       self._hard_cut = False
+       self._rearm_pending = False
+       self.blocked_until_resume = False
++      self._cal_active = False
+       return sends
+ 
++    # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
++    # pattern as fca11_now_nanos: the controller writes a CS attribute the class later reads).
++    CS._fca11_braking_now = self.braking
++
+     # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
+     # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
+     # G9b (drive-14): the resume edge only ARMS the re-arm; the driver latch clears on the first CLEAN
+@@ -435,6 +453,21 @@ class Fca11LongBrake:
+     accel = float(CC.actuators.accel)
+     ok, _why = self.fca11_ok(CS)
+ 
++    # ---- 0029 CAL: step the autonomous sequencer and set the scripted ask source -------------------
++    # The sequencer decides (off the plan file + progress) whether a scripted level is DUE now. It is
++    # ticked ONLY here, in the enabled+longActive path, and ONLY on the 50 Hz SEND slot
++    # (frame % FCA11_SEND_EVERY == 0) -- the same slot the FCA11 frame goes out on. Deciding on the
++    # send slot means cal_on can never be true on a non-send frame, so a hold's first ACTUATING frame
++    # is its first TICK frame: there is no same-frame gap between "cal active" (gas forced to 0) and
++    # the first dec_cmd frame (Fable's gas-neutralization timing item). cal_on is LATCHED between
++    # ticks; it can only ever be true while the last tick commanded a hold AND a gate still holds.
++    if self.cal_seq is not None and frame % FCA11_SEND_EVERY == 0:
++      self.cal_seq.tick(CC, CS, frame)
++    # cal_on is the scripted ASK, gated by `ok` exactly like a planner ask: a production veto (camera
++    # owns, gear out of D, below floor, pedal fault, driver-cut latch) suppresses it on the SAME frame.
++    cal_on = bool(self.cal_seq is not None and self.cal_seq.active_actuation and ok)
++    self._cal_active = False   # re-latched below iff THIS frame commands a scripted hold
++
+     # ---- G5 anti-flap decision ----------------------------------------------------------------
+     # ask: the planner wants a brake THIS frame and every pre-condition (fca11_ok) holds. `ask` drives
+     # the onset debounce only; the release/min-on logic below consumes the *raw* accel.
+@@ -447,10 +480,15 @@ class Fca11LongBrake:
+     # AND the minimum on-time (0.6 s) has elapsed. `self._on_frames` is the previous frame's episode age.
+     # Every `ok == False` (blocked latch, below floor, pedal fault, gear, stale/no camera, camera owns)
+     # makes both terms False -> immediate release: the safety paths are untouched.
++    # 0029 CAL: `cal_on` is the scripted ask. While a cal hold is active the release/min-on logic below
++    # is bypassed (held True) so the scripted level is held for the sequencer's whole hold window --
++    # but STILL AND ONLY while `ok` holds. When the sequencer drops cal_on, the episode releases through
++    # the PRODUCTION path (a veto stops braking on this frame; a soft cal end lets the same release
++    # logic run).
+     onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or accel <= FCA11_ONSET_BYPASS_ACCEL))
+     holding = bool(self.braking and ok and
+                    (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+-    want_brake = bool(onset or holding)
++    want_brake = bool(onset or holding or cal_on)
+ 
+     # ---- G7 panda actuation-budget mirror -------------------------------------------------------
+     # Mirror of safety/modes/hyundai.h:944-961. `self._in_budget` == the panda's act_active.
+@@ -476,14 +514,34 @@ class Fca11LongBrake:
+     # ---------------------------------------------------------------------------------------------
+ 
+     if want_brake:
++      # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
++      # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
++      self._cal_active = bool(cal_on and ok)
+       # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+       # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+       dec_cmd = dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL))
++      # production tiering of the planner ask (unchanged when cal is off -> byte-identical).
+       dec_cmd = clamp_dec_cmd(dec_cmd, personality)
++      if cal_on:
++        # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
++        # planner. max() with the scripted level means: planner coasting -> the cal level (the
++        # controlled step the fit needs); a HARDER planner ask (e.g. a lead cuts in mid-hold) -> the
++        # planner wins, so cal can never make the car brake LESS than production would (Fable: closes
++        # the planner-silenced window). The level is clamped to the PANDA gate 30 LSB = 0.30 g, NOT the
++        # personality tier cap -- cal must reach 0.30 g regardless of the feel dial, and 30 is the
++        # personality-agnostic firmware gate, so there is NO new authority. (Deliberate, disclosed
++        # exception: cal may exceed the owner's configured tier cap, never the panda gate.)
++        dec_cmd = max(dec_cmd, max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, int(self.cal_seq.level_lsb))))
+       # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
+       # camera period of growth; release is immediate. Reference = our last SENT frame.
++      # 0029 CAL: this +RATE_STEP-per-SENT-frame clamp IS the clean entry step the BITE fit needs --
++      # a scripted step enters through the panda-rate ramp even for a low level (where the production
++      # path's LPF + slew would otherwise smear the step). Do NOT bypass it for cal.
+       dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+-      dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
++      if cal_on:
++        dec_cmd = max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, dec_cmd))  # <= panda gate (30)
++      else:
++        dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
+ 
+       t_cam, dat = cam
+       if frame % FCA11_SEND_EVERY == 0:
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index d3ff7a81..998db24a 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -298,14 +298,25 @@ class GasInterceptorCarController:
+     # Freshness reference for the mirrored camera frame: the same now_nanos CarInterface.apply received (replay-safe).
+     CS.fca11_now_nanos = now_nanos
+     brake_sends = self.fca11_brake.update(CC, CS, frame, personality)
++    # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
++    # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
++    # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
++    # ever LOWER gasPressed toward the truth = 0.
++    CS.fca11_cal_active = bool(self.fca11_brake._cal_active)
+ 
+     # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+     # While the FCA11 brake is active the pedal command is EXACTLY zero for this frame (hard zero, not the law's
+     # zero: the law would still add the hold feedforward at speed).
+-    if active and not self.fca11_brake.braking:
++    # 0029 CAL: while a scripted CAL hold is active the pedal is ALSO forced to 0, for the same reason (gas and
++    # brake are never commanded together). This is REQUIRED, not cosmetic: the cal brake is exogenous to the
++    # planner, so the planner sees the car slowing and asks for gas; a commanded gas press would set gas_pressed
++    # and the panda's driver-cut latch would cut the very episode we are measuring. Forcing the pedal to 0
++    # replicates the production condition (when the planner asks brake it never gases) and can only REDUCE
++    # actuation. Inert when cal mode is off (`_cal_active` is False).
++    if active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
+       self.gas = rate_limit_pedal_command(get_pedal_command(CC.actuators.accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo)
+-    elif self.fca11_brake.braking:
++    elif self.fca11_brake.braking or self.fca11_brake._cal_active:
+       self.gas = 0.
+     else:
+       self.gas = 0.
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index dfb0f06c..d1530a31 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -12,6 +12,10 @@ FCA11 long braking (HyundaiFca11Brake, default OFF) car-layer unit tests:
+   - the alert emission in car_specific (via the selfdrived path).
+ """
+ import copy
++import json
++import os
++import tempfile
++import time
+ import unittest
+ 
+ from opendbc.car import structs
+@@ -848,5 +852,579 @@ class TestInterfacePlumbing(unittest.TestCase):
+     self.assertFalse(structs.CarParamsSP().fca11Brake)
+ 
+ 
++# ============================================================================================
++# 0029 CAL command mode (patch 0029-hyundai-fca11-cal-command-mode)
++# ============================================================================================
++from opendbc.sunnypilot.car.hyundai import cal_mode as cm  # noqa: E402
++
++
++def _cal_plan(reps, cond=None, **over):
++  """A well-formed plan.json for a temp dir. `reps` = list of (band_kph, level_lsb[, hold_s[, level2]]).
++
++  Condition defaults are deliberately FAST (band_stable 0.5 s, straight_min 0) so a rep becomes due
++  within a few hundred frames; production defaults (5 s / 2 s) are exercised by the gate tests.
++  """
++  conditions = {"min_lead_m": 60.0, "turn_lat_max": 0.5, "straight_min_s": 0.0,
++                "band_tol_kph": 5.0, "band_stable_s": 0.5, "recovery_s": 3.5}
++  if cond:
++    conditions.update(cond)
++  rep_list = []
++  for i, r in enumerate(reps):
++    rep = {"id": f"r{i}", "phase": "steps", "band_kph": r[0], "level_lsb": r[1]}
++    if len(r) > 2:
++      rep["hold_s"] = r[2]
++    if len(r) > 3:
++      rep["level2_lsb"] = r[3]
++      rep["switch_at_s"] = (r[2] / 2.0) if len(r) > 2 else 1.0
++    rep_list.append(rep)
++  doc = {"rev": 1, "issued_at": time.time(), "ttl_s": 900.0, "conditions": conditions, "reps": rep_list}
++  doc.update(over)
++  return doc
++
++
++# actuation tests need a rep to be due promptly: don't wait 5 s of band stability / 2 s of straight
++_FAST = {"band_stable_s": 0.5, "straight_min_s": 0.0}
++
++
++def _write_plan(d, doc):
++  with open(os.path.join(d, "plan.json"), "w") as f:
++    json.dump(doc, f)
++
++
++class _CalCS:
++  """CarState double carrying the cal sequencer's condition inputs."""
++  def __init__(self, v_ego=16.67, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
++               state=0, cam=None, now=0, lead=None, yaw=0.0):
++    self.out = structs.CarState()
++    self.out.vEgo = v_ego
++    self.out.gearShifter = gear
++    self.out.brakePressed = brake
++    self.out.gasPressed = gas
++    self.out.yawRate = yaw
++    self.interceptor_state = state
++    self.fca11_cam_frame = cam
++    self.fca11_now_nanos = now
++    self.fca11_lead_closing = False
++    self.fca11_lead_drel_m = lead
++    self.fca11_cal_active = False
++    self._fca11_braking_now = False
++
++
++class TestCalModeGate(unittest.TestCase):
++  """plan.json gate: absent / malformed / expired / stale -> INERT; the cal path is subordinate to the
++  production toggle (self.enabled), so the file alone can NEVER actuate."""
++
++  def _brake(self, cp_sp, d):
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    b.cal_seq = cm.CalSequencer(d)
++    b.cal_seq.mark_session(1)
++    b.cal_seq.set_phases(("steps",))
++    return b
++
++  def _cp_sp(self, fca11=True, pedal=True):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = fca11
++    cp_sp.enableGasInterceptor = pedal
++    return cp_sp
++
++  def _cc(self, accel=0.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _drive(self, b, frame, cs=None, cc=None):
++    """Run the cal gate directly: a plan that is due + every condition ok must command the level."""
++    b.cal_seq.tick(cc or self._cc(), cs or _CalCS(cam=_cam()), frame)
++
++  def _warm(self, b, cs, frames=600):
++    for f in range(frames):
++      b.cal_seq.tick(self._cc(), cs, f)
++
++  def test_plan_absent_is_inert(self):
++    with tempfile.TemporaryDirectory() as d:
++      b = self._brake(self._cp_sp(), d)
++      for f in range(40):
++        self._drive(b, f)
++        self.assertFalse(b.cal_seq.active_actuation, f)
++      # and through update(): a planner ask with no plan behaves exactly as today (planner-driven)
++      b2 = self._brake(self._cp_sp(), d)
++      s = b2.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++      self.assertTrue(b2.braking)                 # the planner ask still brakes
++      self.assertFalse(b2._cal_active)            # ...but it is NOT a cal hold
++      # the planner path is unchanged: its first SENT frame is the production +RATE_STEP rate limit
++      self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, fl._get_bits(s[0].dat, 8, 8))
++
++  def test_toggle_off_dominates_even_with_a_valid_plan(self):
++    """Owner directive #2: FCA11 param OFF + valid/fresh plan + perfect conditions -> zero sends.
++    The cal code lives inside the `enabled` branch, so update() returns before it is reached."""
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 30)]))
++      b = fl.Fca11LongBrake(structs.CarParams(), self._cp_sp(fca11=False))  # enabled = False -> no cal_seq
++      self.assertIsNone(b.cal_seq)
++      cs = _CalCS(cam=_cam())
++      for f in range(0, 1200, 2):
++        self.assertEqual([], b.update(self._cc(0.0), cs, f), f)
++        self.assertFalse(b.braking, f)
++        self.assertFalse(b._cal_active, f)
++
++  def test_malformed_plan_is_inert(self):
++    with tempfile.TemporaryDirectory() as d:
++      b = self._brake(self._cp_sp(), d)
++      for bad in ('{"reps": [', '[]', '{"reps": "x"}', '{"reps": [{"band_kph": "z", "level_lsb": 5}]}',
++                  'null', '{"reps": [{"level_lsb": 5}]}'):
++        with open(os.path.join(d, "plan.json"), "w") as f:
++          f.write(bad)
++        self._warm(b, _CalCS(cam=_cam()), frames=30)
++        self.assertFalse(b.cal_seq.active_actuation, bad)
++
++  def test_ttl_expiry_is_inert(self):
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 20)], issued_at=time.time() - 5000.0, ttl_s=900.0))
++      b = self._brake(self._cp_sp(), d)
++      self._warm(b, _CalCS(cam=_cam()))
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("plan_stale_ttl", b.cal_seq._block_reason)
++
++  def test_ttl_zero_or_negative_is_inert(self):
++    with tempfile.TemporaryDirectory() as d:
++      for ttl in (0, -1, 0.0):
++        _write_plan(d, _cal_plan([(60, 20)], ttl_s=ttl))
++        b = self._brake(self._cp_sp(), d)
++        self._warm(b, _CalCS(cam=_cam()))
++        self.assertFalse(b.cal_seq.active_actuation, ttl)
++
++  def test_absolute_expiry_is_inert(self):
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 20)], expires_at=time.time() - 1.0))
++      b = self._brake(self._cp_sp(), d)
++      self._warm(b, _CalCS(cam=_cam()))
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("plan_expired", b.cal_seq._block_reason)
++
++  def test_conditions_gate(self):
++    """Each condition alone must block a rep: band, lead, straight, feet (via fca11_ok), gear."""
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 20)]))
++      # band wrong: cruising at 40 km/h, plan wants 60 -> band_not_ready
++      b = self._brake(self._cp_sp(), d)
++      self._warm(b, _CalCS(v_ego=40 / 3.6, cam=_cam()))
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("band_not_ready", b.cal_seq._block_reason)
++      # band right but a lead within 60 m -> blocked
++      b = self._brake(self._cp_sp(), d)
++      self._warm(b, _CalCS(cam=_cam(), lead=30.0))
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("lead_close", b.cal_seq._block_reason)
++      # band right, no lead, but a sustained turn (yaw) -> not_straight
++      b = self._brake(self._cp_sp(), d)
++      _write_plan(d, _cal_plan([(60, 20)], cond={"straight_min_s": 2.0}))
++      self._warm(b, _CalCS(cam=_cam(), yaw=0.05, v_ego=16.67))  # a_lat = 0.83 > 0.5
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("not_straight", b.cal_seq._block_reason)
++
++  def test_conditions_ok_then_a_rep_is_commandable(self):
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 20)]))
++      b = self._brake(self._cp_sp(), d)
++      # a rep becomes due after band_stable_s (0.5 s = 50 frames); it then holds 2.2 s
++      self._warm(b, _CalCS(v_ego=60 / 3.6, cam=_cam()), frames=120)
++      self.assertTrue(b.cal_seq.active_actuation)
++      self.assertEqual(20, b.cal_seq.level_lsb)
++
++
++class TestCalModeActuation(unittest.TestCase):
++  """The command surface through Fca11LongBrake.update: the scripted level REPLACES the planner ask;
++  it bypasses the onset debounce; it is clamped to the PANDA gate (not the personality cap); the entry
++  is a panda-rate clean step; release goes through the production fade/passive path."""
++
++  def _mk(self, d, fca11=True):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = fca11
++    cp_sp.enableGasInterceptor = True
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    b.cal_seq = cm.CalSequencer(d)
++    b.cal_seq.mark_session(1)
++    b.cal_seq.set_phases(("steps",))
++    return b
++
++  def _prep(self, b, d, cs, warm=600):
++    _write_plan(d, _cal_plan([(60, int(cs.out.vEgo * 3.6 / 3.6 and cs.out.vEgo * 3.6 or 60), 20)]))
++    for f in range(warm):
++      b.cal_seq.tick(structs.CarControl(enabled=True, longActive=True), cs, f)
++
++  def test_cal_actuates_on_an_empty_road_with_no_planner_ask(self):
++    """The scripted level IS the ask: with the planner commanding 0 (a coast request, i.e. NO brake
++    ask at all) the cal episode opens and commands the scripted level. This is the steered-requirement
++    test: it must actuate on an empty road with no lead and no limit change."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 25)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0                    # the planner is NOT asking for a brake
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      sends = []
++      cal_flagged = False
++      for f in range(0, 400):
++        sends += b.update(cc, cs, f)
++        cal_flagged = cal_flagged or b._cal_active
++      decs = [fl._get_bits(s.dat, 8, 8) for s in sends]
++      self.assertTrue(decs, "cal must actuate with no planner ask")
++      self.assertEqual(25, max(decs))            # the exact scripted level was reached
++      self.assertTrue(cal_flagged, "the frame is flagged as a cal hold (gas neutralization)")
++
++  def test_cal_level_reaches_panda_gate_regardless_of_personality(self):
++    """cal must reach 0.30 g (30 LSB) whatever the owner's feel dial: the clamp is the PANDA gate."""
++    for p, tier in ((fl.PERSONALITY_RELAXED, 12), (fl.PERSONALITY_STANDARD, 20),
++                    (fl.PERSONALITY_AGGRESSIVE, 30)):
++      with tempfile.TemporaryDirectory() as d:
++        b = self._mk(d)
++        _write_plan(d, _cal_plan([(60, 30)]))
++        cc = structs.CarControl()
++        cc.enabled = cc.longActive = True
++        cc.actuators.accel = 0.0
++        cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++        decs = []
++        for f in range(0, 400):
++          for s in b.update(cc, cs, f, p):
++            decs.append(fl._get_bits(s.dat, 8, 8))
++        self.assertEqual(30, max(decs), p)       # NOT the tier cap: 30 regardless
++        self.assertGreaterEqual(max(decs), tier, (p, tier))
++
++  def test_cal_clamped_to_panda_gate(self):
++    """A plan asking above the panda gate is clamped to 30 (the plan can never widen authority)."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 200)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      decs = []
++      for f in range(0, 400):
++        for s in b.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(decs))
++
++  def test_cal_entry_is_a_clean_panda_rate_step(self):
++    """A scripted step enters at +RATE_STEP per SENT frame (the clean step the BITE fit needs), not
++    smeared by the production LPF/slew; the SENT-frame deltas never exceed +4."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 12)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      decs = []
++      for f in range(0, 400):
++        for s in b.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertEqual(4, decs[0], "first SENT frame is rate-limited to +4")
++      for a, c in zip(decs, decs[1:]):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
++      self.assertEqual(12, max(decs))
++      # the level is held FLAT at 12 for the rest of the hold (a clean plateau, not a slope); the
++      # trailing 0 is the passive frame that closes the episode.
++      nonzero = [d for d in decs if d > 0]
++      self.assertEqual([4, 8, 12], nonzero[:3], "0 -> 4 -> 8 -> 12")
++      self.assertTrue(all(d == 12 for d in nonzero[3:]), "then a flat plateau at 12")
++
++  def test_cal_release_uses_the_production_fade_and_passive_frame(self):
++    """When the sequencer drops the hold, the episode ends through the PRODUCTION path: a passive
++    frame, not a mid-episode 0, and the panda budget/cooldown mirror stays in charge."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, 0.5)]))   # a 0.5 s hold
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      got = []
++      for f in range(0, 400):
++        for s in b.update(cc, cs, f):
++          got.append((f, fl._get_bits(s.dat, 8, 8), fl._get_bits(s.dat, 3, 2)))
++      self.assertTrue(any(g[1] > 0 for g in got), "actuation happened")
++      self.assertTrue(any(g[1] == 0 and g[2] == 0 for g in got), "exactly one passive frame closes it")
++      # only ONE passive frame (the episode does not flicker passive/active)
++      self.assertEqual(1, sum(1 for g in got if g[1] == 0))
++
++  def test_cal_driver_cut_still_cuts_mid_hold(self):
++    """Every production veto still applies on every frame: a driver brake / gas / gear-out mid-hold
++    cuts the cal episode on the same frame (and latches until the next resume)."""
++    with tempfile.TemporaryDirectory() as d:
++      for bad in ({"brake": True}, {"gas": True}, {"gear": structs.CarState.GearShifter.sport}):
++        b = self._mk(d)
++        self.assertIsNotNone(b.cal_seq)
++        _write_plan(d, _cal_plan([(60, 25)]))
++        cc = structs.CarControl()
++        cc.enabled = cc.longActive = True
++        cc.actuators.accel = 0.0
++        cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++        # a rep becomes due after band_stable_s (0.5 s = 50 frames) and holds 2.2 s
++        for f in range(0, 200):
++          b.update(cc, cs, f)
++        self.assertTrue(b.braking, bad)
++        cut = _CalCS(v_ego=60 / 3.6, cam=_cam(), **bad)
++        b.update(cc, cut, 200)
++        self.assertFalse(b.braking, bad)
++        self.assertTrue(b.blocked_until_resume, bad)
++
++  def test_cal_holds_and_moves_on_when_a_rep_completes(self):
++    """The sequencer persists completion and never re-runs a finished rep (idempotent)."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, 0.5)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 2000):
++        b.update(cc, cs, f)
++      self.assertTrue(b.cal_seq.is_done, "plan complete -> done")
++      prog = json.load(open(os.path.join(d, "progress.json")))
++      self.assertTrue(prog.get("done"))
++      self.assertTrue(any(r.get("outcome") == "ok" for r in prog["reps"].values()))
++      # a second process on the same dir must NOT restart the finished matrix
++      b2 = self._mk(d)
++      b2.cal_seq.mark_session(2)
++      cc.actuators.accel = 0.0
++      for f in range(0, 2000):
++        b2.update(cc, cs, f)
++      self.assertFalse(b2._cal_active, "a completed plan must not re-run")
++
++  def test_reboot_mid_matrix_does_not_restart_completed_reps(self):
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 10, 0.5), (60, 20, 0.5)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      b = self._mk(d)
++      # complete only the first rep, then "reboot"
++      for f in range(0, 900):
++        b.update(cc, cs, f)
++        pj = os.path.join(d, "progress.json")
++        if os.path.exists(pj) and json.load(open(pj)).get("reps", {}).get("r0"):
++          break
++      b2 = self._mk(d)
++      b2.cal_seq.mark_session(2)
++      decs = []
++      for f in range(0, 2000):
++        for s in b2.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      # only the remaining rep ran: exactly ONE episode (one passive 0 frame), and it reached 20
++      self.assertEqual(20, max(decs, default=0), "only the remaining 20 LSB rep runs")
++      self.assertEqual(1, sum(1 for d in decs if d == 0), "exactly one episode -> the done rep did not re-run")
++
++  def test_progress_survives_a_new_plan_revision_and_only_new_reps_run(self):
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, 0.5)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 2000):
++        b.update(cc, cs, f)
++      self.assertTrue(b.cal_seq.is_done)
++      # a NEW plan revision ADDS a gap-fill rep: completion is keyed by rep id, so the already-done
++      # rep (r0) is NOT re-run and only the new rep (extra) runs.
++      doc = _cal_plan([(60, 20, 0.5)])
++      doc["rev"] = 2
++      doc["reps"].append({"id": "extra", "phase": "steps", "band_kph": 60, "level_lsb": 30, "hold_s": 0.5})
++      _write_plan(d, doc)
++      b2 = self._mk(d)
++      b2.cal_seq.mark_session(2)
++      decs = []
++      for f in range(0, 3000):
++        for s in b2.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      # the already-done rep (id r0) is NOT re-run; only the new gap-fill rep (id extra) runs
++      self.assertEqual(30, max(decs, default=0), "only the new 30 LSB gap-fill rep runs")
++      self.assertEqual(1, sum(1 for d in decs if d == 0), "exactly one new episode (progress keyed by rep id)")
++
++  def test_per_drive_cap_stops_after_n_reps(self):
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, lv, 0.3) for lv in (5, 8, 10, 12, 15)], per_drive_cap=2))
++      b = self._mk(d)
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 6000):
++        b.update(cc, cs, f)
++      prog = json.load(open(os.path.join(d, "progress.json")))
++      ok = [r for r in prog["reps"].values() if r.get("outcome") == "ok"]
++      self.assertEqual(2, len(ok), "the per-drive soft cap stops after 2 reps")
++
++  def test_gas_neutralization_only_during_a_cal_hold(self):
++    """The brake exposes _cal_active ONLY on frames it commands a scripted hold; it is False for a
++    planner-driven brake and for an off plan (so the gas path is byte-identical when cal is off)."""
++    with tempfile.TemporaryDirectory() as d:
++      # no plan: a planner-driven brake must NOT set _cal_active
++      b = self._mk(d)
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = -2.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      b.update(cc, cs, 0)
++      self.assertTrue(b.braking)
++      self.assertFalse(b._cal_active)
++      # with a due plan: a cal hold sets _cal_active
++      _write_plan(d, _cal_plan([(60, 25)]))
++      cc.actuators.accel = 0.0
++      for f in range(0, 400):
++        b.update(cc, cs, f)
++        if b._cal_active:
++          break
++      self.assertTrue(b._cal_active)
++
++  def test_malformed_progress_is_inert(self):
++    """A present-but-corrupt progress.json must be treated as INERT, never as 'no progress' (which
++    would silently re-run completed reps)."""
++    with tempfile.TemporaryDirectory() as d:
++      _write_plan(d, _cal_plan([(60, 20, 0.5)]))
++      with open(os.path.join(d, "progress.json"), "w") as f:
++        f.write("{not json")
++      b = self._mk(d)
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 800):
++        b.update(cc, cs, f)
++        self.assertFalse(b._cal_active, f)
++      self.assertEqual("progress_malformed", b.cal_seq._block_reason)
++
++  def test_plan_lapse_mid_hold_drops_cal(self):
++    """A plan/file lapse mid-hold (deleted / TTL fired) is an explicit VETO: cal drops and the
++    production release closes the episode (one passive frame), not a silent continue."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 25, 5.0)]))   # a long hold we will interrupt
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      got = []
++      hit = False
++      for f in range(0, 800):
++        if not hit and b._cal_active:
++          os.remove(os.path.join(d, "plan.json"))   # plan vanishes mid-hold
++          hit = True
++        for s in b.update(cc, cs, f):
++          got.append((f, fl._get_bits(s.dat, 8, 8)))
++      self.assertTrue(hit, "the hold must have started")
++      self.assertFalse(b._cal_active)
++      self.assertTrue(any(g[1] == 0 for g in got), "the episode is released with a passive frame")
++
++  def test_planner_ask_is_never_silenced_by_cal(self):
++    """Fable hardening: the scripted level is a FLOOR. A harder planner ask mid-hold must still win
++    (cal can only ADD braking)."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 5, 5.0)]))    # scripted 5 LSB
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      for f in range(0, 200):
++        b.update(cc, cs, f)                        # bring the hold up at the scripted 5
++      self.assertTrue(b._cal_active)
++      # now the PLANNER asks hard (a lead) mid-hold: the emitted command must exceed the scripted 5
++      cc.actuators.accel = -2.0
++      decs = []
++      for f in range(200, 400):
++        for s in b.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertTrue(decs)
++      self.assertGreater(max(decs), 5, "the harder planner ask must not be silenced")
++
++  def test_gas_neutralization_has_no_same_frame_gap(self):
++    """Fable timing item: the FIRST frame a cal hold is active must also be a frame that emits an
++    actuating 0x38D (the sequencer decides on the 50 Hz SEND slot), so no frame exists where gas is
++    forced to 0 but no brake command goes out."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 25)]))
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      first = None
++      for f in range(0, 600):
++        sends = b.update(cc, cs, f)
++        has = any(int(s.address) == fl.FCA11_ADDR and fl._get_bits(s.dat, 8, 8) > 0 for s in sends)
++        if b._cal_active and first is None:
++          first = (f, has, bool(sends))
++      self.assertIsNotNone(first, "a cal hold must have been active")
++      self.assertTrue(first[1], f"the first cal_active frame must also actuate: {first}")
++
++  def test_status_preflight(self):
++    """The operator's pre-flight status: no plan -> inert reason; a valid+due plan -> counts; and it
++    reports the toggle-independent plan state."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      self.assertFalse(b.cal_seq.status()["plan_present"])
++      self.assertFalse(b.cal_seq.status()["plan_valid"])
++      _write_plan(d, _cal_plan([(60, 20, 0.5), (60, 30, 0.5)]))
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      b.cal_seq.tick(structs.CarControl(enabled=True, longActive=True), cs, 0)
++      st = b.cal_seq.status()
++      self.assertTrue(st["plan_present"] and st["plan_valid"])
++      self.assertEqual(2, st["n_reps_total"])
++      self.assertEqual(0, st["n_reps_done"])
++      self.assertFalse(st["done"])
++
++  def test_mid_hold_step_down_partial_release(self):
++    """The contract's partial-release test (0.20 -> 0.10 g): a rep with level2_lsb/switch_at_s steps
++    the command DOWN mid-hold, emitted immediately, within one clean episode."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 20, 2.2, 10)]))   # hold 2.2 s, step to 10 @1.1 s
++      cc = structs.CarControl()
++      cc.enabled = cc.longActive = True
++      cc.actuators.accel = 0.0
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
++      # patch the plan to carry the step fields
++      import json as _json
++      doc = _json.load(open(os.path.join(d, "plan.json")))
++      doc["reps"][0]["level2_lsb"] = 10
++      doc["reps"][0]["switch_at_s"] = 1.1
++      _write_plan(d, doc)
++      decs = []
++      for f in range(0, 800):
++        for s in b.update(cc, cs, f):
++          decs.append(fl._get_bits(s.dat, 8, 8))
++      self.assertIn(20, decs, "the hold reaches the 20 LSB plateau")
++      self.assertIn(10, decs, "the mid-hold step-down reaches 10 LSB")
++      # the step-down comes AFTER the 20 plateau and only one episode closes
++      i20 = decs.index(20)
++      i10 = decs.index(10)
++      self.assertGreater(i10, i20)
++      self.assertEqual(1, sum(1 for dd in decs if dd == 0), "one episode -> one passive frame")
++
++  def test_lead_condition_skips_the_high_level_rep(self):
++    """A high-level rep (>= 20 LSB) is skipped while a lead is close; the sequencer waits."""
++    with tempfile.TemporaryDirectory() as d:
++      b = self._mk(d)
++      _write_plan(d, _cal_plan([(60, 25)]))
++      cs = _CalCS(v_ego=60 / 3.6, cam=_cam(), lead=40.0)
++      for f in range(0, 600):
++        b.cal_seq.tick(structs.CarControl(enabled=True, longActive=True), cs, f)
++      self.assertFalse(b.cal_seq.active_actuation)
++      self.assertEqual("lead_close", b.cal_seq._block_reason)
++      # the lead clears -> the rep runs (it starts, holds 2.2 s, then releases; assert it actuated)
++      cs.fca11_lead_drel_m = None
++      ran = False
++      for f in range(600, 1200):
++        b.cal_seq.tick(structs.CarControl(enabled=True, longActive=True), cs, f)
++        ran = ran or b.cal_seq.active_actuation
++      self.assertTrue(ran, "with the lead gone the rep actuates")
++
++
+ if __name__ == "__main__":
+   unittest.main()
+-- 
+2.54.0 (Apple Git-157)
+
