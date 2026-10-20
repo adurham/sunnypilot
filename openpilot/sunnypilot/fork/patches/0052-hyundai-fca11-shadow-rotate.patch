@@ -1,0 +1,309 @@
+From 85d5b79a537860b5c2eaf8148196c633e712855a Mon Sep 17 00:00:00 2001
+From: Adam Durham <amdnative@gmail.com>
+Date: Tue, 20 Oct 2026 18:39:14 -0500
+Subject: [PATCH] hyundai: FCA11 shadow writer rotates at the byte cap instead
+ of truncating the drive (0052)
+
+Drive 15c lost its final 22 minutes to the FCA11 shadow writer's per-drive byte bound
+(FCA11_SHADOW_MAX_BYTES = 25 MB): on reaching it the writer appended ONE k="trunc" record and
+then stopped writing for the rest of that drive (self.truncated gates write()); 15e and 15f hit
+the same cap (~8 k cap-hit frames each). Long drives are exactly the ones a brake tune needs, so
+truncation destroys the useful data.
+
+Fix - ROTATE instead of truncate. When the next record would cross the cap the writer closes the
+current file with one k="rot" record (t_wall, part, bytes), shifts the existing generation chain
+exactly as the constructor's _rotate() does (the oldest is dropped, .4->.5 ... current->.1) and
+keeps writing in a fresh fca11-shadow.jsonl whose FIRST record is the same drive header plus
+cont=<part> (identical oldlaw_armed / consts / note, a fresh t_wall), so a long drive becomes a
+SEQUENCE of parts instead of a truncated file. The part count is bounded by the new
+FCA11_SHADOW_MAX_PARTS = FCA11_SHADOW_KEEP (5): reaching the cap ON the last allowed part falls
+back to the deployed truncation behaviour (one k="trunc", writes gated again), so the worst case
+is 5 x 25 MB of parts per drive rather than a silent early stop.
+
+Not restructured: _rotate(), the buffer/flush policy, the windowed frame records (including the
+pre-context ring across a hop), the epilogue and the V3-fault paths are untouched. The cap check
+now tries _rotate_at_cap() before setting self.truncated, and the byte / n_records / buffer
+bookkeeping moved verbatim into _emit() so the continuation header can be written without a cap
+check. Below the cap the writer is unchanged: a recorded shadow drive replayed through the real
+Fca11LongBrake produces 453 records identical to the deployed module in every field except the
+wall-clock ones (t_wall / t_wall_start / t_wall_end).
+
+RETENTION: the generation chain is FCA11_SHADOW_KEEP = 5 TOTAL and a rotating drive reuses it, so
+MAX_PARTS is set EQUAL to KEEP. A drive that rotates keeps every part of its OWN drive (start
+included) and evicts the OLDER drives instead - the intended trade for validation, bounded at
+5 x 25 MB = 125 MB per drive.
+
+Tests (tests/test_fca11_shadow.py, new class TestShadowRotateAtCap, +5): a tiny cap (2000 B) with
+setUp/tearDown save-restore of FCA11_SHADOW_MAX_BYTES / FCA11_SHADOW_MAX_PARTS - (a) writing
+continues past the cap and the last record written is on disk (never k="trunc"); (b) every
+rotated part exists, opens with a k="hdr" and ends with exactly one k="rot" carrying its own part
+number and size; (c) the live part opens with k="hdr" cont=2 and otherwise the same header as
+part 1; (d) the union of all parts == exactly the records written, each once; (e) at
+FCA11_SHADOW_MAX_PARTS the last part ends with k="trunc" and write() is gated again. The pre-0052
+byte-bound test is re-pinned to that fallback (MAX_PARTS = 1), which keeps it pinning the
+deployed behaviour. 6/6 targeted mutations of the new code are killed; the shadow file alone passes 108/108 (pytest). Python only - no safety/
+change, no firmware, no param/capnp change.
+---
+ opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py        |  60 ++++++++++++++----
+ opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py | 114 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 160 insertions(+), 14 deletions(-)
+
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+index 9d4b64a8..f10e268f 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+@@ -18,7 +18,9 @@ V3 WOULD have commanded alongside what OLD-LAW DID command. Records are PRIMITIV
+ camera request, latch/state flags, lead) so any authority-floor design can be derived OFFLINE; no floor formula is here.
+ 
+ FORMAT (one JSON object per line, ``sort_keys``; every record has ``"k"`` = record kind and ``"schema"`` = 2):
+-  k="hdr"    once per writer (= once per ignition / card start): schema, t_wall, oldlaw_armed, law constants, note.
++  k="hdr"    once per part: schema, t_wall, oldlaw_armed, law constants, note. ``cont`` (= part number, >= 2) marks a
++             CONTINUATION part — a long drive that rotated at the byte bound; the first part has no ``cont`` and the
++             remaining fields are identical to it (a fresh t_wall).
+   k="f"      one FRAME record per 50 Hz send slot while the shadow window is OPEN (see ``ShadowLogger.frame``):
+     timestamps   t_wall (wall clock, s), t_mono_ns (the car layer's now_nanos = card's monotonic clock), frame (100 Hz
+                  controller frame), t_since_engage (s; null when disengaged)
+@@ -46,7 +48,10 @@ FORMAT (one JSON object per line, ``sort_keys``; every record has ``"k"`` = reco
+              v start/min/end, ask min, camera_request_seen, end_reason, tier_cap.
+   k="v3fail" one per V3 FAILURE (V3-fault isolation): frame, kind ("exception" | "overrun"), err, elapsed_ms, n_failures,
+              n_overruns, v3_disabled. The OLD-LAW send of that frame was already on the wire (V3 runs post-send).
+-  k="trunc"  once if the per-drive byte bound is hit (nothing further is written this drive).
++  k="rot"    once per part that ended at the byte bound: t_wall, part (the part being closed), bytes (its size). The
++             generation chain is shifted as at construction and the drive continues in the next part (``cont``).
++  k="trunc"  once if the byte bound is hit on the LAST allowed part (FCA11_SHADOW_MAX_PARTS reached: nothing further is
++             written this drive).
+ 
+ COUNTERFACTUAL NOTE (read before analysing): the car is driven by OLD-LAW (or not braked by us at all with Braking OFF).
+ The V3 stream is computed OPEN-LOOP against the vehicle as it actually moved, assuming every V3 frame were accepted by the
+@@ -55,9 +60,14 @@ panda (no echo verdicts exist for V3). It is NOT the closed-loop trajectory V3 w
+ WHERE / SIZE
+ Directory = the FCA11 log dir convention (fca11_log.FCA11_LOG_DIR = /data/fca11-log, env FCA11_LOG_DIR; "0"
+ disables I/O). File ``fca11-shadow.jsonl``. Per-drive bound: at construction the previous drive's file rotates to
+-``.1`` (.1 -> .2 ... up to FCA11_SHADOW_KEEP generations; the oldest is dropped) and a drive writes at most
+-FCA11_SHADOW_MAX_BYTES (then one k="trunc" record). Writes are buffered and flushed ~1/s and at every episode end / V3
+-failure; every OSError is swallowed (a log must never take card down).
++``.1`` (.1 -> .2 ... up to FCA11_SHADOW_KEEP generations; the oldest is dropped) and a part writes at most
++FCA11_SHADOW_MAX_BYTES. Reaching that bound ROTATES instead of truncating: the part is closed with one k="rot"
++record, the same generation shift runs, and a fresh ``fca11-shadow.jsonl`` opens with the drive header plus
++cont=<part>, so a long drive is a SEQUENCE of parts (bounded at FCA11_SHADOW_MAX_PARTS (= FCA11_SHADOW_KEEP, 5); once those are used up
++the last part truncates exactly as before, with one k="trunc" record). Retention is FCA11_SHADOW_KEEP generations
++total, so the parts of a rotating drive evict the oldest ones as it goes (MAX_PARTS == KEEP, so a drive that uses
++all 8 parts keeps its newest 5 on disk). Writes are buffered and flushed ~1/s and at every episode end / V3 failure;
++every OSError is swallowed (a log must never take card down).
+ """
+ import json
+ import os
+@@ -67,8 +77,9 @@ from opendbc.sunnypilot.car.hyundai import fca11_log
+ 
+ FCA11_SHADOW_FILE = "fca11-shadow.jsonl"
+ FCA11_SHADOW_SCHEMA = 2
+-FCA11_SHADOW_MAX_BYTES = 25 * 1024 * 1024   # per drive
++FCA11_SHADOW_MAX_BYTES = 25 * 1024 * 1024   # per part (a drive, or one part of a rotated long drive)
+ FCA11_SHADOW_KEEP = 5                        # previous drives kept (.1 newest .. .5 oldest)
++FCA11_SHADOW_MAX_PARTS = FCA11_SHADOW_KEEP   # parts per drive; == KEEP so a rotating drive keeps ALL of its own parts
+ FCA11_SHADOW_FLUSH_RECORDS = 50              # ~1 s of 50 Hz frame records
+ # the shadow WINDOW (when frame records are written): open while V3 or OLD-LAW is braking, the ask is at/below the
+ # release threshold, or the camera is requesting; plus PRE/POST context of this many 50 Hz records (1 s each).
+@@ -108,8 +119,10 @@ class ShadowLogger:
+     self.enabled = self.dir is not None
+     self.path = os.path.join(self.dir, FCA11_SHADOW_FILE) if self.enabled else None
+     self.bytes = 0
++    self.part = 1
+     self.truncated = False
+     self.n_records = 0
++    self._header = dict(header or {})   # the drive's header constants, repeated (plus cont=) by every continuation part
+     self._buf: list[str] = []
+     self._pre: list[dict] = []        # pre-context ring (frame records not yet written)
+     self._post_left = 0
+@@ -130,22 +143,45 @@ class ShadowLogger:
+     if os.path.exists(self.path):
+       os.replace(self.path, f"{self.path}.1")
+ 
++  def _rotate_at_cap(self) -> bool:
++    """The byte cap was reached: close the current part with one k="rot" record, shift the generation chain exactly as
++    at construction, and keep writing in a fresh part whose first record is the same header plus cont=<part>.
++    False — the caller truncates instead — once FCA11_SHADOW_MAX_PARTS parts are used up or the chain cannot be moved."""
++    if self.part >= FCA11_SHADOW_MAX_PARTS:
++      return False
++    self._buf.append(json.dumps(dict(k="rot", schema=FCA11_SHADOW_SCHEMA, t_wall=time.time(), part=self.part,
++                                     bytes=self.bytes), sort_keys=True, separators=(",", ":")) + "\n")
++    self.flush()
++    try:
++      self._rotate()
++    except OSError:
++      return False
++    self.part += 1
++    self.bytes = 0
++    # the continuation header is written directly (never dropped, never capped): a part must open with a k="hdr"
++    self._emit(json.dumps(dict(k="hdr", schema=FCA11_SHADOW_SCHEMA, t_wall=time.time(), cont=self.part, **self._header),
++                          sort_keys=True, separators=(",", ":")) + "\n")
++    return True
++
++  def _emit(self, line: str) -> None:
++    self.bytes += len(line)
++    self.n_records += 1
++    self._buf.append(line)
++    if len(self._buf) >= FCA11_SHADOW_FLUSH_RECORDS:
++      self.flush()
++
+   def write(self, rec: dict) -> None:
+     if not self.enabled or self.truncated:
+       return
+     rec.setdefault("schema", FCA11_SHADOW_SCHEMA)
+     line = json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n"
+-    if self.bytes + len(line) > FCA11_SHADOW_MAX_BYTES:
++    if self.bytes + len(line) > FCA11_SHADOW_MAX_BYTES and not self._rotate_at_cap():
+       self.truncated = True
+       self._buf.append(json.dumps(dict(k="trunc", schema=FCA11_SHADOW_SCHEMA, t_wall=time.time(), bytes=self.bytes),
+                                   sort_keys=True) + "\n")
+       self.flush()
+       return
+-    self.bytes += len(line)
+-    self.n_records += 1
+-    self._buf.append(line)
+-    if len(self._buf) >= FCA11_SHADOW_FLUSH_RECORDS:
+-      self.flush()
++    self._emit(line)
+ 
+   def flush(self) -> None:
+     if not self._buf:
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+index 50a03373..34f5fb5f 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+@@ -546,23 +546,133 @@ class TestShadowLogFormat:
+     assert not b.shadow_log.enabled and b.shadow_log.n_records == 0
+     assert not os.path.exists(tmp_path / "fca11-log")
+ 
+-  def test_rotation_per_drive_and_byte_bound(self, monkeypatch, tmp_path):
++  def test_rotation_per_drive_and_truncation_after_parts(self, monkeypatch, tmp_path):
+     d = tmp_path / "rot"
+     for i in range(shlog.FCA11_SHADOW_KEEP + 2):
+       w = shlog.ShadowLogger(str(d), header=dict(drive=i))
+       w.flush()
+     files = sorted(os.listdir(d))
+     assert len(files) == shlog.FCA11_SHADOW_KEEP + 1     # current + KEEP generations
++    # 0052: the cap now ROTATES (see TestShadowRotateAtCap). The deployed truncation is pinned here as the FALLBACK,
++    # with the part budget spent (a single part), which must behave byte-for-byte as before 0052.
+     monkeypatch.setattr(shlog, "FCA11_SHADOW_MAX_BYTES", 2000)
++    monkeypatch.setattr(shlog, "FCA11_SHADOW_MAX_PARTS", 1)
++    before = sorted(os.listdir(d))
+     w = shlog.ShadowLogger(str(d), header={})
+     for i in range(200):
+       w.write(dict(k="f", i=i))
+     w.flush()
++    assert w.part == 1 and w.truncated                                  # one part only: no rotation at all
++    assert sorted(os.listdir(d)) == before                              # ... and no new generation was created
+     lines = (d / shlog.FCA11_SHADOW_FILE).read_text().splitlines()
+-    assert json.loads(lines[-1])["k"] == "trunc" and w.truncated
++    assert json.loads(lines[-1])["k"] == "trunc"
++    assert "rot" not in {json.loads(x)["k"] for x in lines}
+     assert os.path.getsize(d / shlog.FCA11_SHADOW_FILE) < 2400
+ 
+ 
++# ---------------------------------------------------------------------------------------------- writer rotation (0052)
++class TestShadowRotateAtCap:
++  """0052: reaching the byte cap ROTATES the file (one k="rot" closes the part, the chain shifts as at construction, the
++  next part opens with the same k="hdr" plus cont=<part>) instead of truncating the drive. Only once
++  FCA11_SHADOW_MAX_PARTS parts are used up does the deployed truncation behaviour come back."""
++
++  CAP = 2000
++  N = 200
++  HDR = dict(drive=7, oldlaw_armed=True, consts=dict(K=9.6, BITE=0.74))
++
++  def setup_method(self):
++    self._saved = (shlog.FCA11_SHADOW_MAX_BYTES, shlog.FCA11_SHADOW_MAX_PARTS)
++    shlog.FCA11_SHADOW_MAX_BYTES = self.CAP
++    shlog.FCA11_SHADOW_MAX_PARTS = 5
++
++  def teardown_method(self):
++    shlog.FCA11_SHADOW_MAX_BYTES, shlog.FCA11_SHADOW_MAX_PARTS = self._saved
++
++  def _write(self, d, n=None):
++    w = shlog.ShadowLogger(str(d), header=dict(self.HDR))
++    for i in range(self.N if n is None else n):
++      w.write(dict(k="f", i=i))
++    w.flush()
++    return w
++
++  @staticmethod
++  def _part(d, gen=None):
++    p = d / (shlog.FCA11_SHADOW_FILE if gen is None else f"{shlog.FCA11_SHADOW_FILE}.{gen}")
++    assert p.exists(), p
++    return [json.loads(x) for x in p.read_text().splitlines()]
++
++  def test_writing_continues_past_the_cap(self, tmp_path):
++    """(a) the cap is a part bound, not a drive bound: no truncation, and the last record written is on disk."""
++    d = tmp_path / "a"
++    w = self._write(d)
++    assert not w.truncated and w.part > 1                    # the drive rotated and kept writing
++    live = self._part(d)
++    assert live[0]["k"] == "hdr" and "cont" in live[0]
++    frames = [r["i"] for r in live if r["k"] == "f"]
++    assert frames and max(frames) == self.N - 1               # the final record landed in the last part
++    assert w.n_records == self.N + w.part                      # initial hdr + N frames + one hdr per continuation
++    assert "trunc" not in {r["k"] for r in live}
++
++  def test_closed_part_ends_with_rot_marker(self, tmp_path):
++    """(b) the rotated part exists and its last record is k="rot"."""
++    d = tmp_path / "b"
++    w = self._write(d)
++    assert w.part >= 2
++    for gen in range(1, w.part):                              # .1 = the last closed part, .2 the one before, ...
++      part, recs = w.part - gen, self._part(d, gen)
++      assert recs[0]["k"] == "hdr"                            # a part opens with a header ...
++      assert ("cont" not in recs[0]) if part == 1 else (recs[0]["cont"] == part)
++      assert recs[-1]["k"] == "rot"                           # ... and closes with exactly one rot marker
++      assert recs[-1]["part"] == part and 0 < recs[-1]["bytes"] <= self.CAP
++      assert sum(1 for r in recs if r["k"] == "rot") == 1
++
++  def test_live_part_starts_with_continuation_header(self, tmp_path):
++    """(c) the live file opens with k="hdr" carrying cont=2, otherwise identical to the first header."""
++    d = tmp_path / "c"
++    w = shlog.ShadowLogger(str(d), header=dict(self.HDR))
++    for i in range(400):
++      if w.part > 1:
++        break
++      w.write(dict(k="f", i=i))
++    w.flush()
++    assert w.part == 2
++    live, first = self._part(d), self._part(d, 1)
++    assert live[0]["k"] == "hdr" and live[0]["cont"] == 2
++    assert live[0]["schema"] == shlog.FCA11_SHADOW_SCHEMA
++    for r in (live[0], first[0]):                         # same constants as the first header (fresh t_wall only)
++      r.pop("t_wall")
++      r.pop("cont", None)
++    assert live[0] == first[0]
++
++  def test_no_record_lost_across_the_hop(self, tmp_path):
++    """(d) union of the parts == exactly the records written, each once."""
++    d = tmp_path / "d"
++    w = self._write(d)
++    assert w.part >= 3                                        # at least two hops at this cap/record size
++    got = []
++    for gen in [None, *range(1, w.part)]:
++      got += [r["i"] for r in self._part(d, gen) if r["k"] == "f"]
++    assert sorted(got) == list(range(self.N))
++    assert len({r["k"] for gen in [None, *range(1, w.part)] for r in self._part(d, gen)} - {"f", "hdr", "rot"}) == 0
++
++  def test_parts_exhausted_falls_back_to_trunc(self, tmp_path):
++    """(e) FCA11_SHADOW_MAX_PARTS reached: the last part truncates and the drive stops, exactly as before 0052."""
++    d = tmp_path / "e"
++    shlog.FCA11_SHADOW_MAX_PARTS = 2
++    w = self._write(d)
++    assert w.truncated and w.part == 2
++    assert sorted(os.listdir(d)) == [shlog.FCA11_SHADOW_FILE, f"{shlog.FCA11_SHADOW_FILE}.1"]
++    live = self._part(d)
++    assert live[-1]["k"] == "trunc" and live[-1]["bytes"] <= self.CAP
++    assert all(r["k"] != "rot" for r in live)                 # the last part never opens a new one
++    assert self._part(d, 1)[-1]["k"] == "rot"                 # part 1 still closed properly
++    assert max(r["i"] for r in live if r["k"] == "f") < self.N - 1     # ... and write() is gated again
++    n = w.n_records
++    w.write(dict(k="f", i=999))
++    w.flush()
++    assert w.n_records == n and "999" not in (d / shlog.FCA11_SHADOW_FILE).read_text()
++
++
+ # ---------------------------------------------------------------------------------------------- FCA11-DISABLED (debug)
+ class TestFca11DisabledDebugMode:
+   """The first shadow build's semantics (our stack fully off, V3 logged), kept ONLY as an explicitly named debug transform.
