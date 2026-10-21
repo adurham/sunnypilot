@@ -594,6 +594,21 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           python3 openpilot/sunnypilot/fork/tests/check_capnp_parity.py --tree "$RUNNER_TEMP/prebuilt"
 
+      - name: Verify superproject imports resolve against opendbc (import-chain gate)
+        # Static, stdlib-only guard (2026-10-21 sync): every name the superproject imports
+        # FROM opendbc must exist in the opendbc tree.  Upstream removed STD_CARGO_KG from
+        # opendbc.car in the 922513f312 sync and the fork's vehicle_specs.py still imported
+        # it; nothing else caught it - capnp parity and param reachability look at schemas
+        # and params, and the opendbc suites never import the superproject - so the UI
+        # process crash-looped with ImportError on the device while the build was green.
+        # Scans <prebuilt>/openpilot (production) only: tools/ scripts lag upstream renames
+        # and are not shipped to the car.
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 openpilot/sunnypilot/fork/tests/check_opendbc_imports.py --tree "$RUNNER_TEMP/prebuilt"
+
       - name: Verify fork param reachability (key registry / CarParamsSP writer / FCA11 env ban)
         # Static, stdlib-only guard (patch 0044): every fork-owned param key the code
         # uses must be registered in params_keys.h, every CarParamsSP field the code
