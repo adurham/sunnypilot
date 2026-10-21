@@ -76,6 +76,21 @@ def _default_series() -> Path:
   return Path(__file__).resolve().parents[1] / "patches"
 
 
+def check_shared_number_space(series: Path) -> list[tuple[str, Path]]:
+  """The panda patch subdir (`<series>/panda`, FORK.md row 83) shares the series' NNNN- number space so FORK.md can
+  cite one number: every panda patch must be numbered, and no prefix may appear in BOTH dirs. Raises ValueError."""
+  panda = series / "panda"
+  if not panda.is_dir():
+    return []
+  top = dict(find_patch_numbers([series], require_numbered=True))
+  sub = find_patch_numbers([panda], require_numbered=True)
+  for prefix, path in sub:
+    if prefix in top:
+      raise ValueError(f"DUPLICATE patch number {prefix} across the opendbc series and its panda subdir: " +
+                       f"{top[prefix].name}  vs  panda/{path.name}")
+  return sub
+
+
 def main(argv: list[str] | None = None) -> int:
   ap = argparse.ArgumentParser(description="Fail if two patches share a numeric prefix.")
   ap.add_argument("--series", type=Path, default=_default_series(),
@@ -91,11 +106,14 @@ def main(argv: list[str] | None = None) -> int:
   try:
     series = find_patch_numbers([args.series], require_numbered=True)
     held = find_patch_numbers(args.held, require_numbered=False)
+    panda = check_shared_number_space(args.series)
   except ValueError as e:
     print(f"::error::patch-number guard FAILED: {e}", file=sys.stderr)
     return 1
 
   print(f"series: {args.series}  -> {len(series)} numbered patch(es), all prefixes unique")
+  if panda:
+    print(f"panda:  {args.series / 'panda'}  -> {len(panda)} numbered patch(es), no prefix shared with the series")
   for d in args.held:
     print(f"held:   {d}  -> {len(find_patch_numbers([d], require_numbered=False))} numbered patch(es), unique")
   return 0

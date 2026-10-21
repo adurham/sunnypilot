@@ -61,6 +61,27 @@ class TestPatchNumberGuard(unittest.TestCase):
       self.assertEqual(G.main(["--series", str(d)]), 1)
     self.assertEqual(G.main(["--series", str(G._default_series())]), 0)
 
+  def test_panda_subdir_shares_the_number_space(self):
+    with tempfile.TemporaryDirectory() as t:
+      d = _mk(t, "0001-a.patch", "0004-b.patch")
+      (d / "panda").mkdir()
+      _mk(d / "panda", "0004-panda-x.patch")
+      with self.assertRaises(ValueError) as cm:
+        G.check_shared_number_space(d)
+      self.assertIn("panda/0004-panda-x.patch", str(cm.exception))
+      self.assertEqual(G.main(["--series", str(d)]), 1)
+
+  def test_panda_subdir_requires_prefix(self):
+    with tempfile.TemporaryDirectory() as t:
+      d = _mk(t, "0001-a.patch")
+      (d / "panda").mkdir()
+      _mk(d / "panda", "rx-order.patch")
+      with self.assertRaises(ValueError):
+        G.check_shared_number_space(d)
+
+  def test_real_panda_subdir_is_disjoint(self):
+    self.assertGreater(len(G.check_shared_number_space(G._default_series())), 0)
+
 
 if __name__ == "__main__":
   unittest.main()

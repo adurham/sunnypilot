@@ -92,6 +92,12 @@ env:
   # fork-only namespace holding the opendbc patch series. An absent or empty
   # directory is a supported state: it means "no opendbc divergence to ship".
   PATCH_DIR: openpilot/sunnypilot/fork/patches
+  # fork patches to the PANDA submodule (board/ firmware sources), applied inside
+  # panda/ before the firmware build. A subdirectory on purpose: the opendbc
+  # series above is applied from inside opendbc_repo with -maxdepth 1, so these
+  # are never fed to it, and check_patch_numbers.py scans the same depth. Numbered
+  # in the same NNNN- space as the opendbc series so FORK.md can cite one number.
+  PANDA_PATCH_DIR: openpilot/sunnypilot/fork/patches/panda
 
 on:
   # a merge/push to main means the fork's source moved: rebuild the deployable
@@ -326,15 +332,33 @@ jobs:
           fi
           PATCH_COUNT=${#PATCHES_ABS[@]}
 
+          # --- the panda patch series (board/ firmware sources), same rules ----
+          PANDA_PATCHES_ABS=()
+          if [ -d "${PANDA_PATCH_DIR}" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] && PANDA_PATCHES_ABS+=("$(readlink -f "$f")")
+            done < <(find "${PANDA_PATCH_DIR}" -maxdepth 1 -type f -name '*.patch' | LC_ALL=C sort)
+          fi
+          PANDA_PATCH_COUNT=${#PANDA_PATCHES_ABS[@]}
+          TOTAL_PATCH_COUNT=$((PATCH_COUNT + PANDA_PATCH_COUNT))
+
           # --- patch-set fingerprint ----------------------------------------
           # sha256 over "<basename>\n<contents>" for every patch, in order. Covers
           # every way the series can change -- a patch added, edited, renamed or
           # removed. The empty series has a well-defined fingerprint too, so
           # *deleting* the fork's patches is noticed rather than silently ignored
-          # (the prebuilt would need rebuilding from unpatched source).
-          if [ "$PATCH_COUNT" -gt 0 ]; then
-            PATCHES_SHA=$( { for f in "${PATCHES_ABS[@]}"; do
+          # (the prebuilt would need rebuilding from unpatched source). Panda
+          # patches are folded in under a "panda/" name; with none present the
+          # fingerprint is byte-for-byte the opendbc-only one it always was.
+          if [ "$TOTAL_PATCH_COUNT" -gt 0 ]; then
+            PATCHES_SHA=$( { for f in "${PATCHES_ABS[@]:-}"; do
+                                [ -n "$f" ] || continue
                                 echo "== $(basename "$f")"
+                                cat "$f"
+                              done
+                              for f in "${PANDA_PATCHES_ABS[@]:-}"; do
+                                [ -n "$f" ] || continue
+                                echo "== panda/$(basename "$f")"
                                 cat "$f"
                               done; } | sha256sum | cut -d' ' -f1)
           else
@@ -366,10 +390,10 @@ jobs:
           # hash. A skip is allowed ONLY when the clone's firmware bytes provably
           # equal the hash the last fork build recorded (firmware-sha256).
           FW_NEEDED=false
-          FW_REASON='no opendbc patches to apply'
-          if [ "$PATCH_COUNT" -gt 0 ]; then
+          FW_REASON='no opendbc or panda patches to apply'
+          if [ "$TOTAL_PATCH_COUNT" -gt 0 ]; then
             if [ -z "${PREBUILT_OPENDBC_PIN:-}" ] && [ -z "${PREBUILT_PATCHES_SHA:-}" ]; then
-              FW_NEEDED=true; FW_REASON="first v3 build; ${PATCH_COUNT} patch(es) present"
+              FW_NEEDED=true; FW_REASON="first v3 build; ${TOTAL_PATCH_COUNT} patch(es) present"
             elif [ "$PATCHES_SHA" != "${PREBUILT_PATCHES_SHA:-}" ]; then
               FW_NEEDED=true; FW_REASON="patch set changed"
             elif [ "$OPENDBC_PIN" != "${PREBUILT_OPENDBC_PIN:-}" ]; then
@@ -388,12 +412,13 @@ jobs:
           # needed, because that is what produces the files copied into the prebuilt
           # tree -- so the submodule checkout is needed whenever there are patches.
           NEED_SUBMODULES=false
-          if [ "$PATCH_COUNT" -gt 0 ]; then NEED_SUBMODULES=true; fi
+          if [ "$TOTAL_PATCH_COUNT" -gt 0 ]; then NEED_SUBMODULES=true; fi
 
           {
             echo "OPENDBC_PIN=${OPENDBC_PIN}"
             echo "PANDA_PIN=${PANDA_PIN}"
             echo "PATCH_COUNT=${PATCH_COUNT}"
+            echo "PANDA_PATCH_COUNT=${PANDA_PATCH_COUNT}"
             echo "PATCHES_SHA=${PATCHES_SHA}"
             echo "FW_NEEDED=${FW_NEEDED}"
             echo "BASE_FW_SHA=${BASE_FW_SHA}"
@@ -404,11 +429,14 @@ jobs:
             echo 'OPENDBC_PATCHES<<OPENDBC_PATCHES_EOF'
             printf '%s\n' "${PATCHES_ABS[@]:-}"
             echo 'OPENDBC_PATCHES_EOF'
+            echo 'PANDA_PATCHES<<PANDA_PATCHES_EOF'
+            printf '%s\n' "${PANDA_PATCHES_ABS[@]:-}"
+            echo 'PANDA_PATCHES_EOF'
           } >> "$GITHUB_ENV"
 
           echo "opendbc pin:    ${OPENDBC_PIN:0:10} (prebuilt built from ${PREBUILT_OPENDBC_PIN:0:10})"
           echo "panda pin:      ${PANDA_PIN:0:10} (prebuilt built from ${PREBUILT_PANDA_PIN:0:10})"
-          echo "patch series:   ${PATCH_COUNT} patch(es), sha256 ${PATCHES_SHA:0:12}"
+          echo "patch series:   ${PATCH_COUNT} opendbc + ${PANDA_PATCH_COUNT} panda patch(es), sha256 ${PATCHES_SHA:0:12}"
           echo "submodules:     ${NEED_SUBMODULES}"
           echo "clone firmware sha: ${BASE_FW_SHA:0:12} (last fork build: ${PREBUILT_FW_SHA:0:12})"
           echo "firmware build: ${FW_NEEDED} (${FW_REASON})"
@@ -431,7 +459,7 @@ jobs:
           echo "panda checked out at $(git -C panda rev-parse HEAD)"
 
       - name: Apply the fork's opendbc patch series
-        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true'
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true' && env.PATCH_COUNT != '0'
         run: |
           set -euo pipefail
           SUBMODULE=opendbc_repo
@@ -462,8 +490,44 @@ jobs:
           git diff --name-status HEAD
           echo "APPLIED_PATCHES=${APPLIED}" >> "$GITHUB_ENV"
 
+      - name: Apply the fork's panda patch series
+        # Firmware-only patches to the panda submodule (board/ sources). Nothing
+        # here is copied into the prebuilt tree: the prebuilt ships only the
+        # compiled app (panda/board/obj/panda_h7.bin.signed), and the firmware
+        # step below compiles from this patched checkout. Same rules as the
+        # opendbc series: plain `git apply` (a patch that no longer matches the
+        # pinned panda is a hard, red-run error), and every touched path must be
+        # under board/ so a panda patch can never reach host-side code.
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true' && env.PANDA_PATCH_COUNT != '0'
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/panda"
+          echo "applying to pristine panda $(git rev-parse HEAD)"
+          mapfile -t PATCHES < <(printf '%s\n' "${PANDA_PATCHES}")
+          APPLIED=0
+          for p in "${PATCHES[@]}"; do
+            [ -n "$p" ] || continue
+            echo "--- applying panda/$(basename "$p")"
+            while IFS= read -r path; do
+              case "$path" in
+                board/*) ;;
+                *) echo "::error::panda patch $(basename "$p") touches a path outside board/: $path"; exit 1 ;;
+              esac
+            done < <(git apply --numstat "$p" | cut -f3)
+            git apply --check "$p"
+            git apply --verbose "$p"
+            APPLIED=$((APPLIED + 1))
+          done
+          [ "$APPLIED" -gt 0 ] || { echo "::error::panda patch dir was non-empty but no patch applied"; exit 1; }
+          echo "applied ${APPLIED} panda patch(es); files changed:"
+          git diff --name-status HEAD
+          # FORK.md row 83: the RX path must hand every frame to the safety layer
+          # BEFORE the forwarding decision (camera FCA11 hand-back). Proven on the
+          # exact source the firmware step is about to compile.
+          python3 "${GITHUB_WORKSPACE}/openpilot/sunnypilot/fork/tests/check_panda_rx_order.py" --panda .
+
       - name: Copy the patched opendbc files into the prebuilt tree
-        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true'
+        if: env.SKIP != 'true' && env.NEED_SUBMODULES == 'true' && env.PATCH_COUNT != '0'
         run: |
           set -euo pipefail
           W="${GITHUB_WORKSPACE}/opendbc_repo"
@@ -834,6 +898,7 @@ jobs:
           panda-pin: ${PANDA_PIN}
           patches-sha256: ${PATCHES_SHA}
           patches: ${PATCH_COUNT:-0}
+          panda-patches: ${PANDA_PATCH_COUNT:-0}
           firmware: ${FW_UPDATED:-false}
           firmware-sha256: ${FINAL_FW_SHA}
           run: ${GITHUB_RUN_ID}
@@ -896,6 +961,7 @@ jobs:
             echo "| schema changed | ${SCHEMA_CHANGED:-n/a} |"
             echo "| opendbc patches applied | ${APPLIED_PATCHES:-0} |"
             echo "| opendbc files copied | ${OPENDBC_FILES_COPIED:-0} |"
+            echo "| panda patches applied | ${PANDA_PATCH_COUNT:-0} |"
             echo "| opendbc pin | \`${OPENDBC_PIN}\` |"
             echo "| panda pin | \`${PANDA_PIN}\` |"
             echo "| patch set sha256 | \`${PATCHES_SHA}\` |"
