@@ -34,7 +34,11 @@ Sources for the numbers
 * wheelbase 2.72 m and tireStiffnessFactor 0.65 are already correct for the N
   (same CN7 platform, 107.1 in wheelbase) — deliberately not overridden.
 """
-from opendbc.car import STD_CARGO_KG, structs
+# upstream removed STD_CARGO_KG from opendbc.car in the car-mass change (#39072, landed with the
+# 922513f312 sync); the convention it encoded — a 136 kg driver/payload allowance added to the
+# curb weight — is kept here so mass maths is unchanged.
+STD_CARGO_KG = 136.0
+from opendbc.car import structs
 
 LB_TO_KG = 0.453592
 

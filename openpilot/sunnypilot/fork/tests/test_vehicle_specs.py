@@ -4,7 +4,11 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-from opendbc.car import STD_CARGO_KG, structs
+# upstream removed STD_CARGO_KG from opendbc.car in the car-mass change (#39072, landed with the
+# 922513f312 sync); the convention it encoded — a 136 kg driver/payload allowance added to the
+# curb weight — is kept here so mass maths is unchanged.
+STD_CARGO_KG = 136.0
+from opendbc.car import structs
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.fork.vehicle_specs import FORK_VEHICLE_SPECS, LB_TO_KG, apply_fork_vehicle_specs
