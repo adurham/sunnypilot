@@ -55,9 +55,13 @@ class TestRate(OpenpilotTestCase):
       self.assertLess(s, a, v)
 
   def test_relaxed_and_standard_well_under_upstream_ceiling(self):
-    # the owner's complaint: 1.0-1.2 m/s^2 flat. relaxed / standard must ask well under the upstream ACC ceiling
+    # the owner's complaint: 1.0-1.2 m/s^2 flat. relaxed / standard must ask well under what the stock cruise path
+    # builds up in the ease's own leash window (the upstream jerk ramp, capped by the ACCEL_MAX ceiling).
+    # 922513f312 upstream sync: the personality-scaled A_CRUISE_MAX table is gone, so the reference is the jerk-limited
+    # get_cruise_accel ramp, not get_max_accel(v).
     for v in np.arange(8., 40., 1.):
-      ceiling = float(upstream_lp.get_max_accel(v))
+      ceiling = min(float(np.interp(v, upstream_lp.J_CRUISE_BP, upstream_lp.J_CRUISE_VALS) * se.LEASH_S),
+                    float(upstream_lp.ACCEL_MAX))
       self.assertLessEqual(se.get_rate(P.standard, v) * se.LEASH_S, 1.15 * ceiling + 1e-6, v)
       self.assertLess(se.get_rate(P.relaxed, v), 0.6 * ceiling, v)
       self.assertLess(se.get_rate(P.standard, v), 0.8 * ceiling, v)
@@ -322,10 +326,10 @@ class TestLaunch(OpenpilotTestCase):
 class TestCruiseAccelBounds(OpenpilotTestCase):
   """Through the REAL upstream get_cruise_accel: easing only ever lowers a positive request, never adds decel."""
 
-  def _target(self, e2e, v_cruise, v_ego):
-    CP = mock.Mock(steerRatio=15., wheelbase=2.7)
-    # dt large -> the jerk limit does not bind, this is the unclipped target_accel
-    return upstream_lp.get_cruise_accel(e2e, v_cruise, v_ego, 0., 0., CP, 100., 0., True)
+  def _target(self, v_cruise, v_ego):
+    # dt large -> the jerk limit does not bind (a_prev = 0), this is the unclipped target_accel. 922513f312 upstream
+    # sync: get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt) -- no e2e / ACC-mode / personality arguments left.
+    return upstream_lp.get_cruise_accel(v_cruise, v_ego, 0., 100.)
 
   def test_eased_request_between_min0_and_upstream(self):
     rng = np.random.default_rng(0)
@@ -337,11 +341,10 @@ class TestCruiseAccelBounds(OpenpilotTestCase):
       for _ in range(int(rng.integers(0, 60))):
         e.step(float(rng.uniform(0., 40.)), float(rng.uniform(3.5, 38.)), p, True, float(rng.uniform(-1, 1)))
       v_ease = e.step(v_target, v_ego, p, True, 0.)
-      for e2e in (False, True):
-        up = self._target(e2e, v_target, v_ego)
-        eased = self._target(e2e, v_ease, v_ego)
-        self.assertLessEqual(eased, up + 1e-9)
-        self.assertGreaterEqual(eased, min(0., up) - 1e-9)
+      up = self._target(v_target, v_ego)
+      eased = self._target(v_ease, v_ego)
+      self.assertLessEqual(eased, up + 1e-9)
+      self.assertGreaterEqual(eased, min(0., up) - 1e-9)
 
 
 HWY = 55 * MPH  # road_type_classifier.HIGHWAY_SPEED_THRESHOLD
@@ -476,7 +479,11 @@ class TestMergeGate(OpenpilotTestCase):
     import inspect
     lm = messaging.new_message('carStateSP').carStateSP
     fields = {f.proto.name for f in lm.schema.fields_list}
-    self.assertEqual(fields, {'speedLimit', 'driveMode'})
+    # (the struct grew other upstream/fork levels since this pin was written, so pin the two fields this test is about
+    # plus the absence of any freshness channel rather than the whole field set)
+    self.assertIn('speedLimit', fields)
+    self.assertIn('driveMode', fields)        # the fork's drive-mode-personality level
+    self.assertEqual(lm.schema.fields['speedLimit'].proto.slot.type.which(), 'float32')  # a bare Float32
     self.assertNotIn('valid', fields)         # no validity channel
     self.assertNotIn('age', fields)           # no age/freshness channel
     self.assertNotIn('timestamp', fields)
@@ -544,7 +551,7 @@ class TestMergeStateShared(OpenpilotTestCase):
       self.assertEqual(up.call_count, 1)
 
 
-def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, lcs=LongCtrlState.pid, override=False,
+def planner_sm(v_ego, v_cruise_kph, personality=P.standard, lcs=LongCtrlState.pid, override=False,
                lead=None, road_type=None, map_limit=0., car_limit=0., cur_lat=0., pred_lat=0.):
   N = len(ModelConstants.T_IDXS)
   md = messaging.new_message('modelV2').modelV2
@@ -566,7 +573,6 @@ def planner_sm(v_ego, v_cruise_kph, personality=P.standard, experimental=False, 
   ctl.curvature = float(cur_lat / max(v_ego, 0.1) ** 2)  # SCC-V current lat accel = v^2 * |curvature|
   sd = messaging.new_message('selfdriveState').selfdriveState
   sd.enabled = True
-  sd.experimentalMode = experimental
   sd.personality = personality
   rs = messaging.new_message('radarState').radarState
   if lead is not None:
@@ -599,14 +605,16 @@ class TestUpstreamHooks(OpenpilotTestCase):
   """The fork hooks these upstream members; a rename / signature change upstream must fail here."""
 
   def test_pinned_signatures(self):
+    # 922513f312 upstream sync: get_cruise_accel lost the e2e / ACC-mode / personality arguments (the fork's ACC cruise
+    # path is gone; the ceiling is ACCEL_MAX always and the candidate is jerk-limited from a_cruise_prev)
     self.assertEqual(list(inspect.signature(upstream_lp.get_cruise_accel).parameters),
-                     ['e2e', 'v_cruise', 'v_ego', 'a_cruise_prev', 'angle_steers', 'CP', 'dt', 'accel_coast', 'allow_throttle', 'personality'])
+                     ['v_cruise', 'v_ego', 'a_cruise_prev', 'dt'])
     self.assertEqual(list(inspect.signature(LongitudinalPlannerSP.update_targets).parameters),
                      ['self', 'sm', 'v_ego', 'a_ego', 'v_cruise'])
     src = inspect.getsource(upstream_lp.LongitudinalPlanner.update)
     # the planner must feed update_targets' returned v_cruise into get_cruise_accel
     self.assertIn('v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(', src)
-    self.assertIn('get_cruise_accel(is_e2e, v_cruise, v_ego', src)
+    self.assertIn('get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)', src)
 
   def _run(self, planner, n, v_ego, v_cruise_kph, **kw):
     for _ in range(n):
@@ -617,18 +625,18 @@ class TestUpstreamHooks(OpenpilotTestCase):
 
   def test_end_to_end_bump_is_eased(self):
     # +10 mph at 45 mph through the REAL LongitudinalPlanner: the cruise candidate stays near the personality rate
-    # (upstream: the ceiling within ~1 s). ACC and e2e.
+    # (upstream: the ceiling within ~1 s). 922513f312 upstream sync: the e2e candidate is always in the plan, so the
+    # old ACC / e2e loop over experimental mode is gone.
     v = 45 * MPH
     kph = 55 * 1.609344
-    for exp in (False, True):
-      for p in PERSONALITIES:
-        planner = make_planner()
-        self._run(planner, 5, v, 45 * 1.609344, personality=p, experimental=exp)
-        self._run(planner, 40, v, kph, personality=p, experimental=exp)  # 2 s after the press, car not moving (worst case)
-        self.assertLessEqual(planner.a_cruise, se.get_rate(p, v) * se.LEASH_S + 1e-6, (exp, p))
-        self.assertGreater(planner.a_cruise, 0.2)
-        # vTarget published to longitudinalPlanSP stays the raw target
-        self.assertAlmostEqual(planner.output_v_target, kph / 3.6, places=4)
+    for p in PERSONALITIES:
+      planner = make_planner()
+      self._run(planner, 5, v, 45 * 1.609344, personality=p)
+      self._run(planner, 40, v, kph, personality=p)  # 2 s after the press, car not moving (worst case)
+      self.assertLessEqual(planner.a_cruise, se.get_rate(p, v) * se.LEASH_S + 1e-6, p)
+      self.assertGreater(planner.a_cruise, 0.2)
+      # vTarget published to longitudinalPlanSP stays the raw target
+      self.assertAlmostEqual(planner.output_v_target, kph / 3.6, places=4)
 
   def test_eased_with_far_lead(self):
     # a lead far ahead and faster (not binding) must not switch the easing off: +10 mph at 45 mph stays eased
@@ -637,38 +645,42 @@ class TestUpstreamHooks(OpenpilotTestCase):
     self._run(planner, 5, v, 45 * 1.609344, lead=(150., v + 3.))
     self._run(planner, 40, v, 55 * 1.609344, lead=(150., v + 3.))
     self.assertLessEqual(planner.a_cruise, se.get_rate(P.standard, v) * se.LEASH_S + 1e-6)
-    self.assertLess(planner.output_a_target, float(upstream_lp.get_max_accel(v)) - 0.2)
+    # 922513f312 upstream sync: get_max_accel is gone, the cruise ceiling is ACCEL_MAX -- the published plan still has to
+    # stay below it (the eased request, not the ceiling / the e2e candidate, is what got published)
+    self.assertLess(planner.output_a_target, float(upstream_lp.ACCEL_MAX) - 0.2)
 
   def test_lead_braking_identical_on_same_input(self):
     # Same input sequence to two real planners (eased / hook bypassed): cruising at 45 mph, +15 mph press, then a slow
     # lead cuts in close and the car must slow. Whenever the plan comes from the lead (MPC) or asks to slow, the eased
     # planner's output must equal the upstream one: easing never touches braking / lead-follow decel.
+    # 922513f312 upstream sync: e2e is always on, so the old ACC / e2e loop over experimental mode is gone.
     v = 45 * MPH
-    for exp in (False, True):
-      eased, stock = make_planner(), make_planner()
-      stock.setspeed_ease.update = lambda sm, v_target, *a: v_target
-      seq = [planner_sm(v, 45 * 1.609344, experimental=exp) for _ in range(10)]
-      seq += [planner_sm(v, 60 * 1.609344, experimental=exp) for _ in range(40)]
-      seq += [planner_sm(v, 60 * 1.609344, experimental=exp, lead=(18. + 0.2 * i, 40 * MPH)) for i in range(60)]
-      n_lead = 0
-      for sm in seq:
-        eased.update(sm)
-        stock.update(sm)
-        if sm['radarState'].leadOne.present and stock.output_a_target < 0.:
-          n_lead += 1
-          self.assertAlmostEqual(eased.output_a_target, stock.output_a_target, places=2, msg=f'exp={exp}')
-          self.assertNotEqual(str(eased.mpc.source), 'cruise')
-        self.assertLessEqual(eased.output_a_target, stock.output_a_target + 1e-3)
-      self.assertGreater(n_lead, 30)  # the lead phase really braked
+    eased, stock = make_planner(), make_planner()
+    stock.setspeed_ease.update = lambda sm, v_target, *a: v_target
+    seq = [planner_sm(v, 45 * 1.609344) for _ in range(10)]
+    seq += [planner_sm(v, 60 * 1.609344) for _ in range(40)]
+    seq += [planner_sm(v, 60 * 1.609344, lead=(18. + 0.2 * i, 40 * MPH)) for i in range(60)]
+    n_lead = 0
+    for sm in seq:
+      eased.update(sm)
+      stock.update(sm)
+      if sm['radarState'].leadOne.present and stock.output_a_target < 0.:
+        n_lead += 1
+        self.assertAlmostEqual(eased.output_a_target, stock.output_a_target, places=2)
+        self.assertNotEqual(str(eased.mpc.source), 'cruise')
+      self.assertLessEqual(eased.output_a_target, stock.output_a_target + 1e-3)
+    self.assertGreater(n_lead, 30)  # the lead phase really braked
 
   def test_end_to_end_control_without_ease(self):
-    # positive control for the test above: with the hook bypassed the same input reaches the upstream ceiling
+    # positive control for the test above: with the hook bypassed the same input reaches the upstream ceiling.
+    # 922513f312 upstream sync: get_max_accel is gone and the cruise candidate is jerk-limited, so the un-eased path
+    # ramps to ACCEL_MAX over a couple of seconds (j_cruise(v ~ 20 m/s) ~ 0.93 m/s^3 -> ~2.2 s)
     v = 45 * MPH
     planner = make_planner()
     planner.setspeed_ease.update = lambda sm, v_target, *a: v_target
     self._run(planner, 5, v, 45 * 1.609344, personality=P.relaxed)
-    self._run(planner, 40, v, 55 * 1.609344, personality=P.relaxed)
-    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, P.relaxed)), places=3)
+    self._run(planner, 300, v, 55 * 1.609344, personality=P.relaxed)
+    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.ACCEL_MAX), places=3)
 
   def test_end_to_end_big_down_passes_through(self):
     # 45 mph, set 45 -> 20 mph: a 25 mph drop is past the coast budget, so it passes straight through (as upstream)
@@ -693,7 +705,9 @@ class TestUpstreamHooks(OpenpilotTestCase):
     self._run(planner, 5, v, 60 * 1.609344)
     self._run(planner, 40, v, 50 * 1.609344)
     self.assertAlmostEqual(planner.setspeed_ease.v_ease, 50 * 1.609344 / 3.6, places=4)
-    self.assertLess(planner.a_cruise, -0.5)
+    # 922513f312 upstream sync: upstream now floors the cruise request at A_CRUISE_MIN (-0.5 m/s^2, was the deeper ACC
+    # minimum), so "a real decel" means sitting on that floor instead of the coast the eased case holds
+    self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.A_CRUISE_MIN), places=6)
 
   def test_end_to_end_bump_size_orders_the_request(self):
     # +5 mph at 60 mph must ask for less than +10 mph at 60 mph (the owner: a +5 bump is still too quick)
@@ -755,6 +769,8 @@ class TestUpstreamHooks(OpenpilotTestCase):
 
   def test_end_to_end_onramp_not_eased(self):
     # on-ramp (12f @686 shape): 30 mph, set 75 mph, the car reads a 70 mph limit (no map way match): upstream ceiling
+    # 922513f312 upstream sync: the reference for "not eased" is a stock planner (hook bypassed) on the same inputs --
+    # get_max_accel(v, p) is gone and the un-eased request is jerk-limited, not a table value
     v = 30 * MPH
     for road in ({'car_limit': 70 * MPH}, {'road_type': 'highway', 'map_limit': 70 * MPH}, {}):
       for p in PERSONALITIES:
@@ -762,7 +778,11 @@ class TestUpstreamHooks(OpenpilotTestCase):
         self._run(planner, 5, v, 30 * 1.609344, personality=p, **road)
         self._run(planner, 40, v, 75 * 1.609344, personality=p, **road)
         self.assertTrue(planner.setspeed_ease.merging, (road, p))
-        self.assertAlmostEqual(planner.a_cruise, float(upstream_lp.get_max_accel(v, p)), places=3, msg=str((road, p)))
+        stock = make_planner()
+        stock.setspeed_ease.update = lambda sm, v_target, *a, **k: v_target
+        self._run(stock, 5, v, 30 * 1.609344, personality=p, **road)
+        self._run(stock, 40, v, 75 * 1.609344, personality=p, **road)
+        self.assertAlmostEqual(planner.a_cruise, stock.a_cruise, places=3, msg=str((road, p)))
 
   def test_end_to_end_bump_on_normal_road_still_eased(self):
     # +10 mph at 45 mph on an urban 45 mph road, and +10 mph at 65 mph on a 70 mph highway: eased (discretionary)

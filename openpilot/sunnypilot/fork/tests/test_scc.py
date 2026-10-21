@@ -3,6 +3,7 @@ Fork SCC fixes + throttle-only guard (fork/scc.py). Scenarios are taken from rou
 (car-features/drive-12e-12f-report.md §B; an12ef/scc_episodes.py, scc_uncorr.py).
 """
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -29,6 +30,15 @@ LAT0, LON0 = 41.5, -87.3
 M_PER_DEG_LAT = R * np.pi / 180.
 
 
+def gps_sm(lat=LAT0, lon=LON0, live_map=None) -> dict:
+  """SubMaster stand-in carrying the car's GPS position. 922513f312 upstream sync: upstream reads the position from
+  sm[get_gps_location_service(params)] (gpsLocation / gpsLocationExternal), not from the LastGPSPosition param."""
+  pos = SimpleNamespace(latitude=lat, longitude=lon)
+  sm = {'gpsLocation': pos, 'gpsLocationExternal': pos}
+  sm['liveMapDataSP'] = live_map if live_map is not None else messaging.new_message('liveMapDataSP').liveMapDataSP
+  return sm
+
+
 def model_sm(v_ego: float, cur_lat: float, pred_lat: float, live_map=None) -> dict:
   """sm for SCC-V: predicted lat accel = |orientationRate.z| * velocity.x = pred_lat at every point; current lat accel
   = v^2 * |curvature| = cur_lat."""
@@ -38,7 +48,8 @@ def model_sm(v_ego: float, cur_lat: float, pred_lat: float, live_map=None) -> di
   cs = messaging.new_message('controlsState')
   cs.controlsState.curvature = float(cur_lat / max(v_ego, 0.1) ** 2)
   sm = {'modelV2': mdl.modelV2, 'controlsState': cs.controlsState}
-  sm['liveMapDataSP'] = live_map if live_map is not None else messaging.new_message('liveMapDataSP').liveMapDataSP
+  # the composite ForkSmartCruiseControl also runs the map controller, which needs the GPS service in sm
+  sm.update(gps_sm(live_map=live_map))
   return sm
 
 
@@ -52,10 +63,10 @@ def matched_map(name="Casimir Pulaski Memorial Highway"):
 
 
 def put_path(params, offset_m: float, points: list[tuple[float, float]]):
-  """Car at (LAT0, LON0). Path due north starting offset_m east of the car: [(ahead_m, velocity), ...]."""
+  """Car at (LAT0, LON0). Path due north starting offset_m east of the car: [(ahead_m, velocity), ...].
+  The car's own position goes in the sm (see gps_sm); only the path is a param."""
   dlon = offset_m / (M_PER_DEG_LAT * np.cos(np.radians(LAT0)))
   tv = [{"latitude": LAT0 + ahead / M_PER_DEG_LAT, "longitude": LON0 + dlon, "velocity": v} for ahead, v in points]
-  params.put("LastGPSPosition", json.dumps({"latitude": LAT0, "longitude": LON0}), block=True)
   params.put("MapTargetVelocities", json.dumps(tv), block=True)
 
 
@@ -300,13 +311,14 @@ class TestMap(OpenpilotTestCase):
     self.params = Params()
     self.params.put_bool("SmartCruiseControlMap", True, block=True)
 
-  def _run(self, cls, n, v=20.7, live_map=None, v_cruise=30.):
+  def _run(self, cls, n, v=20.7, live_map=None, v_cruise=30., sm=None):
     c = cls()
     if live_map is not None:
       c.live_map = live_map
+    sm = gps_sm(live_map=live_map) if sm is None else sm
     states = []
     for _ in range(n):
-      c.update(True, False, v, 0., v_cruise)
+      c.update(sm, True, False, v, 0., v_cruise)
       states.append((c.state, c.output_v_target))
     return c, states
 
@@ -355,7 +367,7 @@ class TestMap(OpenpilotTestCase):
     hold = int(round(fscc.MAP_REJECT_HOLD_S / DT_MDL))
     for i in range(hold + 1):
       c.live_map = unmatched
-      c.update(True, False, 20.7, 0., 30.)
+      c.update(gps_sm(live_map=unmatched), True, False, 20.7, 0., 30.)
       if i < hold - 1:
         self.assertEqual(c.state, MapState.turning, i)
     self.assertEqual(c.state, MapState.enabled)
@@ -364,7 +376,7 @@ class TestMap(OpenpilotTestCase):
     c2, _ = self._run(fscc.ForkSCCMap, 5, live_map=matched_map())
     for live in [unmatched] * 3 + [matched_map()] * 30:
       c2.live_map = live
-      c2.update(True, False, 20.7, 0., 30.)
+      c2.update(gps_sm(live_map=live), True, False, 20.7, 0., 30.)
       self.assertEqual(c2.state, MapState.turning)
 
   def test_diagnostics_logged(self):
@@ -384,7 +396,7 @@ class TestMap(OpenpilotTestCase):
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       c = fscc.ForkSCCMap()
       for _ in range(50):
-        c.update(False, False, 20., 0., 30.)
+        c.update(gps_sm(), False, False, 20., 0., 30.)
     self.assertFalse([x for x in ev.call_args_list if x.args and x.args[0] == "scc_map_diag"])
 
 
@@ -395,7 +407,7 @@ class TestMap(OpenpilotTestCase):
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       c = fscc.ForkSCCMap()
       for _ in range(int(5. / DT_MDL)):
-        c.update(False, False, 20., 0., 30.)
+        c.update(gps_sm(), False, False, 20., 0., 30.)
     paths = [x.kwargs for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"]
     self.assertEqual(len(paths), 1)  # unchanged path -> logged once
     self.assertEqual(paths[0]["n"], len(RAMP_PATH))
@@ -405,7 +417,7 @@ class TestMap(OpenpilotTestCase):
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       for i in range(int(4. / DT_MDL)):
         put_path(self.params, float(i % 7), RAMP_PATH)  # content changes every cycle
-        c.update(False, False, 20., 0., 30.)
+        c.update(gps_sm(), False, False, 20., 0., 30.)
     paths = [x for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"]
     self.assertGreaterEqual(len(paths), 1)
     self.assertLessEqual(len(paths), int(4. / fscc.MAP_PATH_MIN_GAP_S) + 1)
@@ -415,7 +427,7 @@ class TestMap(OpenpilotTestCase):
     self.params.put("MapTargetVelocities", json.dumps(big), block=True)
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       c = fscc.ForkSCCMap()
-      c.update(False, False, 20., 0., 30.)
+      c.update(gps_sm(), False, False, 20., 0., 30.)
     p = [x.kwargs for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"][0]
     self.assertEqual(p["n"], len(big))
     self.assertTrue(p["truncated"])
@@ -501,6 +513,9 @@ class TestEndToEndPlanner(OpenpilotTestCase):
     msgs['carControl'].carControl.enabled = True
     msgs['carControl'].carControl.orientationNED = [0., 0., 0.]
     msgs['selfdriveState'].selfdriveState.personality = log.LongitudinalPersonality.standard
+    # the map controller reads the car's position from sm (not from a param)
+    msgs['gpsLocation'].gpsLocation.latitude = LAT0
+    msgs['gpsLocation'].gpsLocation.longitude = LON0
     sm['modelV2'].meta.disengagePredictions.gasPressProbs = [1.0] * 6
     sm['modelV2'].position.x = [float(x) for x in (v + 0.5) * np.array(ModelConstants.T_IDXS)]
     sm['modelV2'].action.desiredAcceleration = 0.5

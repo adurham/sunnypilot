@@ -25,7 +25,6 @@ from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_cap
 from openpilot.sunnypilot.fork.fca11_shadow_hook import fca11_shadow_post_send
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
-from openpilot.sunnypilot.fork.cruise_prefs import experimental_active
 from openpilot.sunnypilot.fork.esc_diag import run_from_card as run_esc_diag_from_card
 from openpilot.sunnypilot.fork.esc_probe_0027 import run_from_card as run_esc_probe_0027_from_card
 
@@ -136,9 +135,6 @@ class Car:
     set_alternative_experience(self.CP, self.CP_SP, self.params)
     set_car_specific_params(self.CP, self.CP_SP, self.params)
 
-    # Dynamic Experimental Control
-    self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")
-
     openpilot_enabled_toggle = self.params.get_bool("OpenpilotEnabledToggle")
     controller_available = self.CI.CC is not None and openpilot_enabled_toggle and not self.CP.dashcamOnly
     self.CP.passive = not controller_available or self.CP.dashcamOnly
@@ -190,9 +186,7 @@ class Car:
     self.v_cruise_helper = VCruiseHelper(self.CP, self.CP_SP)
 
     self.is_metric = self.params.get_bool("IsMetric")
-    # fork #30: the runtime gate, not the raw param — a developer maneuver mode suppresses
-    # experimental mode without touching the owner's stored preference.
-    self.experimental_mode = experimental_active(self.params, self.CP.openpilotLongitudinalControl)
+    self.initial_cruise_speed = self.params.get("InitialCruiseSpeedKph", return_default=True)
 
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
@@ -225,7 +219,7 @@ class Car:
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)
     if self.sm['carControl'].enabled and not self.CC_prev.enabled:
       # Use CarState w/ buttons from the step selfdrived enables on
-      self.v_cruise_helper.initialize_v_cruise(self.CS_prev, self.experimental_mode, self.dynamic_experimental_control)
+      self.v_cruise_helper.initialize_v_cruise(self.CS_prev, self.initial_cruise_speed)
 
     # TODO: mirror the carState.cruiseState struct?
     CS.vCruise = float(self.v_cruise_helper.v_cruise_kph)
@@ -313,13 +307,9 @@ class Car:
   def params_thread(self, evt):
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
-      self.experimental_mode = experimental_active(self.params, self.CP.openpilotLongitudinalControl)
+      self.initial_cruise_speed = self.params.get("InitialCruiseSpeedKph", return_default=True)
 
       # sunnypilot
-      # fork #30: gate DEC on longitudinal too (symmetric with selfdrived); DEC's own active() gate
-      # already requires selfdriveState.experimentalMode, so this cannot change behaviour when long
-      # IS available, it only keeps the exposed flag consistent while long is unavailable.
-      self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl") and self.CP.openpilotLongitudinalControl
       self.v_cruise_helper.read_custom_set_speed_params()
 
       time.sleep(0.1)

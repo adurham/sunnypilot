@@ -85,8 +85,7 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     # only transiently unavailable (pedal interceptor disarmed for an ignition); the consumers
     # are already gated on longitudinal being active, so nothing reads them while unavailable.
     cloudlog.warning("openpilot Longitudinal Control and ICBM not available, cleaning up params")
-    for key in ("DynamicExperimentalControl", "CustomAccIncrementsEnabled",
-                "SmartCruiseControlVision", "SmartCruiseControlMap"):
+    for key in ("CustomAccIncrementsEnabled", "SmartCruiseControlVision", "SmartCruiseControlMap"):
       remove_unless_preserved(params, key)
 
   set_speed_limit_assist_availability(CP, CP_SP, params)

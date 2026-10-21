@@ -83,14 +83,8 @@ class CruiseLayout(Widget):
       callback=lambda: self._set_current_panel(PanelType.SLA)
     )
 
-    self.dec_toggle = toggle_item_sp(
-      title=tr("Enable Dynamic Experimental Control"),
-      description=tr("Enable toggle to allow the model to determine when to use sunnypilot ACC or sunnypilot End to End Longitudinal."),
-      param="DynamicExperimentalControl")
-
     items = [
       self.icbm_toggle,
-      self.dec_toggle,
       self.scc_v_toggle,
       self.scc_m_toggle,
       self.custom_acc_toggle,
@@ -145,14 +139,12 @@ class CruiseLayout(Widget):
 
       if has_long or has_icbm:
         self.custom_acc_toggle.action_item.set_enabled(((has_long and not ui_state.CP.pcmCruise) or has_icbm) and ui_state.is_offroad())
-        self.dec_toggle.action_item.set_enabled(has_long)
         self.scc_v_toggle.action_item.set_enabled(True)
         self.scc_m_toggle.action_item.set_enabled(True)
       else:
         # fork #30: disable the toggles but KEEP the stored prefs, and show the stored value so
         # the screen always matches the param even while greyed out.
         for item, key in ((self.custom_acc_toggle, "CustomAccIncrementsEnabled"),
-                          (self.dec_toggle, "DynamicExperimentalControl"),
                           (self.scc_v_toggle, "SmartCruiseControlVision"),
                           (self.scc_m_toggle, "SmartCruiseControlMap")):
           item.action_item.set_enabled(False)

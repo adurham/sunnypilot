@@ -3,12 +3,12 @@ import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import log
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
@@ -18,65 +18,31 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 
-A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MIN = -1.2
-# fork (adurham): the cruise candidate ceiling (A_CRUISE_MAX) is the driver-felt "chase" cap — how hard the car pulls
-# on a raised set speed / a faster lead (drive 149 §1: it capped highway pulls at 0.6-0.8 m/s^2, personality-independent).
-# LongitudinalPersonality scales it: STANDARD = 1.0 reproduces upstream exactly, relaxed is gentler, aggressive harder.
-# Keys are the raw cereal enum values (0 = aggressive, 1 = standard, 2 = relaxed). The e2e ceiling (ACCEL_MAX) and the
-# pedal law's own cap are separate and untouched here.
-PERSONALITY_CRUISE_SCALE = {
-  log.LongitudinalPersonality.aggressive: 1.15,   # 0
-  log.LongitudinalPersonality.standard: 1.00,     # 1 (upstream)
-  log.LongitudinalPersonality.relaxed: 0.80,      # 2
-}
+J_CRUISE_BP = [0., 10.0, 25., 40.]
+A_CRUISE_MIN = -0.5
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
-ALLOW_THROTTLE_THRESHOLD = 0.4
-MIN_ALLOW_THROTTLE_SPEED = 2.5
 
-# Lookup table for turns
+
+# fork (G4): lookup table for the turn (lateral) accel budget. Upstream dropped it together with the chill/ACC cruise
+# path (#39097); the fork still needs it to turn-limit the e2e launch candidate below.
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
-def personality_scale(personality) -> float:
-  """Cruise-ceiling multiplier for a LongitudinalPersonality (raw value or capnp _DynamicEnum). Unknown -> standard."""
-  try:
-    pid = int(getattr(personality, 'raw', personality))
-  except (TypeError, ValueError):
-    pid = int(log.LongitudinalPersonality.standard)
-  return PERSONALITY_CRUISE_SCALE.get(pid, PERSONALITY_CRUISE_SCALE[log.LongitudinalPersonality.standard])
-
-def get_max_accel(v_ego, personality=log.LongitudinalPersonality.standard):
-  return personality_scale(personality) * float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
-
-def get_coast_accel(pitch):
-  return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
 def turn_accel_limit(v_ego, angle_steers, CP):
-  """Longitudinal accel budget left over after the lateral (turn) demand, from the same
-  a_total_max(v) ellipse the cruise candidate uses. Returns sqrt(a_total_max^2 - a_y^2) >= 0.
+  """Longitudinal accel budget left over after the lateral (turn) demand, from the a_total_max(v) ellipse
+  (formerly also used by the ACC cruise candidate). Returns sqrt(a_total_max^2 - a_y^2) >= 0.
   angle_steers is the effective (offset-removed) road-wheel angle in degrees; abs() so a
   left/right turn both limit."""
   a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
   a_y = abs(v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase))
   return math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
-                     personality=log.LongitudinalPersonality.standard):
-  max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego, personality)
 
-  if not e2e:
-    a_x_allowed = turn_accel_limit(v_ego, angle_steers, CP)
-    max_accel = min(max_accel, a_x_allowed)
-    if not allow_throttle:
-      clipped_accel_coast = max(accel_coast, ACCEL_MIN)
-      coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
-      max_accel = min(max_accel, coast_limit)
-
-  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)
-  j_cruise = np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS)
+def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt):
+  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, ACCEL_MAX)
+  j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
@@ -89,7 +55,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     LongitudinalPlannerSP.__init__(self, self.CP, CP_SP, self.mpc)
     self.fcw = False
     self.dt = dt
-    self.allow_throttle = True
+    self.accel_boost = AccelBoost()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -102,11 +68,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
   def update(self, sm):
     LongitudinalPlannerSP.update(self, sm)
-
-    if len(sm['carControl'].orientationNED) == 3:
-      accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
-    else:
-      accel_coast = ACCEL_MAX
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
@@ -122,11 +83,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
     reset_state = reset_state or not v_cruise_initialized
 
-    throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
-    throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
-    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
-
-    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
+    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg  # fork: G4
 
     if reset_state:
       self.v_desired_filter.x = v_ego
@@ -143,8 +100,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
-    self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
-    t_follow = LongitudinalPlannerSP.get_t_follow(self, sm, v_ego)
+    if self.CP.openpilotLongitudinalControl:
+      self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
+    else:
+      self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
+    t_follow = LongitudinalPlannerSP.get_t_follow(self, sm, v_ego)  # fork: adaptive follow distance (None = stock)
     self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality, t_follow=t_follow)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
@@ -173,17 +133,14 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                               max(turn_accel_limit(v_ego, steer_angle_without_offset, self.CP), 0.3))
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    is_e2e = self.is_e2e(sm)
-
-    self.a_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego,
-                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle, sm['selfdriveState'].personality)
+    self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
+    output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, output_a_target_mpc, self.a_cruise)
+
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
-                  (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
-    if is_e2e:
-      candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
+                  (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
+                  (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
@@ -210,9 +167,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     longitudinalPlan.fcw = self.fcw
 
     longitudinalPlan.aTarget = float(self.output_a_target)
+    longitudinalPlan.accelBoost = float(self.accel_boost.total_boost)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
-    longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
     pm.send('longitudinalPlan', plan_send)
 

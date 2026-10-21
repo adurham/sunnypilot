@@ -101,10 +101,10 @@ def write_supercombo_run_pkl(tmp_path, output_slices=None):
   layout. LegacyModelAdapter now reads a top-level `run_policy` JIT plus a
   `(cam_w, cam_h)` warp JIT; the old `'run_model': {(w, h): jit}` nesting is no
   longer accepted (KeyError: (1928, 1208)). Mirrors helpers.make_pkl_data().
-  Also note: dump_oob moved from openpilot.selfdrive.modeld.helpers to
-  openpilot.sunnypilot.modeld_v2.helpers.
+  922513f312 sync: upstream (#2050) replaced the OOB pickle with a plain artifact and dropped
+  dump_oob; like upstream's write_pkl(), this writes a plain pickle and relies on the
+  patch_modeld fixture stubbing modeld.load_model with pickle.loads.
   """
-  from openpilot.sunnypilot.modeld_v2.helpers import dump_oob
   if output_slices is None:
     output_slices = SUPERCOMBO_SLICES  # plan/hidden_state/meta; defined below
   pkl_data = {'metadata': {'model': {'input_shapes': SUPERCOMBO_RUN_INPUT_SHAPES,
@@ -112,8 +112,7 @@ def write_supercombo_run_pkl(tmp_path, output_slices=None):
               'run_policy': _noop_jit,
               (CAM_W, CAM_H): _noop_jit}
   pkl_path = tmp_path / 'driving_test_tinygrad.pkl'
-  with open(pkl_path, 'wb') as f:
-    dump_oob(pkl_data, f)
+  pkl_path.write_bytes(pickle.dumps(pkl_data))
   return pkl_path
 
 
@@ -241,10 +240,8 @@ def make_pkl_data(archetype):
 
 
 def write_pkl(tmp_path, archetype):
-  from openpilot.sunnypilot.modeld_v2.helpers import dump_oob
   pkl_path = tmp_path / 'driving_test_tinygrad.pkl'
-  with open(pkl_path, 'wb') as f:
-    dump_oob(make_pkl_data(archetype), f)
+  pkl_path.write_bytes(pickle.dumps(make_pkl_data(archetype)))
   return pkl_path
 
 
@@ -264,6 +261,7 @@ def patch_modeld(monkeypatch):
   def _patch(bundle):
     monkeypatch.setattr(helpers, 'get_active_bundle', lambda params=None, *, chestnut=None: bundle)
     monkeypatch.setattr(modeld_module, 'get_active_bundle', lambda params=None, *, chestnut=None: bundle)
+    monkeypatch.setattr(modeld_module, 'load_model', lambda path, **_: pickle.loads(pathlib.Path(path).read_bytes()))
 
   return _patch
 

@@ -38,6 +38,7 @@ RELEVANT = {EventName.buttonEnable, EventName.buttonCancel, EventName.wrongCarMo
 PK = CANPacker("hyundai_can_generated")
 PPK = CANPacker(gi.GAS_INTERCEPTOR_DBC)
 UP, DOWN, PAUSE = 1, 2, 4  # CF_Clu_CruiseSwState (route 00000128: RES/ACCEL 1 x23, SET/DECEL 2 x39, pause/resume 4 x5)
+INITIAL_CRUISE_SPEED_KPH = 40  # card.py: the InitialCruiseSpeedKph param default it hands initialize_v_cruise
 SHORT = 5                  # CLU11 samples (0.1 s): a short press
 LONG = 40                  # CLU11 samples (0.8 s): past CRUISE_LONG_PRESS (50 frames = 0.5 s), before the 2nd tick
 
@@ -79,7 +80,7 @@ class _Openpilot:
     self.enable_frames = []
     self.alerts = set()
 
-  def step(self, btn=0, brake=False, gas=False, main=False, v=20., experimental=False):
+  def step(self, btn=0, brake=False, gas=False, main=False, v=20.):
     """one 50 Hz CLU11 sample = two 100 Hz openpilot frames"""
     for sub in range(2):
       self.t += int(DT_CTRL * 1e9)
@@ -99,10 +100,13 @@ class _Openpilot:
       CS = CS.as_reader()
       CS_SP = CS_SP.as_reader() if hasattr(CS_SP, "as_reader") else CS_SP
 
-      # card.py order: update_v_cruise, then initialize on the enable edge using the previous CarState
+      # card.py order: update_v_cruise, then initialize on the enable edge using the previous CarState.
+      # 922513f312 upstream sync: initialize_v_cruise(CS, initial_speed) -- the experimental_mode /
+      # dynamic_experimental_control args are gone; card passes the InitialCruiseSpeedKph param (default 40), which the
+      # fork's pedal branch ignores.
       self.vch.update_v_cruise(CS, self.enabled, is_metric=self.is_metric)
       if self.enabled and not self.enabled_prev:
-        self.vch.initialize_v_cruise(self.CS_prev_card, experimental, False)
+        self.vch.initialize_v_cruise(self.CS_prev_card, INITIAL_CRUISE_SPEED_KPH)
       self.enabled_prev = self.enabled
       self.CS_prev_card = CS
 
@@ -252,12 +256,9 @@ class TestPedalButtons(OpenpilotTestCase):
     op.run(5, gas=True)
     assert op.enabled and op.vch.v_cruise_kph == v_set
 
-  def test_pause_in_experimental_mode_uses_current_speed(self):
-    # route 00000128 (experimental mode ON): SET at 26-30 mph gave a 105 km/h (65 mph) set speed. Must be ~vEgo now.
-    op = _Openpilot()
-    op.run(10, v=12., experimental=True)
-    op.press(PAUSE, v=12., experimental=True)
-    assert op.enabled and op.v_set_mph == 27
+  # removed at the 922513f312 upstream sync: there is no experimental mode (e2e longitudinal is always on) and the
+  # experimental-mode 105 km/h set-speed floor it tested no longer exists anywhere -- a fresh engage is vEgo-rounding
+  # in every case, which test_pause_resume_first_engage_at_current_speed already pins
 
   def test_metric_first_engage_rounds_to_kph(self):
     op = _Openpilot(is_metric=True)

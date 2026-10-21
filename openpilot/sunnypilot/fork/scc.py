@@ -183,8 +183,8 @@ class ForkSCCMap(SmartCruiseControlMap):
         best, best_i = d, i
     return (best, best_i) if best_i >= 0 else (-1., -1)
 
-  def update_calculations(self) -> None:
-    super().update_calculations()
+  def update_calculations(self, sm: messaging.SubMaster) -> None:
+    super().update_calculations(sm)  # upstream (#2064) reads the GPS position from sm instead of LastGPSPosition
     self.nearest_dist, self.nearest_idx = self._nearest()
 
     if self.nearest_idx < 0:
@@ -261,8 +261,8 @@ class ForkSCCMap(SmartCruiseControlMap):
     self._last_path_key = key
     self._last_path_frame = self.frame
 
-  def update(self, long_enabled: bool, long_override: bool, v_ego, a_ego, v_cruise) -> None:
-    super().update(long_enabled, long_override, v_ego, a_ego, v_cruise)
+  def update(self, sm: messaging.SubMaster, long_enabled: bool, long_override: bool, v_ego, a_ego, v_cruise) -> None:
+    super().update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
     self._log_diag()
     self._log_path()
 
