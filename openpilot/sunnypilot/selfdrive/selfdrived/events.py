@@ -321,8 +321,11 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # openpilot hands FCA11 back and stops injecting; it resumes on its own ~1.5 s after the camera's last braking frame.
   # Raised only while CarStateSP.fca11CameraBraking holds; no latch, no restart needed.
   EventNameSP.fca11CameraBraking: {
+    # AUDIBLE on purpose (review 2026-10-21): the hand-back pauses openpilot braking while the car may
+    # still be cruising toward a lead, so the driver has to hear it, not just catch a small text line.
+    # warningSoft (not warningImmediate) keeps it below a take-control alarm and it does not mask one.
     ET.WARNING: Alert("camera braking", "openpilot braking paused",
-                      AlertStatus.userPrompt, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
+                      AlertStatus.userPrompt, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.warningSoft, .2),
   },
 
   # fork (adurham), patch 0053: the panda refused FCA11 frames that only its camera hand-back can refuse while the car
