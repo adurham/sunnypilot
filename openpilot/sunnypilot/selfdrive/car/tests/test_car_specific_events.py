@@ -82,3 +82,44 @@ class TestPedalEvents:
     events, events_sp = _run(0., interceptor=False, button_enable=button_enable, non_adaptive=True)
     assert not events.has(EventName.manualRestart) and not events.has(EventName.belowEngageSpeed)
     assert len(events_sp) == 0
+
+
+class TestFca11CameraHandbackEvents:
+  """fork (0053): the camera hand-back is TRANSIENT (fca11CameraBraking) and no longer the permanent fca11Unavailable;
+  a Python <-> panda disagreement raises fca11Divergence, which takes precedence over the transient notice."""
+
+  def _run(self, unavailable=False, camera=False, divergence=False, armed=True):
+    CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
+                         openpilotLongitudinalControl=True)
+    CP_SP = SimpleNamespace(enableGasInterceptor=True, fca11Brake=armed)
+    CS_SP = SimpleNamespace(brakeNow=False, stopComplete=False, superviseStop=False, fca11Unavailable=unavailable,
+                            fca11CameraBraking=camera, fca11Divergence=divergence)
+    CS = SimpleNamespace(vEgo=20., buttonEvents=[], cruiseState=SimpleNamespace(nonAdaptive=False))
+    return CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, Events(), True)
+
+  def test_camera_braking_is_transient_not_unavailable(self):
+    ev = self._run(camera=True)
+    assert ev.has(EventNameSP.fca11CameraBraking)
+    assert not ev.has(EventNameSP.fca11Unavailable)
+
+  def test_divergence_wins_over_camera_braking(self):
+    ev = self._run(camera=True, divergence=True)
+    assert ev.has(EventNameSP.fca11Divergence)
+    assert not ev.has(EventNameSP.fca11CameraBraking)
+
+  def test_unavailable_still_raised_for_its_own_causes(self):
+    ev = self._run(unavailable=True)
+    assert ev.has(EventNameSP.fca11Unavailable)
+    assert not ev.has(EventNameSP.fca11CameraBraking)
+
+  def test_nothing_when_not_armed(self):
+    ev = self._run(camera=True, divergence=True, unavailable=True, armed=False)
+    for e in (EventNameSP.fca11CameraBraking, EventNameSP.fca11Divergence, EventNameSP.fca11Unavailable):
+      assert not ev.has(e)
+
+  def test_alert_definitions(self):
+    from openpilot.selfdrive.selfdrived.events import ET
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
+    assert ET.WARNING in EVENTS_SP[EventNameSP.fca11CameraBraking]
+    assert ET.PERMANENT in EVENTS_SP[EventNameSP.fca11Divergence]
+    assert "until restart" in EVENTS_SP[EventNameSP.fca11Unavailable][ET.PERMANENT].alert_text_2

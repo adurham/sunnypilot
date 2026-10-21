@@ -298,9 +298,10 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("N Mode: openpilot Long Off", "Drive mode N blocks openpilot longitudinal"),
   },
 
-  # fork (adurham), patches 0030 / 0042: FCA11-long braking is UNAVAILABLE for the REST OF THIS IGNITION. Three
-  # fail-closed causes now converge on this one alert (all published by CarStateExt as CarStateSP.fca11Unavailable):
-  #   - the panda HANDED FCA11 BACK to the stock camera (a bus-2 FCA11 actuation/warning frame), or
+  # fork (adurham), patches 0030 / 0042 / 0053: FCA11-long braking is UNAVAILABLE for the REST OF THIS IGNITION. Two
+  # fail-closed causes converge on this one alert (both published by CarStateExt as CarStateSP.fca11Unavailable).
+  # 0053: the camera hand-back is NO LONGER one of them (owner, 2026-10-21: "a camera WARNING must not stop openpilot
+  # braking ... do not latch until the next ignition") - it has its own transient alert, fca11CameraBraking, below.
   #   - a PEDAL FAULT latched the panda's cut (0042: mirrored in the car layer as _pedal_cut), or
   #   - the panda is REFUSING a sustained wall of our actuating 0x38D (0042: echo-confirmed, >= 3 consecutive
   #     refusals while braking -> _refused_cut).
@@ -314,5 +315,20 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # frame proves the panda is clear.
   EventNameSP.fca11Unavailable: {
     ET.PERMANENT: NormalPermanentAlert("FCA11 Braking Unavailable", "openpilot braking is off until restart"),
+  },
+
+  # fork (adurham), patch 0053: TRANSIENT - the stock camera is sending actual BRAKE commands (braking-class FCA11), so
+  # openpilot hands FCA11 back and stops injecting; it resumes on its own ~1.5 s after the camera's last braking frame.
+  # Raised only while CarStateSP.fca11CameraBraking holds; no latch, no restart needed.
+  EventNameSP.fca11CameraBraking: {
+    ET.WARNING: Alert("camera braking", "openpilot braking paused",
+                      AlertStatus.userPrompt, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
+  },
+
+  # fork (adurham), patch 0053: the panda refused FCA11 frames that only its camera hand-back can refuse while the car
+  # layer believed the camera was NOT braking - the two safety layers disagree. The car layer adopts the panda's view
+  # (pauses FCA11 braking); a third disagreement in one ignition withholds FCA11 until restart.
+  EventNameSP.fca11Divergence: {
+    ET.PERMANENT: NormalPermanentAlert("FCA11 Safety Mismatch", "openpilot braking paused - camera state disagrees"),
   },
 }

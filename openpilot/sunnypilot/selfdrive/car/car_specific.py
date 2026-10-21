@@ -77,6 +77,13 @@ class CarSpecificEventsSP:
         # (the opendbc half, CarStateExt): without it, openpilot silently plans stops it cannot execute.
         if self.CP_SP.fca11Brake and CS_SP.fca11Unavailable:
           events_sp.add(EventNameSP.fca11Unavailable)
+        # fork (adurham), patch 0053: the camera hand-back is no longer a latch. While the stock camera is BRAKING the
+        # driver sees a TRANSIENT notice that clears on its own when openpilot resumes; a Python <-> panda
+        # disagreement on that hand-back raises its own alert (the divergence guard, fca11_long.py).
+        if self.CP_SP.fca11Brake and CS_SP.fca11Divergence:
+          events_sp.add(EventNameSP.fca11Divergence)
+        elif self.CP_SP.fca11Brake and CS_SP.fca11CameraBraking:
+          events_sp.add(EventNameSP.fca11CameraBraking)
 
     elif self.CP.brand == 'toyota':
       if self.CP.openpilotLongitudinalControl:

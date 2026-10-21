@@ -365,6 +365,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     fca11SuperviseStop @31;  # fork (0040): steady YELLOW "supervise stop" while braking below 15 km/h (warning only)
     fca11StopComplete @32;  # fork (0040): steady YELLOW "stop complete - hold brake pedal" while holding at a stop (hand-off, NOT a cap)
     fca11BrakeNow @33;  # fork (0040): persistent RED "BRAKE NOW" - ESC non-response or hold lost; clears only on driver brake
+    fca11CameraBraking @34;  # fork (0053): TRANSIENT - the stock camera is braking, openpilot braking paused (resumes on its own)
+    fca11Divergence @35;  # fork (0053): panda refused FCA11 while the car layer saw no camera braking (Python <-> panda disagreement)
   }
 }
 
@@ -488,6 +490,8 @@ struct CarStateSP @0xb86e6369214c01c8 {
   nModeRevMatch @15 :UInt8;     # 0 off / 1 on
   nModeELSD @16 :UInt8;         # 0 Normal / 1 Sport / 2 Sport+
   nModeSteering @17 :UInt8;     # 0 Comfort / 1 Normal / 2 Sport
+  fca11CameraBraking @18 :Bool;  # fork (0053): TRANSIENT - stock camera braking, openpilot braking paused (self-releasing)
+  fca11Divergence @19 :Bool;     # fork (0053): panda refused FCA11 while the car layer saw no camera braking
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
