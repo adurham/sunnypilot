@@ -27,30 +27,26 @@ card computed.
 
 Sources for the numbers
 -----------------------
-* Curb weight 3,296 lb (2022 Elantra N DCT): Hyundai 2022 Elantra product
-  guide (N DCT curb 3,296 lb), Edmunds, MotorTrend first-test spec panels.
+* (Curb weight 3,296 lb is no longer applied: upstream removed CarParams.mass.)
 * Overall steering gear ratio 12.2:1: Hyundai Elantra N published steering
   specification (rack-and-pinion, 2.2 turns lock-to-lock).
 * wheelbase 2.72 m and tireStiffnessFactor 0.65 are already correct for the N
   (same CN7 platform, 107.1 in wheelbase) — deliberately not overridden.
 """
-# upstream removed STD_CARGO_KG from opendbc.car in the car-mass change (#39072, landed with the
-# 922513f312 sync); the convention it encoded — a 136 kg driver/payload allowance added to the
-# curb weight — is kept here so mass maths is unchanged.
-STD_CARGO_KG = 136.0
 from opendbc.car import structs
 
 LB_TO_KG = 0.453592
 
 # Keyed by the fingerprint string the car actually resolves to at runtime.
 #
-# mass is CURB weight, matching how platform CarSpecs express it. This hook runs
-# after CarInterfaceBase.get_params() has already added STD_CARGO_KG (136 kg,
-# upstream's assumed driver/payload), so the same allowance is added here to
-# land on the identical convention: curb + cargo.
+# NO "mass" key: upstream removed CarParams.mass (opendbc "Remove car mass", moved to
+# CarParams.deprecated.mass in the 922513f312 sync). Vehicle dynamics are mass-normalised
+# (rotationalInertiaPerMass / tireStiffness*PerMass), so no consumer reads mass any more, and
+# assigning CP.mass raises "struct has no such member" -> card crash-loops at every ignition.
+# Add a key here only after checking it exists in opendbc/car/car.capnp (test_vehicle_specs
+# asserts every key is a live CarParams field).
 FORK_VEHICLE_SPECS: dict[str, dict[str, float]] = {
   "HYUNDAI_ELANTRA_2022_NON_SCC": {
-    "mass": 3296 * LB_TO_KG,  # [kg] N DCT curb weight (base Elantra spec: 2800 lb)
     "steerRatio": 12.2,       # [] N rack ratio (base Elantra spec: 12.9)
     # [] true speed / wheel-speed speed. Measured on routes 00000127+00000128 (46 km): GPS doppler/vEgo 1.0125,
     # GPS position distance/vEgo distance 1.0131 (127: 1.0118/1.0109), flat across 12-36 m/s. Upstream default 1.0
@@ -67,7 +63,6 @@ def apply_fork_vehicle_specs(CP: structs.CarParams) -> bool:
   if spec is None:
     return False
 
-  CP.mass = spec["mass"] + (0. if CP.notCar else STD_CARGO_KG)
   CP.steerRatio = spec["steerRatio"]
   if "wheelSpeedFactor" in spec:
     # CarState reads CP.wheelSpeedFactor live (CarStateBase.parse_wheel_speeds) and holds this same CP object, so the
