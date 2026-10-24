@@ -1,7 +1,8 @@
 # CYCLE 1 — far-lead e2e gate (planner only)
 
-Branch `cycle1-early-brake` from `adurham/main` `5e162a6786`. Not pushed, not deployed. Brake law, gain, onset
-thresholds, panda and firmware are untouched.
+Branch `cycle1-early-brake` from `adurham/main` `5e162a6786`. Not pushed, not deployed. Gain, onset
+thresholds, release, panda and firmware are untouched. The one brake-law change is the crawl dwell escape (opendbc patch
+`0005`, section "Under-brake fix" below).
 
 ## Change
 
@@ -114,3 +115,106 @@ simulated.
 - FCA11 episode counts under the new plan.
 - Behaviour on routes other than 167/168.
 - Any acceptance number for the AccelBoost interaction when the gate changes boost eligibility.
+
+# Under-brake fix — FCA11 crawl dwell escape (opendbc patch `0005`)
+
+## Defect
+
+Route 167 seg 9, 15:50:36.69–39.34 CDT: the car crept from 1.13 to 1.49 m/s toward a lead closing 6.4 → 3.4 m with
+no brake for 2.65 s. The ask stayed ≤ −0.5 for 74 frames, lifted to −0.459 for about 53 frames, then stayed ≤ −0.5 for
+68 frames (14 of them ≤ −0.60). Above the 3 km/h hold band a new episode needs 20 frames ≤ −0.60, an ask ≤ −1.2, or the
+1.0 s dwell (100 consecutive frames ≤ −0.5). None was met (evidence: `wsSTOP/feel-167-168/underbrake/VERDICT.md`).
+
+## Change
+
+`opendbc/sunnypilot/car/hyundai/fca11_long.py`, feel path only: a second, strict counter `_feel_dwell_slow` counts the
+same qualifying frames as the dwell (ok ∧ ask ≤ −0.5) only while vEgo < `FCA11_FEEL_DWELL_SLOW_MPS` (2.0 m/s). Any other
+frame resets it. It opens an episode at `FCA11_FEEL_DWELL_SLOW_FRAMES` (70 = 0.7 s). Because the counter is strict, a car
+slowing through 2 m/s cannot open off frames it counted at speed. At or above 2 m/s the 100-frame dwell is unchanged.
+Gain, release (−0.30), min-on, bypass, coast-first, camera hand-back, panda and planner are untouched. The counter is
+cleared on a longActive drop and on a feature disable, the same as `_feel_dwell`.
+
+## Variant replay
+
+Method: an open-loop frame replay of the validated gate (`underbrake/gate_replay.py`, which matches 135/155 real brake
+starts within 60 ms), changing only the dwell counter. Scripts and JSON are in `wsSTOP/feel-167-168/underbrake-fix/`
+(`variant_replay.py`, `sweep.py`, `final_table.json`). The replay asserts it reproduces `gate_replay.sim` exactly for
+the deployed configuration. Column definitions:
+- "standstills perturbed": the 27 approach windows (t_stop − 30 s … t_stop + hold) where the brake command differs.
+- "changed openings": every episode opening, route-wide, that the deployed gate does not have.
+- "standalone": a new brake run that does not overlap any deployed run.
+
+| variant | seg 9 opens (15:…) | standstills perturbed /27 | changed openings | of them > 2 m/s (max) | standalone pulses (speed) | added brake-on: stop windows / route-wide |
+|---|---|---|---|---|---|---|
+| A: DWELL 100 → 70, all speeds | 50:37.99 | 11 | 38 | 36 (26.4 m/s) | 1.31, **12.32, 4.76** m/s | 4.73 s / 14.71 s |
+| B: leak −2 per above frame | not covered | 12 | 0 | 0 | none | 19.54 s / 101.42 s |
+| B: leak −3 per above frame | not covered | 12 | 0 | 0 | none | 15.59 s / 71.61 s |
+| B: reset after 2 consecutive above | not covered | 10 | 0 | 0 | none | 0.13 s / 0.12 s |
+| B: reset after 3 consecutive above | not covered | 10 | 0 | 0 | none | 0.26 s / 0.24 s |
+| B′: freeze in (−0.50, −0.45], all speeds | 50:38.88 | 2 | 4 | 3 (11.2 m/s) | 1.46 m/s | 1.19 s / 1.92 s |
+| B′: freeze in (−0.50, −0.45], v < 2 m/s | 50:38.88 | 1 | 1 | 0 | 1.46 m/s | 0.42 s / 0.42 s |
+| **Landed: dwell 70 while v < 2 m/s (strict)** | **50:37.99** | **3** | **2** | **0 (1.39 m/s)** | 1.31 m/s (seg 9 itself) | 1.82 s / 1.52 s |
+
+The landed variant's 3 windows are 167-s9 (+1.22 s) and 167-s25 16:07:01 / 16:07:23 (+0.30 s each). The s25 entries are
+one window counted twice, so this is 2 distinct approaches. The s25 opening is at 16:06:59.89, 1.39 m/s, ask −0.58 and
+deepening. The deployed gate opens 0.33 s later on the same ask, so this is not a new pulse. No variant loses brake-on
+time (0 s lost everywhere). Scoping the landed variant to 1.5 m/s gives identical results. A non-strict scoped variant
+(the speed checked only at the open) gives identical numbers on these drives, but it is weaker in principle, so the strict
+form was landed.
+
+## Selection
+
+- **Brief A is rejected by the at-speed rule.** 36 of its 38 changed openings are above 2 m/s (up to 26 m/s), and it adds
+  standalone pulses at 12.3 and 4.8 m/s. That is the owner's early-braking-at-speed complaint.
+- **Brief B (dropout tolerance) cannot fix this defect.** The lift is a 53-frame shallow dip, not a dropout:
+  - A leak of 2 or 3 per frame drains the count. Counting 2–3 frames before a reset still resets inside the dip.
+  - With 100 frames needed, the earliest any dropout-tolerant counter can open is about 15:50:38.23, after the brief's
+    15:50:38 target.
+  - The leak forms also keep the dwell latched after the ask rises above −0.30, so episodes run past the release rule
+    (+72 to +101 s). That is a release change and out of scope.
+- **The freeze-in-band B′ scoped below 2 m/s is the narrowest variant (1 window), but it opens at 15:50:38.88.** That is
+  0.46 s before the driver braked. The VERDICT already judged an open 0.35 s before the driver too late, so B′ does not
+  fix the defect.
+- **The landed variant is A's constant, scoped to the crawl regime.** It meets the coverage bar (1.35 s before the driver)
+  and passes the reject rule. Strictly, it departs from the brief's two literal variants. A reference-model review agreed
+  with this pick and asked that the deviation be stated, which it is here.
+
+## Verification
+
+- **Real class on the logged stream:** the patched `Fca11LongBrake` was driven with the logged 167 15:50:20–39.34
+  carControl/carState (`underbrake-fix/real_class_seg9.py`). It opens at **15:50:37.99, 1.31 m/s**. With the escape
+  disabled it does not open.
+- **Tests:** new `test_fca11_crawl_dwell.py` has 12 tests:
+  - opens at exactly 70 frames;
+  - 100 frames at 2.0, 2.5, 5, 12 and 25 m/s;
+  - strictness: frames counted at speed are ignored, and crossing 2 m/s resets;
+  - a lift above −0.5 resets, and the gas/`ok` veto plus the hold-off resets;
+  - the seg-9 ask shape opens while crawling, and the deployed gate does not open on it;
+  - the episode holds through the −0.48 lift;
+  - FEEL off: the counter never runs;
+  - disengage and feature-disable both reset.
+- **Suite:** `opendbc/sunnypilot/car/hyundai/tests` + `opendbc/car/hyundai/tests` (pytest) went from 718 passed to
+  **730 passed**, with 2 skipped. The skips are pre-existing Santa Cruz parametrized subtests ("Skip checking Santa Cruz
+  for its parts", "No part numbers for car model"), with the same count on the unpatched series.
+- **Mutation:** **14/14 killed**, run in a scratch copy with `PYTHONDONTWRITEBYTECODE=1` and `__pycache__` cleared. The
+  mutants:
+  - the speed limit set to 2.5 and to 1.5, and `<` changed to `<=`;
+  - 69 and 71 frames, and `>=` changed to `>`;
+  - the speed scope dropped, `ok` dropped, `feel` dropped;
+  - a non-strict hold, the onset hook removed, the threshold set to the release value;
+  - no reset on a longActive drop, no reset on disable.
+- **Series:**
+  - Rehearsal: a pristine clone at pin `e3f1487d`, then the `LC_ALL=C`-sorted `patches/*.patch` (`0001`, `0002`, `0003`,
+    `0005`) applied with plain `git apply`: 4/4 applied. The resulting tree is `diff -r` identical to the worktree's
+    `opendbc_repo`. `fca11_long.py` sha256 is `c8308e69…` and the test file is `3c26d03a…`.
+  - `0005` refuses to apply alone on a pristine pin, because it depends on `0002`.
+  - `check_patch_numbers` passes: 4 series + 1 panda, unique (`0004` is the panda patch).
+
+## Not verified (under-brake fix)
+
+- Closed-loop behaviour: the replay is open-loop, and the planner would re-plan after an earlier brake.
+- On-car feel at the crawl open: soft ramp from 4 LSB, the measured plant is about 1 m/s² at 4–5 LSB.
+- Routes other than 167/168.
+- Interaction with the camera hand-back and the one-slot release-pending delay, which the replay does not model (the
+  real-class run uses a quiet camera).
+- Nothing pushed, built into a prebuilt, or deployed.
