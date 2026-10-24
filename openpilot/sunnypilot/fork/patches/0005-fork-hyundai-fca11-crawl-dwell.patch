@@ -66,10 +66,10 @@ index 42535391..f0e2581a 100644
      want_brake = bool(onset or holding or cal_on)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
 new file mode 100644
-index 00000000..ad8db8a5
+index 00000000..374a4c3b
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +"""
 +Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 +
@@ -152,7 +152,9 @@ index 00000000..ad8db8a5
 +  def test_seg9_shape_opens_while_crawling(self):
 +    # the logged 167 seg-9 ask: 74 frames -0.56..-0.50, 53 frames -0.50..-0.46, 68 frames -0.51..-0.62 (14 <= -0.60)
 +    asks = [-0.52] * 74 + [-0.48] * 53 + [-0.55] * 54 + [-0.61] * 14
-+    v = lambda f: 1.25 + 0.25 * f / len(asks)
++
++    def v(f):
++      return 1.25 + 0.25 * f / len(asks)
 +    b = _brake(True)
 +    self.assertEqual(SLOW - 1, _first_open(b, asks, v), "opens inside the first 74-frame run (log: 15:50:37.99)")
 +    self.assertTrue(b.braking)

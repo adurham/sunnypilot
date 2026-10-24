@@ -212,7 +212,7 @@ form was landed.
 
 ## Not verified (under-brake fix)
 
-- Closed-loop behaviour: the replay is open-loop, and the planner would re-plan after an earlier brake.
+- Closed-loop behavior: the replay is open-loop, and the planner would re-plan after an earlier brake.
 - On-car feel at the crawl open: soft ramp from 4 LSB, the measured plant is about 1 m/s² at 4–5 LSB.
 - Routes other than 167/168.
 - Interaction with the camera hand-back and the one-slot release-pending delay, which the replay does not model (the
