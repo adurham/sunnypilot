@@ -42,6 +42,12 @@ E2E_GATE_STAY_TTC = 8.0
 E2E_GATE_STAY_VREL = -3.5
 E2E_GATE_STAY_MPC = -0.2
 E2E_GATE_ENTER_FRAMES = 10    # 0.5 s at 20 Hz
+# lead-decel veto (cycle 1 audit, 168 17:14:55): the gate may not enter, and drops at once, while the lead is braking.
+# leadOne.aLeadK is the lead's ABSOLUTE accel (m/s^2, negative = lead decelerating): radard's Kalman accel state for a
+# radar track, or modelV2.leadsV3[0].a[0] for a vision-only lead (get_RadarState_from_vision; on the Elantra N every
+# lead is vision-only). It is the same value the MPC extrapolates the lead with (long_mpc.process_lead).
+E2E_GATE_ENTER_ALEAD = -0.5   # m/s^2, enter only while aLeadK > this
+E2E_GATE_STAY_ALEAD = -0.8    # m/s^2, exit the first frame aLeadK <= this
 
 
 def turn_accel_limit(v_ego, angle_steers, CP):
@@ -88,6 +94,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     (TTC > 12 s) and the MPC candidate is not braking, the vision model's accel wish may not undercut the MPC: e2e is
     raised to the MPC value. RAISE ONLY. Enters after 10 consecutive qualifying frames (0.5 s at 20 Hz), exits on the
     first frame the looser stay test fails (gap < 1.1x, TTC < 8 s, vRel < -3.5, MPC < -0.2: a cut-in drops it at once).
+    Lead-decel veto: enter needs aLeadK > -0.5, stay needs aLeadK > -0.8, so the gate is never active while the lead is
+    braking (a far but braking lead is exactly when the model's early ask must be kept).
 
     d_des matches the MPC's steady follow distance: get_safe_obstacle_distance(v_ego, t_follow) minus the lead's
     stopped-equivalence term is STOP_DISTANCE + t_follow * v_ego at equal speeds, with the same t_follow the MPC got."""
@@ -95,9 +103,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     ttc = lead.dRel / max(-lead.vRel, 0.1)
     base = lead.present and v_ego > E2E_GATE_MIN_SPEED and not should_stop_e2e
     enter = (base and lead.dRel > E2E_GATE_ENTER_GAP * d_des and ttc > E2E_GATE_ENTER_TTC and
-             lead.vRel > E2E_GATE_ENTER_VREL and output_a_target_mpc >= E2E_GATE_ENTER_MPC)
+             lead.vRel > E2E_GATE_ENTER_VREL and output_a_target_mpc >= E2E_GATE_ENTER_MPC and
+             lead.aLeadK > E2E_GATE_ENTER_ALEAD)
     stay = (base and lead.dRel > E2E_GATE_STAY_GAP * d_des and ttc > E2E_GATE_STAY_TTC and
-            lead.vRel > E2E_GATE_STAY_VREL and output_a_target_mpc >= E2E_GATE_STAY_MPC)
+            lead.vRel > E2E_GATE_STAY_VREL and output_a_target_mpc >= E2E_GATE_STAY_MPC and
+            lead.aLeadK > E2E_GATE_STAY_ALEAD)
     if self.e2e_gate:
       self.e2e_gate = bool(stay)  # exit is immediate
       self.e2e_gate_cnt = 0

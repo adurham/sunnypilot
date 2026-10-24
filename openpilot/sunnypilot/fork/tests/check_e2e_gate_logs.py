@@ -4,7 +4,7 @@ Logged-signal harness for the cycle-1 far-lead e2e gate (longitudinal_planner.Lo
 
 Replays ONLY the gate decision over recorded drives, open-loop: every input comes from the rlogs of the planner
 frame being replayed:
-  radarState.leadOne (present/dRel/vRel/vLead), carState (vEgo/aEgo/steeringAngleDeg/vCruise),
+  radarState.leadOne (present/dRel/vRel/vLead/aLeadK), carState (vEgo/aEgo/steeringAngleDeg/vCruise),
   vehicleParameters.angleOffsetDeg, modelV2.action (desiredAcceleration/shouldStop, matched by modelMonoTime),
   longitudinalPlan (source/aTarget/shouldStop/accelBoost/speeds/accels), liveMapDataSP.roadType (adaptive follow),
   selfdriveState (enabled/personality), carControl.longActive, controlsState, longitudinalPlanSP.vTarget.
@@ -37,7 +37,7 @@ DEFAULT_ROUTES = ['00000167--0bfe2c0c45', '00000168--d69017f041']
 SRC = {'cruise': 0, 'lead0': 1, 'lead1': 2, 'lead2': 3, 'e2e': 4}
 COLS = ['t', 'a_old', 'src', 'ss_old', 'boost', 'mpc', 'md_mono', 'md_ss', 'md_found', 'l_present', 'l_drel', 'l_vrel',
         'l_vlead', 'v', 'a_ego', 'steer', 'vcruise_kph', 'offset', 'enabled', 'pers', 'long_active', 'lcs_off',
-        'force_decel', 'vtarget_sp', 'road', 'seg']
+        'force_decel', 'vtarget_sp', 'road', 'seg', 'l_alead']
 MD_A = len(COLS)  # the raw model accel is appended after COLS at route level
 ROAD = {'urban': 0, 'highway': 1, 'interstate': 2, 'unknown': 3}
 ROAD_INV = {v: k for k, v in ROAD.items()}
@@ -53,6 +53,7 @@ def extract_segment(args):
   t_idx = ModelConstants.T_IDXS[:CONTROL_N]
   st = {'l': (0, 0., 0., 0.), 'cs': (0., 0., 0., 255.), 'off': 0., 'en': 0, 'pers': 1, 'la': 0, 'lcs_off': 1, 'fd': 0, 'vt': 255.,
             'road': 3}
+  st_l_alead = 0.
   rows, models, meta = [], [], {}
   for m in LogReader(f'{ROUTES_DIR}/{route}--{seg}/rlog.zst'):
     w = m.which()
@@ -72,6 +73,7 @@ def extract_segment(args):
     elif w == 'radarState':
       ld = m.radarState.leadOne
       st['l'] = (int(ld.present), ld.dRel, ld.vRel, ld.vLead)
+      st_l_alead = ld.aLeadK
     elif w == 'carState':
       c = m.carState
       st['cs'] = (c.vEgo, c.aEgo, c.steeringAngleDeg, c.vCruise)
@@ -98,7 +100,7 @@ def extract_segment(args):
       rows.append((m.logMonoTime * 1e-9, p.aTarget, SRC.get(str(p.longitudinalPlanSource), 9), int(p.shouldStop),
                    p.accelBoost, mpc, float(p.modelMonoTime), 0, 0,
                    *st['l'], *st['cs'][:3], st['cs'][3], st['off'], st['en'], st['pers'], st['la'], st['lcs_off'],
-                   st['fd'], st['vt'], st['road'], seg))
+                   st['fd'], st['vt'], st['road'], seg, st_l_alead))
   return (np.array(rows, dtype=np.float64).reshape(-1, len(COLS)), np.array(models, dtype=np.float64).reshape(-1, 3),
           meta)
 
@@ -107,7 +109,9 @@ def extract_route(route, cache_dir):
   cache = os.path.join(cache_dir, f'{route[:8]}.npz')
   meta_f = cache[:-4] + '.meta.json'
   if os.path.exists(cache) and os.path.exists(meta_f):
-    return np.load(cache)['rows'], json.load(open(meta_f))
+    rows = np.load(cache)['rows']
+    if rows.shape[1] == len(COLS) + 1:  # a cache from an older column set is re-extracted
+      return rows, json.load(open(meta_f))
   segs = sorted(int(re.match(r'.*--(\d+)$', d).group(1)) for d in os.listdir(ROUTES_DIR)
                 if d.startswith(route + '--') and os.path.exists(f'{ROUTES_DIR}/{d}/rlog.zst'))
   with ProcessPoolExecutor(max_workers=min(12, os.cpu_count() or 4)) as ex:
@@ -171,7 +175,8 @@ def replay(rows, meta):
   for i in range(n):
     r = rows[i]
     v = r[C['v']]
-    lead = SimpleNamespace(present=bool(r[C['l_present']]), dRel=r[C['l_drel']], vRel=r[C['l_vrel']])
+    lead = SimpleNamespace(present=bool(r[C['l_present']]), dRel=r[C['l_drel']], vRel=r[C['l_vrel']],
+                           aLeadK=r[C['l_alead']])
     tf = af.update(int(r[C['pers']]), v, ROAD_INV[int(r[C['road']])], lead.present, r[C['l_vlead']])
     if tf is None:
       tf = get_T_FOLLOW(int(r[C['pers']]))
@@ -218,6 +223,7 @@ def load_phantom_onsets(r8, t0):
 
 
 def main():
+  from openpilot.selfdrive.controls.lib import longitudinal_planner as lp
   from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
   ap = argparse.ArgumentParser()
   ap.add_argument('--routes', nargs='+', default=DEFAULT_ROUTES)
@@ -290,7 +296,9 @@ def main():
       checks = ((rows[i, C['l_present']] < 0.5, 'no lead'), (v[i] <= 3., 'v<=3'),
                 (rows[i, C['md_ss']] > 0.5, 'model shouldStop'), (dr <= 1.2 * dd, f'gap {dr / dd:.2f}x<=1.2'),
                 (ttc <= 12., f'ttc {ttc:.1f}<=12'), (vr <= -3., f'vRel {vr:.1f}<=-3'),
-                (mpc[i] < -0.1, f'mpc {mpc[i]:.2f}<-0.1'))
+                (mpc[i] < -0.1, f'mpc {mpc[i]:.2f}<-0.1'),
+                (rows[i, C['l_alead']] <= lp.E2E_GATE_ENTER_ALEAD,
+                 f'aLeadK {rows[i, C["l_alead"]]:.2f}<={lp.E2E_GATE_ENTER_ALEAD}'))
       why = [txt for bad, txt in checks if bad]
       return ', '.join(why) or 'enter count < 10 frames'
     o4c = [at_onset(e) for e in eps if e['why'].startswith('4c') and e['binder'] == 'model']

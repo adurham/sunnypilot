@@ -218,3 +218,112 @@ form was landed.
 - Interaction with the camera hand-back and the one-slot release-pending delay, which the replay does not model (the
   real-class run uses a quiet camera).
 - Nothing pushed, built into a prebuilt, or deployed.
+
+
+# Lead-deceleration veto (BRIEF G, after the gate audit)
+
+The audit (`~/comma-sim/wsSTOP/feel-167-168/gate-audit/AUDIT.md`) failed the gate's safety rule. At 168 17:14:55 the
+lead braked at about −1.0 to −1.7 m/s², and the gate discarded a −0.73 e2e ask for about 1.3 s.
+
+## Change
+
+- `update_e2e_gate()` adds `lead.aLeadK > E2E_GATE_ENTER_ALEAD` (−0.5) to **enter** and
+  `lead.aLeadK > E2E_GATE_STAY_ALEAD` (−0.8) to **stay**.
+- Nothing else changed: raise-only, the 10-frame delay, gap/TTC/vRel/MPC terms, turn-limit placement, law `0005`, gain.
+- **Sign convention, from the code:** `radarState.leadOne.aLeadK` is the lead's **absolute** accel in m/s².
+  Negative means the lead is braking.
+  - For a radar track it is `radard.Track.aLeadK = kf.x[ACCEL]`, the KF1D accel state on `vLead`.
+  - For a vision lead it is `get_RadarState_from_vision`'s `modelV2.leadsV3[0].a[0]`.
+  - The MPC uses the same value (`long_mpc.process_lead`: `a_lead = lead.aLeadK`).
+- **Caveat: on 167/168 every lead frame is vision-only** (`radar` = False, `radarTrackId` = −1 on 100 % of lead
+  frames). So the veto runs on the model's lead-accel estimate, not a radar Kalman state.
+  - This is still the signal the follow MPC uses.
+  - It agrees with the audit's independent series: p99 |Δ| 0.08 / 0.09 m/s².
+- No `vRel` derivative and no TTC-shrink term were added.
+- Harness: `check_e2e_gate_logs.py` now extracts `leadOne.aLeadK` per plan frame (new column `l_alead`; the cache is
+  re-extracted when the column set changes) and passes it to the real gate.
+- Audit re-run: `~/comma-sim/wsSTOP/feel-167-168/lead-veto/audit_veto.py` → `veto_audit.json`, `veto_bad_frames.json`.
+  - It reuses the committed `extract_route`/`replay` and the audit's LS2/Q2 estimators unchanged.
+  - Variants patch the two constants in-process. `noveto` reproduces the audit (0 lowered, 26 frames ≤ −1.0, set B
+    209/217).
+
+## Measured trade-off (pooled 167 + 168, open-loop)
+
+Column notes:
+- Bad aLeadK: gate active ∧ aLeadK ≤ −1.0 ∧ TTC shrinking.
+- LS2 / LS2&Q2: the audit's −1.5 rule.
+- Set B: the audit's engaged ∧ e2e ∧ old-enter-predicate frames with aTarget < −0.5 that were raised.
+- Onsets: out of the 33 addressable lead-present e2e 4c onsets.
+
+| variant (enter/stay) | bad aLeadK ≤ −1.0 | LS2 / LS2&Q2 ≤ −1.5 | lowered | set B raised | onsets | stops first-ask unchanged |
+|---|---|---|---|---|---|---|
+| noveto | 26 | 35 / 17 | 0 | 209/217 = 96.3 % | 30/33 | 12/15, lost 0 |
+| veto_-0.5/-0.8 | 0 | 13 / 8 | 0 | 146/217 = 67.3 % | 29/33 | 14/15, lost 0 |
+| enter-0.3 | 0 | 13 / 8 | 0 | 136/217 = 62.7 % | 29/33 | 14/15, lost 0 |
+| enter-0.7 | 0 | 13 / 8 | 0 | 161/217 = 74.2 % | 29/33 | 14/15, lost 0 |
+| stay-0.6 | 0 | 7 / 3 | 0 | 134/217 = 61.8 % | 27/33 | 15/15, lost 0 |
+| stay-1.0 | 0 | 17 / 8 | 0 | 152/217 = 70.0 % | 29/33 | 13/15, lost 0 |
+| loosest_-0.7/-1.0 | 0 | 17 / 8 | 0 | 167/217 = 77.0 % | 29/33 | 13/15, lost 0 |
+
+## Acceptance (committed −0.5 / −0.8)
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Gate-active ∧ aLeadK ≤ −1.0 ∧ TTC shrinking | **0** (was 26). Gate-active aLeadK minimum −0.79 / −0.76. **PASS** |
+| 2 | Plan lowered, pooled | **0** of 65,505; e2e lowered 0. **PASS** |
+| 3 | Set B raise fraction (≥ 80 %) | **146/217 = 67.3 %** (was 96.3 %). **FAIL.** Best allowed setting −0.7/−1.0: 76.96 %, still FAIL |
+| 4 | Onset coverage (33) | **29/33** (was 30/33). The new miss is 167 16:15:16. A single-frame vision aLeadK spike of −1.10 at 16:15:16.18 dropped the gate, which was still inside its 10-frame re-entry at the onset. aLeadK was +0.04 on the next frame. The vision aLeadK has such 1-frame spikes, and the veto acts on them by design: it errs toward keeping the brake ask |
+| 5 | Stops | `shouldStop` changed 0; gate on model-shouldStop frames 0. Standstill plan changes 0. No stop lost its brake. **14/15** first-ask unchanged vs the base build (was 12/15). The one change is 167 16:00:38: 28.51 → 28.16 s, the same as before the veto. **PASS** |
+| 6 | Unit tests | `test_e2e_far_lead_gate.py` **25 passed, 0 skipped** (was 17). 8 of them fail with the veto reverted. **PASS** |
+
+**Why #3 fails.** Of the 63 set-B frames that lost their raise:
+- 12 had aLeadK ≤ −0.8 (stay veto).
+- 24 were in the −0.8 … −0.5 band, during an entry being blocked.
+- 27 had aLeadK > −0.5 on the frame itself, still inside the 10-frame re-entry after a veto earlier in the episode.
+- 31 of the 63 have LS2 ≤ −1.0.
+
+Most of what is lost is the lead actually slowing: 168 17:14:55 is 13 of these frames, 167 15:56:40 is 25. This is
+the trade the veto exists for.
+
+Set B restricted to frames that also pass the new enter term is 131/164 = 79.9 %.
+
+**Inside the brief's bounds (±0.2 per threshold), #3 cannot be met without giving up #1's intent.** Relaxing #3, or
+re-defining set B to exclude braking-lead frames, is the brief owner's call. It was not changed here.
+
+**17:14:55 (168), replayed:**
+- The gate drops at 17:14:55.33 (aLeadK −0.81), and from then on aTarget equals the logged plan (−0.47 → −0.68).
+- Without the veto it held +0.29 → −0.14 until 17:14:56.58.
+- That is about 1.25 s of e2e braking restored.
+
+**Remaining LS2 ≤ −1.5 frames (13, aLeadK all > −0.8). These are the audit's noise / identity-switch episodes:**
+- 167 16:05:10.30: not engaged.
+- 168 16:39:25.04–25.29: aLeadK −0.74 … −0.60, raw −0.50 → +0.39.
+- 168 16:59:54.84–55.29.
+- 168 17:00:01.59.
+- 168 17:09:38.53.
+
+Of these, three episodes are LS2&Q2 (8 frames): 16:39:25, 16:59:54, 17:09:38. 167 16:15:16–17 (aLeadK −1.28) and
+168 17:14:55 are gone.
+
+## Tests (veto)
+
+- `test_e2e_far_lead_gate.py`: 25 passed, no skips. New tests:
+  - sign / hysteresis order;
+  - a hard-braking lead (−0.5 … −3.0) blocks entry and resets the enter count;
+  - −0.8 / −1.0 / −1.7 drop the stay on the same frame, with the ask passed through;
+  - the −0.6 stay band;
+  - a mildly braking lead (−0.3) still gates;
+  - the 168 17:14:55 shape from the logged values;
+  - a planner-level lockstep check: a braking 4× lead is bit-exact with ungated, with a non-vacuous control.
+- The exit-is-immediate and 20k randomized raise-only tests now include aLeadK.
+- `fork/tests` + `selfdrive/controls/tests` (excluding `test_leads.py`): **515 passed, 2 skipped, 18 failed, 9 errors**.
+  The failures are the same pre-existing environment set as above: following_distance 7, latcontrol 5 + 1,
+  cruise_prefs 2, cal_consent_big_ui 9 errors.
+- `ruff`: clean.
+
+## Not verified (veto)
+
+- Closed loop. On-car feel.
+- Radar-track leads: this car's leads are vision-only, so the radar-Kalman `aLeadK` path is untested on logs.
+- Routes other than 167/168.
+- Nothing pushed or deployed.

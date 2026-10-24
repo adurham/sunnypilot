@@ -29,8 +29,8 @@ def d_des(v):
   return STOP_DISTANCE + T_FOLLOW * v
 
 
-def lead(present=True, d_rel=60., v_rel=-1.):
-  return SimpleNamespace(present=present, dRel=d_rel, vRel=v_rel)
+def lead(present=True, d_rel=60., v_rel=-1., a_lead=0.):
+  return SimpleNamespace(present=present, dRel=d_rel, vRel=v_rel, aLeadK=a_lead)
 
 
 class GateOnly:
@@ -100,6 +100,7 @@ class TestGateLogic(OpenpilotTestCase):
       'ttc<8': {'ld': lead(d_rel=1.5 * d_des(V), v_rel=-1.5 * d_des(V) / 7.9)},
       'vRel<-3.5': {'ld': lead(d_rel=200., v_rel=-3.6)},
       'mpc<-0.2': {'ld': FAR, 'mpc': -0.21},
+      'aLeadK<=-0.8': {'ld': lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=-0.8)},
     }
     for name, kw in exits.items():
       g = GateOnly()
@@ -160,20 +161,117 @@ class TestGateLogic(OpenpilotTestCase):
       ratio0 = float(rng.choice([rng.uniform(0.5, 1.3), rng.uniform(1.0, 3.)], p=[0.3, 0.7]))
       vrel0 = float(rng.uniform(-4., 2.))
       mpc0 = float(rng.uniform(-0.6, 1.0))
+      alead0 = float(rng.choice([rng.uniform(-2.5, -0.4), rng.uniform(-0.6, 1.0)], p=[0.2, 0.8]))
       ss = bool(rng.random() < 0.05)
       for _ in range(int(rng.integers(1, 80))):
         v = max(v0 + float(rng.normal(0., 0.1)), 0.)
-        ld = lead(present, (ratio0 + float(rng.normal(0., 0.03))) * d_des(v), vrel0 + float(rng.normal(0., 0.2)))
+        ld = lead(present, (ratio0 + float(rng.normal(0., 0.03))) * d_des(v), vrel0 + float(rng.normal(0., 0.2)),
+                  alead0 + float(rng.normal(0., 0.1)))
         e2e = float(rng.uniform(-3., 2.))
         mpc = mpc0 + float(rng.normal(0., 0.05))
         out = g.step(ld, v=v, e2e=e2e, mpc=mpc, should_stop=ss)
         self.assertGreaterEqual(out, e2e)
         self.assertIn(out, (e2e, max(e2e, mpc)))
-        if not present or ss or v <= 3.:
-          self.assertEqual(out, e2e)  # never touches a no-lead / shouldStop / slow frame
+        if not present or ss or v <= 3. or ld.aLeadK <= lp.E2E_GATE_STAY_ALEAD:
+          self.assertEqual(out, e2e)  # never touches a no-lead / shouldStop / slow / braking-lead frame
         n_raised += out > e2e
         n += 1
     self.assertGreater(n_raised, 1000)  # the property was actually exercised
+
+
+# ---- lead-decel veto (cycle 1 audit, route 168 17:14:55) ----
+# leadOne.aLeadK is the lead's absolute accel, negative = braking (radard Track.aLeadK = Kalman accel state of vLead;
+# vision lead: modelV2.leadsV3[0].a[0]). Enter needs aLeadK > -0.5, stay needs aLeadK > -0.8.
+
+# route 168 17:14:52.49 - 17:14:56.74 CDT, 4 Hz decimation of the logged plan frames (gate-audit
+# bad_episode_context.json): (vEgo, dRel, vRel = vLead - vEgo, aLeadK, raw e2e, MPC candidate)
+LOG_168_171455 = [
+  (16.76, 52.5, 0.29, -0.19, -0.02, 0.68), (16.74, 55.6, 0.96, 0.01, 0.02, 0.66), (16.72, 53.6, 0.47, -0.33, -0.06, 0.66),
+  (16.70, 53.9, 0.83, -0.04, -0.06, 0.63), (16.69, 54.2, 0.89, 0.04, -0.05, 0.63), (16.67, 55.9, 1.01, -0.01, -0.05, 0.66),
+  (16.64, 54.6, 0.25, -0.29, -0.18, 0.69), (16.63, 53.9, 0.42, -0.34, -0.24, 0.64), (16.61, 55.3, 0.99, -0.11, -0.28, 0.61),
+  (16.59, 55.7, -1.34, -0.55, -0.44, 0.54), (16.55, 56.8, -0.45, -0.62, -0.45, 0.40), (16.50, 58.6, -1.09, -0.85, -0.49, 0.32),
+  (16.43, 60.2, -1.75, -0.79, -0.53, 0.22), (16.33, 58.2, -1.69, -0.78, -0.60, 0.12), (16.24, 56.3, -1.66, -0.75, -0.64, 0.02),
+  (16.10, 55.1, -2.42, -0.93, -0.76, -0.08), (15.89, 56.7, -1.44, -0.78, -0.68, -0.20), (15.52, 55.1, -2.65, -1.00, -0.70, -0.23),
+]
+# adaptive follow moved t_follow 1.45 -> ~1.97 over the trace (logged gap 1.73x -> 1.46x); the standard 1.45 is used, the
+# gap/TTC/vRel/MPC stay terms hold on every row either way, so only the aLeadK veto decides the exit here
+T_FOLLOW_168 = T_FOLLOW
+
+
+class TestLeadDecelVeto(OpenpilotTestCase):
+  def test_sign_convention(self):
+    self.assertLess(lp.E2E_GATE_ENTER_ALEAD, 0.)
+    self.assertLess(lp.E2E_GATE_STAY_ALEAD, lp.E2E_GATE_ENTER_ALEAD)  # stay is the looser (hysteresis) side
+
+  def test_hard_braking_lead_blocks_entry(self):
+    for a in (-0.5, -1.0, -1.5, -3.0):
+      g = GateOnly()
+      for _ in range(200):
+        self.assertEqual(g.step(lead(d_rel=2.0 * d_des(V), v_rel=-0.5, a_lead=a)), -0.8, a)
+      self.assertFalse(g.e2e_gate, a)
+
+  def test_braking_lead_resets_the_enter_count(self):
+    g = GateOnly()
+    for _ in range(N_ENTER - 1):
+      g.step(FAR)
+    g.step(lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=-1.0))
+    self.assertEqual(g.e2e_gate_cnt, 0)
+    outs = [g.step(FAR) for _ in range(N_ENTER)]
+    self.assertTrue(all(o == -0.8 for o in outs[:N_ENTER - 1]))
+    self.assertEqual(outs[-1], 0.2)
+
+  def test_hard_braking_lead_drops_stay_same_frame(self):
+    for a in (-0.8, -1.0, -1.7):
+      g = GateOnly()
+      for _ in range(N_ENTER + 5):
+        g.step(FAR)
+      self.assertTrue(g.e2e_gate)
+      out = g.step(lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=a), e2e=-0.73)
+      self.assertFalse(g.e2e_gate, a)
+      self.assertEqual(out, -0.73, a)  # the brake ask passes through on the exit frame
+
+  def test_stay_band_between_enter_and_stay_veto(self):
+    # -0.6 fails the enter veto but satisfies stay: an entered gate holds, a fresh one never enters
+    mid = lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=-0.6)
+    g = GateOnly()
+    for _ in range(N_ENTER):
+      g.step(FAR)
+    for _ in range(50):
+      self.assertEqual(g.step(mid), 0.2)
+    fresh = GateOnly()
+    for _ in range(50):
+      self.assertEqual(fresh.step(mid), -0.8)
+
+  def test_mildly_braking_lead_still_gates(self):
+    # -0.3 m/s^2 (lift-off / engine braking) is NOT a veto: the gate enters on time and holds
+    mild = lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=-0.3)
+    g = GateOnly()
+    outs = [g.step(mild) for _ in range(N_ENTER + 40)]
+    self.assertTrue(all(o == -0.8 for o in outs[:N_ENTER - 1]))
+    self.assertTrue(all(o == 0.2 for o in outs[N_ENTER - 1:]))
+
+  def test_route_168_171455_shape(self):
+    # the audit's failing case: gate active on a far lead, then the lead brakes (aLeadK -0.55 at 17:14:54.73, falling
+    # to -1.0) while the e2e ask grows to -0.76. Old gate: e2e discarded until MPC < -0.2 (~1.5-2 s late).
+    # New gate: e2e passes through from the first frame aLeadK <= -0.8, and never re-enters while aLeadK <= -0.5.
+    g = GateOnly()
+    for _ in range(N_ENTER):  # gate already active on the steady far lead before the trace starts
+      v, d, vr, a, e2e, mpc = LOG_168_171455[0]
+      g.step(lead(d_rel=d, v_rel=vr, a_lead=a), v=v, e2e=e2e, mpc=mpc, t_follow=T_FOLLOW_168)
+    self.assertTrue(g.e2e_gate)
+    first_veto = next(i for i, r in enumerate(LOG_168_171455) if r[3] <= lp.E2E_GATE_STAY_ALEAD)
+    self.assertEqual(first_veto, 11)  # 17:14:55.23, aLeadK -0.85
+    for i, (v, d, vr, a, e2e, mpc) in enumerate(LOG_168_171455):
+      for _ in range(5):  # 4 Hz trace -> 20 Hz frames, each row held
+        out = g.step(lead(d_rel=d, v_rel=vr, a_lead=a), v=v, e2e=e2e, mpc=mpc, t_follow=T_FOLLOW_168)
+      if i < first_veto:
+        self.assertTrue(g.e2e_gate, i)  # far, steady or mildly braking lead: still gated
+        self.assertEqual(out, max(e2e, mpc), i)
+      else:
+        self.assertFalse(g.e2e_gate, i)  # braking lead: every e2e ask from here is kept
+        self.assertEqual(out, e2e, i)
+    # the -0.73 / -0.76 asks the old gate discarded (17:14:56.0-56.3) now reach the min() untouched
+    self.assertGreater(len(LOG_168_171455) - first_veto, 5)
 
 
 # ---- through the REAL LongitudinalPlanner.update(): gate vs gate-disabled, in lockstep ----
@@ -187,7 +285,8 @@ def make_planner():
   return lp.LongitudinalPlanner(CP, CP_SP, init_v=15.)
 
 
-def planner_sm(v_ego, desired_accel, should_stop=False, lead_present=True, d_rel=60., v_lead=None, steer=0.):
+def planner_sm(v_ego, desired_accel, should_stop=False, lead_present=True, d_rel=60., v_lead=None, steer=0.,
+               a_lead=0.):
   N = len(ModelConstants.T_IDXS)
   msgs = {k: messaging.new_message(k) for k in ('modelV2', 'carState', 'carControl', 'controlsState', 'selfdriveState',
                                                 'radarState', 'liveMapDataSP', 'vehicleParameters', 'carStateSP',
@@ -219,6 +318,7 @@ def planner_sm(v_ego, desired_accel, should_stop=False, lead_present=True, d_rel
     l1.vLead = float(vl)
     l1.vRel = float(vl - v_ego)
     l1.vLeadK = float(vl)
+    l1.aLeadK = float(a_lead)
     l1.aLeadTau = 1.5
     l1.modelProb = 1.0
   return {k: getattr(m, k) for k, m in msgs.items()}
@@ -270,6 +370,21 @@ class TestGateThroughPlanner(OpenpilotTestCase):
     self.assertTrue(all(flags[N_ENTER - 1:]))
     self.assertGreater(og[-1], -0.3)   # the e2e wish no longer wins
     self.assertLess(ou[-1], -0.85)     # control: without the gate the model ask binds
+
+  def test_braking_far_lead_keeps_e2e_through_planner(self):
+    # a lead 4x the desired gap braking at -1.0 m/s^2: far enough that the MPC candidate stays >= -0.1 (without the veto
+    # the gate enters on frame 10 and the plan sits at 0.0), so only the veto keeps the -0.9 e2e ask binding
+    v = 15.
+    frames = [{'v_ego': v, 'desired_accel': -0.9, 'd_rel': 4.0 * d_des(v), 'v_lead': v, 'a_lead': -1.0} for _ in range(60)]
+    og, ou, flags = self._lockstep(frames)
+    self.assertFalse(any(flags))
+    self.assertEqual(og, ou)
+    self.assertLess(og[-1], -0.85)
+    # control: the same frames with the veto thresholds disabled DO gate, so the test is not vacuous
+    with mock.patch.object(lp, 'E2E_GATE_ENTER_ALEAD', -99.), mock.patch.object(lp, 'E2E_GATE_STAY_ALEAD', -99.):
+      og2, _, flags2 = self._lockstep(frames)
+    self.assertTrue(any(flags2))
+    self.assertGreater(og2[-1], -0.3)
 
   def test_gate_never_lowers_through_planner(self):
     # inside the real update(): on every frame the e2e value leaving the gate is >= the raw model value entering it,
