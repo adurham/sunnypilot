@@ -55,7 +55,7 @@ Other numbers from the same run:
     - 16:56:14 and 16:56:42: MPC −0.86.
     - 17:01:35: gap 0.82×, TTC 9.4 s.
     - 17:02:34: gap 1.07×.
-  - Of the 41 onsets, 34 now have a plan > −0.3 at the onset frame. That count includes 4 missed onsets whose logged
+  - Of the 41 onsets, 34 now have a plan > −0.3 at the onset frame. That count includes 3 missed onsets whose logged
     ask was already above −0.3 at that frame. 23 of the 41 episodes no longer reach −0.3 at any point.
   - **Ambiguity:** "lead-present e2e-sourced" read literally over ALL phantom-hunt planner episodes gives 93 onsets
     (41 on 167 alone), with the gate active at 42/93 = 45 %. The brief's "41 total" matches the 4c set (13 + 28), so
