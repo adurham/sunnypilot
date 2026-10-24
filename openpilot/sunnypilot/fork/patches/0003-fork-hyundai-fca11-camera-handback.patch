@@ -1,0 +1,1988 @@
+diff --git a/opendbc/can/parser.py b/opendbc/can/parser.py
+index 89f842ce..56e54ccb 100644
+--- a/opendbc/can/parser.py
++++ b/opendbc/can/parser.py
+@@ -141,6 +141,9 @@ class CANParser:
+     # car layer needs the raw bytes, not just the decoded signals). Empty = no cost in the hot loop.
+     self.capture_addrs: set[int] = set()
+     self.captured: dict[int, tuple[int, bytes]] = {}
++    # fork (0053): EVERY captured frame of the last update() call, in arrival order. The FCA11 camera hand-back counts
++    # camera FRAMES exactly like the panda does, so it must not see only the newest one per tick.
++    self.captured_all: dict[int, list[tuple[int, bytes]]] = {}
+ 
+   def _add_message(self, name_or_addr: str | int, freq: int | None = None) -> None:
+     if isinstance(name_or_addr, numbers.Number):
+@@ -209,6 +212,8 @@ class CANParser:
+     for addr in self.addresses:
+       for k in self.vl_all[addr]:
+         self.vl_all[addr][k].clear()
++    if self.capture_addrs:
++      self.captured_all = {}
+ 
+     updated_addrs: set[int] = set()
+     for entry in strings:
+@@ -222,6 +227,7 @@ class CANParser:
+         if self.capture_addrs and address in self.capture_addrs:
+           # fork: keep the newest raw frame for the mirrored-address consumers (FCA11 long braking)
+           self.captured[address] = (t, bytes(dat))
++          self.captured_all.setdefault(address, []).append(self.captured[address])
+         state = self.message_states.get(address)
+         if state is None or len(dat) > 64:
+           continue
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 4cef9eff..cfd7d484 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -186,6 +186,12 @@ class CarStateSP:
+   # superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
+   # fails silently while openpilot keeps planning stops it cannot execute). Coupled with custom.capnp CarStateSP.
+   fca11Unavailable: bool = auto_field()
++  # 0053: TRANSIENT - the stock camera is BRAKING (braking-class FCA11 frame within the last ~1.5 s of camera frames):
++  # openpilot braking is paused and resumes on its own when the camera stops. Coupled with custom.capnp CarStateSP.
++  fca11CameraBraking: bool = auto_field()
++  # 0053: the panda refused passive FCA11 frames while the car layer believed the camera was not braking (a Python <->
++  # panda disagreement). Coupled with custom.capnp CarStateSP.
++  fca11Divergence: bool = auto_field()
+   # 0040: the three owner-approved FCA11 braking alerts. Set by GasInterceptorCarController.create_gas_command (the
+   # same 1-frame pattern as fca11_unavailable) and read by the superproject (car_specific.py -> events.py). Coupled
+   # with custom.capnp CarStateSP.
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index cbff8c96..4902bcfe 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -164,6 +164,24 @@ static bool hyundai_legacy = false;
+ #define HYUNDAI_FCA11_LONG_TX_STALE_US 100000U
+ #define HYUNDAI_FCA11_LONG_GEAR_D 5U  // LVR12 CF_Lvr_Gear: 5 = D (same decode as the rolling window)
+ 
++// *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
++// "A camera WARNING must not stop openpilot braking. If the camera starts sending actual BRAKE messages, hand back -
++// but do not latch until the next ignition: when the camera stops braking, openpilot resumes."
++// The camera's bus-2 0x38D is classified with two masks over its first 4 bytes (little-endian, i.e. DBC start bits
++// 0..31). BRAKING class (hand back): CF_VSM_HBACmd (1-2), CF_VSM_BeltCmd (5-7), CR_VSM_DecCmd (8-15), FCA_CmdAct (20),
++// FCA_StopReq (21), CF_VSM_DecCmdAct (31). WARNING class (keep braking, informational only): CF_VSM_Prefill (0),
++// CF_VSM_Warn (3-4). Must equal HYUNDAI_FCA11_CAM_BRAKE_MASK / _WARN_MASK in opendbc/sunnypilot/car/hyundai/values.py;
++// a unit test pins both against each other AND against the DBC signal layout, and the shared vector table
++// (sunnypilot/car/hyundai/tests/fca11_cam_vectors.py) is consumed by the Python and the C tests alike.
++#define HYUNDAI_FCA11_CAM_BRAKE_MASK 0x8030FFE6U
++#define HYUNDAI_FCA11_CAM_WARN_MASK 0x00000019U
++// CAMERA FRAMES (not wall time) of non-braking 0x38D after the last braking-class one before openpilot may own FCA11
++// again: 75 x 20 ms = ~1.5 s. Long enough not to re-grab the bus between the pulses of one AEB sequence, short enough
++// not to strand the drive. A silent camera does not advance it (stay handed back; the 0x38D RX frequency check owns a
++// dead camera). The car layer resumes 2 frames LATER (it is biased stricter). Must equal HYUNDAI_FCA11_CAM_QUIET_FRAMES
++// in opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
++#define HYUNDAI_FCA11_CAM_QUIET_FRAMES 75U
++
+ // Per-arm state. Reset by every hyundai_init (each ignition / re-arm starts clean, un-cut, with no evidence yet).
+ enum {
+   HYUNDAI_LONG_SEEN_SPEED = 1,
+@@ -172,7 +190,7 @@ enum {
+   HYUNDAI_LONG_SEEN_GAS = 8,
+   HYUNDAI_LONG_SEEN_ALL = 15,
+ };
+-static bool hyundai_fca11_long_cut;         // LATCHED: no further actuation until the next init
++static bool hyundai_fca11_long_cut;         // LATCHED (pedal fault only since 0053): no further actuation until the next init
+ static uint32_t hyundai_fca11_long_seen;    // HYUNDAI_LONG_SEEN_* bits
+ static bool hyundai_fca11_long_gear_d;
+ static uint32_t hyundai_fca11_long_speed_min;  // raw, slowest wheel
+@@ -180,7 +198,12 @@ static uint32_t hyundai_fca11_long_ts_speed;
+ static uint32_t hyundai_fca11_long_ts_gear;
+ static uint32_t hyundai_fca11_long_ts_brake;
+ static uint32_t hyundai_fca11_long_ts_gas;
+-static bool hyundai_fca11_long_camera_owns;   // LATCHED: camera requested actuation -> camera FCA11 forwarded, our TX blocked
++// 0053: the camera hand-back is NOT latched any more. cam_brake is set by any braking-class bus-2 0x38D and cleared
++// after HYUNDAI_FCA11_CAM_QUIET_FRAMES consecutive non-braking camera frames. While set: every host 0x38D is refused
++// (TX hook), the camera's own 0x38D is forwarded to the ESC (fwd hook), and a non-zero pedal GAS_COMMAND is refused.
++// Never gated on engagement (an engagement gate is exactly what diverged on drive 14d). Only hyundai_init resets it.
++static bool hyundai_fca11_long_cam_brake;
++static uint32_t hyundai_fca11_long_cam_quiet;  // saturating at HYUNDAI_FCA11_CAM_QUIET_FRAMES
+ static bool hyundai_fca11_long_tx_seen;       // panda has transmitted an accepted 0x38D since this arm
+ static uint32_t hyundai_fca11_long_ts_tx;     // ... last one at
+ static int hyundai_fca11_long_dec_last;       // last ACCEPTED CR_VSM_DecCmd (rate-limit reference; -1 = none this arm)
+@@ -271,29 +294,37 @@ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_ts_gear = 0U;
+   hyundai_fca11_long_ts_brake = 0U;
+   hyundai_fca11_long_ts_gas = 0U;
+-  hyundai_fca11_long_camera_owns = false;
++  hyundai_fca11_long_cam_brake = false;
++  hyundai_fca11_long_cam_quiet = HYUNDAI_FCA11_CAM_QUIET_FRAMES;
+   hyundai_fca11_long_tx_seen = false;
+   hyundai_fca11_long_ts_tx = 0U;
+   hyundai_fca11_long_dec_last = -1;
+ }
+ 
++// 0053: one bus-2 camera 0x38D frame through the hand-back state machine (counted in CAMERA FRAMES).
++static void hyundai_fca11_long_cam_step(const CANPacket_t *msg) {
++  if ((GET_BYTES_LE(msg, 0, 4) & HYUNDAI_FCA11_CAM_BRAKE_MASK) != 0U) {
++    hyundai_fca11_long_cam_brake = true;
++    hyundai_fca11_long_cam_quiet = 0U;
++  } else if (hyundai_fca11_long_cam_quiet < HYUNDAI_FCA11_CAM_QUIET_FRAMES) {
++    hyundai_fca11_long_cam_quiet += 1U;
++    if (hyundai_fca11_long_cam_quiet >= HYUNDAI_FCA11_CAM_QUIET_FRAMES) {
++      hyundai_fca11_long_cam_brake = false;
++    }
++  } else {
++  }
++}
++
+ // Called at the END of hyundai_rx_hook for valid, RX-checked frames. Records the window inputs and LATCHES the cut on:
+-// driver brake, driver gas, gear != D, pedal fault, or a real camera FCA11 request (which also hands FCA11 back).
+-// G9 (R7-B): the DRIVER-INPUT latch (brake/gas/gear) re-arms on the openpilot RESUME edge (controls_allowed rising,
+-// mirroring the car layer's blocked_until_resume); the camera hand-back and the pedal-fault cut stay latched for the
+-// whole arm (fail-closed). Any driver input still cuts the CURRENT episode immediately, and every actuating frame is
+-// re-checked against the live window.
++// driver brake, gear != D or a pedal fault, and steps the camera hand-back on every bus-2 0x38D.
++// G9 (R7-B): the DRIVER-INPUT latch (brake/gear) re-arms on the openpilot RESUME edge (controls_allowed rising,
++// mirroring the car layer's blocked_until_resume); the pedal-fault cut stays latched for the whole arm (fail-closed).
++// 0053: the camera hand-back is NOT a latch any more (hyundai_fca11_long_cam_step: braking class only, released after
++// HYUNDAI_FCA11_CAM_QUIET_FRAMES quiet camera frames; a WARNING-class frame changes nothing).
+ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+   uint32_t ts = microsecond_timer_get();
+   if ((msg->bus == 2U) && (msg->addr == 0x38DU)) {
+-    // the camera's OWN request: any actuation or warning field -> it is a real event, the camera gets FCA11 back for
+-    // the rest of this arm (latched; fwd hook stops blocking, tx hook rejects every 0x38D)
+-    bool cam_act = (msg->data[1] != 0U) || ((msg->data[0] & 0x1FU) != 0U) || GET_BIT(msg, 20U) || GET_BIT(msg, 21U) ||
+-                   GET_BIT(msg, 31U);
+-    if (cam_act) {
+-      hyundai_fca11_long_camera_owns = true;
+-      hyundai_fca11_long_cut = true;
+-    }
++    hyundai_fca11_long_cam_step(msg);
+   }
+   if (msg->bus == 0U) {
+     if (msg->addr == 0x386U) {
+@@ -721,10 +752,10 @@ static bool hyundai_fwd_hook(int bus_num, int addr) {
+   if (hyundai_fca11_long && (bus_num == 2) && (addr == 0x38D)) {
+     // same dynamic-blocking model as the rolling test: while openpilot is braking it MIRRORS the camera's 0x38D on bus 0
+     // (only the brake fields overridden), so the camera's own copy must not also reach the ESC (two FCA11 sources); the
+-    // block exists ONLY while panda transmitted an accepted 0x38D recently (<= TX_STALE) and the camera has not made its
+-    // own request. Host death / stale stream / a real camera request -> the camera's FCA11 forwards again within one
+-    // camera period (~20 ms), the same fail-open the test mode proved on the car.
+-    block = hyundai_fca11_long_tx_seen && !hyundai_fca11_long_camera_owns &&
++    // block exists ONLY while panda transmitted an accepted 0x38D recently (<= TX_STALE) and the camera is not braking.
++    // Host death / stale stream / a braking-class camera frame -> the camera's FCA11 forwards again within one camera
++    // period (~20 ms), the same fail-open the test mode proved on the car. 0053: forwarded for as long as cam_brake holds.
++    block = hyundai_fca11_long_tx_seen && !hyundai_fca11_long_cam_brake &&
+             (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_fca11_long_ts_tx) <= HYUNDAI_FCA11_LONG_TX_STALE_US);
+   }
+   if (hyundai_lkas_park_test && (bus_num == 2) && (addr == 0x340)) {
+@@ -1086,15 +1117,17 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       violation |= FCA_StopReq;
+       violation |= CF_VSM_DecCmdAct;           // variant B: FCA_CmdAct carries the command, not DecCmdAct
+       violation |= actuation ? (CF_VSM_Warn != 3) : (CF_VSM_Warn != 0);
+-      violation |= hyundai_fca11_long_camera_owns;
++      // 0053: while the camera is BRAKING (braking-class frame within the last HYUNDAI_FCA11_CAM_QUIET_FRAMES camera
++      // frames) EVERY host 0x38D is refused, actuating and passive: the camera owns the ESC's FCA11 input outright.
++      violation |= hyundai_fca11_long_cam_brake;
+       // 0030 (D2-i): the controls_allowed / heartbeat gate applies to ACTUATING frames only. A PASSIVE frame is the
+       // camera's own idle shape (all brake fields 0, Warn 0, DecCmd 0); accepting it can only ever CLOSE an episode
+       // (the rate-limit reference drops to 0, so the next episode restarts its onset ramp) and can never command the
+       // ESC. Requiring the engagement gate for it meant a close frame sent at an engage edge (!heartbeat_engaged, the
+       // heartbeat only lands at pandad's 10 Hz step) or a disengage edge (!controls_allowed) was REFUSED, so the panda
+-      // episode never closed (the 860-frame stale act_active defect, 14f). The CAMERA-OWNS hand-back still blocks
+-      // EVERY host frame (a passive host frame injected while the camera is actuating could cancel its AEB), and
+-      // !camera_owns is checked before any state change.
++      // episode never closed (the 860-frame stale act_active defect, 14f). The camera hand-back (0053: cam_brake) still
++      // blocks EVERY host frame (a passive host frame injected while the camera is braking could cancel its AEB), and
++      // it is checked before any state change.
+       violation |= actuation && (!controls_allowed || !heartbeat_engaged);
+       violation |= actuation && !hyundai_fca11_long_window_ok();
+       // 0040: the speed floor clause is DELETED. `hyundai_fca11_long_speed_min` is still tracked (the slowest-wheel
+@@ -1261,6 +1294,11 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+         tx = false;
+       }
+     }
++    // 0053: while the CAMERA is braking, openpilot may not throttle against it: a non-zero GAS_COMMAND is refused (a
++    // zero / clear frame is always accepted, so the pedal stream and its fault-clear path keep flowing).
++    if (hyundai_fca11_long && hyundai_fca11_long_cam_brake && ((gas_a != 0U) || (gas_b != 0U))) {
++      tx = false;
++    }
+   }
+ 
+   // BUTTONS: used for resume spamming and cruise cancellation
+diff --git a/opendbc/safety/tests/libsafety/libsafety_py.py b/opendbc/safety/tests/libsafety/libsafety_py.py
+index fd61c517..b7372392 100644
+--- a/opendbc/safety/tests/libsafety/libsafety_py.py
++++ b/opendbc/safety/tests/libsafety/libsafety_py.py
+@@ -146,6 +146,8 @@ void set_heartbeat_engaged_mads(bool c);
+ void mads_heartbeat_engaged_check(void);
+ void set_steering_disengage(bool c);
+ int get_gas_interceptor_prev(void);
++bool get_hyundai_fca11_cam_brake(void);
++uint32_t get_hyundai_fca11_cam_quiet(void);
+ 
+ int get_self_tx_count(void);
+ void clear_self_tx(void);
+diff --git a/opendbc/safety/tests/libsafety/safety.c b/opendbc/safety/tests/libsafety/safety.c
+index b2cc5421..a5f62f4b 100644
+--- a/opendbc/safety/tests/libsafety/safety.c
++++ b/opendbc/safety/tests/libsafety/safety.c
+@@ -348,6 +348,15 @@ int get_gas_interceptor_prev(void){
+   return gas_interceptor_prev;
+ }
+ 
++// 0053: the FCA11-long camera hand-back state (hyundai.h), observable by the safety tests and the lockstep test
++bool get_hyundai_fca11_cam_brake(void){
++  return hyundai_fca11_long_cam_brake;
++}
++
++uint32_t get_hyundai_fca11_cam_quiet(void){
++  return hyundai_fca11_long_cam_quiet;
++}
++
+ void init_tests(void){
+   safety_mode_cnt = 2U;  // avoid ignoring relay_malfunction logic
+   alternative_experience = 0;
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 73dfe243..27013a86 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -26,6 +26,9 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_
+   HYUNDAI_LKAS_PARK_RATE_DOWN, HYUNDAI_LKAS_PARK_MAX_ARM_S, HYUNDAI_LKAS_PARK_WHEEL_MAX_RAW, HYUNDAI_LKAS_PARK_MAX_ANGLE_DEG, \
+   HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
++from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_CAM_BRAKE_MASK, HYUNDAI_FCA11_CAM_WARN_MASK, \
++  HYUNDAI_FCA11_CAM_QUIET_FRAMES
++from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cam_vectors
+ 
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+ GAS_ON = 0.1
+@@ -39,9 +42,9 @@ HYUNDAI_FCA11_LONG_TX_STALE_US = 100000
+ 
+ def _c_define(path: str, name: str) -> int:
+   with open(path) as f:
+-    m = re.search(rf"#define\s+{name}\s+(\d+)U?", f.read())
++    m = re.search(rf"#define\s+{name}\s+(0x[0-9A-Fa-f]+|\d+)U?\b", f.read())
+   assert m is not None, f"{name} not found in {path}"
+-  return int(m.group(1))
++  return int(m.group(1), 0)
+ 
+ 
+ # 0038: the gas hold-off and the host-liveness watchdog, pinned to the header values
+@@ -2725,8 +2728,8 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     # camera owns at raw 0
+     self._rearm()
+     self._open_window(0)
+-    self._rx(self._cam_fca11(CF_VSM_Warn=2))
+-    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + camera request: still refused")
++    self._rx(self._cam_fca11(CR_VSM_DecCmd=0.10))     # 0053: a camera BRAKE (a warning no longer refuses)
++    self.assertFalse(self._tx(self._brake_cmd(1)), "raw 0 + camera braking: still refused")
+ 
+   def test_floor_constant_absent_from_the_header(self):
+     """0040: the floor MACRO is DELETED from safety/modes/hyundai.h (not merely unused). FALSIFIABLE CONTRAST: it is
+@@ -3071,7 +3074,9 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     """F6 (starvation gate): a host that looks WEDGED (keeps streaming 30 LSB every 20 ms, heartbeat fine, controls
+     allowed, inputs fresh) is cut the moment the stock camera requests FCA11 mid-episode (10 s in): every host frame
+     (actuating AND passive) is refused, and the camera's own 0x38D is forwarded to the ESC from that frame on."""
+-    for field, val in (("CF_VSM_Warn", 2), ("CR_VSM_DecCmd", 0.10), ("FCA_CmdAct", 1), ("CF_VSM_Prefill", 1)):
++    # 0053: braking-class fields only; Warn / Prefill alone no longer hand back (pinned in TestHyundaiFca11CamHandback)
++    for field, val in (("CR_VSM_DecCmd", 0.10), ("FCA_CmdAct", 1), ("CF_VSM_DecCmdAct", 1), ("FCA_StopReq", 1),
++                       ("CF_VSM_HBACmd", 1), ("CF_VSM_BeltCmd", 1)):
+       with self.subTest(field=field):
+         self._rearm()
+         self._open_window()
+@@ -3084,6 +3089,7 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+         for k in range(1, 251):                                      # 5 s more of the wedged host
+           self.safety.set_timer(t + k * self.PERIOD_MS * 1000)
+           self._feed_inputs()
++          self._rx(self._cam_fca11(**{field: val}))                  # 0053: the camera KEEPS braking (non-latching)
+           self.assertFalse(self._tx(self._brake_cmd(30)))
+           self.assertFalse(self._tx(self._fca11()))
+           self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
+@@ -3331,16 +3337,16 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertFalse(self._tx(self._brake_cmd(1)))    # still latched
+ 
+   def test_camera_owns_survives_resume(self):
+-    """T4: a camera FCA11 request keeps the hand-back (and the cut) across a resume edge — the camera's
+-    authority is not re-armed by an openpilot pause/resume."""
++    """T4 -> 0053: a camera BRAKE keeps the hand-back across a resume edge (an openpilot pause/resume does not re-arm
++    it) - only quiet CAMERA frames release it."""
+     self._rearm()
+     self._disengage_frame()
+-    self._rx(self._cam_fca11(CF_VSM_Warn=2))          # camera request latches the hand-back
++    self._rx(self._cam_fca11(CR_VSM_DecCmd=0.10))     # camera brake -> hand-back
+     self.assertFalse(self._tx(self._brake_cmd(1)))
+     self._feed_clean_window_inputs()
+     self._engage(True, True)
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # still latched
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # a resume edge does not release it
+ 
+   def test_driver_input_on_the_grant_frame_still_cuts_then_rearms_on_release(self):
+     """T5 (G9b, drive-14): the SET runs BEFORE the clear, so a driver input ON the grant frame re-latches (driver
+@@ -3424,10 +3430,10 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     after a camera request must NOT re-arm it (rule 4 of the G9b review)."""
+     self._rearm()
+     self._disengage_frame()
+-    self._rx(self._cam_fca11(CF_VSM_Warn=2))          # camera request -> hyundai_fca11_long_cut (hard)
++    self._rx(self._cam_fca11(CR_VSM_DecCmd=0.10))     # 0053: camera brake -> cam_brake (separate from the driver latch)
+     self._engage(True, True)
+     self._feed_clean_window_inputs()                  # a fully clean frame, post-grant
+-    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused: camera owns is not the driver latch
++    self.assertFalse(self._tx(self._brake_cmd(1)))    # still refused: the camera hand-back is not the driver latch
+ 
+   def test_grant_within_one_period_of_reinit_with_brake_held(self):
+     """T6 (post-init race, recommended by second-opinion review): a mid-drive re-init while the driver is
+@@ -3507,8 +3513,11 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertTrue(self._tx(self._brake_cmd(1)))
+     # panda transmitted -> the camera's copy is blocked while our stream is fresh
+     self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
+-    # a real camera request (Warn) hands FCA11 back the same frame, un-blocks the camera, and blocks our TX
++    # 0053: a camera WARNING changes nothing (our stream keeps the ESC) ...
+     self._rx(self._cam_fca11(CF_VSM_Warn=2))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    # ... a camera BRAKE hands FCA11 back the same frame, un-blocks the camera, and blocks our TX
++    self._rx(self._cam_fca11(CR_VSM_DecCmd=0.10))
+     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
+     self._open_window()
+     self.assertFalse(self._tx(self._brake_cmd(1)))
+@@ -3549,6 +3558,307 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+         self._engage(True, True)
+         self.assertFalse(self._tx(self._brake_cmd(1)))
+ 
++  # *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21), driven by the SHARED vector table ***
++
++  def _cam_raw(self, dat):
++    return common.make_msg(2, 0x38D, 8, dat)
++
++  def _cam_idle(self, n=1):
++    for _ in range(n):
++      self._rx(self._cam_raw(cam_vectors.frame()))
++
++  def _cam_brake_frame(self):
++    return self._cam_raw(cam_vectors.frame(CR_VSM_DecCmd=10))
++
++  def test_0053_masks_pinned_to_header_values_and_dbc(self):
++    """ONE definition of each class, pinned three ways: hyundai.h == values.py == the DBC signal layout by name."""
++    self.assertEqual(_c_define(HYUNDAI_H, "HYUNDAI_FCA11_CAM_BRAKE_MASK"), HYUNDAI_FCA11_CAM_BRAKE_MASK)
++    self.assertEqual(_c_define(HYUNDAI_H, "HYUNDAI_FCA11_CAM_WARN_MASK"), HYUNDAI_FCA11_CAM_WARN_MASK)
++    self.assertEqual(_c_define(HYUNDAI_H, "HYUNDAI_FCA11_CAM_QUIET_FRAMES"), HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++    self.assertEqual(cam_vectors.field_mask(cam_vectors.BRAKING_FIELDS), HYUNDAI_FCA11_CAM_BRAKE_MASK)
++    self.assertEqual(cam_vectors.field_mask(cam_vectors.WARNING_FIELDS), HYUNDAI_FCA11_CAM_WARN_MASK)
++    self.assertEqual(0, HYUNDAI_FCA11_CAM_BRAKE_MASK & HYUNDAI_FCA11_CAM_WARN_MASK)
++    self.assertEqual(75, HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++    # the old hard-coded camera predicate and the latch it fed are gone from the header
++    with open(HYUNDAI_H) as f:
++      src = f.read()
++    self.assertNotIn("hyundai_fca11_long_camera_owns", src)
++    long_rx = src[src.index("static void hyundai_fca11_long_rx("):src.index("static bool hyundai_fca11_long_fresh(")]
++    self.assertNotIn("0x1FU", long_rx)                               # no hand-written bit test in the long RX path
++    self.assertIn("hyundai_fca11_long_cam_step(msg)", long_rx)
++    # (the TEST-ONLY rolling mode, bit 128, keeps its own latched camera_owns: deliberately out of 0053's scope)
++
++  def test_0053_vector_table_tx_fwd_and_pedal(self):
++    """Every shared vector: a BRAKING-class camera frame alone blocks our 0x38D (actuating AND passive), forwards the
++    camera's own 0x38D and blocks non-zero pedal gas; a WARNING-only / PREFILL-only / neutral frame does none of it."""
++    vecs = cam_vectors.vectors()
++    self.assertGreater(len(vecs), 40)
++    for name, dat, braking, _warning in vecs:
++      with self.subTest(vector=name):
++        self._rearm()
++        self._open_window()
++        self.assertTrue(self._tx(self._brake_cmd(1)))               # our stream owns the ESC
++        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++        self._rx(self._cam_raw(dat))
++        self.assertEqual(braking, self.safety.get_hyundai_fca11_cam_brake())
++        self._open_window()
++        self.assertEqual(not braking, self._tx(self._brake_cmd(1)))
++        self.assertEqual(not braking, self._tx(self._fca11()))      # passive too
++        self.assertEqual(0 if braking else -1, self.safety.safety_fwd_hook(2, 0x38D))
++        # pedal: separate arm (no brake frame -> no 0038 throttle exclusivity in play)
++        self._rearm()
++        self._open_window()
++        self._rx(self._cam_raw(dat))
++        self.assertEqual(not braking, self._tx(self._interceptor_gas_cmd(0.1)))
++        self.assertTrue(self._tx(self._interceptor_gas_cmd(0)))      # a zero / clear frame always passes
++
++  def test_0053_quiet_boundary_blocked_at_n_minus_1_allowed_at_n(self):
++    self._rearm()
++    self._open_window()
++    self._rx(self._cam_brake_frame())
++    self._cam_idle(HYUNDAI_FCA11_CAM_QUIET_FRAMES - 1)
++    self.assertEqual(HYUNDAI_FCA11_CAM_QUIET_FRAMES - 1, self.safety.get_hyundai_fca11_cam_quiet())
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)), "blocked at N_QUIET - 1")
++    self.assertFalse(self._tx(self._fca11()))
++    self._cam_idle(1)
++    self.assertFalse(self.safety.get_hyundai_fca11_cam_brake())
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)), "allowed at N_QUIET")
++    # saturating: further quiet frames never wrap
++    self._cam_idle(1000)
++    self.assertEqual(HYUNDAI_FCA11_CAM_QUIET_FRAMES, self.safety.get_hyundai_fca11_cam_quiet())
++
++  def test_0053_braking_frame_mid_count_resets(self):
++    self._rearm()
++    self._open_window()
++    self._rx(self._cam_brake_frame())
++    self._cam_idle(50)
++    self._rx(self._cam_raw(cam_vectors.frame(FCA_StopReq=1)))       # braking again, mid-count
++    self.assertEqual(0, self.safety.get_hyundai_fca11_cam_quiet())
++    self._cam_idle(HYUNDAI_FCA11_CAM_QUIET_FRAMES - 1)
++    self._open_window()
++    self.assertFalse(self._tx(self._brake_cmd(1)), "the count restarted at the second braking frame")
++    self._cam_idle(1)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++
++  def test_0053_warning_frames_advance_the_quiet_count(self):
++    """A warning is NOT braking: a warn/prefill tail after an AEB pulse counts toward the release like an idle frame."""
++    self._rearm()
++    self._open_window()
++    self._rx(self._cam_brake_frame())
++    for _ in range(HYUNDAI_FCA11_CAM_QUIET_FRAMES):
++      self._rx(self._cam_raw(cam_vectors.frame(CF_VSM_Warn=3, CF_VSM_Prefill=1)))
++    self.assertFalse(self.safety.get_hyundai_fca11_cam_brake())
++
++  def test_0053_fwd_flips_with_state(self):
++    self._rearm()
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))
++    self._rx(self._cam_brake_frame())
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))      # camera forwarded while it brakes
++    self._cam_idle(HYUNDAI_FCA11_CAM_QUIET_FRAMES - 1)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self._cam_idle(1)
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x38D))     # released: our (fresh) stream owns it again
++    self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_TX_STALE_US + 1)
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))      # and the stale-TX hand-back is unchanged
++
++  def test_0053_works_with_controls_allowed_false(self):
++    """The 14d condition: openpilot DISENGAGED. The hand-back must step anyway (never gated on engagement)."""
++    self._rearm()
++    self._engage(False, False)
++    self._feed_clean_window_inputs()
++    self.assertTrue(self._tx(self._fca11()))                         # passive accepted while disengaged ...
++    self._rx(self._cam_brake_frame())
++    self.assertTrue(self.safety.get_hyundai_fca11_cam_brake())
++    self.assertFalse(self._tx(self._fca11()))                        # ... until the camera brakes
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D))
++    self.assertFalse(self._tx(self._interceptor_gas_cmd(0.1)))
++    self._cam_idle(HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++    self.assertFalse(self.safety.get_hyundai_fca11_cam_brake())
++    self.assertTrue(self._tx(self._fca11()))
++    # warning-only while disengaged: nothing at all
++    self._rx(self._cam_raw(cam_vectors.frame(CF_VSM_Warn=1, CF_VSM_Prefill=1)))
++    self.assertFalse(self.safety.get_hyundai_fca11_cam_brake())
++    self.assertTrue(self._tx(self._fca11()))
++
++  def test_0053_silent_camera_stays_handed_back(self):
++    """Counted in CAMERA FRAMES, not time: a camera that goes silent mid-hand-back leaves it set (fail toward the
++    camera); the 0x38D RX frequency check owns a dead camera."""
++    self._rearm()
++    self._open_window()
++    self._rx(self._cam_brake_frame())
++    for k in range(1, 6):
++      self.safety.set_timer(1000000 + k * 2000000)                   # 10 s of wall time, no camera frame
++      self._feed_inputs()
++      self._engage(True, True)
++      self.assertFalse(self._tx(self._brake_cmd(1)))
++    self.assertTrue(self.safety.get_hyundai_fca11_cam_brake())
++
++  def test_0053_hand_back_is_not_a_cut_and_init_clears_it(self):
++    """The camera no longer sets hyundai_fca11_long_cut: after the release a NEW episode is accepted in the same arm
++    (on the pre-0053 header this stayed refused until init). hyundai_init clears a held hand-back."""
++    self._rearm()
++    self._open_window()
++    self._rx(self._cam_brake_frame())
++    self._cam_idle(HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++    self._open_window()
++    self.assertTrue(self._tx(self._brake_cmd(1)))
++    self._rx(self._cam_brake_frame())
++    self.assertTrue(self.safety.get_hyundai_fca11_cam_brake())
++    self._rearm()
++    self.assertFalse(self.safety.get_hyundai_fca11_cam_brake())
++    self.assertEqual(HYUNDAI_FCA11_CAM_QUIET_FRAMES, self.safety.get_hyundai_fca11_cam_quiet())
++
++  def test_0053_passive_refused_only_by_cam_brake(self):
++    """The divergence guard's premise (fca11_long.py FCA11_DIVERGENCE_*): a well-formed PASSIVE 0x38D is refused by
++    NOTHING but cam_brake - not disengaged, not a stale heartbeat, not a pedal fault, not gas held, not gear != D, not
++    a driver brake, not stale inputs."""
++    def scenarios():
++      yield "disengaged", lambda: self._engage(False, False)
++      yield "heartbeat stale", lambda: self._engage(True, False)
++      yield "pedal fault", lambda: self._rx(self._interceptor_user_gas(0, state=3))
++      yield "gas held", lambda: self._rx(self._interceptor_user_gas(HYUNDAI_GAS_INTERCEPTOR_THRESHOLD + 100))
++      yield "gear P", lambda: self._rx(self._gear_msg(0))
++      yield "driver brake", lambda: self._rx(self._user_brake_msg(True))
++      yield "inputs stale", lambda: self.safety.set_timer(1000000 + 5000000)
++    for name, fault in scenarios():
++      with self.subTest(scenario=name):
++        self._rearm()
++        self._open_window()
++        fault()
++        self.assertFalse(self._tx(self._brake_cmd(1)), "the actuating frame IS refused")
++        self.assertTrue(self._tx(self._fca11()), "the passive frame is NOT")
++        self._rx(self._cam_brake_frame())
++        self.assertFalse(self._tx(self._fca11()), "... except while the camera brakes")
++
++  # *** 0053: LOCKSTEP - one synthetic CAN sequence through the car layer AND libsafety ***
++
++  def _lockstep(self, script, engaged=True, py_lag=0, accel=-2.0):
++    """Step `script` (one camera frame per 20 ms slot = 2 controller frames) through fca11_long.Fca11LongBrake.update
++    AND libsafety, Python's own 0x38D sends going through the panda TX hook (echoes fed back the next tick, exactly as
++    pandad does). `py_lag` delays what Python sees of the camera by that many slots (USB/host latency). Returns per-slot
++    records (slot, panda_cam_brake, py_cam_brake, n_sent, n_refused)."""
++    from opendbc.car import structs
++    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    py = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    py.log.enabled = False
++    py.cal_seq = None
++
++    class _CS:
++      pass
++    cs = _CS()
++    cs.out = structs.CarState()
++    cs.out.vEgo = 20.0
++    cs.out.gearShifter = structs.CarState.GearShifter.drive
++    cs.interceptor_state = 0
++    cs.interceptor_fault_seen = False
++    cs.fca11_wheel_min_kph = None
++
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = engaged
++    cc.actuators.accel = accel
++
++    self._rearm()
++    self._engage(engaged, engaged)
++    seen = []
++    echoes = []
++    out = []
++    t0 = 2000000
++    for slot, dat in enumerate(script):
++      t_us = t0 + slot * 20000
++      self.safety.set_timer(t_us)
++      self._feed_inputs()
++      self._engage(engaged, engaged)
++      self._rx(self._cam_raw(dat))                                   # the panda sees the camera first (it is ON the bus)
++      seen.append((t_us * 1000, dat))
++      py_frames = [seen[slot - py_lag]] if slot - py_lag >= 0 else []
++      n_sent = n_ref = 0
++      for sub in (0, 1):                                             # two 100 Hz controller frames per camera period
++        frame = 2 * slot + sub
++        cs.fca11_cam_frames = py_frames if sub == 0 else []
++        cs.fca11_cam_frame = py_frames[-1] if py_frames else (seen[0] if seen else None)
++        cs.fca11_now_nanos = cs.fca11_cam_frame[0] if cs.fca11_cam_frame else 0
++        cs.fca11_echoes = echoes
++        py.ingest_camera(cs, frame)
++        py.observe_echo(echoes)
++        echoes = []
++        for s in py.update(cc, cs, frame):
++          ok = self._tx(libsafety_py.make_CANPacket(s.address, 0, bytes(s.dat)))
++          n_sent += 1
++          n_ref += 0 if ok else 1
++          echoes.append((128 if ok else 192, bytes(s.dat)))
++      out.append((slot, bool(self.safety.get_hyundai_fca11_cam_brake()), bool(py.cam_brake or py._div_latched),
++                  n_sent, n_ref))
++    return py, out
++
++  def _lockstep_scripts(self):
++    idle = cam_vectors.frame()
++    warn = cam_vectors.frame(CF_VSM_Warn=1, CF_VSM_Prefill=1)
++    brk = cam_vectors.frame(CR_VSM_DecCmd=12, FCA_CmdAct=1, CF_VSM_Warn=3, CF_VSM_Prefill=1)
++    hba = cam_vectors.frame(CF_VSM_HBACmd=2)
++    scripts = {
++      # 15b-like: a ~1 s warning burst (50 frames), nothing else
++      "warn_burst": [idle] * 100 + [warn] * 50 + [idle] * 200,
++      # an AEB: braking pulses separated by gaps SHORTER than N_QUIET (one hand-back), then quiet -> resume
++      "aeb_pulses": [idle] * 60 + ([brk] * 10 + [idle] * 40) * 3 + [idle] * 200,
++      # braking frame landing exactly at N_QUIET - 1 of the count
++      "mid_count": [idle] * 60 + [brk] + [idle] * (HYUNDAI_FCA11_CAM_QUIET_FRAMES - 1) + [hba] + [idle] * 200,
++      # repeated hand-backs each fully released
++      "repeat": [idle] * 40 + ([brk] * 5 + [idle] * 120) * 4,
++    }
++    rng = random.Random(53)
++    for k in range(4):
++      seq = []
++      while len(seq) < 600:
++        seq += [rng.choice((idle, idle, idle, warn, brk, hba))] * rng.randint(1, 90)
++      scripts[f"random_{k}"] = seq
++    return scripts
++
++  def test_0053_lockstep_never_disagrees_in_the_dangerous_direction(self):
++    """Per 20 ms slot: whenever the PANDA holds the hand-back, the car layer holds it too (never Python-allows /
++    panda-denies), and every 0x38D Python sends is ACCEPTED (it never commands into a refusal). The only allowed
++    disagreement is Python withholding: exactly FCA11_CAM_QUIET_MARGIN slots per release."""
++    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++    for engaged in (True, False):
++      for name, script in self._lockstep_scripts().items():
++        with self.subTest(script=name, engaged=engaged):
++          py, recs = self._lockstep(script, engaged=engaged)
++          dangerous = [r for r in recs if r[1] and not r[2]]
++          self.assertEqual([], dangerous, "Python allowed while the panda handed back")
++          self.assertEqual(0, sum(r[4] for r in recs), "a Python 0x38D was refused")
++          withheld = sum(1 for r in recs if r[2] and not r[1])
++          releases = sum(1 for a, b in zip(recs, recs[1:], strict=False) if a[1] and not b[1])
++          self.assertEqual(withheld, releases * fl.FCA11_CAM_QUIET_MARGIN, (withheld, releases))
++          if name != "warn_burst":
++            self.assertGreater(releases, 0, "the script must exercise at least one hand-back + release")
++            if engaged:
++              last_rel = max(i for i, (a, b) in enumerate(zip(recs, recs[1:], strict=False)) if a[1] and not b[1])
++              self.assertGreater(sum(r[3] for r in recs[last_rel + 1:]), 0, "openpilot RESUMES sending after release")
++          self.assertFalse(py.fca11_unavailable or py.fca11_divergence or py._refused_cut)
++          if engaged and name == "warn_burst":
++            self.assertGreater(sum(r[3] for r in recs[150:]), 50, "openpilot kept braking through the warning burst")
++            self.assertFalse(any(r[1] or r[2] for r in recs))
++
++  def test_0053_lockstep_with_host_lag_only_in_flight_refusals(self):
++    """With Python seeing the camera ONE slot late (host latency), the panda refuses at most the frames already in
++    flight at each hand-back onset; those refusals must NOT read as a refusal wall nor as a divergence."""
++    for name, script in self._lockstep_scripts().items():
++      with self.subTest(script=name):
++        py, recs = self._lockstep(script, engaged=True, py_lag=1)
++        onsets = sum(1 for a, b in zip(recs, recs[1:], strict=False) if b[1] and not a[1])
++        self.assertLessEqual(sum(r[4] for r in recs), 2 * onsets)
++        self.assertFalse(py.fca11_unavailable, "in-flight refusals are not a wall")
++        self.assertFalse(py.fca11_divergence, "in-flight refusals are not a divergence")
++
+ 
+ @parameterized_class(LDA_BUTTON)
+ class TestHyundaiNonSCCCN7SteerRampSafety(TestHyundaiNonSCCSafety):
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index e3e2f620..f77b0063 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -49,6 +49,7 @@ class CarStateExt:
+     # (written by the controller each frame, same pattern as pedal_long_engaged). fca11_lead_closing = a lead is
+     # closing (the low-speed hand-over alert gate), also written by the controller from CarControlSP.
+     self.fca11_cam_frame: tuple[int, bytes] | None = None
++    self.fca11_cam_frames: list[tuple[int, bytes]] = []   # 0053: every camera 0x38D of this tick (hand-back counter)
+     self.fca11_now_nanos: int = 0
+     self.fca11_lead_closing = False
+     # 0029 CAL command mode: the lead's distance (the cal sequencer skips a rep when a lead is within
+@@ -62,6 +63,8 @@ class CarStateExt:
+     # 0030 (D1-b): the FCA11-long hand-back flag (camera owns / pedal fault), written by the controller each frame
+     # (same pattern as fca11_cal_active) and mirrored onto CarStateSP.fca11Unavailable for the superproject alert.
+     self.fca11_unavailable = False
++    self.fca11_camera_braking = False   # 0053: transient camera hand-back (written by the controller each frame)
++    self.fca11_divergence = False       # 0053: Python <-> panda disagreement on the camera hand-back
+     # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
+     # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
+     # ESC do below 12 km/h / at standstill". None = not published this frame.
+@@ -206,6 +209,8 @@ class CarStateExt:
+         cap = can_parsers[Bus.cam].captured.get(FCA11_ADDR)
+         if cap is not None:
+           self.fca11_cam_frame = (cap[0], bytes(cap[1]))
++        # 0053: EVERY camera 0x38D of this tick, in order (the hand-back counts camera frames, like the panda)
++        self.fca11_cam_frames = list(can_parsers[Bus.cam].captured_all.get(FCA11_ADDR, ()))
+ 
+       # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
+       # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every
+@@ -259,6 +264,9 @@ class CarStateExt:
+     # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
+     # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
+     ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
++    # 0053: the transient camera hand-back and the Python <-> panda divergence fault (same 1-frame pattern).
++    ret_sp.fca11CameraBraking = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_camera_braking", False))
++    ret_sp.fca11Divergence = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_divergence", False))
+     # 0040: the three FCA11 braking alerts (see structs.py CarStateSP). Only when the feature is armed, so the fields
+     # are exactly "this alert is up right now".
+     armed = bool(self.CP_SP.fca11Brake)
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 8a52b156..42535391 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -61,7 +61,8 @@ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car.hyundai import cal_mode
+ from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP,
+-                                                   HYUNDAI_FCA11_PEDAL_STATE_OK)
++                                                   HYUNDAI_FCA11_PEDAL_STATE_OK, HYUNDAI_FCA11_CAM_BRAKE_MASK,
++                                                   HYUNDAI_FCA11_CAM_WARN_MASK, HYUNDAI_FCA11_CAM_QUIET_FRAMES)
+ from opendbc.sunnypilot.car.hyundai import fca11_log
+ 
+ FCA11_ADDR = 0x38D
+@@ -162,6 +163,46 @@ FCA11_BRAKE_NOW_CLEAR_S = 2.0
+ # refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with zero deadlock.
+ FCA11_REFUSED_STREAK_CUT = 3
+ 
++# *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
++# "A camera WARNING must not stop openpilot braking. A warning just means we got close to something. If the camera
++# starts sending actual BRAKE messages, hand back - but do not latch until the next ignition: when the camera stops
++# braking, openpilot resumes." Both incidents that shaped the old latch were WARNING-only (route 14d: 93,170 camera
++# frames, 0 braking-class; route 15b: 23,834 frames, 0 braking-class, a 1 s warn/prefill burst that cost the last 99 s
++# of the drive). The classes are the shared masks in values.py (one definition, also the panda's):
++#   BRAKING (hand back): HBACmd, BeltCmd, DecCmd, CmdAct, StopReq, DecCmdAct.   WARNING (keep braking): Prefill, Warn.
++# State machine (cam_brake + a saturating quiet counter, counted in CAMERA FRAMES - never wall time - and NEVER gated on
++# engagement): a braking-class frame sets cam_brake and zeroes the counter, a non-braking frame advances it, and the
++# hand-back is released at HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN. The panda releases at
++# HYUNDAI_FCA11_CAM_QUIET_FRAMES, so this layer is STRICTER on both edges: it stops on the same frame it sees a braking
++# message (before any send decision) and resumes 2 camera frames after the panda would allow it - the only possible
++# disagreement is "we withheld a frame the panda would have accepted". A silent camera does not advance the counter.
++FCA11_CAM_QUIET_MARGIN = 2
++FCA11_CAM_RESUME_FRAMES = HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN
++
++# *** 0053: refusal-cut PROBATION after a resume ***
++# The echo refusal cut (FCA11_REFUSED_STREAK_CUT, consecutive) is what actually protects against the 14d failure
++# (commanding into a refused wall) and stays independent of the camera state. For the first FCA11_PROBATION_ECHOES
++# actuating echoes after a hand-back clears and after every (re)engage, a CUMULATIVE count is ALSO kept (an accepted
++# echo does not reset it): FCA11_PROBATION_REFUSED_CUT refused actuating echoes inside the window trip the cut too, so an
++# intermittent wall (accept 1 / refuse many) right after we resume cannot hide behind the consecutive rule. A probation
++# trip holds until the window closes. No probe decel is ever sent to test acceptance: only real braking feeds it.
++FCA11_PROBATION_ECHOES = 50
++FCA11_PROBATION_REFUSED_CUT = 5
++
++# *** 0053: Python <-> panda DIVERGENCE guard ***
++# After 0053 the ONLY panda rule that refuses a well-formed PASSIVE 0x38D is its cam_brake (a passive frame is accepted
++# disengaged, outside the window, with a pedal fault ...). So FCA11_DIVERGENCE_PASSIVE_STREAK consecutive REFUSED passive
++# echoes while this layer believes the camera is NOT braking = the two layers disagree (e.g. a camera frame the host
++# never saw). Reaction: adopt the panda's view (cam_brake = True, counter 0 - the stricter direction) and raise the
++# divergence alert; the FCA11_DIVERGENCE_LATCH_EVENTS-th event in one ignition latches: no 0x38D for the rest of it.
++# Armed only after the first ACCEPTED 0x38D echo (a panda that is not armed refuses everything).
++FCA11_DIVERGENCE_PASSIVE_STREAK = 2
++FCA11_DIVERGENCE_LATCH_EVENTS = 3
++# Attribution of a refusal WALL (FCA11_REFUSED_STREAK_CUT refused actuating echoes while we see no camera brake): the
++# episode is ended for at most this many controller frames (3 send slots) so the owed PASSIVE close frame goes out and
++# its echo says whether the panda is handing back to the camera (refused) or the wall is something else (accepted).
++FCA11_ATTRIB_HOLD_FRAMES = 6
++
+ # 0040: per-episode logger. One compact JSON line per braking episode to /data/fca11-log/episodes.jsonl (see fca11_log
+ # for the schema, the fields and the reasoning). Inert (no accumulation, no I/O) unless enabled.
+ FCA11_LOG_ENABLED = os.environ.get("FCA11_LOG_DIR", "") != "0"
+@@ -723,8 +764,8 @@ FCA11_CAM_FRESH_S = 0.100
+ # send rate divisor: controller frames are 100 Hz; every other frame = the camera's own 50 Hz.
+ FCA11_SEND_EVERY = 2
+ 
+-# camera-actuation detect on the freshest bus-2 frame (a real AEB/warning request -> hand back):
+-# any of Prefill / Warn / CmdAct / StopReq / DecCmdAct or the HBA bits set.
++# bit positions of the camera's request fields (the shadow log's camera_warn reads CAM_ACT_WARN_BITS). 0053: the
++# hand-back itself is decided ONLY by the shared masks (camera_braking below), never by hand-written bit tests.
+ CAM_ACT_PREFILL_BIT = 0
+ CAM_ACT_HBA_BITS = (1, 2)
+ CAM_ACT_WARN_BITS = (3, 2)
+@@ -799,17 +840,36 @@ def _get_bits(dat: bytes, start: int, length: int) -> int:
+   return v
+ 
+ 
+-def camera_requesting(dat: bytes) -> bool:
+-  """True if a bus-2 camera FCA11 frame carries a real actuation/warning request (hand back)."""
++def _cam_word(dat: bytes) -> int:
++  """The camera frame's first 4 bytes, little-endian (= DBC start bits 0..31) - exactly the panda's GET_BYTES_LE(msg, 0, 4)."""
++  return int.from_bytes(bytes(dat[:4]), "little")
++
++
++def camera_braking(dat: bytes) -> bool:
++  """0053: True if a bus-2 camera FCA11 frame is BRAKING class (HYUNDAI_FCA11_CAM_BRAKE_MASK) -> hand back."""
+   if dat is None or len(dat) != 8:
+     return False
+-  return (dat[1] != 0 or  # CR_VSM_DecCmd (byte 1): a commanded decel
+-          _get_bits(dat, CAM_ACT_PREFILL_BIT, 1) != 0 or
+-          _get_bits(dat, CAM_ACT_HBA_BITS[0], CAM_ACT_HBA_BITS[1]) != 0 or
+-          _get_bits(dat, CAM_ACT_WARN_BITS[0], CAM_ACT_WARN_BITS[1]) != 0 or
+-          _get_bits(dat, CAM_ACT_CMDACT_BIT, 1) != 0 or
+-          _get_bits(dat, CAM_ACT_STOPREQ_BIT, 1) != 0 or
+-          _get_bits(dat, CAM_ACT_DECCMDACT_BIT, 1) != 0)
++  return (_cam_word(dat) & HYUNDAI_FCA11_CAM_BRAKE_MASK) != 0
++
++
++def camera_warning(dat: bytes) -> bool:
++  """0053: True if the frame carries a WARNING-class field (Prefill / Warn). Informational only - never a gate."""
++  if dat is None or len(dat) != 8:
++    return False
++  return (_cam_word(dat) & HYUNDAI_FCA11_CAM_WARN_MASK) != 0
++
++
++def camera_requesting(dat: bytes) -> bool:
++  """Braking OR warning class (the pre-0053 predicate). 0053: INFORMATIONAL ONLY (shadow log field
++  ``camera_requesting``); no gate may use it - the hand-back is ``camera_braking``."""
++  return camera_braking(dat) or camera_warning(dat)
++
++
++def fca11_passive(dat: bytes) -> bool:
++  """A host 0x38D in the camera's idle shape: no brake field and no warning field set (DecCmd 0, Prefill 0, Warn 0,
++  CmdAct 0, DecCmdAct 0, HBA 0, StopReq 0, Belt 0). The panda accepts such a frame unless its cam_brake is set."""
++  return dat is not None and len(dat) == 8 and \
++    (_cam_word(dat) & (HYUNDAI_FCA11_CAM_BRAKE_MASK | HYUNDAI_FCA11_CAM_WARN_MASK)) == 0
+ 
+ 
+ def build_fca11_frame(cam_dat: bytes, cam_alive: int, m: Fca11MirrorFrame) -> bytes:
+@@ -887,12 +947,11 @@ class Fca11LongBrake:
+     self.braking = False               # an FCA11 actuating frame was sent THIS frame
+     self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
+     # G9b/0042: split the cut the way the panda does. _driver_cut (brake / gear != D) re-arms on the resume
+-    # edge but clears on the first clean engaged frame; _hard_cut (camera hand-back) and _pedal_cut (pedal
+-    # fault, 0042) are fail-closed and NOT re-armed. 0042 v2: blocked_until_resume is the DRIVER+CAMERA cut
+-    # only - the pedal mirror is ALERT-ONLY and never gates a send (a pre-arm over-latch must never fabricate
+-    # a brake loss); see update() for the full reasoning.
++    # edge but clears on the first clean engaged frame; _pedal_cut (pedal fault, 0042) is fail-closed and NOT
++    # re-armed. 0042 v2: blocked_until_resume is the DRIVER cut only - the pedal mirror is ALERT-ONLY and never
++    # gates a send (a pre-arm over-latch must never fabricate a brake loss); see update() for the full reasoning.
++    # 0053: the camera hand-back is no longer a latch (the old _hard_cut is deleted): see cam_brake below.
+     self._driver_cut = False
+-    self._hard_cut = False
+     self._pedal_cut = False            # 0042: the panda's hyundai_interceptor_pedal_fault, latched (see update())
+     self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+     # 0040: the single low-speed hand-over alert (below the old 12 km/h floor) is DELETED - it is now false. Replaced
+@@ -923,9 +982,9 @@ class Fca11LongBrake:
+     # 0030 (D1-b) / 0042: surface the fail-closed loss. The panda's hyundai_fca11_long_cut is fail-closed for the
+     # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed it refuses EVERY actuating frame for
+     # the whole drive - and that failure was otherwise SILENT (the driver just sees openpilot plan stops it cannot
+-    # execute; route 156 lost ALL braking this way). The car layer mirrors the two panda latch SOURCES as separate
+-    # flags: _hard_cut = the CAMERA hand-back (a bus-2 camera request), _pedal_cut = a PEDAL FAULT (0042); both are
+-    # fail-closed and NOT re-armed. _refused_cut is the ECHO-CONFIRMED wall (B): the panda's own verdict on our
++    # execute; route 156 lost ALL braking this way). The car layer mirrors the panda latch SOURCE as _pedal_cut (a
++    # PEDAL FAULT, 0042; fail-closed, NOT re-armed). 0053: the camera hand-back is no longer a source - it is the
++    # self-releasing cam_brake with its own transient alert. _refused_cut is the ECHO-CONFIRMED wall (B): the panda's own verdict on our
+     # in-flight frames, so even a latch the Python mirror cannot see still surfaces. CarStateExt publishes the OR as
+     # CarStateSP.fca11Unavailable; the superproject raises a persistent driver alert from it.
+     # 0042 v2: this flag is KNOW + ALERT only - it drives NO send gate (see blocked_until_resume below). While it is
+@@ -946,6 +1005,31 @@ class Fca11LongBrake:
+     # actuating echo resets the streak and self-heals the flag (the wall is gone). No send gating rides on this.
+     self._refused_streak = 0
+     self._refused_cut = False
++    # 0053: the NON-LATCHING camera hand-back (see the FCA11_CAM_* block). `cam_brake` = the camera is braking (a
++    # braking-class bus-2 0x38D within the last FCA11_CAM_RESUME_FRAMES camera frames): no 0x38D of ours goes out at
++    # all and the pedal command is forced to 0. `_cam_quiet` = non-braking camera frames since the last braking one
++    # (saturating). Starts released, like the panda's hyundai_init.
++    self.cam_brake = False
++    self._cam_quiet = FCA11_CAM_RESUME_FRAMES
++    self.camera_braking_alert = False  # transient "camera braking - openpilot braking paused" (CarStateSP)
++    # 0053: refusal-cut probation (FCA11_PROBATION_*): actuating echoes left in the window, refused ones counted in it,
++    # and whether the window tripped the cut (held until the window closes).
++    self._probation_left = 0
++    self._probation_refused = 0
++    self._probation_cut = False
++    # 0053: divergence guard (FCA11_DIVERGENCE_*). `_div_armed` = an accepted 0x38D echo was seen (the panda is armed);
++    # `_div_refused_passive` = refused PASSIVE echoes waiting to be judged after this tick's camera frames are ingested;
++    # `_div_streak` consecutive ones; `_div_events` per ignition; `_div_latched` = withhold every 0x38D until the next
++    # ignition (the only hard camera-side cut left). `fca11_divergence` drives the driver alert.
++    self._div_armed = False
++    self._div_refused_passive = 0
++    self._div_streak = 0
++    self._div_events = 0
++    self._div_latched = False
++    self._div_active = False
++    self.fca11_divergence = False
++    self._attrib_hold = 0              # controller frames left of a refusal-attribution hold (passive frames only)
++    self._cam_ingested_frame: int | None = None
+     self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+     self._dec_last_sent = 0
+     self._sent_this_episode = False
+@@ -1062,8 +1146,12 @@ class Fca11LongBrake:
+     t_cam, dat = cam
+     if len(dat) != 8 or (now - t_cam) > FCA11_CAM_FRESH_S * 1e9:
+       return False, "stale_camera_frame"
+-    if camera_requesting(dat):
+-      return False, "camera_owns"
++    # 0053: ONLY the braking class hands back (a warning keeps openpilot braking). update() already withholds every
++    # frame while cam_brake / the divergence latch hold; this is the belt-and-braces gate on the freshest frame.
++    if self._div_latched:
++      return False, "divergence_latched"
++    if self.cam_brake or camera_braking(dat):
++      return False, "camera_braking"
+     return True, ""
+ 
+   def _alerts(self, CS, frame: int, v_kph: float, dec_cmd: int) -> None:
+@@ -1170,7 +1258,7 @@ class Fca11LongBrake:
+     self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or standstill))
+     self.low_speed_alert = self.supervise_stop   # alias
+     # 0042 v2: while FCA11-long is UNAVAILABLE (the panda refuses every actuating frame for the rest of the
+-    # ignition: camera hand-back / pedal-fault latch / echo-confirmed refusal wall), the three 0040/0041 alerts
++    # ignition: pedal-fault latch / echo-confirmed refusal wall; 0053: no longer the camera), the three 0040/0041 alerts
+     # above are MISLEADING - they all assume we are actually braking and delivering decel. The dedicated
+     # "FCA11 Braking Unavailable" permanent alert supersedes them, so force them off; they re-arm normally on
+     # their own conditions once availability returns (fca11_unavailable clears on an accepted actuating echo).
+@@ -1235,7 +1323,42 @@ class Fca11LongBrake:
+     # zero deadlock. (A refused PASSIVE close frame is the separate re-owe path below, not counted here.)
+     refused = sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0)
+     accepted = sum(1 for src, dat in echoes if int(src) == 128 and len(dat) == 8 and dat[1] != 0)
+-    if accepted:
++    # 0053: refusals that land while the camera is braking are the in-flight race of the hand-back itself (the panda
++    # saw the camera's braking frame before our already-queued frame reached its TX hook). They are EXPECTED and say
++    # nothing about a wall or a divergence, so they feed neither the refusal streak, the probation, nor the guard.
++    # (ingest_camera runs BEFORE observe_echo on the real path, so cam_brake already reflects this tick's camera.)
++    if self.cam_brake:
++      refused = 0
++    # 0053 divergence guard: an ACCEPTED 0x38D of any shape arms it (the panda is in FCA11-long and taking frames) and
++    # breaks a refused-passive streak; a REFUSED PASSIVE echo while we believe the camera is NOT braking extends it.
++    if any(int(src) == 128 and len(dat) == 8 for src, dat in echoes):
++      self._div_armed = True
++      self._div_streak = 0
++      if any(int(src) == 128 and fca11_passive(bytes(dat)) for src, dat in echoes):
++        self._attrib_hold = 0            # attribution answered: the panda takes passive frames -> not the camera
++    elif self._div_armed and not self.cam_brake and \
++        any(int(src) == 192 and fca11_passive(bytes(dat)) for src, dat in echoes):
++      self._div_streak += 1
++      if self._div_streak >= FCA11_DIVERGENCE_PASSIVE_STREAK:
++        self._divergence_event()
++    # 0053 probation: the first FCA11_PROBATION_ECHOES actuating echoes after a resume also run a CUMULATIVE refusal
++    # count (an accepted echo does not reset it). Fed only by real braking: no probe decel is ever sent for it.
++    if self._probation_left > 0 and (accepted or (refused and self.braking)):
++      n = accepted + (refused if self.braking else 0)
++      self._probation_refused += refused if self.braking else 0
++      self._probation_left = max(0, self._probation_left - n)
++      if self._probation_refused >= FCA11_PROBATION_REFUSED_CUT:
++        self._probation_cut = True
++        self._refused_cut = True
++      if self._probation_left == 0:
++        self._probation_cut = False   # the window closed: the ordinary consecutive rule (and its heal) owns the cut
++    if accepted and self._probation_cut:
++      # a probation trip is held until its window closes: an occasional accepted frame in a mostly refused wall is
++      # exactly what the cumulative count exists to catch. (The pedal-fault heal below still applies: an accepted
++      # actuating frame proves the panda's pedal cut is clear.)
++      self._refused_streak = 0
++      self._pedal_cut = False
++    elif accepted:
+       # An ACCEPTED ACTUATING echo (src 128, len 8, dat[1]!=0) is PROOF the panda is NOT latched: it accepted a
+       # frame that only goes out while FCA11-long is armed AND its cut is clear. So it resets the refusal streak,
+       # clears _refused_cut (the wall is gone) AND clears _pedal_cut (the pedal-fault latch cannot be live if the
+@@ -1247,9 +1370,16 @@ class Fca11LongBrake:
+       self._refused_cut = False
+       self._pedal_cut = False
+     elif refused and self.braking:
++      was = self._refused_streak
+       self._refused_streak += refused
+       if self._refused_streak >= FCA11_REFUSED_STREAK_CUT:
+         self._refused_cut = True
++        # 0053 ATTRIBUTION: a refused ACTUATING frame is ambiguous (window, rate, gas hold-off ... or the panda's
++        # cam_brake), a refused PASSIVE one is not. On the crossing into a wall, end the episode so the owed passive
++        # close goes out (zero decel - the ESC was getting nothing from us anyway): accepted -> a real wall, the cut
++        # stands; refused twice -> the panda is handing back to a camera brake we never saw -> divergence (resync).
++        if was < FCA11_REFUSED_STREAK_CUT and self._div_armed and not self.cam_brake:
++          self._attrib_hold = FCA11_ATTRIB_HOLD_FRAMES
+     if self._pending_echo is None:
+       return
+     pending = self._pending_echo
+@@ -1265,6 +1395,68 @@ class Fca11LongBrake:
+       self._pending_echo = None
+       return
+ 
++  # ---- 0053: camera hand-back + divergence guard ----
++
++  def _cam_step(self, dat: bytes) -> None:
++    """One bus-2 camera 0x38D through the hand-back state machine (the panda's hyundai_fca11_long_cam_step, released
++    FCA11_CAM_QUIET_MARGIN frames later)."""
++    if dat is None or len(dat) != 8:
++      return
++    if camera_braking(dat):
++      if not self.cam_brake:
++        self._refused_streak = 0         # refusals around the hand-back edge are the hand-back, not a wall
++      self.cam_brake = True
++      self._cam_quiet = 0
++    elif self._cam_quiet < FCA11_CAM_RESUME_FRAMES:
++      self._cam_quiet += 1
++      if self._cam_quiet >= FCA11_CAM_RESUME_FRAMES and self.cam_brake:
++        self.cam_brake = False
++        self._div_active = False         # a resync hold ends with the hand-back it adopted
++        self._start_probation()
++        # the FIRST host 0x38D after every release is a PASSIVE frame (the camera's idle shape, zero decel - not a
++        # probe): it re-opens our stream cleanly at the panda AND is the divergence guard's evidence - the panda
++        # refuses a well-formed passive frame ONLY while its own cam_brake still holds.
++        self._release_pending = True
++
++  def _start_probation(self) -> None:
++    self._probation_left = FCA11_PROBATION_ECHOES
++    self._probation_refused = 0
++    self._probation_cut = False
++
++  def _divergence_event(self) -> None:
++    """The panda refused passive frames while we believed the camera was not braking: adopt the panda's view (the
++    stricter direction), raise the alert, latch on the FCA11_DIVERGENCE_LATCH_EVENTS-th event this ignition."""
++    self._div_streak = 0
++    self._div_events += 1
++    self._div_active = True
++    self._attrib_hold = 0
++    self._refused_streak = 0             # the refusals were the panda's hand-back, not a wall
++    self._refused_cut = False
++    self.cam_brake = True
++    self._cam_quiet = 0
++    if self._div_events >= FCA11_DIVERGENCE_LATCH_EVENTS:
++      self._div_latched = True
++
++  def ingest_camera(self, CS, frame: int) -> None:
++    """0053: feed EVERY bus-2 camera 0x38D of this tick to the hand-back state machine, in order. Runs once per
++    controller frame, BEFORE observe_echo and update (create_gas_command calls it first; update() calls it itself if
++    nobody did). Never gated on engagement or on longActive: the drive-14d divergence was exactly such a gate.
++
++    Real path: CS.fca11_cam_frames (CarStateExt, every frame of the tick). Fallback for callers that only carry the
++    freshest frame (CS.fca11_cam_frame): a non-braking frame counts once per 50 Hz send slot (the camera's own rate),
++    a BRAKING-class frame counts on every controller frame (the stricter direction: a brake is never skipped)."""
++    if self._cam_ingested_frame == frame:
++      return
++    self._cam_ingested_frame = frame
++    if not self.enabled:
++      return
++    frames = getattr(CS, "fca11_cam_frames", None)
++    if frames is None:
++      cam = getattr(CS, "fca11_cam_frame", None)
++      frames = [cam] if (cam is not None and (frame % FCA11_SEND_EVERY == 0 or camera_braking(cam[1]))) else []
++    for _t, dat in frames:
++      self._cam_step(bytes(dat))
++
+   def _passive_frame(self, CS, frame: int) -> list[CanData]:
+     """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+@@ -1587,7 +1779,7 @@ class Fca11LongBrake:
+       tier_cap=int(cap), personality=int(getattr(personality, "raw", personality)),
+       engaged=bool(enabled), long_active=bool(long_active), v3_braking=v3_braking,
+       held_band=bool(o.v3_ok and v3._shape_in_hold_band), latched=bool(v3.blocked_until_resume),
+-      hc_unavailable=bool(v3.fca11_unavailable), hard_cut=bool(v3._hard_cut), pedal_cut=bool(v3._pedal_cut),
++      hc_unavailable=bool(v3.fca11_unavailable), hard_cut=bool(v3.cam_brake), pedal_cut=bool(v3._pedal_cut),
+       excl_reason=why, episode_id=(ep["episode_id"] if ep is not None else None),
+       standstill=bool(getattr(CS.out, "standstill", False)), gas_pressed=bool(CS.out.gasPressed),
+       brake_pressed=bool(CS.out.brakePressed),
+@@ -1631,7 +1823,6 @@ class Fca11LongBrake:
+       self._cal_frames = 0
+       # G9b/0042: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
+       self._driver_cut = False
+-      self._hard_cut = False
+       self._pedal_cut = False
+       self._rearm_pending = False
+       self.blocked_until_resume = False
+@@ -1640,6 +1831,14 @@ class Fca11LongBrake:
+       # 0042 (B): clear the echo-confirmed refusal wall too.
+       self._refused_streak = 0
+       self._refused_cut = False
++      # 0053: the camera hand-back, the probation and the divergence guard start clean too (the panda's hyundai_init).
++      self.cam_brake = False
++      self._cam_quiet = FCA11_CAM_RESUME_FRAMES
++      self.camera_braking_alert = False
++      self._probation_left = self._probation_refused = 0
++      self._probation_cut = False
++      self._div_armed = self._div_latched = self._div_active = self.fca11_divergence = False
++      self._div_streak = self._div_events = self._attrib_hold = 0
+       self._cal_active = False
+       # 0038: no gas hold-off state either.
+       self._gas_release_frame = None
+@@ -1666,14 +1865,15 @@ class Fca11LongBrake:
+     engaged = bool(CC.enabled)
+     if engaged and not self._engaged_prev:
+       self._rearm_pending = True
++      self._start_probation()          # 0053: every (re)engage opens a refusal-cut probation window
+     self._engaged_prev = engaged
+ 
+-    # latch the cut on what the car layer CAN observe (camera request, driver brake, gear).
++    # latch the cut on what the car layer CAN observe (driver brake, gear).
+     # 0038: GAS is deliberately NOT part of _driver_cut any more (owner requires a gas press never lock out future
+     # braking). It is enforced per-frame in fca11_ok below plus the elapsed-frame hold-off. The DRIVER latch
+     # (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut (brake / gear != D): it re-arms on the resume
+-    # edge but clears only on the first clean engaged frame. The CAMERA hand-back goes to _hard_cut; a pedal FAULT
+-    # goes to _pedal_cut (0042). Both mirror the panda's hyundai_fca11_long_cut and are NOT re-armed.
++    # edge but clears only on the first clean engaged frame. A pedal FAULT goes to _pedal_cut (0042), mirroring the
++    # panda's hyundai_fca11_long_cut. 0053: the camera is NOT a latch any more (cam_brake, ingest_camera).
+     driver_cut = (bool(CS.out.brakePressed) or
+                   CS.out.gearShifter != structs.CarState.GearShifter.drive)
+     if CC.longActive and driver_cut:
+@@ -1682,14 +1882,16 @@ class Fca11LongBrake:
+       self._driver_cut = False
+       self._rearm_pending = False
+     cam = getattr(CS, "fca11_cam_frame", None)
+-    # 0030 (D1-a): latch the camera hand-back on the camera request REGARDLESS of longActive, matching the panda
+-    # EXACTLY. The panda's hyundai_fca11_long_rx sets camera_owns / cut on ANY bus-2 0x38D with an actuation/warning
+-    # field, with no host-engagement condition at all (hyundai.h:228-236), and only hyundai_init clears it. The old
+-    # `CC.longActive and ...` gate was the divergence: the triggering stock FCW on drive 14d arrived while openpilot
+-    # was DISENGAGED, so Python never latched, kept believing it could brake, and kept commanding into a refused
+-    # wall for the remaining ~16 min of the ignition (1983 refused actuating frames, all three 20@90 cal reps).
+-    if cam is not None and camera_requesting(cam[1]):
+-      self._hard_cut = True
++    # 0053: the camera hand-back. EVERY bus-2 0x38D of this tick steps the non-latching state machine REGARDLESS of
++    # longActive / engagement, exactly like the panda's hyundai_fca11_long_cam_step (the 0030 D1-a lesson: the old
++    # `CC.longActive and ...` gate on drive 14d let the two layers disagree for 16 minutes). Idempotent per frame: the
++    # real path already ran it in create_gas_command BEFORE observe_echo. Only the BRAKING class sets cam_brake; a
++    # warning (the whole of 14d and 15b) leaves openpilot braking. While cam_brake holds, nothing of ours goes out on
++    # 0x38D (see `withhold` below) and the pedal is forced to 0 (gas_interceptor.py).
++    self.ingest_camera(CS, frame)
++    withhold = bool(self.cam_brake or self._div_latched)
++    self.camera_braking_alert = bool(self.enabled and self.cam_brake and not self._div_active)
++    self.fca11_divergence = bool(self.enabled and (self._div_active or self._div_latched))
+     # 0042 (A): latch the PEDAL FAULT exactly like the panda. The panda computes pedal_state = (data[4] >> 4) & 0xF
+     # from ANY 0x701 frame and sets hyundai_interceptor_pedal_fault = state not in {0,4,5} (hyundai.h:962-963), which
+     # hyundai_fca11_long_rx folds into hyundai_fca11_long_cut on ANY rx frame regardless of engagement/arm and only
+@@ -1706,14 +1908,15 @@ class Fca11LongBrake:
+       self._pedal_cut = True
+     if not engaged:
+       self._rearm_pending = False
+-    # 0042 v2: SEND GATE vs ALERT. blocked_until_resume stays the DRIVER+CAMERA cut ONLY - the pedal mirror
++    # 0042 v2: SEND GATE vs ALERT. blocked_until_resume stays the DRIVER cut ONLY (0053: the camera gate is cam_brake,
++    # which releases on its own; it is not a resume-gated latch any more) - the pedal mirror
+     # (_pedal_cut) must NEVER gate a send. The car-layer mirror has no per-frame ARM gate (its arm is the constant
+     # `enabled`), so on route 155 it over-latches on a pre-arm STATE=1 blip the deployed panda never saw; letting
+     # that fabricate a `blocked_until_resume` would invent a brake loss and suppress every send for the rest of the
+     # ignition. Refused sends are inert (they never reach the car), so keeping ours LIVE preserves the ground truth
+     # + the echo evidence, and there is no deadlock. _pedal_cut (and _refused_cut) only drive fca11_unavailable:
+     # KNOW + ALERT (and the alert-state suppression in _alerts()), never control.
+-    self.blocked_until_resume = self._driver_cut or self._hard_cut
++    self.blocked_until_resume = self._driver_cut
+     # 0038: track the driver's gas RELEASE edge (for the elapsed-frame hold-off). CS.out.gasPressed is the driver's
+     # physical pedal (the panda's gas source is the interceptor sensor, not our throttle command). On the frame the
+     # pedal releases, stamp the frame; _gas_holdoff_ok refuses for GAS_HOLDOFF_FRAMES after it. No latch.
+@@ -1721,10 +1924,10 @@ class Fca11LongBrake:
+     if self._gas_prev and not gas_now:
+       self._gas_release_frame = frame
+     self._gas_prev = gas_now
+-    # 0042: surface the fail-closed loss. _hard_cut (camera hand-back) and _pedal_cut (pedal fault) are the two
+-    # hyundai_fca11_long_cut latch sources; _refused_cut (B) is the echo-confirmed refusal wall. Any of them means
+-    # the panda refuses every actuating frame for the rest of this ignition, so FCA11-long braking is unavailable.
+-    self.fca11_unavailable = bool(self.enabled and (self._hard_cut or self._pedal_cut or self._refused_cut))
++    # 0042: surface the fail-closed loss. _pedal_cut (pedal fault) is the hyundai_fca11_long_cut latch source and
++    # _refused_cut (B) is the echo-confirmed refusal wall. 0053: these two - and ONLY these two - own the PERMANENT
++    # "unavailable until restart" alert; the camera owns the transient camera_braking_alert instead.
++    self.fca11_unavailable = bool(self.enabled and (self._pedal_cut or self._refused_cut))
+ 
+     # 0040: this frame's speed (km/h); the alert state machine + logger both read it.
+     v_kph_now = float(CS.out.vEgo) * 3.6
+@@ -1830,6 +2033,11 @@ class Fca11LongBrake:
+     # frame while braking.
+     if want_brake and self._release_pending:
+       want_brake = False
++    # 0053: refusal attribution (see FCA11_ATTRIB_HOLD_FRAMES): end the episode briefly so the passive close frame is
++    # the next thing the panda judges. Bounded, so it can never wedge braking.
++    if self._attrib_hold > 0:
++      self._attrib_hold -= 1
++      want_brake = False
+     # 0051 (c): lead present -> absent EDGE while a feel episode is open and moving (not the hold band, not cal): freeze the
+     # last SENT level as a decaying floor (see FCA11_FEEL_LEAD_LOSS_*). The edge is tracked on every frame so a lead lost
+     # BEFORE an episode never arms it. Inert off the fix (CS without the lead attribute reads as no lead -> never an edge).
+@@ -1952,7 +2160,10 @@ class Fca11LongBrake:
+       if was_braking:
+         # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+         self._release_pending = True
+-      if self._release_pending:
++      # 0053: while the camera is braking (or the divergence latch holds) NOTHING of ours goes out on 0x38D, not even
++      # the passive close frame (the panda refuses it then, and the camera's own frame is what the ESC must see). The
++      # close frame stays OWED and goes out on the first send slot after the hand-back releases.
++      if self._release_pending and not withhold:
+         sends += self._passive_frame(CS, frame)
+         if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
+           self._release_pending = False
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+index f10e268f..44f8dd8b 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+@@ -36,7 +36,8 @@ FORMAT (one JSON object per line, ``sort_keys``; every record has ``"k"`` = reco
+     V3           v3_ok (False once V3 was disabled by a fault -> the v3_* values are null), v3_wouldbe_lsb (V3's would-be
+                  SENT CR_VSM_DecCmd this frame; 0 = passive/none), v3_send_wouldbe, v3_target_lsb (the V3 level target
+                  before slew/hold/+4 clamps), v3_braking, held_band, latched (blocked_until_resume), hc_unavailable (V3
+-                 core's 0042 fca11_unavailable), hard_cut, pedal_cut, excl_reason (V3 core's fca11_ok why-not; null = ok;
++                 core's 0042 fca11_unavailable), hard_cut (0053: the V3 core's cam_brake - the camera is braking and
++                 holds FCA11; name kept for schema 2 readers), pedal_cut, excl_reason (V3 core's fca11_ok why-not; null = ok;
+                  "v3_disabled" after a fault), v3_alert_bits_wouldbe (1 supervise-stop | 2 stop-complete | 4 brake-now)
+     lead         lead_present, lead_drel_m, lead_vrel_mps, lead_vlead_mps, lead_alead_mps2 (radarState aLeadK),
+                  lead_model_prob, lead_radar - see the fca11_long.py SHADOW block for the pinned conventions:
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 3db97b65..eef9410d 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -327,6 +327,9 @@ class GasInterceptorCarController:
+     CS.fca11_now_nanos = now_nanos
+     # 0030 (D2-iii): feed the pandad echo of our own 0x38D frames (collected in CarInterface.update) so the class can
+     # confirm the passive close frame was ACCEPTED (the clean hand-back); a refused close frame is re-owed.
++    # 0053: the camera hand-back ingests this tick's camera 0x38D frames FIRST, so the echo judgement below (refusal
++    # streak, probation, divergence guard) sees the camera state the panda had when it judged our frames.
++    self.fca11_brake.ingest_camera(CS, frame)
+     self.fca11_brake.observe_echo(getattr(CS, "fca11_echoes", None))
+     # 0034: STEERING-WHEEL consent. The CarState phase recognised a double-press on this frame's cruise
+     # buttons and (if it was a consent gesture for the rep parked on a PREVIOUS frame) dropped its taps
+@@ -339,9 +342,12 @@ class GasInterceptorCarController:
+       if wheel is not None:
+         self.fca11_brake.cal_seq.wheel_gesture(wheel, frame)
+     brake_sends = self.fca11_brake.update(CC, CS, frame, personality)
+-    # 0030 (D1-b): publish the FCA11-long hand-back so the CarState side can surface it (CarStateSP.fca11Unavailable);
+-    # _hard_cut == the panda's fail-closed hyundai_fca11_long_cut (camera owns / pedal fault), NOT re-armed this ignition.
++    # 0030 (D1-b): publish the FCA11-long loss so the CarState side can surface it (CarStateSP.fca11Unavailable);
++    # 0053: that PERMANENT alert is the pedal-fault latch / refusal wall only. The camera hand-back is the TRANSIENT
++    # fca11CameraBraking, and a Python<->panda disagreement is fca11Divergence.
+     CS.fca11_unavailable = bool(self.fca11_brake.fca11_unavailable)
++    CS.fca11_camera_braking = bool(self.fca11_brake.camera_braking_alert)
++    CS.fca11_divergence = bool(self.fca11_brake.fca11_divergence)
+     # 0040: publish the three FCA11 braking alerts (read by CarStateExt -> CarStateSP, then car_specific.py -> events.py).
+     CS.fca11_supervise_stop = bool(self.fca11_brake.supervise_stop)
+     CS.fca11_stop_complete = bool(self.fca11_brake.stop_complete)
+@@ -362,7 +368,12 @@ class GasInterceptorCarController:
+     # and the panda's driver-cut latch would cut the very episode we are measuring. Forcing the pedal to 0
+     # replicates the production condition (when the planner asks brake it never gases) and can only REDUCE
+     # actuation. Inert when cal mode is off (`_cal_active` is False).
+-    if active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
++    # 0053: while the CAMERA is braking (cam_brake), openpilot never throttles against it: the pedal command is forced to
++    # exactly 0 (the panda refuses any non-zero GAS_COMMAND then too). The zero stream keeps flowing (fault-clear path).
++    if self.fca11_brake.cam_brake:
++      self.gas = 0.
++      self.gas_launching = False
++    elif active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
+       accel = CC.actuators.accel
+       # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
+       # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/fca11_cam_vectors.py b/opendbc/sunnypilot/car/hyundai/tests/fca11_cam_vectors.py
+new file mode 100644
+index 00000000..575b3dd2
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/fca11_cam_vectors.py
+@@ -0,0 +1,123 @@
++"""0053: the SHARED camera-classification vector table for the FCA11 camera hand-back.
++
++ONE table, consumed by BOTH layers' tests: the car layer (fca11_long.camera_braking, test_fca11_long.py) and the panda
++(libsafety hyundai_fca11_long_cam_step, safety/tests/test_hyundai.py). Neither side hand-writes bit tests: every vector's
++EXPECTED class is derived from DBC SIGNAL NAMES (hyundai_can.dbc BO_ 909 FCA11), never from the masks under test, so a
++wrong mask in values.py / hyundai.h fails here instead of agreeing with itself.
++
++  BRAKING class (hand back):  CF_VSM_HBACmd, CF_VSM_BeltCmd, CR_VSM_DecCmd, FCA_CmdAct, FCA_StopReq, CF_VSM_DecCmdAct
++  WARNING class (keep braking): CF_VSM_Prefill, CF_VSM_Warn
++  NEUTRAL (never a class): FCA_Status, PAINT1_Status, FCA_DrvSetStatus, FCA_Failinfo, CR_FCA_Alive,
++                           FCA_RelativeVelocity, FCA_TimetoCollision, CR_FCA_ChkSum, and the DBC-undefined bits
++
++Each vector is (name, 8 data bytes, braking: bool, warning: bool). The frames are built in the camera's real idle shape
++(FCA_Status 2, DrvSetStatus 1, RelVel/TTC idle, the always-set undefined byte4 bit7, valid CRC) with exactly the named
++field(s) changed, plus REAL camera frames recorded on routes 14d / 15b (the two incidents).
++"""
++import os
++import re
++
++from opendbc.car.hyundai.hyundaican import hyundai_checksum
++
++BRAKING_FIELDS = ("CF_VSM_HBACmd", "CF_VSM_BeltCmd", "CR_VSM_DecCmd", "FCA_CmdAct", "FCA_StopReq", "CF_VSM_DecCmdAct")
++WARNING_FIELDS = ("CF_VSM_Prefill", "CF_VSM_Warn")
++NEUTRAL_FIELDS = ("FCA_Status", "PAINT1_Status", "FCA_DrvSetStatus", "FCA_Failinfo", "CR_FCA_Alive",
++                  "FCA_RelativeVelocity", "FCA_TimetoCollision")
++
++_DBC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "dbc", "generator", "hyundai",
++                    "hyundai_can.dbc")
++
++
++def dbc_fca11_layout() -> dict[str, tuple[int, int]]:
++  """{signal: (start_bit, length)} for BO_ 909 FCA11, parsed straight from the DBC (Intel / @1 signals only)."""
++  with open(_DBC) as f:
++    src = f.read()
++  m = re.search(r"^BO_ 909 FCA11:.*?\n((?: SG_ .*\n)+)", src, re.MULTILINE)
++  assert m is not None, "BO_ 909 FCA11 not found in hyundai_can.dbc"
++  out = {}
++  for sm in re.finditer(r"SG_ (\w+) : (\d+)\|(\d+)@1", m.group(1)):
++    out[sm.group(1)] = (int(sm.group(2)), int(sm.group(3)))
++  return out
++
++
++def field_mask(fields) -> int:
++  """The bit mask (over the frame's first 4 bytes, little-endian) of the named DBC signals."""
++  lay = dbc_fca11_layout()
++  mask = 0
++  for name in fields:
++    start, length = lay[name]
++    assert start + length <= 32, f"{name} is outside bytes 0..3"
++    mask |= ((1 << length) - 1) << start
++  return mask
++
++
++def frame(**fields) -> bytes:
++  """A camera 0x38D in the real idle shape with the given DBC fields set (raw values), CRC fixed."""
++  lay = dbc_fca11_layout()
++  vals = {"FCA_Status": 2, "FCA_DrvSetStatus": 1, "FCA_RelativeVelocity": 255, "FCA_TimetoCollision": 254,
++          "CR_FCA_Alive": 5}
++  vals.update(fields)
++  b = bytearray(8)
++  for name, v in vals.items():
++    start, length = lay[name]
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(v) >> i) & 1) << (pos % 8)
++  b[4] |= 0x80            # byte4 bit7: undefined, always 1 on this car
++  b[7] = hyundai_checksum(bytes(b[:7]))
++  return bytes(b)
++
++
++# REAL bus-2 camera frames from the two incidents (rlog hex, chosen by recorded_camera_frames() below and frozen here so
++# the tests need no logs). Expected class is from decoding them by DBC field name, not from the masks.
++RECORDED: tuple[tuple[str, str], ...] = (
++  # every distinct warning-class shape on the two incident routes + one idle frame each (harvest_cam_frames.py).
++  # NOTE the warning frames also carry byte3 bit 29 (DBC-undefined) - it must NOT be braking class.
++  ("14d idle", "00000800887ffee0"),
++  ("14d warning byte0=0x08 (Warn 1)", "08000820f07ffe3c"),
++  ("15b idle", "00000800907ffef4"),
++  ("15b warning byte0=0x09 (Warn 1 + Prefill)", "09000820f07ffe61"),
++  ("15b warning byte0=0x08 (Warn 1)", "08000820d87ffe00"),
++)
++
++
++def _classify_by_fields(dat: bytes) -> tuple[bool, bool]:
++  lay = dbc_fca11_layout()
++  val = int.from_bytes(dat, "little")
++
++  def get(name):
++    s, n = lay[name]
++    return (val >> s) & ((1 << n) - 1)
++  return any(get(f) for f in BRAKING_FIELDS), any(get(f) for f in WARNING_FIELDS)
++
++
++def vectors() -> list[tuple[str, bytes, bool, bool]]:
++  lay = dbc_fca11_layout()
++  out: list[tuple[str, bytes, bool, bool]] = [("idle", frame(), False, False)]
++  # every BRAKING field: each single bit on its own (so each bit is proven to hand back), plus its max value
++  for name in BRAKING_FIELDS:
++    _s, n = lay[name]
++    for i in range(n):
++      out.append((f"{name}=bit{i}", frame(**{name: 1 << i}), True, False))
++    out.append((f"{name}=max", frame(**{name: (1 << n) - 1}), True, False))
++  # every WARNING field alone: never a hand-back
++  for name in WARNING_FIELDS:
++    _s, n = lay[name]
++    for v in range(1, 1 << n):
++      out.append((f"{name}={v}", frame(**{name: v}), False, True))
++  out.append(("warn3+prefill (the camera's FCW lead-in)", frame(CF_VSM_Warn=3, CF_VSM_Prefill=1), False, True))
++  out.append(("warn2+prefill", frame(CF_VSM_Warn=2, CF_VSM_Prefill=1), False, True))
++  # NEUTRAL fields at their max: never a class
++  for name in NEUTRAL_FIELDS:
++    _s, n = lay[name]
++    out.append((f"{name}=max", frame(**{name: (1 << n) - 1}), False, False))
++  # mixed: a warning PLUS a braking field is braking (the hand-back wins)
++  out.append(("warn+dec", frame(CF_VSM_Warn=2, CR_VSM_DecCmd=10), True, True))
++  out.append(("prefill+cmdact", frame(CF_VSM_Prefill=1, FCA_CmdAct=1), True, True))
++  out.append(("variant-B (our own actuating shape)", frame(CF_VSM_Warn=3, CF_VSM_Prefill=1, FCA_CmdAct=1, CR_VSM_DecCmd=20),
++              True, True))
++  for name, hx in RECORDED:
++    dat = bytes.fromhex(hx)
++    brk, wrn = _classify_by_fields(dat)
++    out.append((f"recorded:{name}", dat, brk, wrn))
++  return out
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+index c8393b33..76b7004c 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+@@ -363,12 +363,12 @@ class TestContractWithFeel(unittest.TestCase):
+       last = d
+ 
+   def test_one_passive_frame_on_every_exit_from_a_soft_episode(self):
+-    cam_req = (0, _real_camera_frame(warn=2))
++    # 0053: the camera-BRAKING exit sends nothing while it holds (its owed close frame is pinned in
++    # test_camera_handback_releases_and_resumes below), so it is not one of the "one passive frame within 6" exits.
+     exits = {
+       "brake": lambda f: _CS(cam=_cam(), brake=True),
+       "gas": lambda f: _CS(cam=_cam(), gas=True),
+       "gear": lambda f: _CS(cam=_cam(), gear=structs.CarState.GearShifter.sport),
+-      "camera_owns": lambda f: _CS(cam=cam_req),
+       "stale": lambda f: _CS(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9)),
+       "release": lambda f: _CS(cam=_cam()),
+     }
+@@ -391,12 +391,25 @@ class TestContractWithFeel(unittest.TestCase):
+     got = _run(b, [-0.8] * 4, start=101)
+     self.assertEqual(0, got[0][1])
+ 
+-  def test_camera_handback_latches_and_no_auto_resume(self):
++  def test_camera_handback_releases_and_resumes(self):
++    """0053 (was test_camera_handback_latches_and_no_auto_resume): a camera BRAKE hands back (nothing of ours on 0x38D
++    while it holds), a camera WARNING does not, and openpilot RESUMES on its own after FCA11_CAM_RESUME_FRAMES quiet
++    camera frames - first the owed passive close frame, then a fresh soft onset."""
+     b = _brake(True)
+     _run(b, [-0.8] * 100)
+-    _run(b, [-0.8] * 2, start=100, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(warn=2))))
+-    self.assertTrue(b.blocked_until_resume)
+-    self.assertEqual([], [g for g in _run(b, [-2.0] * 200, start=102) if g[1] > 0], "hard cut: never resumes")
++    self.assertTrue(b.braking)
++    self.assertNotEqual([], _run(b, [-0.8] * 10, start=100, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(warn=2)))),
++                        "a warning keeps openpilot braking")
++    self.assertTrue(b.braking)
++    self.assertEqual([], _run(b, [-0.8] * 4, start=110, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(dec=7)))))
++    self.assertTrue(b.cam_brake)
++    self.assertFalse(b.blocked_until_resume)
++    quiet = _run(b, [-2.0] * (2 * fl.FCA11_CAM_RESUME_FRAMES - 2), start=114)
++    self.assertEqual([], quiet, "handed back until the quiet count")
++    after = _run(b, [-2.0] * 20, start=114 + 2 * fl.FCA11_CAM_RESUME_FRAMES - 2)
++    self.assertEqual(0, after[0][1], f"the owed close frame first: {after}")
++    self.assertTrue([g for g in after if g[1] > 0], "openpilot braking resumes")
++    self.assertLessEqual(next(g[1] for g in after if g[1] > 0), STEP, "a fresh onset (panda ref restarted)")
+ 
+   def test_refused_echo_restarts_the_ramp_within_the_panda_onset_step(self):
+     """0035 contract: a REFUSED actuating echo while braking drops our reference to 0 -> the next SENT frame is <= +RATE_STEP
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 11c7db51..8b3acd1d 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -152,16 +152,17 @@ class TestMirrorFrame(unittest.TestCase):
+       fl.build_fca11_frame(None, 1, m)
+ 
+   def test_camera_requesting(self):
++    # 0053: camera_requesting stays the pre-0053 union (informational / shadow log only) ...
+     self.assertFalse(fl.camera_requesting(_real_camera_frame()))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(warn=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(warn=2)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(dec=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(prefill=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(cmd_act=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(dec_cmd_act=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(hba=1)))
+-    self.assertTrue(fl.camera_requesting(_real_camera_frame(stop_req=1)))
++    for kw in (dict(warn=1), dict(warn=2), dict(dec=1), dict(prefill=1), dict(cmd_act=1), dict(dec_cmd_act=1),
++               dict(hba=1), dict(stop_req=1)):
++      self.assertTrue(fl.camera_requesting(_real_camera_frame(**kw)), kw)
+     self.assertFalse(fl.camera_requesting(b""))
++    # ... and the hand-back is ONLY the braking class
++    for kw in (dict(dec=1), dict(cmd_act=1), dict(dec_cmd_act=1), dict(hba=1), dict(hba=2), dict(stop_req=1)):
++      self.assertTrue(fl.camera_braking(_real_camera_frame(**kw)), kw)
++    for kw in (dict(), dict(warn=1), dict(warn=2), dict(warn=3), dict(prefill=1), dict(warn=3, prefill=1)):
++      self.assertFalse(fl.camera_braking(_real_camera_frame(**kw)), kw)
+ 
+ 
+ class _CS:
+@@ -295,10 +296,15 @@ class TestController(unittest.TestCase):
+     for st in (1, 2, 3, 6):
+       b = engaged_ctrl()
+       self.assertFalse(b.update(self._cc(-2.0), _CS(cam=_cam(), state=st), 1), st)
+-    # camera owns -> latch + release
++    # 0053: camera BRAKING -> release on the same frame, NO resume-gated latch (cam_brake releases on its own)
+     b = engaged_ctrl()
+-    self.assertFalse(b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 1))
+-    self.assertTrue(b.blocked_until_resume)
++    self.assertFalse(b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(dec=10))), 1))
++    self.assertTrue(b.cam_brake)
++    self.assertFalse(b.blocked_until_resume)
++    # 0053: a camera WARNING does NOT release (the owner policy; on the pre-0053 tree this released + latched)
++    b = engaged_ctrl()
++    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 2))
++    self.assertTrue(b.braking)
+     # no camera frame -> release
+     b = engaged_ctrl()
+     self.assertFalse(b.update(self._cc(-2.0), _CS(cam=None), 1))
+@@ -528,11 +534,15 @@ class TestController(unittest.TestCase):
+       self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f), f)
+       self.assertFalse(b.braking, f)
+ 
+-  def test_camera_request_latches(self):
++  def test_camera_braking_hands_back_but_warning_does_not(self):
++    """0053 (was test_camera_request_latches): a braking-class camera frame withholds every 0x38D; a warning does not."""
+     b = self._brake(self._cp_sp())
+-    cam_req = (0, _real_camera_frame(warn=2))
+-    b.update(self._cc(-2.0), _CS(cam=cam_req), 0)
+-    self.assertTrue(b.blocked_until_resume)
++    self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(dec=5))), 0))
++    self.assertTrue(b.cam_brake)
++    self.assertFalse(b.blocked_until_resume)
++    b = self._brake(self._cp_sp())
++    self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 0))
++    self.assertFalse(b.cam_brake)
+ 
+   def test_gear_gate(self):
+     b = self._brake(self._cp_sp())
+@@ -788,17 +798,42 @@ class TestG8FrameContract(unittest.TestCase):
+     the panda's episode state persists (brake / gas / gear / camera-owns / staleness / longActive-off).
+     The only path that sends none is the DISABLED path, where the panda re-arms on hyundai_init - checked
+     separately at the end."""
+-    cam_req = (0, _real_camera_frame(warn=2))
+-
+     def exits(f):
++      # 0053: the CAMERA-BRAKING exit is the one path that sends NOTHING while it holds (the panda refuses every host
++      # 0x38D then, and the camera's frame is what the ESC must see); its owed close frame is checked just below.
+       return {
+         "brake": _CS(cam=_cam(), brake=True),
+         "gas": _CS(cam=_cam(), gas=True),
+         "gear": _CS(cam=_cam(), gear=structs.CarState.GearShifter.sport),
+-        "camera_owns": _CS(cam=cam_req),
+         "stale": _CS(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9)),
+       }
+ 
++    # 0053 camera-braking exit: zero 0x38D while the camera brakes, then EXACTLY one passive close frame - the first
++    # host frame after the hand-back releases - and only then can a new episode actuate.
++    b = self._brake()
++    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
++    self.assertTrue(b.braking)
++    got = []
++    f = 1
++    for _ in range(10):
++      got += [(f, fl._get_bits(x.dat, 8, 8)) for x in b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(dec=9))), f)]
++      f += 1
++    self.assertEqual([], got, "nothing of ours on 0x38D while the camera brakes")
++    self.assertFalse(b.braking)
++    self.assertTrue(b._release_pending, "the close frame is OWED, not dropped")
++    while True:                       # the update that RELEASES the hand-back may itself send (the owed close)
++      out = [(f, fl._get_bits(x.dat, 8, 8)) for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f)]
++      f += 1
++      if not b.cam_brake:
++        got += out
++        break
++      self.assertEqual([], out, "still nothing until the hand-back releases")
++    for _ in range(6):
++      got += [(f, fl._get_bits(x.dat, 8, 8)) for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f)]
++      f += 1
++    self.assertEqual(0, got[0][1], f"first frame after the release is the owed passive close: {got}")
++    self.assertEqual(1, len([g for g in got if g[1] == 0]), got)
++
+     for name, cs in exits(_cam()).items():
+       for exit_f in (1, 2):  # odd and even exit frames: the passive must appear either way
+         b = self._brake()
+@@ -924,19 +959,23 @@ class TestG9bDriverCutRearm(unittest.TestCase):
+     self.assertFalse(b.blocked_until_resume)
+     self.assertNotEqual([], sends)
+ 
+-  def test_camera_cut_is_hard_not_rearmed(self):
+-    """The camera hand-back must NOT be re-armed by a clean frame (separate _hard_cut, mirroring the panda's
+-    hard-latched hyundai_fca11_long_cut)."""
++  def test_camera_handback_is_not_cleared_by_a_resume_edge_only_by_quiet_frames(self):
++    """0053 (was test_camera_cut_is_hard_not_rearmed): a resume edge / clean driver frame does NOT clear the camera
++    hand-back; only FCA11_CAM_RESUME_FRAMES quiet CAMERA frames do - and then it clears with no resume needed."""
+     b = self._brake(self._cp_sp())
+-    cam_req = (0, _real_camera_frame(warn=2))
+-    b.update(self._cc(engaged=False), _CS(cam=cam_req), 0)
+-    b.update(self._cc(engaged=True), _CS(cam=cam_req), 2)
+-    b.update(self._cc(engaged=True), _CS(cam=cam_req), 4)            # still a clean *driver* frame
+-    self.assertTrue(b._hard_cut)
+-    self.assertTrue(b.blocked_until_resume)
+-    # a fresh clean camera frame on a later tick still does not clear the hard latch
+-    b.update(self._cc(engaged=True), _CS(cam=_cam()), 6)
+-    self.assertTrue(b.blocked_until_resume)
++    cam_brk = (0, _real_camera_frame(dec=8))
++    b.update(self._cc(engaged=False), _CS(cam=cam_brk), 0)
++    b.update(self._cc(engaged=True), _CS(cam=cam_brk), 2)
++    b.update(self._cc(engaged=True), _CS(cam=cam_brk), 4)            # still a clean *driver* frame
++    self.assertTrue(b.cam_brake)
++    self.assertFalse(b.blocked_until_resume)
++    f = 6
++    for _ in range(fl.FCA11_CAM_RESUME_FRAMES - 1):                  # one camera frame per 50 Hz slot
++      b.update(self._cc(engaged=True), _CS(cam=_cam()), f)
++      f += 2
++    self.assertTrue(b.cam_brake, "one quiet frame short: still handed back")
++    b.update(self._cc(engaged=True), _CS(cam=_cam()), f)
++    self.assertFalse(b.cam_brake, "released by quiet camera frames alone, no resume edge")
+ 
+   def test_gas_release_serves_the_next_request_without_any_edge(self):
+     """0038: a gas press while ENGAGED, controls never dropping, must NOT bar actuation afterwards. Once the pedal
+@@ -1827,13 +1866,10 @@ class TestCalModeActuation(unittest.TestCase):
+ 
+ 
+ class Test0030CameraLatchWithoutLongActive(unittest.TestCase):
+-  """0030 (D1-a): the camera hand-back latch must mirror the panda EXACTLY - set on a camera request even while
+-  openpilot is DISENGAGED (longActive False). The panda's hyundai_fca11_long_rx sets camera_owns/cut on ANY bus-2
+-  0x38D carrying an actuation/warning field with NO host-engagement condition (safety/modes/hyundai.h:228-236), and
+-  only hyundai_init clears it. FALSIFIABLE CONTRAST: on the deployed 29-patch tree every latch assert below FAILS
+-  (the old `CC.longActive and camera_requesting(...)` gate meant a stock FCW seen while disengaged never latched, so
+-  openpilot kept believing it could brake and kept commanding into a refused wall - 1983 refused actuating frames on
+-  drive 14d, incl. all three 20@90 cal reps)."""
++  """0030 (D1-a) -> 0053: the camera hand-back must step EXACTLY like the panda - on every camera frame even while
++  openpilot is DISENGAGED (longActive False). The 0030 lesson stands (drive 14d: an engagement gate let Python and panda
++  disagree for 16 minutes, 1983 refused actuating frames); 0053 changes WHAT is handed back (braking class only) and
++  that it RELEASES after FCA11_CAM_RESUME_FRAMES quiet camera frames instead of latching for the ignition."""
+ 
+   def _brake(self):
+     cp_sp = structs.CarParamsSP()
+@@ -1848,46 +1884,62 @@ class Test0030CameraLatchWithoutLongActive(unittest.TestCase):
+     cc.actuators.accel = accel
+     return cc
+ 
+-  def test_camera_request_latches_while_long_inactive(self):
++  def test_camera_braking_hands_back_while_long_inactive_then_resumes(self):
+     b = self._brake()
+-    cam_req = (0, _real_camera_frame(warn=2))       # the camera itself is braking/warning
+-    # longActive OFF (and disengaged): the OLD update() returned in its `not CC.longActive` branch BEFORE the latch,
+-    # so the camera request was never seen at all.
+-    b.update(self._cc(long_active=False, engaged=False), _CS(cam=cam_req), 0)
+-    self.assertTrue(b._hard_cut, "camera request must latch the hand-back even when long is inactive")
+-    self.assertTrue(b.blocked_until_resume)
+-    self.assertTrue(b.fca11_unavailable)            # D1-b: surfaced
+-    # and it stays latched (not re-armed) once long comes back: openpilot must not silently keep braking
+-    b.update(self._cc(-2.0), _CS(cam=_cam()), 2)
+-    self.assertTrue(b.blocked_until_resume)
+-    self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 4))
+-    self.assertFalse(b.braking)
+-
+-  def test_camera_request_latches_while_long_inactive_through_controller(self):
+-    """The same divergence through the real controller entry point (create_gas_command), where longActive is the
+-    live CarControl value and openpilot can be disengaged at the moment of the stock FCW."""
++    cam_brk = (0, _real_camera_frame(dec=12))       # the camera itself is BRAKING
++    b.update(self._cc(long_active=False, engaged=False), _CS(cam=cam_brk), 0)
++    self.assertTrue(b.cam_brake, "the camera brake must hand back even when long is inactive (the 14d lesson)")
++    self.assertTrue(b.camera_braking_alert)          # transient alert, not the permanent one
++    self.assertFalse(b.fca11_unavailable)
++    self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 2))
++    f = 4
++    sends = []
++    while f < 1000:
++      out = b.update(self._cc(-2.0), _CS(cam=_cam()), f)
++      f += 2
++      if not b.cam_brake:             # the releasing frame may already send
++        sends += out
++        break
++      self.assertEqual([], out)
++    self.assertLess(f, 1000)
++    for g in range(f, f + 10):
++      sends += b.update(self._cc(-2.0), _CS(cam=_cam()), g)
++    self.assertTrue(any(fl._get_bits(s.dat, 8, 8) > 0 for s in sends), "openpilot braking RESUMES after the camera stops")
++    self.assertFalse(b.camera_braking_alert)
++
++  def test_camera_braking_hands_back_while_long_inactive_through_controller(self):
++    """The same through the real controller entry point (create_gas_command): ingest runs before the longActive gate."""
+     CarInterface, CP, CP_SP = _get_ci(True, "1")
+     CI = CarInterface(CP, CP_SP)
+-    # use the real CarState (with its pedal_fault_monitor etc.) and just feed the camera frame + params; the
+-    # divergence we are pinning is the latch, not the pedal stream.
+     cs = CI.CS
+     cs.out = structs.CarState()
+     cs.out.vEgo = 20.0
+     cs.out.gearShifter = structs.CarState.GearShifter.drive
+     cs.interceptor_state = 0
+-    cs.fca11_cam_frame = (0, _real_camera_frame(warn=2))
++    cs.fca11_cam_frame = (0, _real_camera_frame(dec=12))
++    cs.fca11_cam_frames = [cs.fca11_cam_frame]
+     cs.fca11_now_nanos = 0
+     cs.fca11_echoes = []
+     cc = self._cc(-2.0, engaged=False, long_active=False)
+     sends = CI.CC.create_gas_command(cc, cs, 0, 0)
+     self.assertFalse(any(int(a) == fl.FCA11_ADDR for a, _d, _s in sends))
+-    self.assertTrue(CI.CC.fca11_brake._hard_cut)
++    self.assertTrue(CI.CC.fca11_brake.cam_brake)
++    self.assertTrue(cs.fca11_camera_braking)
+ 
+-  def test_no_camera_request_does_not_latch_while_inactive(self):
+-    """Guard: the widened latch must NOT fire on an ordinary idle camera frame (else FCA11-long would self-cut)."""
++  def test_camera_warning_does_not_hand_back_while_inactive(self):
++    """0053: a WARNING (the whole of drives 14d and 15b) neither hands back nor surfaces unavailable."""
+     b = self._brake()
+-    b.update(self._cc(long_active=False, engaged=False), _CS(cam=_cam()), 0)   # idle camera shape
+-    self.assertFalse(b._hard_cut)
++    for f in range(0, 200, 2):
++      b.update(self._cc(long_active=False, engaged=False), _CS(cam=(0, _real_camera_frame(warn=1, prefill=1))), f)
++    self.assertFalse(b.cam_brake)
++    self.assertFalse(b.fca11_unavailable)
++    self.assertFalse(b.camera_braking_alert)
++
++  def test_no_camera_request_does_not_hand_back_while_inactive(self):
++    """Guard: an ordinary idle camera frame never hands back (else FCA11-long would self-cut)."""
++    b = self._brake()
++    b.update(self._cc(long_active=False, engaged=False), _CS(cam=_cam()), 0)
++    self.assertFalse(b.cam_brake)
+     self.assertFalse(b.fca11_unavailable)
+ 
+   def test_fca11_unavailable_only_when_armed(self):
+@@ -1896,8 +1948,9 @@ class Test0030CameraLatchWithoutLongActive(unittest.TestCase):
+     cp_sp.fca11Brake = False
+     cp_sp.enableGasInterceptor = True
+     b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+-    b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 0)
++    b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(dec=9))), 0)
+     self.assertFalse(b.fca11_unavailable)
++    self.assertFalse(b.cam_brake)
+ 
+ 
+ class Test0030EchoConfirmedClose(unittest.TestCase):
+@@ -3178,3 +3231,263 @@ class TestFca11RefusalNotEnabledReset(_RefusalBrakeMixin, unittest.TestCase):
+ 
+ if __name__ == "__main__":
+   unittest.main()
++
++
++class Test0053CameraHandback(unittest.TestCase):
++  """0053: the NON-LATCHING camera hand-back, car-layer half. Same shared vector table as the panda
++  (tests/fca11_cam_vectors.py), the hand-back -> quiet -> resume sequence, probation and the divergence guard."""
++
++  def _brake(self):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    b.log.enabled = False
++    b.cal_seq = None
++    return b
++
++  def _cc(self, accel=-2.0, engaged=True, long_active=True):
++    cc = structs.CarControl()
++    cc.enabled = engaged
++    cc.longActive = long_active
++    cc.actuators.accel = accel
++    return cc
++
++  def _step(self, b, dat, frame, accel=-2.0, engaged=True, echoes=None):
++    """One 20 ms camera period = 2 controller frames, the camera frame delivered on the first (the real cadence)."""
++    sends = []
++    for sub in (0, 1):
++      f = frame + sub
++      cs = _CS(cam=(f * 10_000_000, dat), now=f * 10_000_000)
++      cs.fca11_cam_frames = [(f * 10_000_000, dat)] if sub == 0 else []
++      b.ingest_camera(cs, f)
++      b.observe_echo(echoes if (sub == 0 and echoes) else [])
++      sends += b.update(self._cc(accel, engaged, engaged), cs, f)
++    return sends
++
++  def test_constants(self):
++    from opendbc.sunnypilot.car.hyundai import values as v
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    self.assertEqual(cv.field_mask(cv.BRAKING_FIELDS), v.HYUNDAI_FCA11_CAM_BRAKE_MASK)
++    self.assertEqual(cv.field_mask(cv.WARNING_FIELDS), v.HYUNDAI_FCA11_CAM_WARN_MASK)
++    self.assertEqual(75, v.HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++    self.assertEqual(fl.FCA11_CAM_RESUME_FRAMES, v.HYUNDAI_FCA11_CAM_QUIET_FRAMES + 2)
++    self.assertEqual(3, fl.FCA11_REFUSED_STREAK_CUT)
++    self.assertEqual((50, 5), (fl.FCA11_PROBATION_ECHOES, fl.FCA11_PROBATION_REFUSED_CUT))
++
++  def test_shared_vectors_classify_and_gate(self):
++    """Every shared vector through the REAL update path: braking class -> zero 0x38D on that same frame (and pedal
++    forced to 0 via cam_brake), warning-only / prefill-only / neutral -> openpilot keeps braking."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    for name, dat, braking, warning in cv.vectors():
++      with self.subTest(vector=name):
++        self.assertEqual(braking, fl.camera_braking(dat))
++        self.assertEqual(warning, fl.camera_warning(dat))
++        b = self._brake()
++        self.assertNotEqual([], self._step(b, cv.frame(), 0))         # braking on an idle camera
++        sends = self._step(b, dat, 2)
++        self.assertEqual(braking, b.cam_brake)
++        if braking:
++          self.assertEqual([], sends, "no 0x38D at all on the frame the camera brakes")
++          self.assertTrue(b.camera_braking_alert)
++        else:
++          self.assertTrue(any(fl._get_bits(x.dat, 8, 8) > 0 for x in sends), "a warning keeps openpilot braking")
++          self.assertFalse(b.camera_braking_alert)
++        self.assertFalse(b.fca11_unavailable, "the camera never owns the PERMANENT alert")
++
++  def test_handback_quiet_resume_sequence(self):
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    idle, brk = cv.frame(), cv.frame(CR_VSM_DecCmd=15, FCA_CmdAct=1)
++    b = self._brake()
++    f = 0
++    for _ in range(10):
++      self.assertNotEqual([], self._step(b, idle, f)); f += 2
++    self.assertTrue(b.braking)
++    for _ in range(5):                                                 # the camera brakes for 100 ms
++      self.assertEqual([], self._step(b, brk, f)); f += 2
++    self.assertTrue(b.cam_brake)
++    # quiet: blocked through N_QUIET + MARGIN - 1 camera frames (the panda already allows at N_QUIET)
++    for k in range(fl.FCA11_CAM_RESUME_FRAMES - 1):
++      self.assertEqual([], self._step(b, idle, f), k); f += 2
++      self.assertTrue(b.cam_brake, k)
++    sends = self._step(b, idle, f); f += 2
++    self.assertFalse(b.cam_brake)
++    self.assertFalse(b.camera_braking_alert)
++    self.assertEqual(1, len(sends))
++    self.assertTrue(fl.fca11_passive(bytes(sends[0].dat)), "the first frame after a release is the passive close")
++    later = []
++    for _ in range(10):
++      later += self._step(b, idle, f); f += 2
++    lv = [fl._get_bits(x.dat, 8, 8) for x in later]
++    self.assertGreater(max(lv), 0, "openpilot braking RESUMED")
++    self.assertLessEqual(next(x for x in lv if x > 0), fl.HYUNDAI_FCA11_LONG_RATE_STEP, "fresh onset ramp")
++    self.assertFalse(b.fca11_unavailable or b.fca11_divergence)
++
++  def test_python_resumes_strictly_after_the_panda(self):
++    """Bias: on every release Python is still handed back on the camera frame the panda (N_QUIET) releases."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    b._cam_step(cv.frame(CF_VSM_DecCmdAct=1))
++    for _ in range(fl.HYUNDAI_FCA11_CAM_QUIET_FRAMES + fl.FCA11_CAM_QUIET_MARGIN - 1):
++      b._cam_step(cv.frame())
++      self.assertTrue(b.cam_brake)
++    b._cam_step(cv.frame())
++    self.assertFalse(b.cam_brake)
++
++  def test_mid_count_braking_frame_resets(self):
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    b._cam_step(cv.frame(CR_VSM_DecCmd=1))
++    for _ in range(fl.FCA11_CAM_RESUME_FRAMES - 1):
++      b._cam_step(cv.frame())
++    b._cam_step(cv.frame(CF_VSM_BeltCmd=4))
++    self.assertEqual(0, b._cam_quiet)
++    for _ in range(fl.FCA11_CAM_RESUME_FRAMES - 1):
++      b._cam_step(cv.frame())
++    self.assertTrue(b.cam_brake)
++
++  def test_disengaged_hand_back_steps_and_gas_forced_zero(self):
++    """The 14d condition (disengaged) through the real controller: the state machine steps anyway, the pedal is 0."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    CarInterface, CP, CP_SP = _get_ci(True, "1")
++    CI = CarInterface(CP, CP_SP)
++    cs = CI.CS
++    cs.out = structs.CarState()
++    cs.out.vEgo = 20.0
++    cs.out.gearShifter = structs.CarState.GearShifter.drive
++    cs.interceptor_state = 0
++    cs.fca11_cam_frame = (0, cv.frame(CF_VSM_HBACmd=1))
++    cs.fca11_cam_frames = [cs.fca11_cam_frame]
++    cs.fca11_now_nanos = 0
++    cs.fca11_echoes = []
++    CI.CC.create_gas_command(self._cc(1.0, engaged=False, long_active=False), cs, 0, 0)
++    self.assertTrue(CI.CC.fca11_brake.cam_brake)
++    sends = CI.CC.create_gas_command(self._cc(1.0), cs, 2, 0)        # engaged + a gas ask while the camera brakes
++    self.assertEqual(0., CI.CC.gas)
++    self.assertFalse(any(int(a) == fl.FCA11_ADDR for a, _d, _s in sends))
++    self.assertTrue(cs.fca11_camera_braking)
++
++  # ---- probation ----
++
++  def _brake_stream(self, b, f, n, verdict):
++    """n camera periods of a hard ask; each sent frame's echo is decided by verdict(i) (True = accepted)."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    echoes = []
++    for i in range(n):
++      sends = self._step(b, cv.frame(), f, echoes=echoes)
++      f += 2
++      echoes = [(128 if verdict(i) else 192, bytes(x.dat)) for x in sends]
++    return f
++
++  def test_probation_catches_an_intermittent_wall_after_resume(self):
++    """After every (re)engage: accept 1 / refuse 2 never makes 3 CONSECUTIVE, so the 0042 rule alone never fires;
++    the cumulative probation count does, within the first 50 actuating echoes, and it does not self-heal mid-window."""
++    b = self._brake()
++    self._brake_stream(b, 0, 40, lambda i: i % 3 == 0)
++    self.assertTrue(b._refused_cut, "probation trips on an intermittent wall")
++    self.assertTrue(b.fca11_unavailable)
++    # contrast: the SAME stream after probation has expired does not trip (the consecutive rule is the steady state)
++    b2 = self._brake()
++    f = self._brake_stream(b2, 0, 60, lambda i: True)                # 60 accepted echoes: the window closes
++    self.assertEqual(0, b2._probation_left)
++    self._brake_stream(b2, f, 40, lambda i: i % 3 == 0)
++    self.assertFalse(b2._refused_cut)
++
++  def test_probation_reopens_after_camera_release(self):
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    f = self._brake_stream(b, 0, 60, lambda i: True)
++    self.assertEqual(0, b._probation_left)
++    f2 = f
++    self._step(b, cv.frame(CR_VSM_DecCmd=5), f2); f2 += 2
++    while b.cam_brake:
++      self._step(b, cv.frame(), f2); f2 += 2
++    self.assertEqual(fl.FCA11_PROBATION_ECHOES, b._probation_left, "a released hand-back opens probation")
++
++  def test_probation_does_not_false_trip_on_isolated_refusals(self):
++    b = self._brake()
++    self._brake_stream(b, 0, 60, lambda i: i not in (3, 17, 30, 44))  # 4 isolated refusals inside the window
++    self.assertFalse(b._refused_cut)
++
++  def test_consecutive_rule_unchanged(self):
++    b = self._brake()
++    f = self._brake_stream(b, 0, 60, lambda i: True)
++    self._brake_stream(b, f, 3 + 2, lambda i: i == 0)                 # 1 accepted (the echo of the last good frame), then refused
++    self.assertTrue(b._refused_cut)
++
++  # ---- divergence guard ----
++
++  def test_divergence_on_refused_passive_resyncs_then_latches_on_the_third(self):
++    """The panda refuses PASSIVE frames only while ITS cam_brake holds. Two refused passive echoes while Python sees no
++    camera brake: adopt the panda's view (cam_brake, alert), the third such event this ignition latches."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    idle = cv.frame()
++    passive = b._passive_frame(_CS(cam=(0, idle)), 0)[0].dat
++    b.observe_echo([(128, bytes(passive))])                            # armed: the panda is taking our frames
++    for ev in range(1, 4):
++      b.observe_echo([(192, bytes(passive))])
++      self.assertFalse(b.fca11_divergence and ev == 1 and b._div_events == 0)
++      b.observe_echo([(192, bytes(passive))])
++      self.assertEqual(ev, b._div_events)
++      self.assertTrue(b.cam_brake, "resync: the stricter direction")
++      self._step(b, idle, 10 * ev)
++      self.assertTrue(b.fca11_divergence)
++      self.assertEqual(ev >= fl.FCA11_DIVERGENCE_LATCH_EVENTS, b._div_latched)
++      while b.cam_brake:
++        self._step(b, idle, 10 * ev + 2)
++      if ev < fl.FCA11_DIVERGENCE_LATCH_EVENTS:
++        self.assertFalse(b.fca11_divergence, "a resync clears with the hand-back it adopted")
++    self.assertEqual([], self._step(b, idle, 1000), "latched: no 0x38D for the rest of the ignition")
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_refused_passive_while_camera_brakes_is_not_divergence(self):
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    passive = b._passive_frame(_CS(cam=(0, cv.frame())), 0)[0].dat
++    b.observe_echo([(128, bytes(passive))])
++    b._cam_step(cv.frame(CR_VSM_DecCmd=3))
++    for _ in range(5):
++      b.observe_echo([(192, bytes(passive))])
++    self.assertEqual(0, b._div_events)
++
++  def test_divergence_not_armed_before_first_accepted_echo(self):
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    passive = b._passive_frame(_CS(cam=(0, cv.frame())), 0)[0].dat
++    for _ in range(10):
++      b.observe_echo([(192, bytes(passive))])
++    self.assertEqual(0, b._div_events)
++
++  def test_wall_attribution_passive_accepted_keeps_the_cut(self):
++    """A refusal wall with no camera brake in sight: the episode ends for <= FCA11_ATTRIB_HOLD_FRAMES so the passive
++    close is judged. Accepted -> a real wall (cut stands, no divergence); braking resumes after the bounded hold."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    f = self._brake_stream(b, 0, 60, lambda i: True)
++    got, echoes = [], []
++    for _ in range(12):
++      sends = self._step(b, cv.frame(), f, echoes=echoes); f += 2
++      got += sends
++      # the panda: every ACTUATING frame refused (a wall), every PASSIVE frame accepted (not the camera)
++      echoes = [(128 if fl.fca11_passive(bytes(x.dat)) else 192, bytes(x.dat)) for x in sends]
++    self.assertTrue(b._refused_cut)
++    passives = [i for i, x in enumerate(got) if fl.fca11_passive(bytes(x.dat))]
++    self.assertTrue(passives, "the passive close went out at the wall")
++    self.assertEqual(0, b._div_events, "an accepted passive frame proves it is not the camera")
++    self.assertTrue(any(fl._get_bits(x.dat, 8, 8) > 0 for x in got[passives[0] + 1:]), "braking is not wedged by the hold")
++
++  def test_wall_attribution_passive_refused_is_divergence(self):
++    """The same wall, but the panda ALSO refuses the passive close: only its cam_brake does that -> divergence, and the
++    refusals are re-attributed to the hand-back (no permanent unavailable)."""
++    from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cv
++    b = self._brake()
++    f = self._brake_stream(b, 0, 60, lambda i: True)
++    echoes = []
++    for _ in range(12):
++      sends = self._step(b, cv.frame(), f, echoes=echoes); f += 2
++      echoes = [(192, bytes(x.dat)) for x in sends]
++    self.assertEqual(1, b._div_events)
++    self.assertTrue(b.cam_brake and b.fca11_divergence)
++    self.assertFalse(b._refused_cut, "re-attributed to the camera hand-back")
++    self.assertFalse(b.fca11_unavailable)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+index 34f5fb5f..7eaa7b91 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+@@ -448,7 +448,11 @@ class TestShadowComputeEquivalence:
+     _, CP, CP_SP = _cp(brake="1", shadow="1")
+     b = fl.Fca11LongBrake(CP, CP_SP)
+     _drive(b, _script())                          # the script ends with a camera FCW (warn=2) blip
+-    assert b._hard_cut and b.fca11_unavailable and b._shadow_v3._hard_cut
++    # 0053: a camera WARNING no longer surfaces unavailable / hands back - on either instance
++    assert not b.fca11_unavailable and not b.cam_brake and not b._shadow_v3.cam_brake
++    b._refused_cut = True                         # the OLD-LAW instance's own refusal wall is what is surfaced
++    _drive(b, _script(4))                         # coasting frames: no actuating echo, so nothing heals it
++    assert b.fca11_unavailable and not b._shadow_v3.fca11_unavailable
+ 
+ 
+ # ---------------------------------------------------------------------------------------------- lead fields
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 4aedf7c7..068a8b17 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -1381,11 +1381,23 @@ class TestFca11LongControllerIntegration:
+     assert any(addr == 0x38D for addr, _dat, _src in sends)
+ 
+   def test_camera_request_cuts_and_handback(self):
++    """0053: a camera BRAKE hands back (no 0x38D, pedal forced to 0, transient alert); a WARNING does neither."""
++    from opendbc.sunnypilot.car.hyundai.fca11_long import camera_braking
+     CI, CP_SP = self._ccr()
+-    cs = _Fca11CS(cam=(0, _fca11_cam_frame(warn=2)))  # the camera itself is braking
+-    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, 0)
++    brk = bytearray(_fca11_cam_frame())
++    brk[1] = 12                                    # CR_VSM_DecCmd: the camera itself is braking
++    assert camera_braking(bytes(brk))
++    cs = _Fca11CS(cam=(0, bytes(brk)))
++    sends = CI.CC.create_gas_command(self._cc(0.5), cs, 0, 0)
+     assert not any(addr == 0x38D for addr, _dat, _src in sends)
+-    assert CI.CC.fca11_brake.blocked_until_resume
++    assert CI.CC.fca11_brake.cam_brake and cs.fca11_camera_braking and not cs.fca11_unavailable
++    assert CI.CC.gas == 0., "no throttle against a braking camera"
++    assert not CI.CC.fca11_brake.blocked_until_resume
++    CI, CP_SP = self._ccr()
++    cs = _Fca11CS(cam=(0, _fca11_cam_frame(warn=2)))  # a camera WARNING only
++    sends = CI.CC.create_gas_command(self._cc(-2.0), cs, 0, 0)
++    assert any(addr == 0x38D for addr, _dat, _src in sends), "a warning must not stop openpilot braking"
++    assert not CI.CC.fca11_brake.cam_brake
+ 
+   def test_mirror_frame_bytes(self):
+     CI, CP_SP = self._ccr()
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index 18eab03d..364e4c63 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -64,6 +64,16 @@ HYUNDAI_FCA11_LONG_MAX_DEC = 30
+ # HYUNDAI_FCA11_LONG_MIN_SPEED and the planner's FCA11_BRAKE_MIN_KPH. Actuation is legal at any speed, through zero.
+ # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
+ HYUNDAI_FCA11_LONG_RATE_STEP = 4
++# 0053: the camera hand-back masks over the bus-2 0x38D's first 4 bytes read little-endian (= DBC start bits 0..31).
++# BRAKING class (hand back): CF_VSM_HBACmd 1-2, CF_VSM_BeltCmd 5-7, CR_VSM_DecCmd 8-15, FCA_CmdAct 20, FCA_StopReq 21,
++# CF_VSM_DecCmdAct 31. WARNING class (keep braking): CF_VSM_Prefill 0, CF_VSM_Warn 3-4. Must equal
++# HYUNDAI_FCA11_CAM_BRAKE_MASK / _WARN_MASK in safety/modes/hyundai.h (pinned by test, also against the DBC layout).
++HYUNDAI_FCA11_CAM_BRAKE_MASK = 0x8030FFE6
++HYUNDAI_FCA11_CAM_WARN_MASK = 0x00000019
++# 0053: camera frames of non-braking 0x38D after the last braking-class one before the PANDA releases the hand-back
++# (~1.5 s at 50 Hz). Must equal HYUNDAI_FCA11_CAM_QUIET_FRAMES in safety/modes/hyundai.h. The car layer resumes at
++# HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN (fca11_long.py): it is biased stricter than the panda.
++HYUNDAI_FCA11_CAM_QUIET_FRAMES = 75
+ # 0038: driver-gas hold-off after the pedal RELEASES, microseconds; the panda refuses actuating FCA11 for this long
+ # (a plain elapsed-time check, NOT a latch and NOT a hold cap). Must equal HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US in
+ # safety/modes/hyundai.h; the car layer mirrors it as GAS_HOLDOFF_FRAMES (100 Hz controller frames) in fca11_long.py.

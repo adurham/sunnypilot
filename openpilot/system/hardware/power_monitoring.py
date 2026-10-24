@@ -9,7 +9,13 @@ from openpilot.sunnypilot.system.statsd import statlog
 CAR_VOLTAGE_LOW_PASS_K = 0.011 # LPF gain for 45s tau (dt/tau / (dt/tau + 1))
 
 # While driving, a battery charges completely in about 30-60 minutes
-CAR_BATTERY_CAPACITY_uWh = 30e6
+# Virtual offroad power budget (uWh), refilled while driving. Raised 30e6 -> 55e6 (fork):
+# the 30 Wh default ended the offroad session well short of the owner's MaxTimeOffroad
+# (1800 min = 30 h) at the ~1.74 W offroad draw, and the comma Prime offroad route
+# uploads (logs + video over LTE) add draw on top of that, so the session has to last
+# long enough for them to finish while parked. VBATT_PAUSE_CHARGING below is unchanged
+# and remains the real battery protection (a low car battery still cuts the device off).
+CAR_BATTERY_CAPACITY_uWh = 55e6
 CAR_CHARGING_RATE_W = 45
 
 VBATT_PAUSE_CHARGING = 11.8           # Lower limit on the LPF car battery voltage

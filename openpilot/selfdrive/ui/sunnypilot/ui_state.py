@@ -11,6 +11,7 @@ from opendbc.car.structs import car
 from opendbc.sunnypilot.car.interfaces import has_bsm
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_active_source
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
 from openpilot.system.ui.lib.application import gui_app
@@ -213,6 +214,7 @@ class UIStateSP:
         self.params.remove("AlphaLongitudinalEnabled")
 
       # BSM not available: clear BSM-dependent settings
+      # BSM not available: clear BSM-dependent settings
       if not has_bsm(CP, self.CP_SP):
         self.params.remove("AutoLaneChangeBsmDelay")
     else:
@@ -231,11 +233,11 @@ class UIStateSP:
       self.params.remove("IntelligentCruiseButtonManagement")
       self.has_icbm = False
 
-    # Cruise features requiring longitudinal or ICBM
+    # Cruise features requiring longitudinal or ICBM: the toggles are disabled, but the stored
+    # prefs are KEPT (fork #30).
     if not (has_long or self.has_icbm):
-      self.params.remove("CustomAccIncrementsEnabled")
-      self.params.remove("SmartCruiseControlVision")
-      self.params.remove("SmartCruiseControlMap")
+      for key in ("CustomAccIncrementsEnabled", "SmartCruiseControlVision", "SmartCruiseControlMap"):
+        remove_unless_preserved(self.params, key)
 
 
 class DeviceSP:
