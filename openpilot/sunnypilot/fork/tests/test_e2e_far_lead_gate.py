@@ -38,6 +38,7 @@ class GateOnly:
   def __init__(self):
     self.e2e_gate = False
     self.e2e_gate_cnt = 0
+    self.e2e_gate_alead = []
 
   def step(self, ld, v=15., e2e=-0.8, mpc=0.2, should_stop=False, t_follow=T_FOLLOW):
     return lp.LongitudinalPlanner.update_e2e_gate(self, ld, v, e2e, mpc, should_stop, t_follow)
@@ -272,6 +273,108 @@ class TestLeadDecelVeto(OpenpilotTestCase):
         self.assertEqual(out, e2e, i)
     # the -0.73 / -0.76 asks the old gate discarded (17:14:56.0-56.3) now reach the min() untouched
     self.assertGreater(len(LOG_168_171455) - first_veto, 5)
+
+
+# ---- median + raw-floor ENTER (BRIEF H): enter needs median_0.3s(aLeadK) > -0.5 AND raw aLeadK > -0.8 ----
+N_MED = lp.E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES
+
+
+def far(a):
+  return lead(d_rel=1.5 * d_des(V), v_rel=-1., a_lead=a)
+
+
+class TestMedianEnter(OpenpilotTestCase):
+  def test_window_is_0p3s(self):
+    self.assertEqual(N_MED, 6)
+    self.assertAlmostEqual(N_MED * DT_MDL, 0.3)
+
+  def test_noise_spike_does_not_block_entry(self):
+    # one- and two-frame vision spikes in the -0.8 .. -0.5 band (the 167 16:15:16 shape, smaller than the stay floor)
+    # leave the 6-frame median above -0.5: the 10-frame entry count runs straight through them
+    for spike in ([-0.6], [-0.75], [-0.79, -0.7]):
+      g = GateOnly()
+      seq = [far(0.)] * 4 + [far(a) for a in spike] + [far(0.)] * (N_ENTER - 4 - len(spike))
+      outs = [g.step(ld) for ld in seq]
+      self.assertEqual(len(outs), N_ENTER)
+      self.assertEqual(outs[-1], 0.2, spike)  # entered on the 10th frame, spike included
+      self.assertTrue(g.e2e_gate, spike)
+
+  def test_raw_spike_below_stay_floor_still_resets_entry(self):
+    # a single raw value <= -0.8 fails the raw floor even though the median is fine: entry restarts
+    g = GateOnly()
+    for _ in range(N_ENTER - 1):
+      g.step(far(0.))
+    g.step(far(-0.8))
+    self.assertEqual(g.e2e_gate_cnt, 0)
+    self.assertFalse(g.e2e_gate)
+
+  def test_genuine_hard_braking_lead_still_blocks(self):
+    # a lead that really brakes (sustained, ramping to -1.0 .. -3.0) never enters, from any starting state
+    for a_end in (-1.0, -1.5, -3.0):
+      g = GateOnly()
+      ramp = [far(a_end * k / 5.) for k in range(1, 6)] + [far(a_end)] * 200
+      outs = [g.step(ld) for ld in ramp]
+      self.assertFalse(any(o != -0.8 for o in outs), a_end)
+      self.assertFalse(g.e2e_gate, a_end)
+
+  def test_sustained_band_braking_blocks_via_median(self):
+    # a lead holding -0.6 (above the raw floor, below the enter threshold) is blocked by the median alone
+    g = GateOnly()
+    for _ in range(200):
+      self.assertEqual(g.step(far(-0.6)), -0.8)
+    self.assertFalse(g.e2e_gate)
+
+  def test_median_lag_cannot_admit_below_floor(self):
+    # the median still reads ~0 for 3 frames after a step to -2.0; the raw floor stops entry on the first frame
+    g = GateOnly()
+    for _ in range(N_ENTER - 1):
+      g.step(far(0.))
+    out = g.step(far(-2.0))
+    self.assertEqual(out, -0.8)
+    self.assertFalse(g.e2e_gate)
+    self.assertEqual(g.e2e_gate_cnt, 0)
+
+  def test_enter_subset_of_stay_randomized(self):
+    # ENTER ⊆ STAY on aLeadK: whenever the enter count advances, the raw aLeadK satisfies the stay veto; and an active
+    # gate is always released on the first raw aLeadK <= -0.8 frame (no smoothing on STAY)
+    rng = np.random.default_rng(7)
+    g = GateOnly()
+    for _ in range(40000):
+      a = float(rng.choice([rng.normal(0., 0.25), rng.uniform(-2., -0.4)], p=[0.85, 0.15]))
+      cnt0, gate0 = g.e2e_gate_cnt, g.e2e_gate
+      out = g.step(far(a), e2e=-0.8)
+      if g.e2e_gate_cnt > cnt0 or (g.e2e_gate and not gate0):
+        self.assertGreater(a, lp.E2E_GATE_STAY_ALEAD)
+      if a <= lp.E2E_GATE_STAY_ALEAD:
+        self.assertFalse(g.e2e_gate)
+        self.assertEqual(out, -0.8)
+
+  def test_median_buffer_resets_without_lead(self):
+    g = GateOnly()
+    for _ in range(N_MED):
+      g.step(far(-0.7))  # median -0.7: blocked
+    g.step(lead(present=False))
+    self.assertEqual(g.e2e_gate_alead, [])
+    outs = [g.step(far(0.)) for _ in range(N_ENTER)]
+    self.assertEqual(outs[-1], 0.2)  # the old braking history does not leak across a lead loss
+
+  def test_stay_is_unfiltered(self):
+    # once active, a single raw -0.8 drops the gate even when the median buffer is all zeros
+    g = GateOnly()
+    for _ in range(N_ENTER + 10):
+      g.step(far(0.))
+    self.assertTrue(g.e2e_gate)
+    out = g.step(far(-0.8), e2e=-0.73)
+    self.assertFalse(g.e2e_gate)
+    self.assertEqual(out, -0.73)
+
+  def test_raw_enter_would_have_blocked_the_spike(self):
+    # control: with the median disabled (window 1) the same -0.6 spike resets the entry, so the spike test is not vacuous
+    with mock.patch.object(lp, 'E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES', 1):
+      g = GateOnly()
+      outs = [g.step(ld) for ld in [far(0.)] * 4 + [far(-0.6)] + [far(0.)] * (N_ENTER - 5)]
+      self.assertEqual(outs[-1], -0.8)
+      self.assertFalse(g.e2e_gate)
 
 
 # ---- through the REAL LongitudinalPlanner.update(): gate vs gate-disabled, in lockstep ----

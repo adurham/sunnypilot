@@ -327,3 +327,134 @@ Of these, three episodes are LS2&Q2 (8 frames): 16:39:25, 16:59:54, 17:09:38. 16
 - Radar-track leads: this car's leads are vision-only, so the radar-Kalman `aLeadK` path is untested on logs.
 - Routes other than 167/168.
 - Nothing pushed or deployed.
+
+# Close-out (BRIEF H): median + raw-floor ENTER, independent safety metric
+
+Scripts and output: `~/comma-sim/wsSTOP/feel-167-168/cycle1-close/` (`noise.py`, `audit_close.py` →
+`close_audit.json` / `close_bad_frames.json`, `robust.py`, `strict_eps.py`, `episodes.py`, `harness.log`, `suite.log`).
+Everything below is open-loop log replay of routes 167/168 through the committed harness and the real gate method.
+
+## Change
+
+- ENTER's veto term is now `median_6(aLeadK) > −0.5 AND raw aLeadK > −0.8`
+  (`E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES` = 6 = 0.3 s at 20 Hz). The median is causal, over the present lead's last 6
+  values. The buffer is cleared on any frame with no lead.
+- The raw floor uses the STAY threshold, so ENTER ⊆ STAY on aLeadK. A lagging median cannot admit a frame that the
+  raw stay test would drop on the next frame.
+- STAY is unchanged: raw `aLeadK > −0.8`, released on the first failing frame, with no smoothing and no dwell.
+- Nothing else changed: raise-only, the 10-frame entry, gap/TTC/vRel/MPC terms, turn-limit placement, `0005`, gain, panda.
+- Planner sha1 `44d8ce69…`.
+
+**Noise measurement (`noise.json`).** Steady frames are hindsight-steady leads: the independent centred-1 s lead
+accel has |a| < 0.3 for ±0.5 s; 1,204 such frames.
+- Raw aLeadK frame-to-frame σ (diff/√2) is **0.034 m/s²** (MAD 0.022).
+- σ of aLeadK minus the independent estimate is **0.244**, and **0.243** after a 6-frame median. That σ is dominated by
+  the independent estimator's own noise, not by aLeadK.
+- Frames ≤ −0.8 on steady leads: 0, both raw and after the median.
+- So the vision aLeadK is not Gaussian-noisy. Its bad frames are sparse 1–2-frame excursions, which is what a median
+  removes. The brief's 6 frames was kept.
+
+## Metrics (fixes to the earlier audit)
+
+**Reverted metric.** The earlier "gate-active ∧ aLeadK ≤ −1.0 ∧ TTC shrinking = 0" was near-tautological, because
+the veto fires on that same signal. It is withdrawn as the safety number; it is still 0 and is reported for reference only.
+
+**New metric 1 (independent ground truth).**
+- Lead accel is the least-squares slope of `vEgo + vRel` over a **centred** 21-frame (~1 s) window. It never uses
+  aLeadK. It is NaN across lead loss or dRel jumps.
+- Count: gate active ∧ a_ind ≤ −1.0 ∧ TTC shrinking.
+- Cross-check: the MPC's own request falls to ≤ −1.0 within the next 2 s.
+- Robustness:
+  - the centred 2 s slope;
+  - the audit's causal 2 s dRel-quadratic (Q2, independent of vRel);
+  - the noise floor of the 1 s estimator on steady leads: σ 0.35, with 1.3 % of steady frames ≤ −1.0 from noise alone.
+
+**Purpose-aligned set.**
+- Set B (engaged ∧ e2e-sourced ∧ old enter predicate ∧ logged aTarget < −0.5) restricted to frames where the MPC
+  candidate stays ≥ −0.1 for the next 1.5 s (and, separately, 2.0 s).
+- On these frames the follow controller itself never asked to brake, so standing down cannot have been correct.
+
+**Chatter.** Engaged gate on→off transitions per addressable minute. Addressable = engaged ∧ e2e ∧ old enter
+predicate, 12,692 frames = 10.6 min.
+
+## Results (pooled 167 + 168)
+
+| metric | pre-veto (df4d5c3) | raw ENTER (a1172fe) | **median + floor (this)** |
+|---|---|---|---|
+| 1 gate ∧ a_ind(1 s) ≤ −1.0 ∧ TTC↓ (engaged ∧ discarded) | 732 (685) | 622 (575) | **630 (583)** |
+| 1 strict: 1 s ∧ 2 s ∧ Q2 all ≤ −1.0 | 97 | 55 | **55** |
+| 1 xchk: gate ∧ TTC↓ ∧ MPC ≤ −1.0 within 2 s | 91 | 76 | **76** |
+| (reverted) gate ∧ aLeadK ≤ −1.0 ∧ TTC↓ | 26 | 0 | 0 |
+| 2 plan lowered | 0 | 0 | **0** / 65,505 |
+| 3 set B raised | 209/217 = 96.3 % | 146/217 = 67.3 % | **155/217 = 71.4 %** |
+| 4 purpose-aligned raised, 1.5 s / 2.0 s | 99.3 % / 99.2 % | 87.3 % / 88.6 % | **126/134 = 94.0 % / 126/132 = 95.5 %** |
+| 5 onsets gated (of 33) | 30 | 29 | **29** |
+| 5 stops first-ask unchanged / lost / shouldStop changed | 12/15 / 0 / 0 | 14/15 / 0 / 0 | **14/15 / 0 / 0** |
+| 6 off-transitions (167 + 168) → per addressable min | 75 → 7.09 | 74 → 7.00 | **74 → 7.00** |
+| 6 gate episodes < 1 s | 17 | 19 | 18 |
+
+The pre-veto replay reproduces the committed pre-veto `replay-*.npz` gate state frame for frame (0 mismatches). The
+harness (`check_e2e_gate_logs.py`) re-run: 0 lowered frames on 33,255 / 32,250; 4c model-bound 30/41.
+
+## Acceptance (criteria fixed in advance)
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | 0 gate-active frames with independent lead decel ≤ −1.0 ∧ TTC shrinking | **630 FAIL.** 55 with all three estimators agreeing. 76 on the MPC cross-check |
+| 2 | 0 plan-lowered frames | **0 PASS** |
+| 3 | Raw set-B raise ≥ 80 % | **71.4 % FAIL** (up from 67.3 %) |
+| 4 | Purpose-aligned raise ≥ 90 % | **94.0 % (1.5 s) / 95.5 % (2.0 s) PASS** |
+| 5 | Onsets ≥ 30/33, with stops unchanged | **29/33 FAIL.** Stops part passes: 14/15, 0 lost, shouldStop 0 |
+| 6 | Chatter no worse than pre-veto | **7.00 vs 7.09 / addressable min, PASS.** Episodes under 1 s: 18 vs 17 |
+| 7 | Unit tests extended, no skips | **35 passed, 0 skipped, PASS** |
+
+**#1, read honestly.**
+- The veto removes only about 14 % of the independent-ground-truth bad frames (732 → 630). The 1 s estimator's
+  noise inflates the raw count: on steady leads about 1.3 % of frames read ≤ −1.0 from noise alone.
+- The strict three-way count and the MPC cross-check are not noise. 55 frames, 16 episodes, 12 of them engaged.
+  The MPC itself later asks for ≤ −1.0 on 76 gate-active closing frames.
+- Example: 168 17:14:54.73–54.84. The veto drops at 55.33, but a_ind −1.86 and Q2 −1.56 are already there. aLeadK
+  (−0.72) lags the lead's real decel by about 0.5 s.
+- Other strict episodes where the gate discarded a real brake ask: 167 15:50:14 (raw −0.70 → −0.19, MPC −0.74 within
+  2 s), 167 16:15:09, 168 16:56:48.
+- Most other strict episodes have raw e2e ≥ −0.1, so the gate discarded nothing material.
+- The veto runs on the model's own lead accel. It cannot see what that signal does not see yet.
+
+**#5: 167 16:15:16 is not recovered.** The premise was a one-frame spike, but the trace shows otherwise:
+- aLeadK reads −1.10, −1.10, −0.82, −0.82 at 16:15:16.14–.28, then −0.91 ×2 at .54, then −1.28 at .83.
+- These are raw values ≤ −0.8. They drop STAY and fail the raw floor. The median never decides this case.
+- vRel jumps to −4.1 over the same frames, and the independent estimators read −4.5 (1 s), −1.9 (2 s) and −3.6 (Q2).
+- Recovering it would need a looser STAY or raw floor, which the brief forbids.
+
+**What the median does buy:**
+- set B +9 frames;
+- purpose-aligned set 87 → 94–95 %;
+- the purpose-aligned misses drop to 2 episodes (167 15:44:17, 168 16:37:57);
+- no change to metric 1 strict or the MPC cross-check;
+- chatter unchanged.
+
+## Tests (close-out)
+
+- `test_e2e_far_lead_gate.py`: **35 passed, 0 skipped** (was 25). New `TestMedianEnter` covers:
+  - the window is 0.3 s;
+  - 1- and 2-frame spikes in the −0.8…−0.5 band do not block entry;
+  - a raw value ≤ −0.8 still resets entry (the floor);
+  - a ramping lead to −1/−1.5/−3 never enters;
+  - a sustained −0.6 is blocked by the median alone;
+  - the median lag after a step to −2.0 cannot admit (floor);
+  - ENTER ⊆ STAY over 40k randomized frames;
+  - the buffer clears on lead loss;
+  - STAY is unfiltered;
+  - a non-vacuous control: window 1 blocks the same spike.
+- `fork/tests` + `selfdrive/controls/tests` (excluding `test_leads.py`): **525 passed, 2 skipped, 18 failed,
+  9 errors**. This is the same pre-existing environment set as above (following_distance 7, latcontrol 5 + 1,
+  cruise_prefs 2, cal_consent_big_ui 9 errors).
+- `ruff` on the changed files: clean.
+
+## Verdict
+
+**Not shippable to a supervised drive test against the fixed criteria: #1, #3 and #5 fail.**
+- #2, #4, #6 and #7 pass.
+- The purpose-aligned and chatter numbers say the gate is not causing needless suppression or flicker.
+- The independent safety metric says the aLeadK veto is too late to be the safety argument. The gate still discards
+  e2e asks while the lead is measurably slowing.

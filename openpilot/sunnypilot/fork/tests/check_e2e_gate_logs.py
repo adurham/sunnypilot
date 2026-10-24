@@ -145,6 +145,7 @@ class _GateState:
   def __init__(self):
     self.e2e_gate = False
     self.e2e_gate_cnt = 0
+    self.e2e_gate_alead = []
 
 
 class _Params:
@@ -297,8 +298,10 @@ def main():
                 (rows[i, C['md_ss']] > 0.5, 'model shouldStop'), (dr <= 1.2 * dd, f'gap {dr / dd:.2f}x<=1.2'),
                 (ttc <= 12., f'ttc {ttc:.1f}<=12'), (vr <= -3., f'vRel {vr:.1f}<=-3'),
                 (mpc[i] < -0.1, f'mpc {mpc[i]:.2f}<-0.1'),
-                (rows[i, C['l_alead']] <= lp.E2E_GATE_ENTER_ALEAD,
-                 f'aLeadK {rows[i, C["l_alead"]]:.2f}<={lp.E2E_GATE_ENTER_ALEAD}'))
+                (rows[i, C['l_alead']] <= lp.E2E_GATE_STAY_ALEAD,
+                 f'aLeadK {rows[i, C["l_alead"]]:.2f}<={lp.E2E_GATE_STAY_ALEAD}'),
+                (float(np.median(rows[max(i - lp.E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES + 1, 0):i + 1, C['l_alead']])) <=
+                 lp.E2E_GATE_ENTER_ALEAD, f'median aLeadK <={lp.E2E_GATE_ENTER_ALEAD}'))
       why = [txt for bad, txt in checks if bad]
       return ', '.join(why) or 'enter count < 10 frames'
     o4c = [at_onset(e) for e in eps if e['why'].startswith('4c') and e['binder'] == 'model']

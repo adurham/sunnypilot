@@ -48,6 +48,10 @@ E2E_GATE_ENTER_FRAMES = 10    # 0.5 s at 20 Hz
 # lead is vision-only). It is the same value the MPC extrapolates the lead with (long_mpc.process_lead).
 E2E_GATE_ENTER_ALEAD = -0.5   # m/s^2, enter only while aLeadK > this
 E2E_GATE_STAY_ALEAD = -0.8    # m/s^2, exit the first frame aLeadK <= this
+# ENTER tests the 0.3 s median of aLeadK (a 1-2 frame vision spike must not block entry) AND the raw aLeadK against the
+# stay threshold, so a lagging median can never admit a frame the raw stay test would drop: ENTER stays a subset of STAY.
+# STAY is unfiltered (raw aLeadK, first-frame release).
+E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES = 6  # 0.3 s at 20 Hz
 
 
 def turn_accel_limit(v_ego, angle_steers, CP):
@@ -88,23 +92,31 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     self.e2e_gate = False
     self.e2e_gate_cnt = 0
+    self.e2e_gate_alead = []  # last E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES aLeadK values of the present lead
 
   def update_e2e_gate(self, lead, v_ego, e2e_raw, output_a_target_mpc, should_stop_e2e, t_follow):
     """fork (cycle 1): far-lead e2e gate. While a lead is present, far (> 1.2x the MPC's desired gap), slow-closing
     (TTC > 12 s) and the MPC candidate is not braking, the vision model's accel wish may not undercut the MPC: e2e is
     raised to the MPC value. RAISE ONLY. Enters after 10 consecutive qualifying frames (0.5 s at 20 Hz), exits on the
     first frame the looser stay test fails (gap < 1.1x, TTC < 8 s, vRel < -3.5, MPC < -0.2: a cut-in drops it at once).
-    Lead-decel veto: enter needs aLeadK > -0.5, stay needs aLeadK > -0.8, so the gate is never active while the lead is
-    braking (a far but braking lead is exactly when the model's early ask must be kept).
+    Lead-decel veto: enter needs median_0.3s(aLeadK) > -0.5 AND raw aLeadK > -0.8, stay needs raw aLeadK > -0.8, so the
+    gate is never active while the lead is braking (a far but braking lead is exactly when the model's early ask must be
+    kept). The median buffer holds the present lead's last 6 values and is cleared while no lead is present.
 
     d_des matches the MPC's steady follow distance: get_safe_obstacle_distance(v_ego, t_follow) minus the lead's
     stopped-equivalence term is STOP_DISTANCE + t_follow * v_ego at equal speeds, with the same t_follow the MPC got."""
     d_des = STOP_DISTANCE + t_follow * v_ego
     ttc = lead.dRel / max(-lead.vRel, 0.1)
     base = lead.present and v_ego > E2E_GATE_MIN_SPEED and not should_stop_e2e
+    if lead.present:
+      self.e2e_gate_alead.append(lead.aLeadK)
+      del self.e2e_gate_alead[:-E2E_GATE_ENTER_ALEAD_MEDIAN_FRAMES]
+    else:
+      self.e2e_gate_alead.clear()
+    alead_med = float(np.median(self.e2e_gate_alead)) if self.e2e_gate_alead else lead.aLeadK
     enter = (base and lead.dRel > E2E_GATE_ENTER_GAP * d_des and ttc > E2E_GATE_ENTER_TTC and
              lead.vRel > E2E_GATE_ENTER_VREL and output_a_target_mpc >= E2E_GATE_ENTER_MPC and
-             lead.aLeadK > E2E_GATE_ENTER_ALEAD)
+             alead_med > E2E_GATE_ENTER_ALEAD and lead.aLeadK > E2E_GATE_STAY_ALEAD)
     stay = (base and lead.dRel > E2E_GATE_STAY_GAP * d_des and ttc > E2E_GATE_STAY_TTC and
             lead.vRel > E2E_GATE_STAY_VREL and output_a_target_mpc >= E2E_GATE_STAY_MPC and
             lead.aLeadK > E2E_GATE_STAY_ALEAD)
