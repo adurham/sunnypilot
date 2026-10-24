@@ -206,7 +206,7 @@ form was landed.
 - **Series:**
   - Rehearsal: a pristine clone at pin `e3f1487d`, then the `LC_ALL=C`-sorted `patches/*.patch` (`0001`, `0002`, `0003`,
     `0005`) applied with plain `git apply`: 4/4 applied. The resulting tree is `diff -r` identical to the worktree's
-    `opendbc_repo`. `fca11_long.py` sha256 is `c8308e69…` and the test file is `3c26d03a…`.
+    `opendbc_repo`. `fca11_long.py` sha256 is `c8308e69…` and the test file is `a9d0e9bd…`.
   - `0005` refuses to apply alone on a pristine pin, because it depends on `0002`.
   - `check_patch_numbers` passes: 4 series + 1 panda, unique (`0004` is the panda patch).
 
