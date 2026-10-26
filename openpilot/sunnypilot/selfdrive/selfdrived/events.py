@@ -260,12 +260,6 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # replaced by the three owner-approved alerts below. EventNameSP.fca11BrakeLowSpeedDEPRECATED @28 holds the retired
   # ordinal so old logs still decode; no alert is defined for it and nothing raises it.
   #
-  # steady YELLOW "supervise stop": a stop is being guided at low speed. Warning only.
-  EventNameSP.fca11SuperviseStop: {
-    ET.WARNING: Alert("supervise stop", "FCA11 is braking to a stop - be ready to press the brake",
-                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
-  },
-
   # steady YELLOW "stop complete - hold brake pedal": FCA11 has brought the car to a stop and is STILL holding. This
   # is an explicit HAND-OFF, not a cap: the brake command keeps flowing. It tells the driver to put a foot on the
   # brake so releasing openpilot/ignition leaves the car held.
@@ -314,7 +308,7 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # echo (proof the panda is not latched), so a pre-arm blip shows this alert only until the first echoed actuating
   # frame proves the panda is clear.
   EventNameSP.fca11Unavailable: {
-    ET.PERMANENT: NormalPermanentAlert("FCA11 Braking Unavailable", "openpilot braking is off until restart"),
+    ET.PERMANENT: NormalPermanentAlert("FCA11 Braking Unavailable", "openpilot braking is off while this shows"),
   },
 
   # fork (adurham), patch 0053: TRANSIENT - the stock camera is sending actual BRAKE commands (braking-class FCA11), so

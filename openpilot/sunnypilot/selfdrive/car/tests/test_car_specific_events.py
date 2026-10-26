@@ -92,7 +92,7 @@ class TestFca11CameraHandbackEvents:
     CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
                          openpilotLongitudinalControl=True)
     CP_SP = SimpleNamespace(enableGasInterceptor=True, fca11Brake=armed)
-    CS_SP = SimpleNamespace(brakeNow=False, stopComplete=False, superviseStop=False, fca11Unavailable=unavailable,
+    CS_SP = SimpleNamespace(brakeNow=False, stopComplete=False, fca11Unavailable=unavailable,
                             fca11CameraBraking=camera, fca11Divergence=divergence)
     CS = SimpleNamespace(vEgo=20., buttonEvents=[], cruiseState=SimpleNamespace(nonAdaptive=False))
     return CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, Events(), True)
@@ -118,8 +118,48 @@ class TestFca11CameraHandbackEvents:
       assert not ev.has(e)
 
   def test_alert_definitions(self):
-    from openpilot.selfdrive.selfdrived.events import ET
+    from openpilot.selfdrive.selfdrived.events import ET, Alert
     from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
     assert ET.WARNING in EVENTS_SP[EventNameSP.fca11CameraBraking]
     assert ET.PERMANENT in EVENTS_SP[EventNameSP.fca11Divergence]
-    assert "until restart" in EVENTS_SP[EventNameSP.fca11Unavailable][ET.PERMANENT].alert_text_2
+    # drive 16a (2026-10-25): the condition cleared itself 170.5 s later on the SAME ignition, so the old second line
+    # ("off until restart") over-claimed. The text must now scope the loss to the time the banner is up.
+    unavailable = EVENTS_SP[EventNameSP.fca11Unavailable][ET.PERMANENT]
+    assert isinstance(unavailable, Alert)  # a plain alert, not a callback: the text is fixed at import
+    assert unavailable.alert_text_2 == "openpilot braking is off while this shows"
+    assert "until restart" not in unavailable.alert_text_2
+
+
+class TestFca11SuperviseStopRemoved:
+  """fork (drive 0000016a, 2026-10-25): "supervise stop" fired 12 times in a 10-minute drive and told the owner nothing
+  he did not already know, so the alert is DELETED. CarStateSP.superviseStop is still published (the opendbc half keeps
+  it in the log for analysis); the car layer must no longer turn it into any event. brakeNow / stopComplete remain."""
+
+  FCA11_EVENTS = (EventNameSP.fca11BrakeNow, EventNameSP.fca11StopComplete, EventNameSP.fca11Unavailable,
+                  EventNameSP.fca11CameraBraking, EventNameSP.fca11Divergence)
+
+  def _run(self, stop_complete=False):
+    # vEgo 5 m/s (18 km/h) is inside the old "braking below 15 km/h" window, so this call would have raised the banner.
+    # superviseStop=True is set on every call: the flag on its own must raise nothing.
+    CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
+                         openpilotLongitudinalControl=True)
+    CP_SP = SimpleNamespace(enableGasInterceptor=True, fca11Brake=True)
+    CS_SP = SimpleNamespace(brakeNow=False, stopComplete=stop_complete, superviseStop=True,
+                            fca11Unavailable=False, fca11CameraBraking=False, fca11Divergence=False)
+    CS = SimpleNamespace(vEgo=5., buttonEvents=[], cruiseState=SimpleNamespace(nonAdaptive=False))
+    return CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, Events(), True)
+
+  def test_supervise_stop_raises_no_fca11_event(self):
+    ev = self._run()
+    assert not any(ev.has(e) for e in self.FCA11_EVENTS)
+    assert len(ev) == 0  # nothing at all in this state: no buttons, nonAdaptive False
+
+  def test_stop_complete_still_raised_with_supervise_stop_set(self):
+    ev = self._run(stop_complete=True)
+    assert ev.has(EventNameSP.fca11StopComplete)
+    assert not ev.has(EventNameSP.fca11BrakeNow)
+
+  def test_enum_still_in_cereal_but_has_no_alert_definition(self):
+    # the enum ordinal stays reserved in custom.capnp (the log keeps the flag); only the alert dict entry is gone
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
+    assert EventNameSP.fca11SuperviseStop not in EVENTS_SP

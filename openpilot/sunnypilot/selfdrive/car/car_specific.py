@@ -58,19 +58,20 @@ class CarSpecificEventsSP:
         if CS.cruiseState.nonAdaptive:
           events_sp.add(EventNameSP.pedalFactoryCruiseLockout)
 
-        # fork (0040): the three FCA11 braking alerts, raised from CarStateSP (the opendbc half, CarStateExt).
-        #   fca11SuperviseStop - steady YELLOW, braking below 15 km/h (a stop is being guided).
+        # fork (0040): the two driver-facing FCA11 braking alerts, raised from CarStateSP (the opendbc half,
+        # CarStateExt).
         #   fca11StopComplete  - steady YELLOW at/near a stop while still holding (an explicit hand-off, NOT a cap:
         #                        the command keeps flowing; it tells the driver to put a foot on the brake).
         #   fca11BrakeNow      - persistent RED on ESC non-response or hold-lost; clears only on driver brake.
+        # "supervise stop" (steady yellow while braking below 15 km/h) was DELETED on the owner's instruction
+        # (drive 16a review, 2026-10-25): it was 12 banners in a 10-minute drive and told him nothing he did not
+        # already know. The CarStateSP.superviseStop flag stays in the log for analysis; nothing raises an event.
         # The old hand-over alert ("FCA11: Take Over Below 12 km/h") is DELETED with the floors it warned about.
         if self.CP_SP.fca11Brake:
           if CS_SP.brakeNow:
             events_sp.add(EventNameSP.fca11BrakeNow)
           elif CS_SP.stopComplete:
             events_sp.add(EventNameSP.fca11StopComplete)
-          elif CS_SP.superviseStop:
-            events_sp.add(EventNameSP.fca11SuperviseStop)
 
         # fork (adurham), patch 0030: FCA11-long is unavailable for the rest of this ignition (the panda has
         # handed FCA11 back to the camera / latched a pedal fault). Surfaced from CarStateSP.fca11Unavailable
