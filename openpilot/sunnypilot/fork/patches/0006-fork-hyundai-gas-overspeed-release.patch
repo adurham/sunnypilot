@@ -1,0 +1,70 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -229,6 +229,33 @@
+   """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake."""
+   return float(np.clip(get_pedal_scale(v_ego, personality) * accel + get_hold_command(v_ego, personality),
+                        0., get_personality_ceiling(v_ego, personality)))
++
++
++# *** over-speed gas release (route 16a, measured) ***
++# When the car is ABOVE the cruise set speed and the planner still asks accel <= 0, the hold feedforward must NOT
++# apply. Route 16a: the owner lowered the set speed 88->80->72 km/h while at 80.6 km/h; for ~20 s the plan asked
++# aTarget ~0 (mean +0.022, min -0.027 m/s^2) but hold_cmd(v) is added unconditionally at accel 0, so the
++# interceptor commanded ~13.5 % pedal -> ~8 % engine throttle -> the car HELD 78 km/h instead of coasting. The
++# owner wants a slow deceleration / engine braking there. The release must be an EXACT zero, not a small offset:
++# pass-through (interceptor idle, foot off, 40-70 km/h) coasts at a median -1.33 m/s^2, and ANY live command
++# (even 2 raw counts) collapses that to about -0.05 m/s^2. A gas amount of exactly 0.0 is below the
++# create_gas_interceptor_command 0.001 enable threshold, so the wire carries the all-zero ENABLE=0 frame and the
++# pedal passes the driver's own signal through.
++OVERSPEED_RELEASE_MARGIN = 0.5   # m/s above the set speed where the release boundary sits (fired strictly above; no hysteresis)
++V_CRUISE_UNSET_KPH = 255.        # carState.vCruise "no set speed" sentinel (superproject V_CRUISE_UNSET); 0 counts as invalid here too
++
++
++def over_speed_release(active: bool, accel: float, v_ego: float, v_cruise: float) -> bool:
++  """True -> force the pedal command to EXACTLY 0.0 for this frame (all-zero ENABLE=0 frame -> pass-through -> the
++  car coasts on engine braking). Measured reason (route 16a): set speed lowered 88->80->72 km/h while at 80.6 km/h;
++  plan aTarget ~0 for 20 s, but hold_cmd added anyway -> ~13.5 % pedal -> ~8 % TPS -> no coast. And any live
++  command collapses the car's own ~-1.33 m/s^2 coast to ~-0.05, so only an exactly-zero command releases. Narrow by
++  design: fires only when longitudinal is active, the set speed is real (0 < vCruise < 255 km/h), vEgo is strictly
++  more than OVERSPEED_RELEASE_MARGIN above it, and the plan's accel ask is <= 0. Inert at/below the set speed, on
++  positive asks, disengaged, unset vCruise (255/0) and standstill launches."""
++  return bool(active and accel <= 0. and
++              0. < v_cruise < V_CRUISE_UNSET_KPH and
++              v_ego > v_cruise * CV.KPH_TO_MS + OVERSPEED_RELEASE_MARGIN)
+ 
+ 
+ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False) -> float:
+@@ -375,16 +402,23 @@
+       self.gas_launching = False
+     elif active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
+       accel = CC.actuators.accel
+-      # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
+-      # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
+-      # (above LAUNCH_RAMP_V_MAX the two branches are the same function anyway). Cleared on any non-positive request
+-      # or once vEgo exceeds LAUNCH_RAMP_V_MAX, so a rolling re-engagement at 11-19 m/s can never set it.
+-      if accel > 0. and CS.out.vEgo <= LAUNCH_RAMP_V_MAX:
+-        self.gas_launching = True
+-      elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
++      # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
++      # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
++      # hold_cmd. Every other case falls through to the unchanged law below.
++      if over_speed_release(active, accel, CS.out.vEgo, CS.out.vCruise):
++        self.gas = 0.
+         self.gas_launching = False
+-      self.gas = rate_limit_pedal_command(get_pedal_command(accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo,
+-                                          self.gas_launching)
++      else:
++        # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
++        # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
++        # (above LAUNCH_RAMP_V_MAX the two branches are the same function anyway). Cleared on any non-positive request
++        # or once vEgo exceeds LAUNCH_RAMP_V_MAX, so a rolling re-engagement at 11-19 m/s can never set it.
++        if accel > 0. and CS.out.vEgo <= LAUNCH_RAMP_V_MAX:
++          self.gas_launching = True
++        elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
++          self.gas_launching = False
++        self.gas = rate_limit_pedal_command(get_pedal_command(accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo,
++                                            self.gas_launching)
+     elif self.fca11_brake.braking or self.fca11_brake._cal_active:
+       self.gas = 0.
+       self.gas_launching = False

@@ -206,6 +206,9 @@ class ModularAssistiveDrivingSystem:
     self.events.remove(EventName.buttonCancel)
     self.events.remove(EventName.pedalPressed)
     self.events.remove(EventName.wrongCruiseMode)
+    # fork (adurham): same rail as wrongCruiseMode — the drive-mode N lockout blocks openpilot longitudinal
+    # (main state machine), but MADS strips it so a lateral-only engagement survives.
+    self.events.remove(EventName.driveModePersonalityBlock)
 
   def update(self, CS: structs.CarState):
     if not self.enabled_toggle:

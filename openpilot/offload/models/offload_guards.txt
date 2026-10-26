@@ -1,0 +1,7 @@
+  GUARD modeld.py:L42-L45  source=L42
+  GUARD modeld.py:L104-L105  source=L104
+  GUARD modeld.py:L177-L182  source=L177
+  GUARD modeld.py:L384-L385  source=L384
+  GUARD modeld.py:L474-L478  source=L474
+  GUARD modeld_base.py:L16-L23  source=L16
+total OFFLOAD If-guards: 6
