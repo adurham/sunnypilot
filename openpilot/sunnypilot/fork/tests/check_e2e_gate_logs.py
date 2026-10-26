@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-ROUTES_DIR = os.path.expanduser('~/comma-routes')
+ROUTES_DIR = os.environ.get('COMMA_ROUTES_DIR', os.path.expanduser('~/comma-routes'))  # env: the worker processes re-import this module
 WS = os.path.expanduser('~/comma-sim/wsSTOP/feel-167-168')
 DEFAULT_ROUTES = ['00000167--0bfe2c0c45', '00000168--d69017f041']
 SRC = {'cruise': 0, 'lead0': 1, 'lead1': 2, 'lead2': 3, 'e2e': 4}
@@ -43,9 +43,37 @@ ROAD = {'urban': 0, 'highway': 1, 'interstate': 2, 'unknown': 3}
 ROAD_INV = {v: k for k, v in ROAD.items()}
 
 
+def scan_meta(route, segs, limit_msgs=40000):
+  """CarParams / CarParamsSP / initData params, scanned ONCE per route.
+
+  They are published at the start of a route, but card re-publishes carParams mid-segment, so a segment-local scan that
+  waits for it drops every plan frame before that point (measured: 636 of 1201 frames on route 16d seg 3, i.e. ~50 % of
+  a route and the first seconds of every segment). Every statistic this harness produced before 2026-10-26 was computed
+  on that biased subset."""
+  from openpilot.tools.lib.logreader import LogReader
+  meta = {}
+  for seg in segs:
+    for i, m in enumerate(LogReader(f'{ROUTES_DIR}/{route}--{seg}/rlog.zst')):
+      w = m.which()
+      if w == 'carParams':
+        cp = m.carParams
+        meta.update(delay=cp.longitudinalActuatorDelay, steerRatio=cp.steerRatio, wheelbase=cp.wheelbase, brand=cp.brand)
+      elif w == 'carParamsSP':
+        meta['gas_interceptor'] = bool(m.carParamsSP.enableGasInterceptor)
+      elif w == 'initData':
+        for e in m.initData.params.entries:
+          if e.key == 'AdaptiveFollowDistance':
+            meta['adaptive_follow'] = bytes(e.value) == b'1'
+      if all(k in meta for k in ('delay', 'brand', 'gas_interceptor', 'adaptive_follow')):
+        return meta
+      if i > limit_msgs:
+        break
+  return meta
+
+
 def extract_segment(args):
   """One segment -> per-longitudinalPlan-frame rows (state = latest message of each service before the plan)."""
-  route, seg = args
+  route, seg, meta0 = args
   from openpilot.tools.lib.logreader import LogReader
   from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
   from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -54,7 +82,7 @@ def extract_segment(args):
   st = {'l': (0, 0., 0., 0.), 'cs': (0., 0., 0., 255.), 'off': 0., 'en': 0, 'pers': 1, 'la': 0, 'lcs_off': 1, 'fd': 0, 'vt': 255.,
             'road': 3}
   st_l_alead = 0.
-  rows, models, meta = [], [], {}
+  rows, models, meta = [], [], dict(meta0)
   for m in LogReader(f'{ROUTES_DIR}/{route}--{seg}/rlog.zst'):
     w = m.which()
     if w == 'carParams':
@@ -93,8 +121,6 @@ def extract_segment(args):
       st['road'] = ROAD.get(str(m.liveMapDataSP.roadType), 3)
     elif w == 'longitudinalPlan':
       p = m.longitudinalPlan
-      if 'delay' not in meta:
-        continue
       mpc = get_accel_from_plan(np.array(p.speeds), np.array(p.accels), t_idx, action_t=meta['delay'] + DT_MDL) \
         if len(p.speeds) == CONTROL_N else np.nan
       rows.append((m.logMonoTime * 1e-9, p.aTarget, SRC.get(str(p.longitudinalPlanSource), 9), int(p.shouldStop),
@@ -114,8 +140,11 @@ def extract_route(route, cache_dir):
       return rows, json.load(open(meta_f))
   segs = sorted(int(re.match(r'.*--(\d+)$', d).group(1)) for d in os.listdir(ROUTES_DIR)
                 if d.startswith(route + '--') and os.path.exists(f'{ROUTES_DIR}/{d}/rlog.zst'))
+  meta0 = scan_meta(route, segs)
+  if 'delay' not in meta0:
+    raise SystemExit(f'{route}: no carParams in any segment; refusing to replay without the actuator delay')
   with ProcessPoolExecutor(max_workers=min(12, os.cpu_count() or 4)) as ex:
-    res = list(ex.map(extract_segment, [(route, s) for s in segs]))
+    res = list(ex.map(extract_segment, [(route, s, meta0) for s in segs]))
   meta = {}
   for _, _, mt in res:
     for k, v in mt.items():
@@ -142,10 +171,14 @@ def extract_route(route, cache_dir):
 
 
 class _GateState:
+  # cycle 2 added the closing-rate veto (median buffer + rebound latch): mirror the planner's own state fields, or the
+  # deployed update_e2e_gate raises AttributeError against this shim
   def __init__(self):
     self.e2e_gate = False
     self.e2e_gate_cnt = 0
     self.e2e_gate_alead = []
+    self.e2e_gate_vrel = []
+    self.e2e_gate_latch = 0
 
 
 class _Params:

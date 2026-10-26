@@ -184,7 +184,7 @@ class TestGateLogic(OpenpilotTestCase):
         mpc = mpc0 + float(rng.normal(0., 0.05))
         out = g.step(ld, v=v, e2e=e2e, mpc=mpc, should_stop=ss)
         self.assertGreaterEqual(out, e2e)
-        self.assertIn(out, (e2e, max(e2e, mpc)))
+        self.assertIn(out, (e2e, max(e2e, min(mpc, lp.E2E_GATE_MAX_RAISE))))
         if not present or ss or v <= 3. or ld.aLeadK <= lp.E2E_GATE_STAY_ALEAD:
           self.assertEqual(out, e2e)  # never touches a no-lead / shouldStop / slow / braking-lead frame
         n_raised += out > e2e
@@ -279,7 +279,7 @@ class TestLeadDecelVeto(OpenpilotTestCase):
         out = g.step(lead(d_rel=d, v_rel=vr, a_lead=a), v=v, e2e=e2e, mpc=mpc, t_follow=T_FOLLOW_168)
       if i < first_veto:
         self.assertTrue(g.e2e_gate, i)  # far, steady or mildly braking lead: still gated
-        self.assertEqual(out, max(e2e, mpc), i)
+        self.assertEqual(out, max(e2e, min(mpc, lp.E2E_GATE_MAX_RAISE)), i)
       else:
         self.assertFalse(g.e2e_gate, i)  # braking lead: every e2e ask from here is kept
         self.assertEqual(out, e2e, i)
@@ -521,7 +521,7 @@ class TestGateThroughPlanner(OpenpilotTestCase):
     self.assertEqual(len(rec), 300)
     for e2e, mpc, out in rec:
       self.assertGreaterEqual(out, e2e)
-      self.assertIn(out, (e2e, max(e2e, mpc)))
+      self.assertIn(out, (e2e, max(e2e, min(mpc, lp.E2E_GATE_MAX_RAISE))))
     self.assertTrue(any(out > e2e for e2e, _, out in rec[:200]))   # gate did act on the far lead
     self.assertTrue(all(out == e2e for e2e, _, out in rec[200:]))  # and not on the 1.05x lead
 
@@ -855,3 +855,63 @@ class TestClosingRateVetoThroughPlanner(OpenpilotTestCase):
       self.assertEqual(float(pg.output_a_target), float(pu.output_a_target), t)
       flags.append(pg.e2e_gate)
     self.assertFalse(any(flags))
+
+
+class TestComfortCap(OpenpilotTestCase):
+  """Cycle 3 (routes 16d/16f, 2026-10-26): the gate may stop the model braking for a far lead, but it may not hand the
+  car the MPC's gap-chasing ask. Raising to min(mpc, E2E_GATE_MAX_RAISE) keeps the anti-lag behaviour (the 167/168
+  lag signature: model +0.04, MPC +0.81) and removes the race-then-brake pattern (measured: gate-caused frames above
+  0.8 m/s^2 drop to zero, accel > 0.3 m/s^2 over a drive 64.7 s -> 17.5 s with the gate off)."""
+
+  def _gated(self, mpc, e2e=-0.9, n=N_ENTER):
+    g = GateOnly()
+    out = None
+    for _ in range(n):
+      out = g.step(FAR, e2e=e2e, mpc=mpc)
+    self.assertTrue(g.e2e_gate)
+    return out
+
+  def test_the_cap_is_a_comfort_acceleration(self):
+    self.assertAlmostEqual(lp.E2E_GATE_MAX_RAISE, 0.4)
+
+  def test_large_mpc_is_capped(self):
+    # a lead 1.5x the desired gap at matching speed, model on the brakes: the MPC's +1.2 does NOT reach the plan
+    self.assertEqual(self._gated(mpc=1.2), 0.4)
+    # mutation: with the cap lifted the same frames hand the car the full MPC ask, so the cap is what does the work
+    with mock.patch.object(lp, 'E2E_GATE_MAX_RAISE', 99.):
+      self.assertEqual(self._gated(mpc=1.2), 1.2)
+
+  def test_small_mpc_passes_through_unchanged(self):
+    # below the cap the gate is exactly what it was before cycle 3
+    self.assertEqual(self._gated(mpc=0.2), 0.2)
+
+  def test_raise_only_still_never_lowers_the_model(self):
+    # a model wish ABOVE the cap must survive the gate untouched: the cap is a ceiling on what the gate adds
+    self.assertEqual(self._gated(mpc=1.2, e2e=0.9), 0.9)
+
+  def test_anti_lag_case_still_accelerates(self):
+    # the case the gate was built for: the model lags (+0.04) while the MPC wants +0.81 -- the car must still get a
+    # real, if comfortable, acceleration instead of the model's near-zero
+    out = self._gated(mpc=0.81, e2e=0.04)
+    self.assertEqual(out, lp.E2E_GATE_MAX_RAISE)
+    self.assertGreater(out, 0.04)
+
+  def test_cap_holds_inside_the_planner_update(self):
+    # in situ through the real update(): every frame's e2e leaving the gate is the raw wish or max(raw, min(mpc, cap))
+    p = make_planner()
+    rec = []
+    orig = lp.LongitudinalPlanner.update_e2e_gate
+
+    def spy(self_, lead_, v_, e2e, mpc, ss, tf):
+      out = orig(self_, lead_, v_, e2e, mpc, ss, tf)
+      rec.append((e2e, mpc, out))
+      return out
+    with mock.patch.object(lp.LongitudinalPlanner, 'update_e2e_gate', spy):
+      for i in range(120):
+        p.update(planner_sm(15., -0.9, d_rel=2.0 * d_des(15.), v_lead=17.))
+    self.assertEqual(len(rec), 120)
+    self.assertTrue(any(out != e2e for e2e, _, out in rec))       # the gate did act
+    for e2e, mpc, out in rec:
+      self.assertGreaterEqual(out, e2e)                           # never lowers
+      self.assertIn(out, (e2e, max(e2e, min(mpc, lp.E2E_GATE_MAX_RAISE))))
+      self.assertLessEqual(out, max(e2e, lp.E2E_GATE_MAX_RAISE))  # and never above the cap unless the model asked

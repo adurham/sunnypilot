@@ -72,6 +72,17 @@ E2E_GATE_VREL_CLOSE_GAP = 3.0     # x d_des, the closing veto applies only insid
 # vRel is clear of the veto band (a frame inside the band freezes it: ambiguous -> fail toward OFF, stock behaviour).
 E2E_GATE_REBOUND_FRAMES = 80      # 4.0 s at 20 Hz
 E2E_GATE_ENTER_VREL_MEDIAN_FRAMES = 6  # 0.3 s at 20 Hz, same window as the aLeadK median
+# comfort cap (cycle 3, routes 16d/16f 2026-10-26): the gate's job is to stop the model braking for a lead it can see
+# far ahead -- NOT to hand the car the MPC's gap-chasing ask. Measured on the deployed gate (replayed frame-by-frame
+# from the rlogs, gate decision from this very function): the gate is on for 25-32 % of long-active time and, uncapped,
+# the plan asks > 0.3 m/s^2 for 3.7x as long as it would without the gate (16d 64.7 s vs 17.5 s) and > 0.8 m/s^2 for
+# 30x as long (3.1 s vs 0.1 s); 11 of 18 gate episodes were followed by a brake within 8 s. The owner's words: "we
+# haven't hit the max yet, let me race to it, oh but now we're too close, I need to brake". So the raise target is
+# min(mpc, E2E_GATE_MAX_RAISE): the model still may not BRAKE for a far, slow-closing lead, but the gate can never
+# command more than a comfortable acceleration on its own. 0.4 m/s^2 removes every gate-caused frame above 0.8 (the
+# hard-accel tail falls back to the pre-gate baseline) while keeping the anti-lag behaviour the gate was built for
+# (the lagging case measured +0.04 model vs +0.81 MPC -> the car now accelerates at 0.4 instead of sticking at 0.04).
+E2E_GATE_MAX_RAISE = 0.4      # m/s^2, ceiling on the accel the gate itself may add
 
 
 def turn_accel_limit(v_ego, angle_steers, CP):
@@ -177,7 +188,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.e2e_gate_cnt = self.e2e_gate_cnt + 1 if enter else 0
       self.e2e_gate = self.e2e_gate_cnt >= E2E_GATE_ENTER_FRAMES
     if self.e2e_gate:
-      e2e_raw = max(e2e_raw, output_a_target_mpc)  # RAISE ONLY, never lower
+      # RAISE ONLY, never lower; capped at a comfortable acceleration so the gate cannot turn the model's wish into the
+      # MPC's gap-chasing ask (see E2E_GATE_MAX_RAISE).
+      e2e_raw = max(e2e_raw, min(output_a_target_mpc, E2E_GATE_MAX_RAISE))
     return e2e_raw
 
   def update(self, sm):
