@@ -6,6 +6,13 @@ stops and on leads sitting 1.2-2.3x the desired gap while the MPC candidate was 
 e2e value to the MPC candidate while a lead is far and slow-closing. These tests pin the approved design:
 enter hysteresis (10 frames), immediate exit, raise-only, bit-exact when there is no lead / shouldStop / v < 3, a cut-in
 drops the gate the same frame, and a lead at exactly 1.2x with TTC 13 s does not gate.
+
+Cycle 2 adds the closing-rate veto (route 169 16b cut-in, t=1647.015): no entry and a same-frame exit while the lead is
+closing faster than -2.0 m/s inside 3x d_des (entry also tests the 0.3 s median against -1.5), plus a 4 s rebound latch
+after any sustained closure at the -3.0 m/s enter floor, so vRel oscillating back above -3.0 on a lead that cut in
+2 s earlier cannot open the gate. The incident profile is replayed frame by frame from the logged drive, the
+matched-speed case that the gate was built for is pinned as unchanged, and the mutation check (veto disabled -> the
+profile gates on the same frame) is a permanent test.
 """
 from types import SimpleNamespace
 from unittest import mock
@@ -34,11 +41,13 @@ def lead(present=True, d_rel=60., v_rel=-1., a_lead=0.):
 
 
 class GateOnly:
-  """The gate state machine alone (the method only touches self.e2e_gate / self.e2e_gate_cnt)."""
+  """The gate state machine alone (the method only touches self.e2e_gate / self.e2e_gate_cnt / its buffers)."""
   def __init__(self):
     self.e2e_gate = False
     self.e2e_gate_cnt = 0
     self.e2e_gate_alead = []
+    self.e2e_gate_vrel = []
+    self.e2e_gate_latch = 0
 
   def step(self, ld, v=15., e2e=-0.8, mpc=0.2, should_stop=False, t_follow=T_FOLLOW):
     return lp.LongitudinalPlanner.update_e2e_gate(self, ld, v, e2e, mpc, should_stop, t_follow)
@@ -77,9 +86,11 @@ class TestGateLogic(OpenpilotTestCase):
     self.assertEqual(outs[-1], 0.2)
 
   def test_stay_band_holds_once_entered(self):
-    # 1.15x / TTC 10 s / MPC -0.15 fails enter but satisfies stay: an entered gate holds, a fresh one never enters
+    # 1.15x / TTC 19 s / MPC -0.15 fails enter but satisfies stay: an entered gate holds, a fresh one never enters.
+    # (The old mid frame closed at 3.19 m/s, TTC 10 s: the closing-rate veto now treats that as a cut-in-class frame,
+    # so the stay-band case moved to a lead still matched inside the veto band.)
     v = V
-    mid = lead(d_rel=1.15 * d_des(v), v_rel=-1.15 * d_des(v) / 10.)
+    mid = lead(d_rel=1.15 * d_des(v), v_rel=-1.7)
     g = GateOnly()
     for _ in range(N_ENTER):
       g.step(FAR)
@@ -145,9 +156,10 @@ class TestGateLogic(OpenpilotTestCase):
     for _ in range(200):
       self.assertEqual(g.step(lead(d_rel=d, v_rel=-d / 13.), v=v, mpc=0.0), -0.8)
     self.assertFalse(g.e2e_gate)
-    # boundary sanity: just over 1.2x with TTC 13 s does gate (the 1.2x edge is what blocks it, not the TTC)
+    # boundary sanity: just over 1.2x at a matched speed does gate (the 1.2x edge is what blocks it, not the TTC).
+    # The same 1.21x frame closing at TTC 13 s (-2.58 m/s) is now a closing-rate veto frame: that is the point.
     g = GateOnly()
-    outs = [g.step(lead(d_rel=1.21 * d_des(v), v_rel=-1.21 * d_des(v) / 13.), v=v, mpc=0.0) for _ in range(N_ENTER)]
+    outs = [g.step(lead(d_rel=1.21 * d_des(v), v_rel=-1.), v=v, mpc=0.0) for _ in range(N_ENTER)]
     self.assertEqual(outs[-1], 0.0)
 
   def test_raise_only_on_every_frame(self):
@@ -156,7 +168,7 @@ class TestGateLogic(OpenpilotTestCase):
     rng = np.random.default_rng(167168)
     g = GateOnly()
     n_raised = n = 0
-    while n < 20000:
+    while n < 40000:
       v0 = float(rng.choice([rng.uniform(0., 3.5), rng.uniform(3., 35.)], p=[0.1, 0.9]))
       present = bool(rng.random() > 0.1)
       ratio0 = float(rng.choice([rng.uniform(0.5, 1.3), rng.uniform(1.0, 3.)], p=[0.3, 0.7]))
@@ -550,3 +562,296 @@ class TestGateThroughPlanner(OpenpilotTestCase):
          mock.patch.object(lp.LongitudinalPlannerSP, 'get_t_follow', lambda self_, sm, v: None):
       p.update(planner_sm(15., -0.5, d_rel=60., v_lead=15.))
     self.assertEqual(seen, [T_FOLLOW])
+
+
+# ---- closing-rate veto (cycle 2): route 169 16b cut-in at t=1647.0 ----
+# Measured harm (report ~/comma-sim/wsSTOP/drive-169-16c/sub/gate-replay/REPORT.md, cut_in.rows): a lead appears 116 m
+# ahead closing -5.8..-7.2 m/s, the gate turned ON at 1647.015 the moment vRel oscillated back above its -3.0 enter
+# floor, raised the model's wish (-0.26 raw) to the MPC candidate (+0.60) and kept the car accelerating while the gap
+# fell to 52 m (1.27x d_des) and v_ego rose 19.25 -> 21.27 m/s; the driver braked at 1650.1 and stayed out for 31 s.
+# Per-frame columns below: (t, v_ego, dRel, vRel, aLeadK, raw e2e, MPC candidate, t_follow the replay fed the gate).
+ROUTE_16B_CUT_IN = [
+  (1645.015, 19.38,  116.0, -5.81, -0.22, -0.449,  1.622, 1.65),
+  (1645.066, 19.38,  108.5, -7.18, -0.47, -0.445,  1.559, 1.70),
+  (1645.116, 19.37,  106.6, -5.32, -0.11, -0.432,  1.492, 1.75),
+  (1645.166, 19.37,  101.8, -4.44, -0.11, -0.407,  1.423, 1.80),
+  (1645.216, 19.36,  101.5, -2.57, -0.10, -0.392,  1.365, 1.85),
+  (1645.267, 19.36,  101.3, -3.45, -0.09, -0.376,  1.305, 1.90),
+  (1645.316, 19.36,  103.1, -4.00, -0.16, -0.368,  1.241, 1.95),
+  (1645.367, 19.32,  100.3, -3.72, -0.20, -0.366,  1.183, 2.00),
+  (1645.416, 19.31,   99.7, -1.62, -0.15, -0.346,  1.150, 1.99),
+  (1645.466, 19.30,   99.1, -1.37, -0.07, -0.313,  1.110, 1.98),
+  (1645.516, 19.28,   98.4, -1.20, -0.05, -0.300,  1.070, 1.97),
+  (1645.566, 19.27,  102.4, -1.69, -0.10, -0.273,  1.043, 1.96),
+  (1645.616, 19.26,  102.6, -2.78, -0.08, -0.250,  1.001, 2.01),
+  (1645.666, 19.25,   98.3, -3.54, -0.05, -0.231,  0.956, 2.05),
+  (1645.716, 19.27,  100.7, -2.73, -0.03, -0.234,  0.929, 2.04),
+  (1645.766, 19.26,   99.0, -4.56, -0.02, -0.217,  0.897, 2.05),
+  (1645.817, 19.27,   99.1, -1.74, -0.03, -0.226,  0.882, 2.04),
+  (1645.866, 19.26,   96.8, -4.33, -0.05, -0.241,  0.852, 2.05),
+  (1645.917, 19.26,  101.2, -2.84, -0.02, -0.267,  0.845, 2.04),
+  (1645.966, 19.26,   97.8, -3.94, -0.03, -0.415,  0.825, 2.05),
+  (1646.015, 19.27,   95.0, -6.11,  0.13, -0.418,  0.842, 2.05),
+  (1646.066, 19.28,  100.2, -3.45,  0.05, -0.396,  0.797, 2.05),
+  (1646.116, 19.29,   96.7, -3.31,  0.00, -0.396,  0.748, 2.05),
+  (1646.166, 19.29,   93.7, -2.74, -0.01, -0.369,  0.720, 2.04),
+  (1646.216, 19.29,   97.0, -1.36, -0.03, -0.349,  0.699, 2.03),
+  (1646.266, 19.29,   95.7, -1.87, -0.05, -0.346,  0.680, 2.02),
+  (1646.317, 19.28,   94.1, -2.09, -0.03, -0.359,  0.670, 2.01),
+  (1646.366, 19.28,   93.2, -2.63, -0.02, -0.342,  0.662, 2.00),
+  (1646.415, 19.30,   94.3, -1.20, -0.02, -0.369,  0.655, 1.99),
+  (1646.466, 19.29,   94.5, -1.62,  0.09, -0.382,  0.671, 1.98),
+  (1646.516, 19.35,   90.5, -3.14,  0.05, -0.370,  0.655, 2.03),
+  (1646.566, 19.29,   88.0, -1.80, -0.03, -0.349,  0.641, 2.02),
+  (1646.616, 19.32,   86.8, -1.48, -0.02, -0.341,  0.627, 2.01),
+  (1646.666, 19.33,   85.6, -1.01, -0.05, -0.347,  0.628, 2.00),
+  (1646.716, 19.31,   91.2, -1.72, -0.07, -0.359,  0.635, 1.99),
+  (1646.766, 19.31,   92.5, -1.83, -0.04, -0.355,  0.643, 1.98),
+  (1646.816, 19.30,   95.6, -2.44, -0.04, -0.336,  0.639, 1.97),
+  (1646.866, 19.29,   84.2, -1.90, -0.05, -0.311,  0.623, 1.96),
+  (1646.916, 19.28,   87.3, -1.73, -0.08, -0.281,  0.613, 1.95),
+  (1646.967, 19.31,   85.2, -1.26, -0.05, -0.265,  0.607, 1.94),
+  (1647.015, 19.25,   84.6, -2.01, -0.04, -0.255,  0.603, 1.93),
+  (1647.066, 19.31,   87.7, -1.48, -0.03, -0.242,  0.217, 1.92),
+  (1647.116, 19.32,   89.1, -1.30, -0.04, -0.230,  0.563, 1.91),
+  (1647.166, 19.32,   83.1, -0.91, -0.02, -0.215,  0.419, 1.90),
+  (1647.216, 19.33,   84.3, -1.35, -0.00, -0.186,  0.571, 1.89),
+  (1647.266, 19.32,   92.2, -1.42, -0.03, -0.157,  0.532, 1.88),
+  (1647.316, 19.37,   84.6, -1.11, -0.02, -0.138,  0.603, 1.87),
+  (1647.367, 19.34,   86.9, -0.27, -0.02, -0.149,  0.610, 1.86),
+  (1647.416, 19.35,   84.7, -1.36, -0.03, -0.146,  0.639, 1.85),
+  (1647.466, 19.39,   83.0, -1.50, -0.01, -0.152,  0.647, 1.84),
+  (1647.516, 19.39,   85.7, -1.80, -0.03, -0.144,  0.665, 1.83),
+  (1647.566, 19.42,   85.1, -0.97, -0.01, -0.138,  0.682, 1.82),
+  (1647.616, 19.45,   82.8, -1.81, -0.01, -0.124,  0.685, 1.81),
+  (1647.666, 19.51,   91.2, -1.75, -0.00, -0.111,  0.704, 1.80),
+  (1647.716, 19.51,   78.4, -1.59,  0.00, -0.106,  0.699, 1.79),
+  (1647.766, 19.55,   85.2, -1.85, -0.01, -0.092,  0.711, 1.78),
+  (1647.816, 19.56,   82.2, -1.96, -0.01, -0.074,  0.707, 1.77),
+  (1647.866, 19.64,   83.4, -0.29, -0.00, -0.077,  0.729, 1.76),
+  (1647.916, 19.65,   81.9, -0.42,  0.02, -0.079,  0.729, 1.75),
+  (1647.966, 19.69,   77.7, -0.50,  0.03, -0.082,  0.737, 1.74),
+  (1648.016, 19.69,   79.9, -0.47,  0.01, -0.067,  0.743, 1.73),
+  (1648.066, 19.76,   80.8, -0.90,  0.01, -0.048,  0.745, 1.72),
+  (1648.117, 19.76,   79.5, -1.98,  0.00, -0.032,  0.738, 1.73),
+  (1648.166, 19.78,   77.6, -1.98, -0.01, -0.013,  0.734, 1.73),
+  (1648.216, 19.82,   69.0, -1.72, -0.03,  0.001,  0.720, 1.72),
+  (1648.266, 19.85,   79.5, -0.86,  0.00,  0.001,  0.731, 1.71),
+  (1648.317, 19.89,   76.4, -1.03,  0.01, -0.007,  0.720, 1.70),
+  (1648.367, 19.94,   78.8, -1.00,  0.01,  0.002,  0.725, 1.69),
+  (1648.417, 19.98,   73.7, -0.36,  0.01, -0.003,  0.720, 1.68),
+  (1648.466, 20.01,   72.8, -0.80,  0.01, -0.002,  0.716, 1.67),
+  (1648.516, 20.06,   71.2, -0.34,  0.03, -0.001,  0.715, 1.66),
+  (1648.566, 20.08,   72.1,  0.41,  0.05,  0.007,  0.722, 1.65),
+  (1648.615, 20.13,   70.2,  0.39,  0.03,  0.014,  0.721, 1.64),
+  (1648.666, 20.16,   70.1, -0.34,  0.03,  0.019,  0.718, 1.63),
+  (1648.716, 20.18,   66.4, -0.70,  0.02,  0.013,  0.710, 1.62),
+  (1648.766, 20.20,   66.8, -0.48,  0.04,  0.012,  0.709, 1.61),
+  (1648.817, 20.24,   65.9, -0.25,  0.05,  0.001,  0.705, 1.60),
+  (1648.866, 20.26,   66.8, -0.92,  0.04, -0.005,  0.697, 1.59),
+  (1648.916, 20.31,   68.6, -0.08,  0.05, -0.014,  0.702, 1.58),
+  (1648.967, 20.34,   66.7, -1.17,  0.04, -0.022,  0.686, 1.57),
+  (1649.016, 20.37,   66.3, -0.18,  0.07, -0.023,  0.693, 1.56),
+  (1649.067, 20.43,   67.9, -0.78,  0.05, -0.035,  0.680, 1.55),
+  (1649.117, 20.47,   71.0, -1.18,  0.06, -0.038,  0.679, 1.55),
+  (1649.167, 20.51,   67.0, -0.51,  0.05, -0.038,  0.673, 1.54),
+  (1649.217, 20.55,   66.4,  0.16,  0.05, -0.040,  0.676, 1.53),
+  (1649.266, 20.64,   64.4, -0.58,  0.03, -0.040,  0.664, 1.52),
+  (1649.317, 20.67,   61.7, -0.11,  0.04, -0.016,  0.665, 1.51),
+  (1649.367, 20.71,   61.8,  0.17,  0.06,  0.012,  0.661, 1.50),
+  (1649.417, 20.77,   62.5,  0.23,  0.05,  0.014,  0.663, 1.49),
+  (1649.468, 20.75,   64.1, -0.25,  0.03,  0.000,  0.660, 1.48),
+  (1649.517, 20.76,   61.9, -1.08, -0.02, -0.020,  0.642, 1.53),
+  (1649.566, 20.84,   63.0, -0.48,  0.02, -0.033,  0.645, 1.52),
+  (1649.616, 20.87,   62.5,  0.45,  0.04, -0.034,  0.645, 1.51),
+  (1649.667, 20.94,   63.0,  0.01,  0.02, -0.051,  0.642, 1.50),
+  (1649.717, 21.00,   58.5, -1.06,  0.02, -0.041,  0.629, 1.53),
+  (1649.766, 20.99,   60.2, -0.95, -0.01, -0.037,  0.632, 1.52),
+  (1649.816, 21.07,   57.3, -1.44, -0.08, -0.023,  0.592, 1.57),
+  (1649.866, 21.14,   58.9, -0.42, -0.04, -0.007,  0.603, 1.56),
+  (1649.917, 21.17,   54.4, -0.76, -0.12, -0.014,  0.594, 1.55),
+  (1649.967, 21.21,   51.9, -1.87, -0.24, -0.045,  0.558, 1.60),
+  (1650.016, 21.27,   52.3, -3.10, -0.17, -0.065,  0.513, 1.65),
+  (1650.066, 21.29,   51.7, -0.61, -0.07, -0.079,  0.506, 1.64),
+]
+CUT_IN_ENTRY = 40  # index of t=1647.015, the frame the gate turned ON (verified against the replay's 62 ON frames)
+
+
+def cut_in_replay():
+  """Replay ROUTE_16B_CUT_IN at 20 Hz through the gate alone; return the per-frame outputs and gate flags."""
+  g = GateOnly()
+  outs, flags = [], []
+  for t, v, d_rel, v_rel, a_lead, e2e, mpc, t_follow in ROUTE_16B_CUT_IN:
+    outs.append(g.step(lead(d_rel=d_rel, v_rel=v_rel, a_lead=a_lead), v=v, e2e=e2e, mpc=mpc, t_follow=t_follow))
+    flags.append(g.e2e_gate)
+  return outs, flags
+
+
+class TestClosingRateVeto(OpenpilotTestCase):
+  def test_constants(self):
+    # the stay side must be the looser one (it tolerates more closing than entry), the band is negative closing,
+    # the veto's gap band is wider than the enter band (the gate acts at 1.27-1.86x on these drives), and the two
+    # median/latch windows are 0.3 s and 4.0 s at 20 Hz
+    self.assertLess(lp.E2E_GATE_STAY_VREL_CLOSE, lp.E2E_GATE_ENTER_VREL_CLOSE)
+    self.assertLess(lp.E2E_GATE_ENTER_VREL_CLOSE, 0.)
+    self.assertGreater(lp.E2E_GATE_VREL_CLOSE_GAP, lp.E2E_GATE_ENTER_GAP)
+    self.assertAlmostEqual(lp.E2E_GATE_ENTER_VREL_MEDIAN_FRAMES * DT_MDL, 0.3)
+    self.assertAlmostEqual(lp.E2E_GATE_REBOUND_FRAMES * DT_MDL, 4.0)
+
+  def test_16b_cut_in_never_gates(self):
+    # (a) the incident profile: the gate never turns ON and the model's wish is never raised, on any of the 102 frames
+    outs, flags = cut_in_replay()
+    self.assertFalse(any(flags))
+    for i, (row, out) in enumerate(zip(ROUTE_16B_CUT_IN, outs)):
+      self.assertEqual(out, row[5], i)  # raw e2e through, bit-exact
+    # the entry frame is blocked by all three terms, not by luck: raw past the stay floor, 0.3 s median past the enter
+    # threshold, and the rebound latch still armed from the -6.1 m/s closure 1 s earlier
+    g = GateOnly()
+    for row in ROUTE_16B_CUT_IN[:CUT_IN_ENTRY]:
+      g.step(lead(d_rel=row[2], v_rel=row[3], a_lead=row[4]), v=row[1], e2e=row[5], mpc=row[6], t_follow=row[7])
+    t, v, d_rel, v_rel = ROUTE_16B_CUT_IN[CUT_IN_ENTRY][:4]
+    self.assertEqual(t, 1647.015)
+    self.assertLess(v_rel, lp.E2E_GATE_STAY_VREL_CLOSE)
+    self.assertLess(float(np.median([r[3] for r in ROUTE_16B_CUT_IN[CUT_IN_ENTRY - 6:CUT_IN_ENTRY]])),
+                    lp.E2E_GATE_ENTER_VREL_CLOSE)
+    self.assertGreater(g.e2e_gate_latch, 0)
+    out = g.step(lead(d_rel=d_rel, v_rel=v_rel), v=v, e2e=ROUTE_16B_CUT_IN[CUT_IN_ENTRY][5],
+                 mpc=ROUTE_16B_CUT_IN[CUT_IN_ENTRY][6], t_follow=ROUTE_16B_CUT_IN[CUT_IN_ENTRY][7])
+    self.assertEqual(g.e2e_gate_cnt, 0)
+    self.assertFalse(g.e2e_gate)
+    self.assertEqual(out, ROUTE_16B_CUT_IN[CUT_IN_ENTRY][5])
+
+  def test_16b_cut_in_would_gate_without_the_veto(self):
+    # mutation check: disable the veto (thresholds and latch) and the same profile gates on the same frame, 62 frames
+    with mock.patch.object(lp, 'E2E_GATE_ENTER_VREL_CLOSE', -99.), \
+         mock.patch.object(lp, 'E2E_GATE_STAY_VREL_CLOSE', -99.), \
+         mock.patch.object(lp, 'E2E_GATE_REBOUND_FRAMES', 0):
+      _, flags = cut_in_replay()
+    self.assertEqual(sum(flags), 62)
+    self.assertEqual(flags.index(True), CUT_IN_ENTRY)
+
+  def test_matched_far_lead_still_enters(self):
+    # (b) the case the gate was built for: far lead, matching to within 1-2 m/s -> unchanged
+    for v_rel in (-0.5, -1.0):
+      g = GateOnly()
+      outs = [g.step(lead(d_rel=1.5 * d_des(V), v_rel=v_rel)) for _ in range(N_ENTER + 20)]
+      self.assertTrue(all(o == -0.8 for o in outs[:N_ENTER - 1]), v_rel)
+      self.assertTrue(all(o == 0.2 for o in outs[N_ENTER - 1:]), v_rel)
+    # and inside the veto's tightest band only at entry: a sustained -1.4 m/s closure still gates
+    g = GateOnly()
+    outs = [g.step(lead(d_rel=2.0 * d_des(V), v_rel=-1.4)) for _ in range(N_ENTER)]
+    self.assertEqual(outs[-1], 0.2)
+
+  def test_closing_lead_at_short_gap_drops_same_frame(self):
+    # (c) an entered gate and a lead that passes every pre-existing stay test but is closing -2.2 m/s at 1.6x d_des
+    # (TTC 25 s, gap > 1.1x, vRel > -3.5, MPC +0.1, aLeadK 0): the gate drops on that frame and the ask passes through
+    v = 20.
+    d = 1.6 * d_des(v)
+    ld = lead(d_rel=d, v_rel=-2.2)
+    self.assertGreater(d, lp.E2E_GATE_STAY_GAP * d_des(v))
+    self.assertGreater(d / -ld.vRel, lp.E2E_GATE_STAY_TTC)
+    self.assertGreater(ld.vRel, lp.E2E_GATE_STAY_VREL)
+    g = GateOnly()
+    for _ in range(N_ENTER + 5):
+      g.step(lead(d_rel=1.5 * d_des(v), v_rel=-1.), v=v, e2e=-0.6, mpc=0.1)
+    self.assertTrue(g.e2e_gate)
+    self.assertEqual(g.step(ld, v=v, e2e=-0.9, mpc=0.1), -0.9)
+    self.assertFalse(g.e2e_gate)
+    # control: with the veto disabled the same frame holds the gate (so only the veto explains the drop)
+    with mock.patch.object(lp, 'E2E_GATE_ENTER_VREL_CLOSE', -99.), \
+         mock.patch.object(lp, 'E2E_GATE_STAY_VREL_CLOSE', -99.):
+      g2 = GateOnly()
+      for _ in range(N_ENTER + 5):
+        g2.step(lead(d_rel=1.5 * d_des(v), v_rel=-1.), v=v, e2e=-0.6, mpc=0.1)
+      self.assertEqual(g2.step(ld, v=v, e2e=-0.9, mpc=0.1), 0.1)
+      self.assertTrue(g2.e2e_gate)
+
+  def test_veto_never_raises_when_the_gate_is_off(self):
+    # (d) bit-exact: with the gate off, a closing lead never gets its ask raised, however attractive the MPC is
+    for v_rel in (-2.0, -2.2, -3.0, -5.0, float('nan')):
+      for e2e in (-2.0, -0.5, 0.0, 1.5):
+        g = GateOnly()
+        out = g.step(lead(d_rel=1.5 * d_des(V), v_rel=v_rel), e2e=e2e, mpc=e2e + 2.0)
+        self.assertFalse(g.e2e_gate, (v_rel, e2e))
+        self.assertEqual(out, e2e, (v_rel, e2e))
+    # control: the same frames at a matched speed DO raise, so the check is not vacuous
+    g = GateOnly()
+    outs = [g.step(lead(d_rel=1.5 * d_des(V), v_rel=-0.5), e2e=-2.0, mpc=0.0) for _ in range(N_ENTER)]
+    self.assertEqual(outs[-1], 0.0)
+
+  def test_gap_band_limits_where_the_veto_applies(self):
+    # inside 3x d_des a sustained -2.5 m/s closure never enters; beyond it the gate still serves the far lead
+    inside = lead(d_rel=2.9 * d_des(V), v_rel=-2.5)
+    outside = lead(d_rel=3.5 * d_des(V), v_rel=-2.5)
+    g = GateOnly()
+    self.assertTrue(all(g.step(inside) == -0.8 for _ in range(100)))
+    self.assertFalse(g.e2e_gate)
+    g = GateOnly()
+    self.assertEqual([g.step(outside) for _ in range(N_ENTER)][-1], 0.2)
+    self.assertTrue(g.e2e_gate)
+
+  def test_rebound_latch_blocks_entry_after_a_fast_closure(self):
+    # a 0.5 s closure at -5 m/s arms E2E_GATE_REBOUND_FRAMES of latch; a lead that is then matched cannot open the gate
+    # until the latch expires, and the 10-frame enter count starts only after that
+    g = GateOnly()
+    for _ in range(N_ENTER):
+      self.assertEqual(g.step(lead(d_rel=2.0 * d_des(V), v_rel=-5.)), -0.8)
+    self.assertEqual(g.e2e_gate_latch, lp.E2E_GATE_REBOUND_FRAMES)
+    matched = lead(d_rel=1.5 * d_des(V), v_rel=-0.5)
+    outs = [g.step(matched) for _ in range(lp.E2E_GATE_REBOUND_FRAMES + N_ENTER + 5)]
+    first_on = outs.index(0.2)
+    # 80 latch frames, then a fresh 10-frame enter count: the whole 4 s is lost, nothing overlaps
+    self.assertEqual(first_on, lp.E2E_GATE_REBOUND_FRAMES + N_ENTER)
+    self.assertTrue(all(o == -0.8 for o in outs[:first_on]))
+
+  def test_latch_does_not_count_down_inside_the_veto_band(self):
+    # a frame at -2.5 m/s (inside the band, above the -3.0 fast-closure floor) freezes the countdown instead of
+    # releasing it: ambiguous -> fail toward OFF
+    g = GateOnly()
+    for _ in range(N_ENTER):
+      g.step(lead(d_rel=2.0 * d_des(V), v_rel=-5.))
+    self.assertEqual(g.e2e_gate_latch, lp.E2E_GATE_REBOUND_FRAMES)
+    for _ in range(200):
+      g.step(lead(d_rel=1.5 * d_des(V), v_rel=-2.5))
+    self.assertEqual(g.e2e_gate_latch, lp.E2E_GATE_REBOUND_FRAMES)
+    self.assertFalse(g.e2e_gate)
+
+  def test_no_lead_clears_the_latch_and_the_vrel_buffer(self):
+    g = GateOnly()
+    for _ in range(N_ENTER):
+      g.step(lead(d_rel=2.0 * d_des(V), v_rel=-5.))
+    g.step(lead(present=False))
+    self.assertEqual(g.e2e_gate_latch, 0)
+    self.assertEqual(g.e2e_gate_vrel, [])
+    outs = [g.step(lead(d_rel=1.5 * d_des(V), v_rel=-0.5)) for _ in range(N_ENTER)]
+    self.assertEqual(outs[-1], 0.2)  # the old closure does not leak across a lead loss
+
+  def test_nan_vrel_is_a_veto(self):
+    # fail toward OFF: an unreadable closing rate never arms the gate
+    g = GateOnly()
+    outs = [g.step(lead(d_rel=1.5 * d_des(V), v_rel=float('nan')), e2e=-1.0, mpc=0.5) for _ in range(100)]
+    self.assertFalse(g.e2e_gate)
+    self.assertTrue(all(o == -1.0 for o in outs))
+    # once armed by a real fast closure, a NaN frame also holds the latch (no countdown on ambiguous input)
+    g = GateOnly()
+    for _ in range(N_ENTER):
+      g.step(lead(d_rel=2.0 * d_des(V), v_rel=-5.))
+    before = g.e2e_gate_latch
+    g.step(lead(d_rel=1.5 * d_des(V), v_rel=float('nan')))
+    self.assertEqual(g.e2e_gate_latch, before)
+
+
+class TestClosingRateVetoThroughPlanner(OpenpilotTestCase):
+  def test_16b_cut_in_bit_exact_through_update(self):
+    # the same profile through the real LongitudinalPlanner.update(): gate and gate-disabled planners agree bit-exactly
+    # on every frame and the gate never turns ON, i.e. the veto cannot move the plan at all in the incident
+    pg, pu = make_planner(), make_planner()
+    pu.update_e2e_gate = lambda lead_, v, e2e, *a: e2e
+    flags = []
+    for t, v, d_rel, v_rel, a_lead, e2e, mpc, t_follow in ROUTE_16B_CUT_IN:
+      sm = planner_sm(v, e2e, d_rel=d_rel, v_lead=v + v_rel, a_lead=a_lead)
+      pg.update(sm)
+      pu.update(sm)
+      self.assertEqual(float(pg.output_a_target), float(pu.output_a_target), t)
+      flags.append(pg.e2e_gate)
+    self.assertFalse(any(flags))
