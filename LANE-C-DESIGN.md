@@ -49,9 +49,15 @@ min() is unchanged, the planner can never brake later than today (0 positive cha
 - arm (entry only): long active, no gas, v ≥ 5 m/s, no lead (leadOne/leadTwo) for ≥ 1.0 s, and gap `commit − e2e < −0.3`.
   Disarm: gap > −0.1, or weight 0. A lead appearing mid-stop does not release the commitment; the MPC can still go
   deeper via min().
-- `delta` follows `weight·min(0, gap)` at a bounded rate (1.0 m/s³ deepening, 1.5 release). The trigger drives a ramp,
+- `delta` follows `weight·min(0, gap)` at a bounded rate (1.0 m/s³ deepening, 1.4 release — the owner's documented
+  1.4 m/s³ comfort reference, FORK row 91; 1.0 stays the single knob). The trigger drives a ramp,
   never a veto. Gas or long-off resets it at once.
 - Applied to the FINAL e2e candidate, after gate, turn limit and boost, so nothing downstream can raise it back.
+- **Far-lead-gate interaction (integration note).** Once armed, a lead appearing mid-stop makes the output
+  `w·commit + (1−w)·e2e` instead of the gate's own +0.4-capped raise, i.e. it *neutralises* the #92 far-lead gate's
+  raise for as long as the commitment holds. That is the correct direction on both 17c occurrences (s04 15624 at
+  111–125 m, s43) but it is a planner-level consequence of this change, so it is pinned by
+  `test_stop_commit_planner.py::test_lead_mid_stop_neutralises_the_gate_raise`.
 
 **Rollback shape.** Param `StopApproachCommit` (registered in `params_keys.h`, BOOL, default "0"). OFF = identity. The
 proof that OFF is identical to the deployed base is in §5. Full rollback = delete the 9 planner lines, the module and
@@ -79,6 +85,13 @@ Not even default-off code is shipped.
 frame run of ≥ 1 s where the ask is ≥ 0.3 m/s² shallower than the kinematic requirement of a lead with TTC < 20 s, the
 lead track has been continuous (no dropout) for ≥ 2 s, and the run ends in a driver brake within 8 s. Count on 17c: 0.
 
+**Delivery-layer observation on this window (integration note, not a plan defect).** During the "flat" 5.5 s
+(17548.3–17553.8) the car **gained +1.3 m/s** (aEgo +0.24 m/s²) against a **mean ask of −0.23 m/s²** (min −0.54), no
+driver gas, long active: the shallow negative ask was not delivered at the pedal (ask-clip coast / pedal hold /
+grade). The plan was asking for a mild slowdown and the car sped up, so part of the owner's "doesn't adjust" feel may
+live below the planner in the delivery layer (Lanes A/B territory) rather than in the lead handling. Carried to the
+next round as a finding, not fixed here.
+
 ## 5. Evidence (route 17c only; all runs = the EXISTING wsH harness `simdrive.py`, file unmodified)
 
 Launcher `~/comma-sim/wsSTOP/fixes-17c/laneC/run_simdrive.py` adapts plumbing only. The harness predates this build's
@@ -91,7 +104,7 @@ precondition count in every changed span is 0; registry-absent keys are skipped.
 |---|---|
 | harness fidelity (ol_planner, flag OFF vs logged aTarget, 27 windows / 3326.9 s) | RMSE **0.032** over 66,550 rows; window (a) 0.000, window (b) 0.029 |
 | **equivalence: flag OFF vs unmodified 096fbddc source** (planner + key stashed, same harness) | **0 differences** over 69,190 rows (aTarget, v, ask, gas, held LSB, src, a) **and every sent CAN frame** |
-| open-loop ON vs OFF | 582 / 66,550 rows changed (0.87 %); **0 positive changes**; 23/27 windows byte-identical |
+| open-loop ON vs OFF | 582 / 66,550 rows changed (0.87 %); **0 positive changes**; **22/27** windows byte-identical (s43-17838 changes 81 rows) |
 | open-loop episodes | 6: 3 STOP, 3 DRIVER_BRAKE, **0 NO_STOP** |
 | closed-loop ON vs OFF (plant v3) | 23/27 windows byte-identical; changed: s04-15473, s22-16571, s28-16884, s72-19569 (≤ 0.04) |
 

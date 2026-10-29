@@ -56,8 +56,8 @@ V_ENTRY = 5.0            # m/s, arm only above this
 LEAD_CLEAR_FRAMES = 20   # 1.0 s at 20 Hz with no lead before arming (a flickering lead track cannot arm/disarm it)
 GAP_ENTER = 0.3          # m/s^2, arm when the model's instantaneous ask is this much shallower than its own plan
 GAP_EXIT = 0.1           # m/s^2, disarm when the gap has closed to within this
-J_IN = 1.0               # m/s^3, deepening rate of delta
-J_OUT = 1.5              # m/s^3, release rate of delta
+J_IN = 1.0               # m/s^3, deepening rate of delta (the single comfort knob; inside the owner's 1.4 reference)
+J_OUT = 1.4              # m/s^3, release rate of delta -- the owner's documented 1.4 m/s^3 comfort reference (FORK row 91)
 
 
 def commit_accel(x, v, t) -> float:

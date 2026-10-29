@@ -169,3 +169,78 @@ class TestStopCommit(OpenpilotTestCase):
     out = run(self.c, 60, -plan[2], 17., plan=plan)  # model's own ask now equals its plan
     self.assertFalse(self.c.armed)
     self.assertAlmostEqual(out[-1], -plan[2], places=6)
+
+
+class TestPinnedConstants(OpenpilotTestCase):
+  """The comfort / debounce constants define the feel and the lead gate. Every other test in this file reads them
+  symbolically (``sc.J_IN``, ``sc.LEAD_CLEAR_FRAMES``, ...), so a mutated VALUE survives the whole suite (review #3:
+  J_IN 1.0->5.0, J_OUT 1.5->50, LEAD_CLEAR_FRAMES 20->1, R_NONE 0.5->1.0 and T_MIN 1->0 all SURVIVED). Each test
+  below pins the literal AND the behaviour that literal produces, with the numbers written out rather than read
+  back from the module."""
+
+  def setUp(self):
+    self.c = sc.StopCommit(params=FakeParams(True))
+
+  def test_the_five_constants_are_pinned(self):
+    self.assertEqual(sc.J_IN, 1.0)                  # m/s^3 deepening: the single knob, inside the owner's 1.4 reference
+    self.assertEqual(sc.J_OUT, 1.4)                 # m/s^3 release: the owner's documented 1.4 reference (FORK row 91)
+    self.assertEqual(sc.LEAD_CLEAR_FRAMES, 20)      # 1.0 s at 20 Hz with no lead before arming
+    self.assertEqual(sc.R_NONE, 0.5)                # plan v_min / v_0 >= 0.5 is not a stop
+    self.assertEqual(sc.T_MIN, 1.0)                 # s, plan points nearer than this are the live ask, not a plan
+
+  def test_deepening_rate_is_1_0_m_s3(self):
+    # behaviour, not the symbol: each 20 Hz frame deepens delta by exactly J_IN*dt = 1.0*0.05 = 0.05 m/s^2
+    plan = stop_plan(17., 100.)
+    run(self.c, 25, -0.4, 17., plan=plan)   # 20 frames to arm + 5 ramping frames; target is -1.045, so still ramping
+    self.assertTrue(self.c.armed)
+    self.assertLess(self.c.delta, 0.)
+    steps = []
+    for _ in range(10):
+      before = self.c.delta
+      self.c.update(-0.4, True, False, 17., False, plan[0], plan[1], T)
+      steps.append(before - self.c.delta)
+    self.assertAlmostEqual(float(np.max(steps)), 0.05, places=9)   # 1.0 m/s^3 * 0.05 s
+    self.assertAlmostEqual(float(np.min(steps)), 0.05, places=9)   # still ramping: every frame is the full step
+    self.assertLessEqual(sc.J_IN, 1.4)                              # the owner's comfort reference is the ceiling
+
+  def test_release_rate_is_the_1_4_reference(self):
+    # behaviour: after the plan stops planning a stop, delta returns at J_OUT*dt = 1.4*0.05 = 0.07 m/s^2 per frame
+    plan = stop_plan(17., 100.)
+    run(self.c, 60, -0.4, 17., plan=plan)
+    self.assertLess(self.c.delta, -0.5)
+    out = [-0.4] + run(self.c, 40, -0.4, 17., plan=cruise_plan(17.))
+    steps = np.diff(out)
+    self.assertAlmostEqual(float(np.max(steps)), 0.07, places=9)   # 1.4 m/s^3 * 0.05 s
+    self.assertGreater(float(np.max(steps)), 0.0)
+
+  def test_a_lead_must_be_clear_for_exactly_twenty_frames(self):
+    # 19 clear frames may NOT arm (the old 20->1 mutation would have armed on the first one); the 20th does
+    plan = stop_plan(17., 100.)
+    c = sc.StopCommit(params=FakeParams(True))
+    for _ in range(19):
+      self.assertEqual(c.update(-0.4, True, False, 17., False, plan[0], plan[1], T), -0.4)
+    self.assertFalse(c.armed)
+    c.update(-0.4, True, False, 17., False, plan[0], plan[1], T)
+    self.assertTrue(c.armed)
+
+  def test_r_none_is_half_the_current_speed(self):
+    # the relative curve ends at exactly half speed: 10 -> 5 m/s is "no stop" (weight 0), 10 -> 4.5 is not
+    v = np.full(len(T), 5.0)
+    v[0] = 10.0
+    self.assertEqual(sc.stop_weight(v), 0.)
+    v = np.full(len(T), 4.5)
+    v[0] = 10.0
+    # ratio 0.45 -> (0.5-0.45)/0.25 = 0.2 ; v_min 4.5 -> (6-4.5)/3 = 0.5 ; product 0.1
+    self.assertAlmostEqual(sc.stop_weight(v), 0.1, places=12)
+
+  def test_t_min_ignores_the_first_second_of_the_plan(self):
+    # a plan that sheds speed hard inside the first second and then holds: those early points are the live ask,
+    # not a plan, so the commit must be the post-1 s value only (with T_MIN = 0 it reads ~-28 m/s^2 instead)
+    t = T
+    v = np.where(t < 0.5, 20. - 28. * t, 6.)
+    x = np.concatenate([[0.], np.cumsum(np.diff(t) * (v[1:] + v[:-1]) / 2.)])
+    keep = t >= 1.0
+    expected = float(((v[keep] ** 2 - v[0] ** 2) / (2. * x[keep])).min())
+    self.assertAlmostEqual(sc.commit_accel(x, v, t), expected, places=9)
+    self.assertGreater(sc.commit_accel(x, v, t), -20.)   # the early-second value is about -28
+
