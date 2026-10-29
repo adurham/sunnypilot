@@ -266,6 +266,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ToyotaTSS2Smooth", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     {"AdaptiveFollowDistance", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/adaptive_follow.py
+    {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params
