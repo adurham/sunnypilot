@@ -74,3 +74,7 @@
   ruff: clean on all touched files. check_patch_numbers: rc 0 (no patch touched). check_param_reachability --tree . : ok.
 - Docs: LANE-C-DESIGN.md (design + evidence), FORK.md draft row 94 (lanes A/B both took 93 -> renumber at integration).
 - Next: commit, push to adurham if auth works, final report.
+
+## CP7 commit + push (done)
+- Commit b639f18c17 on fix/17c-planner-commitment; pushed to adurham (ls-remote = b639f18c1780d584d2ee65aa319c943def674429).
+- Untracked local-only: openpilot/common/libparams_c.dylib (gitignored; Mac build of this tree's registry).
