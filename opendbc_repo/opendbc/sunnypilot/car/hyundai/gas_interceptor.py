@@ -258,9 +258,60 @@ def over_speed_release(active: bool, accel: float, v_ego: float, v_cruise: float
               v_ego > v_cruise * CV.KPH_TO_MS + OVERSPEED_RELEASE_MARGIN)
 
 
-def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False) -> float:
-  """Rise at most get_pedal_rate_up(v_ego, launching) * DT_CTRL per controller frame; fall immediately."""
-  return min(gas, gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL)
+# *** 17c blip smoothing (route 17c, measured): over-speed release HYSTERESIS + soft recovery back up to the hold ***
+# Route 17c: 87 upward throttle pulses in 825 s at/near the set speed (6.3/min; peaks p50 +5.4 %, p90 +16 %, max +22 %
+# pedal; TPS swings to ~30 points). Two law-side mechanisms, both fixed here, neither touching the plan:
+#  (1) the over-speed release fired strictly above set + 0.5 m/s with NO hysteresis, so a car hovering at set + 0.45..0.51
+#      with a ~0 ask toggled coast <-> hold every 2-5 frames (19:57:53-54: ENABLE 0/1/0/1 at 100 ms, raw 0/480/0/558).
+#      Now the release LATCHES once fired (entry predicate unchanged) and holds the exact-zero coast until the car is
+#      back down at the set speed (re-arm margin 0.0 m/s: a 0.5 m/s band, wider than the +-0.1..0.3 m/s speed dither
+#      at set speed on 17c) or the plan makes a DELIBERATE positive ask (>= 0.5 m/s^2; above the set speed on 17c the
+#      ask never exceeded +0.13, and the micro-ask dither is +-0.1..0.4). Entry is still `accel <= 0`, so the
+#      release stays inert on positive asks, at/below the set speed, disengaged, unset vCruise, standstill launches.
+#  (2) the fall is instant but the rise from a dip back up to the hold was the full jerk rate (0.72 pedal/s >= 22 m/s:
+#      0 -> 0.18 hold in 0.25 s), so every dip below the hold (release, law clip to 0 at ask < -hold/scale, or any
+#      sag of the ask, and the gas-override hand-back: 19:40:17 was the driver lifting off the pedal, then 0 -> 0.223
+#      in 0.3 s) returned as a throttle snap. Now a rise BELOW the hold, for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL),
+#      is limited to hold(v) / PEDAL_REENTRY_TIME_S per second: 0 -> hold takes exactly 1.0 s (0.18/s at 30 m/s =
+#      0.49 m/s^3 equivalent jerk, ~4x gentler than 0.72/s), and the speed deficit of one full re-entry is bounded by
+#      0.5 * hold(v)/scale(v) * 1.0 s ~= 0.25 m/s at 30 m/s. Above the hold, and for a deliberate ask (>= 0.5 m/s^2:
+#      lead pulling away, merge, rolling engage with a real ask), the unchanged jerk rate applies.
+# NOT touched: the launch ramp (soft recovery is gated off below LOW_SPEED_FULL_GAS_SPEED = 25 mph and while launching),
+# the ceilings, the personality tables, MAX_INTERCEPTOR_GAS, the 0.001 enable threshold and the fault-clear frames.
+OVERSPEED_REARM_MARGIN = 0.0     # m/s above the set speed at/below which a latched release re-arms (hysteresis band 0.5 m/s)
+OVERSPEED_EXIT_ACCEL = 0.5       # m/s^2; a plan ask at/above this breaks a latched release (deliberate, not dither)
+PEDAL_REENTRY_TIME_S = 1.0       # s; a rise from 0 back up to the hold takes exactly this long (rate = hold(v)/this)
+PEDAL_REENTRY_V_MIN = LOW_SPEED_FULL_GAS_SPEED  # m/s; below this the soft recovery is off (launch/pull-away regime)
+
+
+def over_speed_release_held(active: bool, accel: float, v_ego: float, v_cruise: float) -> bool:
+  """Continuation predicate for an ALREADY-FIRED over-speed release (the latch). True -> keep the exact-zero coast.
+  Holds while longitudinal is active, the set speed is real, vEgo stays above set + OVERSPEED_REARM_MARGIN and the
+  plan's ask is below OVERSPEED_EXIT_ACCEL. Entry is only ever over_speed_release() (unchanged)."""
+  return bool(active and accel < OVERSPEED_EXIT_ACCEL and
+              0. < v_cruise < V_CRUISE_UNSET_KPH and
+              v_ego > v_cruise * CV.KPH_TO_MS + OVERSPEED_REARM_MARGIN)
+
+
+def get_pedal_reentry_rate(v_ego: float) -> float:
+  """Soft recovery rate (pedal fraction per second) for a rise below the hold: 0 -> hold(v) in PEDAL_REENTRY_TIME_S,
+  never faster than the normal jerk rate."""
+  return min(get_hold_command(v_ego) / PEDAL_REENTRY_TIME_S, get_pedal_rate_up(v_ego))
+
+
+def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False,
+                             reentry: bool = False) -> float:
+  """Rise at most get_pedal_rate_up(v_ego, launching) * DT_CTRL per controller frame; fall immediately.
+  reentry=True (17c): while the last command is below the hold, the rise is limited to get_pedal_reentry_rate(v_ego);
+  the cap is that RATE, never the hold value itself (review #1: a `hold` term here pinned the climb whenever vEgo rose,
+  because hold(v_now) > gas_last by ~1e-5 re-entered the branch every frame). At/above the hold the normal rate takes
+  over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
+  limit = gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL
+  if reentry and not launching and v_ego >= PEDAL_REENTRY_V_MIN:
+    hold = get_hold_command(v_ego)
+    if gas_last < hold:
+      limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL)
+  return min(gas, limit)
 
 
 def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
@@ -332,6 +383,9 @@ class GasInterceptorCarController:
     # below), cleared as soon as the car is moving above LAUNCH_RAMP_V_MAX or the request is non-positive (a
     # lift/coast), so it only ever selects the fast launch rate from rest and never a rolling re-engagement.
     self.gas_launching = False
+    # 17c: over-speed release latch (hysteresis). Set by over_speed_release(), held by over_speed_release_held(),
+    # cleared whenever longitudinal is not active.
+    self.overspeed_released = False
     self.interceptor_ids = get_interceptor_ids(CP_SP)
     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
@@ -405,7 +459,12 @@ class GasInterceptorCarController:
       # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
       # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
       # hold_cmd. Every other case falls through to the unchanged law below.
-      if over_speed_release(active, accel, CS.out.vEgo, CS.out.vCruise):
+      # 17c: the release LATCHES (hysteresis): entry is the unchanged over_speed_release(), and once fired it holds the
+      # exact zero until vEgo is back down at set + OVERSPEED_REARM_MARGIN or the plan asks >= OVERSPEED_EXIT_ACCEL.
+      self.overspeed_released = (over_speed_release(active, accel, CS.out.vEgo, CS.out.vCruise) or
+                                 (self.overspeed_released and
+                                  over_speed_release_held(active, accel, CS.out.vEgo, CS.out.vCruise)))
+      if self.overspeed_released:
         self.gas = 0.
         self.gas_launching = False
       else:
@@ -417,14 +476,19 @@ class GasInterceptorCarController:
           self.gas_launching = True
         elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
           self.gas_launching = False
+        # 17c: soft recovery up to the hold for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL); a deliberate ask keeps
+        # the unchanged jerk-rate response (lead pulling away, merge). rate_limit_pedal_command gates it off below
+        # PEDAL_REENTRY_V_MIN and while launching.
         self.gas = rate_limit_pedal_command(get_pedal_command(accel, CS.out.vEgo, personality), self.gas, CS.out.vEgo,
-                                            self.gas_launching)
+                                            self.gas_launching, reentry=accel < OVERSPEED_EXIT_ACCEL)
     elif self.fca11_brake.braking or self.fca11_brake._cal_active:
       self.gas = 0.
       self.gas_launching = False
     else:
       self.gas = 0.
       self.gas_launching = False
+    if not active:
+      self.overspeed_released = False
 
     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
     send_slot = frame % 2 == 0
