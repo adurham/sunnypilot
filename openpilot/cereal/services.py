@@ -94,7 +94,7 @@ _services: dict[str, tuple] = {
   "carControlSP": (True, 100., 10),
   "carStateSP": (True, 100., 10),
   "liveMapDataSP": (True, 1., 1),
-  "modelDataV2SP": (True, 20., None, QueueSize.BIG),
+  "modelDataV2SP": (True, 20., 10, QueueSize.BIG),
 
   # offload shadow services (device-side return-path reframe, INTERFACES §7): the remote (Mac)
   # model's outputs are republished here, NOT under the real modelV2/cameraOdometry/... names, so
@@ -114,7 +114,6 @@ _services: dict[str, tuple] = {
   "offloadCameraOdometry": (False, 20., None, QueueSize.SMALL),
   "offloadDrivingModelData": (False, 20., None, QueueSize.SMALL),
   "offloadModelDataV2SP": (False, 20., None, QueueSize.BIG),
-
   "liveLocationKalman": (True, 20.),
 
   # debug
