@@ -1,8 +1,8 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index f7f1a7966e..0fc5b2a579 100644
+index f7f1a7966e..d68e34ae0d 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-@@ -258,9 +258,58 @@ def over_speed_release(active: bool, accel: float, v_ego: float, v_cruise: float
+@@ -258,9 +258,60 @@ def over_speed_release(active: bool, accel: float, v_ego: float, v_cruise: float
                v_ego > v_cruise * CV.KPH_TO_MS + OVERSPEED_RELEASE_MARGIN)
  
  
@@ -53,18 +53,20 @@ index f7f1a7966e..0fc5b2a579 100644
 +def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False,
 +                             reentry: bool = False) -> float:
 +  """Rise at most get_pedal_rate_up(v_ego, launching) * DT_CTRL per controller frame; fall immediately.
-+  reentry=True (17c): while the last command is below the hold, the rise is limited to get_pedal_reentry_rate(v_ego) and
-+  stops at the hold for this frame; inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
++  reentry=True (17c): while the last command is below the hold, the rise is limited to get_pedal_reentry_rate(v_ego);
++  the cap is that RATE, never the hold value itself (review #1: a `hold` term here pinned the climb whenever vEgo rose,
++  because hold(v_now) > gas_last by ~1e-5 re-entered the branch every frame). At/above the hold the normal rate takes
++  over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
 +  limit = gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL
 +  if reentry and not launching and v_ego >= PEDAL_REENTRY_V_MIN:
 +    hold = get_hold_command(v_ego)
 +    if gas_last < hold:
-+      limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL, hold)
++      limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL)
 +  return min(gas, limit)
  
  
  def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
-@@ -332,6 +381,9 @@ class GasInterceptorCarController:
+@@ -332,6 +383,9 @@ class GasInterceptorCarController:
      # below), cleared as soon as the car is moving above LAUNCH_RAMP_V_MAX or the request is non-positive (a
      # lift/coast), so it only ever selects the fast launch rate from rest and never a rolling re-engagement.
      self.gas_launching = False
@@ -74,7 +76,7 @@ index f7f1a7966e..0fc5b2a579 100644
      self.interceptor_ids = get_interceptor_ids(CP_SP)
      self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
      self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
-@@ -405,7 +457,12 @@ class GasInterceptorCarController:
+@@ -405,7 +459,12 @@ class GasInterceptorCarController:
        # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
        # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
        # hold_cmd. Every other case falls through to the unchanged law below.
@@ -88,7 +90,7 @@ index f7f1a7966e..0fc5b2a579 100644
          self.gas = 0.
          self.gas_launching = False
        else:
-@@ -417,14 +474,19 @@ class GasInterceptorCarController:
+@@ -417,14 +476,19 @@ class GasInterceptorCarController:
            self.gas_launching = True
          elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
            self.gas_launching = False
@@ -110,10 +112,10 @@ index f7f1a7966e..0fc5b2a579 100644
      # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
      send_slot = frame % 2 == 0
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index 068a8b1736..b772fe57b2 100644
+index 068a8b1736..cee31f5896 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-@@ -1432,3 +1432,332 @@ class TestFca11LongControllerIntegration:
+@@ -1432,3 +1432,357 @@ class TestFca11LongControllerIntegration:
          sends = CI.CC.create_gas_command(self._cc(-2.0), cs, f, 0, p)
          dats += [d for a, d, _ in sends if a == 0x38D]
        assert _get_bits(dats[-1], 8, 8) == cap == PERSONALITY_MAX_DEC[p], (p, cap)
@@ -251,7 +253,8 @@ index 068a8b1736..b772fe57b2 100644
 +    assert max(slots) <= 465 + 0.12 * 2151 + 3, max(slots)
 +
 +  def test_helper_boundary(self):
-+    # the 0.5 m/s margin is the boundary: strictly above releases, exactly at it does not (no hysteresis)
++    # the 0.5 m/s margin is the boundary: strictly above releases, exactly at it does not (ENTRY is strict; the latch
++    # and its hysteresis govern the CONTINUATION, see over_speed_release_held)
 +    assert gi.OVERSPEED_RELEASE_MARGIN == 0.5
 +    base = self.KMH_SET * CV.KPH_TO_MS
 +    above = self.KMH_ABOVE * CV.KPH_TO_MS
@@ -346,7 +349,10 @@ index 068a8b1736..b772fe57b2 100644
 +    per = self._per_10s(slots)
 +    assert all(t <= 4 for t, _ in per), per
 +    hold_raw = 2151 * gi.get_hold_command(self.SET_KPH * CV.KPH_TO_MS + 0.9)
-+    soft_step = hold_raw * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL      # one send slot = 2 frames
++    # one slot may straddle the hold as the command crosses it: the first frame still soft, the second at the normal
++    # rate (review #1 removed the `hold` cap, so the crossing no longer parks at the hold)
++    soft_step = (hold_raw * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL
++                 + 2151 * gi.get_pedal_rate_up(self.SET_KPH * CV.KPH_TO_MS + 0.9) * DT_CTRL)
 +    for (r0, e0), (r1, e1) in zip(slots, slots[1:], strict=False):
 +      if e1 and (not e0 or r0 - 465 < hold_raw - self.RAW_TOL) and r1 > r0:
 +        assert r1 - (r0 if e0 else 465) <= soft_step, (r0, r1, soft_step)
@@ -371,6 +377,27 @@ index 068a8b1736..b772fe57b2 100644
 +    assert 0.9 * self.REENTRY_S <= t_hold <= self.REENTRY_S + 0.05, t_hold
 +    target_raw = 465 + 2151 * gi.get_pedal_command(0.2, vs - 0.05)
 +    assert abs(raws[-1] - target_raw) <= self.RAW_TOL, (raws[-1], target_raw)
++
++  def test_reentry_reaches_target_while_speed_rising(self):
++    # REVIEW #1 (BLOCKING, 2026-10-29): the soft rise must not be capped at the MOVING hold value. Pre-fix the
++    # `min(..., hold)` cap re-engaged every frame once gas reached hold(v) with vEgo rising (hold(v_now) > gas_last by
++    # ~1e-5), so the command rode the hold instead of climbing to the law target (scale*ask + hold): any sub-0.5 ask
++    # during a speed rise lagged indefinitely (the lane's own closed loop: 308 s vs 7.1 s of gas-below-target over
++    # 729 s). Fixed: soft 0 -> hold in REENTRY_S, then the normal rate above the hold.
++    # Bound: REENTRY_S + (target - hold)/rate_up + 1 slot.
++    for v0 in (20., 12.):
++      for ask in (0.3, 0.45):
++        CI = self._ci()
++        raws = [r if en else 465 for r, en in
++                self._run(CI, [(ask, v0 + 0.1 * k * DT_CTRL, self.SET_KPH) for k in range(600)])]   # 6 s, v +0.6 m/s
++        target = gi.get_pedal_command(ask, v0)
++        hold = gi.get_hold_command(v0)
++        target_raw = 465 + 2151 * target
++        assert target_raw > 465 + 2151 * hold + 4 * self.RAW_TOL                                  # non-vacuous
++        t_bound = self.REENTRY_S + (target - hold) / gi.get_pedal_rate_up(v0) + 0.1
++        reached = next((i for i, r in enumerate(raws) if r >= target_raw - self.RAW_TOL), None)
++        assert reached is not None, (v0, ask, raws[40:130])          # pre-fix: pinned at hold(v), never reached
++        assert reached * 2 * DT_CTRL <= t_bound + 0.02, (v0, ask, reached * 2 * DT_CTRL, t_bound)
 +
 +  def test_reentry_after_law_clip_is_soft(self):
 +    # the other source of 0 -> hold snaps: an ask below -hold/scale clips the law to exactly 0 (planner-asked coast),
