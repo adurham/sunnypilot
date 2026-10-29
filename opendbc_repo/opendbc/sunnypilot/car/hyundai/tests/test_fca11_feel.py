@@ -220,11 +220,27 @@ class TestCoastFirst(unittest.TestCase):
     self.assertEqual([(0, STEP, 3)], sent)
 
   def test_hold_band_runs_the_deployed_law_byte_identical(self):
-    for v in (0.0, 0.5, 0.8):
-      for asks in ([-0.55] * 200, [-0.9] * 50 + [-0.4] * 100 + [-0.2] * 50, [-2.0] * 100):
-        def cs_fn(f, v=v):
-          return _CS(v_ego=v, cam=_cam(), standstill=(v == 0.0))
-        self.assertEqual(_run(_brake(False), asks, cs_fn=cs_fn), _run(_brake(True), asks, cs_fn=cs_fn), v)
+    # 17c: the feel band IS the deployed band, except the deliberate standstill-hold ceiling (FCA11_STANDSTILL_HOLD_*,
+    # pinned in test_fca11_long.py::Test17cStandstillHold). With that switch off the 0049 identity holds at every band
+    # speed; with it on the identity still holds wherever the car is NOT at standstill and wherever the ask never asks
+    # past the tier cap.
+    # FAIL-BEFORE HONESTY (laneB-REVIEW #6): this AMENDED test is NOT fail-before evidence. Run against the deployed
+    # 096fbddc source it fails with AttributeError on FCA11_STANDSTILL_HOLD_ENABLED (the switch does not exist there),
+    # not on a semantic assertion. The real fail-before is Test17cStandstillHold (9 of its 13 fail on the deployed
+    # source); the 4 that pass there are invariance tests and are supposed to pass on both.
+    prev = fl.FCA11_STANDSTILL_HOLD_ENABLED
+    for hold_on in (False, True):
+      fl.FCA11_STANDSTILL_HOLD_ENABLED = hold_on
+      try:
+        for v in (0.0, 0.5, 0.8):
+          for asks in ([-0.55] * 200, [-0.9] * 50 + [-0.4] * 100 + [-0.2] * 50, [-2.0] * 100):
+            if hold_on and v == 0.0 and min(asks) < -1.3:
+              continue   # standstill AND an ask past the standard cap: the 17c hold raises it (pinned elsewhere)
+            def cs_fn(f, v=v):
+              return _CS(v_ego=v, cam=_cam(), standstill=(v == 0.0))
+            self.assertEqual(_run(_brake(False), asks, cs_fn=cs_fn), _run(_brake(True), asks, cs_fn=cs_fn), (hold_on, v))
+      finally:
+        fl.FCA11_STANDSTILL_HOLD_ENABLED = prev
 
   def test_hold_band_uses_deployed_open(self):
     for v in (0.5, 0.8):   # m/s (<= 3 km/h)

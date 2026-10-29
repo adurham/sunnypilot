@@ -3491,3 +3491,218 @@ class Test0053CameraHandback(unittest.TestCase):
     self.assertTrue(b.cam_brake and b.fca11_divergence)
     self.assertFalse(b._refused_cut, "re-attributed to the camera hand-back")
     self.assertFalse(b.fca11_unavailable)
+
+
+class Test17cStandstillHold(unittest.TestCase):
+  """17c (route 17c, owner: "need higher hold to prevent creep"): at TRUE standstill inside the FEEL hold band the band's
+  ceiling is max(tier cap, FCA11_STANDSTILL_HOLD_LSB) instead of the personality tier cap, latched until the band's
+  UNCHANGED exit (>= FCA11_FEEL_HOLD_EXIT_KPH) / an episode re-open / longActive off. Everything outside that latch must
+  be byte-identical to the deployed law (reference = the same instance class with the 17c switch off, which leaves the
+  deployed clamp lines untouched)."""
+
+  TIERS = (fl.PERSONALITY_RELAXED, fl.PERSONALITY_STANDARD, fl.PERSONALITY_AGGRESSIVE)
+  STANDSTILL_MS = 12 * 0.03125 / 3.6     # opendbc carstate.py STANDSTILL_THRESHOLD (km/h) -> m/s
+
+  def _brake(self, hold_on=True):
+    prev = getattr(fl, "FCA11_STANDSTILL_HOLD_ENABLED", None)
+    fl.FCA11_STANDSTILL_HOLD_ENABLED = hold_on            # read ONCE at construction
+    try:
+      cp_sp = structs.CarParamsSP()
+      cp_sp.fca11Brake = True
+      cp_sp.enableGasInterceptor = True
+      b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+    finally:
+      if prev is None:
+        del fl.FCA11_STANDSTILL_HOLD_ENABLED
+      else:
+        fl.FCA11_STANDSTILL_HOLD_ENABLED = prev
+    b.log.enabled = False
+    b.cal_seq = None
+    return b
+
+  @staticmethod
+  def _cc(accel, long_active=True):
+    cc = structs.CarControl()
+    cc.enabled = True
+    cc.longActive = long_active
+    cc.actuators.accel = accel
+    return cc
+
+  def _run(self, b, rows, personality, start=0):
+    """rows = [(ask, v_mps, standstill|None, long_active)] one per 100 Hz frame. Returns [(frame, dec, warn)] sent and the
+    per-frame (supervise_stop, stop_complete, brake_now) alert tuple."""
+    sent, alerts = [], []
+    for i, row in enumerate(rows):
+      ask, v, ss, la = (row + (True,))[:4] if len(row) == 3 else row
+      ss = (v < self.STANDSTILL_MS) if ss is None else ss
+      f = start + i
+      for s in b.update(self._cc(ask, la), _CS(v_ego=v, cam=_cam(), standstill=ss, a_ego=0.0), f, personality):
+        sent.append((f, fl._get_bits(s.dat, 8, 8), fl._get_bits(s.dat, 3, 2)))
+      alerts.append((b.supervise_stop, b.stop_complete, b.brake_now))
+    return sent, alerts
+
+  @classmethod
+  def _stop_rows(cls, hold_frames=600):
+    """A 17c-shaped stop: braking at 20 km/h, decel to rest through the band, then LongControl's stopping ramp (-0.85 ->
+    -2.0 at -1 m/s^3, the measured 17c shape) at standstill, then a long hold at -2.0."""
+    rows = [(-1.0, 20.0 / 3.6, None)] * 100
+    v = 20.0 / 3.6
+    while v > 0.0:
+      rows.append((-0.9, v, None))
+      v = max(0.0, v - 0.9 * 0.01)
+    ask = -0.85
+    while ask > -2.0:
+      rows.append((ask, 0.0, None))
+      ask = max(-2.0, ask - 0.01)
+    rows += [(-2.0, 0.0, None)] * hold_frames
+    return rows
+
+  def test_constant_is_one_named_level_inside_its_documented_range(self):
+    self.assertGreaterEqual(fl.FCA11_STANDSTILL_HOLD_LSB, fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_STANDARD])
+    self.assertLessEqual(fl.FCA11_STANDSTILL_HOLD_LSB, HYUNDAI_FCA11_LONG_MAX_DEC)
+    self.assertLessEqual(fl.fca11_standstill_hold_lsb(), HYUNDAI_FCA11_LONG_MAX_DEC)
+    self.assertEqual(30, fl.FCA11_STANDSTILL_HOLD_LSB)
+    # an out-of-range edit can never become unsendable: the accessor clamps to the panda gate
+    prev = fl.FCA11_STANDSTILL_HOLD_LSB
+    try:
+      fl.FCA11_STANDSTILL_HOLD_LSB = 99
+      self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.fca11_standstill_hold_lsb())
+    finally:
+      fl.FCA11_STANDSTILL_HOLD_LSB = prev
+
+  def test_standstill_hold_reaches_the_new_level_at_every_tier(self):
+    hold = fl.fca11_standstill_hold_lsb()
+    for p in self.TIERS:
+      sent, _ = self._run(self._brake(), self._stop_rows(), p)
+      tail = [d for _, d, _ in sent[-200:]]
+      self.assertEqual({max(fl.personality_max_dec(p), hold)}, set(tail), p)
+      self.assertTrue(all(w == 3 for _, _, w in sent), "every actuating frame keeps Warn 3")
+      self.assertLessEqual(max(d for _, d, _ in sent), HYUNDAI_FCA11_LONG_MAX_DEC, "never above the panda gate")
+
+  def test_standstill_hold_is_above_the_deployed_tier_cap_for_standard(self):
+    """The owner's tier: the deployed hold was the tier cap 20; the new hold is 30 (the hold REQUEST is x1.5 IF
+    DecCmd -> pressure is linear at standstill — unverified; no LSB -> bar map exists, so no decel claim here)."""
+    old, _ = self._run(self._brake(False), self._stop_rows(), fl.PERSONALITY_STANDARD)
+    new, _ = self._run(self._brake(True), self._stop_rows(), fl.PERSONALITY_STANDARD)
+    self.assertEqual(20, old[-1][1])
+    self.assertEqual(30, new[-1][1])
+
+  def test_nothing_changes_before_true_standstill(self):
+    """Every frame before the first CarState.standstill frame is byte-identical (moving AND the rolling band)."""
+    rows = self._stop_rows()
+    first_ss = next(i for i, r in enumerate(rows) if r[1] < self.STANDSTILL_MS)
+    for p in self.TIERS:
+      old, _ = self._run(self._brake(False), rows, p)
+      new, _ = self._run(self._brake(True), rows, p)
+      self.assertEqual([s for s in old if s[0] < first_ss], [s for s in new if s[0] < first_ss], p)
+      self.assertNotEqual(old, new, p) if p != fl.PERSONALITY_AGGRESSIVE else self.assertEqual(old, new, p)
+
+  def test_band_entry_by_speed_alone_keeps_the_tier_cap(self):
+    """v <= the band edge WITHOUT standstill (rolling at 1.8 km/h, the last metres): unchanged tier cap - the extra hold
+    is not applied while the car still rolls (no final-metre grab)."""
+    rows = [(-2.0, 0.5, False)] * 300
+    for p in self.TIERS:
+      old, _ = self._run(self._brake(False), rows, p)
+      new, _ = self._run(self._brake(True), rows, p)
+      self.assertEqual(old, new, p)
+      self.assertEqual(fl.personality_max_dec(p), new[-1][1], p)
+
+  def test_ramp_arrives_at_the_existing_rate_step(self):
+    """The extra LSB never arrive faster than +RATE_STEP per SENT frame - including a cold standstill ask of -2.0."""
+    for rows in (self._stop_rows(), [(-2.0, 0.0, True)] * 200):
+      for p in self.TIERS:
+        sent, _ = self._run(self._brake(), rows, p)
+        decs = [d for _, d, _ in sent]
+        self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0])
+        for a, c in zip(decs, decs[1:]):
+          self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (p, a, c))
+    # standard from its cap: 20 -> 24 -> 28 -> 30 on consecutive sent frames, once latched
+    sent, _ = self._run(self._brake(), [(-2.0, 0.5, False)] * 100 + [(-2.0, 0.0, True)] * 20, fl.PERSONALITY_STANDARD)
+    decs = [d for f, d, _ in sent if f >= 98]
+    self.assertEqual([20, 24, 28, 30], decs[:4])
+
+  def test_latch_survives_the_creep_and_holds_below_the_exit(self):
+    """The 17c specimen: standstill drops False while the car creeps 0 -> 0.165 m/s. A per-frame gate would weaken the
+    hold right then; the latch keeps it. Creeping on up to 4.5 km/h (inside the 3/5 hysteresis) keeps it too."""
+    rows = [(-2.0, 0.0, True)] * 200
+    rows += [(-2.0, 0.165, False)] * 80          # the creep
+    rows += [(-2.0, 0.02, True)] * 50
+    rows += [(-2.0, 4.5 / 3.6, False)] * 50      # still below EXIT
+    for p in self.TIERS:
+      sent, _ = self._run(self._brake(), rows, p)
+      self.assertEqual({fl.fca11_standstill_hold_lsb()}, {d for f, d, _ in sent if f >= 150}, p)
+
+  def test_band_exit_clears_the_latch_exit_hysteresis_unchanged(self):
+    """At >= FCA11_FEEL_HOLD_EXIT_KPH the band (and the hold) leave exactly as deployed; re-entering the band later by
+    speed alone gets the tier cap again."""
+    # (EXIT + 0.01) km/h: EXIT_KPH / 3.6 round-trips to 4.9999.. km/h, which is BELOW the exit and correctly keeps the band
+    rows = [(-2.0, 0.0, True)] * 200 + [(-2.0, (fl.FCA11_FEEL_HOLD_EXIT_KPH + 0.01) / 3.6, False)] * 60
+    rows += [(-2.0, 2.0 / 3.6, False)] * 200
+    for p in self.TIERS:
+      old, _ = self._run(self._brake(False), rows, p)
+      new, _ = self._run(self._brake(True), rows, p)
+      self.assertEqual([s for s in old if s[0] >= 200], [s for s in new if s[0] >= 200], p)
+      self.assertEqual(fl.personality_max_dec(p), new[-1][1], p)
+    # and just BELOW the exit the hold stays (hysteresis unchanged)
+    rows = [(-2.0, 0.0, True)] * 200 + [(-2.0, (fl.FCA11_FEEL_HOLD_EXIT_KPH - 0.01) / 3.6, False)] * 60
+    sent, _ = self._run(self._brake(True), rows, fl.PERSONALITY_STANDARD)
+    self.assertEqual(fl.fca11_standstill_hold_lsb(), sent[-1][1])
+
+  def test_episode_reopen_and_long_inactive_clear_the_latch(self):
+    """A release (launch) or a longActive drop ends the hold; a new episode rolling in the band starts at the tier cap."""
+    for brk in ([(0.5, 0.0, True)] * 100,                       # planner launch: release
+                [(-2.0, 0.0, True, False)] * 10):              # longActive off
+      rows = [(-2.0, 0.0, True)] * 200 + brk + [(-2.0, 1.0, False)] * 200
+      for p in self.TIERS:
+        sent, _ = self._run(self._brake(), rows, p)
+        self.assertEqual(fl.personality_max_dec(p), sent[-1][1], (p, brk[0]))
+
+  def test_moving_law_bit_identical_outside_the_band(self):
+    """Fixed + seeded-random ask series ABOVE the band (and approaches that never reach standstill): byte-for-byte."""
+    import random
+    rng = random.Random(17)
+    series = [[(-1.5, 15.0, False)] * 300,
+              [(-0.6 - 0.002 * i, 20.0 - 0.05 * i, False) for i in range(300)],
+              [(-0.9, 2.0, False)] * 300]
+    for _ in range(20):
+      series.append([(rng.uniform(-3.0, 0.3), rng.uniform(5.0 / 3.6, 30.0), False) for _ in range(400)])
+    for rows in series:
+      for p in self.TIERS:
+        self.assertEqual(self._run(self._brake(False), rows, p), self._run(self._brake(True), rows, p), p)
+
+  def test_alerts_unchanged(self):
+    """supervise_stop / stop_complete / brake_now are byte-identical frame by frame (incl. a creep past HOLD_LOST)."""
+    rows = self._stop_rows(300) + [(-2.0, 0.165, False)] * 80 + [(-2.0, 2.5 / 3.6, False)] * 120 + [(0.5, 0.0, True)] * 50
+    for p in self.TIERS:
+      _, a_old = self._run(self._brake(False), rows, p)
+      _, a_new = self._run(self._brake(True), rows, p)
+      self.assertEqual(a_old, a_new, p)
+    self.assertEqual(2., fl.FCA11_HOLD_LOST_KPH)
+    self.assertEqual(5.0, fl.FCA11_FEEL_HOLD_EXIT_KPH)
+    self.assertEqual(3.0, fl.FCA11_FEEL_HOLD_BAND_KPH)
+
+  def test_refused_frame_at_the_hold_restarts_the_ramp_and_climbs_back(self):
+    """A panda refusal while holding at 30 drops our reference to 0 (0035): the next frame is RATE_STEP (accepted), and
+    the ramp climbs back to the hold at +RATE_STEP - the higher hold adds no new desync mode."""
+    b = self._brake()
+    f = 0
+    for _ in range(100):
+      b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True), f, fl.PERSONALITY_STANDARD)
+      f += 1
+    self.assertEqual(30, b._dec_last_sent)
+    b.observe_echo([(192, bytes([0, 30, 0, 0, 0, 0, 0, 0]))])
+    decs = []
+    for _ in range(20):
+      for s in b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True), f, fl.PERSONALITY_STANDARD):
+        decs.append(fl._get_bits(s.dat, 8, 8))
+      f += 1
+    self.assertEqual([4, 8, 12, 16, 20, 24, 28, 30], decs[:8])
+
+  def test_switch_off_and_shaped_v3_path_untouched(self):
+    """The kill switch restores the deployed band; the shaped/V3 law (affine_gain, shadow-only on this build) never
+    reads the 17c latch."""
+    self.assertFalse(self._brake(False).standstill_hold)
+    cp_sp = structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=True)
+    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+    self.assertFalse(b.feel)
+    self.assertFalse(b.standstill_hold)

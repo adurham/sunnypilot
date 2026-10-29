@@ -1432,3 +1432,357 @@ class TestFca11LongControllerIntegration:
         sends = CI.CC.create_gas_command(self._cc(-2.0), cs, f, 0, p)
         dats += [d for a, d, _ in sends if a == 0x38D]
       assert _get_bits(dats[-1], 8, 8) == cap == PERSONALITY_MAX_DEC[p], (p, cap)
+
+
+# *** over-speed gas release (route 16a): engaged + real set speed + vEgo > set + 0.5 m/s + plan ask <= 0 -> the gas
+# amount is forced to EXACTLY 0.0 so the wire carries the all-zero ENABLE=0 frame (pass-through) and the car coasts
+# on engine braking instead of holding speed on hold_cmd. Route 16a measured: set speed lowered 88->80->72 km/h at
+# 80.6 km/h, plan aTarget ~0 for 20 s, ~13.5 % pedal -> ~8 % TPS -> held 78 km/h; any live command collapses the
+# car's own ~-1.33 m/s^2 coast to ~-0.05, so only an exactly-zero command releases. ***
+class TestOverSpeedRelease:
+  """Through the real path (CarInterface.apply -> create_gas_command -> wire) plus the helper's boundary directly."""
+  KMH_SET = 72.        # route 16a final set speed
+  KMH_ABOVE = 78.      # what the car was doing when the old law held it there
+
+  def _ci(self):
+    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
+    return CarInterface(CP, CP_SP)
+
+  def _step(self, CI, accel, v_ego, v_cruise, t, long_active=True):
+    CC = structs.CarControl()
+    CC.enabled = CC.latActive = CC.longActive = long_active
+    CC.actuators.accel = accel
+    CI.update([])
+    CI.CS.out.vEgo = v_ego
+    CI.CS.out.vCruise = v_cruise  # km/h; card.py assigns out.vCruise (v_cruise_helper.v_cruise_kph) before apply
+    _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), t)
+    cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+    return _cmd_fields(cmd[0]) if cmd else None
+
+  def _drive(self, CI, accel, v_ego, v_cruise, n=200, long_active=True):
+    out = []
+    for i in range(n):
+      t = i * int(DT_CTRL * 1e9)
+      out.append(self._step(CI, accel, v_ego, v_cruise, t, long_active))
+    cmds = [c for c in out if c is not None]
+    assert cmds, "no pedal send slots in the drive"
+    return cmds
+
+  def _expected_raw(self, accel, v_ego):
+    """The unchanged law's steady-state raw track A (packed exactly like the controller packs it)."""
+    _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.get_pedal_command(accel, v_ego), 0)
+    return (d[0] << 8) | d[1]
+
+  def test_plan_zero_above_set_releases_to_exact_zero(self):
+    # (a) set 72, actual 78 km/h, plan ask 0.0 -> the car would have held 78 (route 16a); now every slot is the
+    # all-zero ENABLE=0 pass-through frame and the stored command is EXACTLY 0.0.
+    CI = self._ci()
+    v = self.KMH_ABOVE * CV.KPH_TO_MS
+    cmds = self._drive(CI, 0.0, v, self.KMH_SET)
+    assert cmds[0][:3] == (0, 0, 0) and all(c[:3] == (0, 0, 0) for c in cmds), cmds[:6]
+    assert CI.CC.gas == 0.0  # exact: a small offset would still collapse the coast (measured: -1.33 -> ~-0.05)
+
+  def test_negative_ask_above_set_releases_to_exact_zero(self):
+    # (b) same, plan ask -0.3 -> release, all-zero / pass-through
+    CI = self._ci()
+    cmds = self._drive(CI, -0.3, self.KMH_ABOVE * CV.KPH_TO_MS, self.KMH_SET)
+    assert all(c[:3] == (0, 0, 0) for c in cmds), cmds[:6]
+    assert CI.CC.gas == 0.0
+
+  def test_at_set_speed_unchanged(self):
+    # (c) at the set speed with ask 0.0 the release must NOT fire: hold feedforward output identical to the old law
+    CI = self._ci()
+    v = self.KMH_SET * CV.KPH_TO_MS
+    cmds = self._drive(CI, 0.0, v, self.KMH_SET)
+    expect = self._expected_raw(0.0, v)
+    assert cmds[-1][2] == 1 and abs(cmds[-1][0] - expect) <= 2, (cmds[-1], expect)
+    assert all(c[2] == 1 for c in cmds)  # ENABLE held the whole drive
+
+  def test_positive_ask_unchanged_even_overspeed(self):
+    # (d) 2 km/h above the set speed (past the 0.5 m/s margin) with ask +0.4 -> positive ask, law untouched
+    CI = self._ci()
+    v = (self.KMH_SET + 2.) * CV.KPH_TO_MS
+    assert v > self.KMH_SET * CV.KPH_TO_MS + gi.OVERSPEED_RELEASE_MARGIN  # genuinely past the margin
+    cmds = self._drive(CI, 0.4, v, self.KMH_SET)
+    expect = self._expected_raw(0.4, v)
+    assert cmds[-1][2] == 1 and abs(cmds[-1][0] - expect) <= 2, (cmds[-1], expect)
+    assert all(c[2] == 1 for c in cmds)
+
+  def test_disengaged_unchanged(self):
+    # (e) disengaged (longActive False, both enabled+lateral-only and fully off) at 78 km/h over a real 72 km/h set
+    # speed: the release never fires and the pass-through zero frames are exactly the old behaviour
+    for enabled in (True, False):
+      CI = self._ci()
+      v = self.KMH_ABOVE * CV.KPH_TO_MS
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = enabled  # longActive stays False: longitudinal not engaged
+      assert not CC.longActive
+      out = []
+      for i in range(30):
+        t = i * int(DT_CTRL * 1e9)
+        CI.update([])
+        CI.CS.out.vEgo = v
+        CI.CS.out.vCruise = self.KMH_SET
+        _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), t)
+        cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+        if cmd:
+          out.append(_cmd_fields(cmd[0]))
+      assert out and all(c[:3] == (0, 0, 0) for c in out), (enabled, out[:4])
+      assert CI.CC.gas == 0.0
+
+  def test_unset_vcruise_unchanged(self):
+    # (e) vCruise unset (255 = V_CRUISE_UNSET, or 0 = unset capnp default) at 78 km/h with ask 0.0: no real set
+    # speed is known, so the release never fires and the old hold law output is byte-identical to before
+    for vc in (gi.V_CRUISE_UNSET_KPH, 0.):
+      CI = self._ci()
+      cmds = self._drive(CI, 0.0, self.KMH_ABOVE * CV.KPH_TO_MS, vc)
+      expect = self._expected_raw(0.0, self.KMH_ABOVE * CV.KPH_TO_MS)
+      assert gi.over_speed_release(True, 0.0, self.KMH_ABOVE * CV.KPH_TO_MS, vc) is False
+      assert cmds[-1][2] == 1 and abs(cmds[-1][0] - expect) <= 2, (vc, cmds[-1], expect)
+      assert all(c[2] == 1 for c in cmds)
+      assert CI.CC.gas > 0.  # the old hold law was still in force
+
+  def test_standstill_launch_unchanged(self):
+    # standstill launch with a positive ask: the release can't fire (not above any set speed) and the launch is
+    # byte-identical to the pre-change ramp
+    CI = self._ci()
+    CC = structs.CarControl()
+    CC.enabled = CC.latActive = CC.longActive = True
+    CC.actuators.accel = 1.2
+    slots = []
+    for i in range(80):
+      t = i * int(DT_CTRL * 1e9)
+      CI.update([])
+      CI.CS.out.vEgo = 0.
+      CI.CS.out.vCruise = self.KMH_SET
+      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), t)
+      cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+      if cmd:
+        slots.append((cmd[0][0] << 8) | cmd[0][1])
+    # same pinning as TestLaunchRampIntegration.test_standstill_launch_reaches_authority_fast
+    assert len(slots) >= 11
+    assert slots[4] >= 573 - 6, slots[:6]
+    assert slots[8] >= 680 - 6, slots[:10]
+    assert max(slots) <= 465 + 0.12 * 2151 + 3, max(slots)
+
+  def test_helper_boundary(self):
+    # the 0.5 m/s margin is the boundary: strictly above releases, exactly at it does not (ENTRY is strict; the latch
+    # and its hysteresis govern the CONTINUATION, see over_speed_release_held)
+    assert gi.OVERSPEED_RELEASE_MARGIN == 0.5
+    base = self.KMH_SET * CV.KPH_TO_MS
+    above = self.KMH_ABOVE * CV.KPH_TO_MS
+    assert gi.over_speed_release(True, 0.0, above, self.KMH_SET)
+    assert gi.over_speed_release(True, -0.3, above, self.KMH_SET)
+    assert not gi.over_speed_release(True, 0.4, above, self.KMH_SET)          # positive ask
+    assert not gi.over_speed_release(False, 0.0, above, self.KMH_SET)         # not active
+    assert not gi.over_speed_release(True, 0.0, base, self.KMH_SET)           # at the set speed
+    assert not gi.over_speed_release(True, 0.0, base - 1., self.KMH_SET)      # below it
+    for over in (0.0, 0.499):                                                 # ...and for any set speed
+      assert not gi.over_speed_release(True, 0.0, self.KMH_SET * CV.KPH_TO_MS + gi.OVERSPEED_RELEASE_MARGIN - over,
+                                       self.KMH_SET)
+    assert gi.over_speed_release(True, 0.0, self.KMH_SET * CV.KPH_TO_MS + gi.OVERSPEED_RELEASE_MARGIN + 1e-3,
+                                 self.KMH_SET)
+    for vc in (gi.V_CRUISE_UNSET_KPH, 0., -1.):
+      assert not gi.over_speed_release(True, 0.0, above, vc)
+
+
+# *** 17c blip smoothing (route 17c, 2026-10-28): over-speed release hysteresis + soft recovery up to the hold ***
+# Measured: 87 upward throttle pulses in 825 s at/near the set speed; the release fired strictly above set + 0.5 m/s with
+# no hysteresis (19:57:51-54: ENABLE 0/1/0/1 every ~100 ms while hovering at set + 0.45..0.51), and every dip below the
+# hold came back at the full 0.72 pedal/s jerk rate (19:40:17: 0 -> 0.223 in 0.3 s, TPS 2.8 -> 29.6 %).
+# These tests drive the REAL path (CarInterface.apply -> GasInterceptorCarController.create_gas_command -> 0x700 wire)
+# and assert in raw wire units, so they do not depend on any constant introduced by the fix.
+def _frac(raw: int) -> float:
+  """0x700 raw track A -> pedal fraction (bench-pinned DBC mapping: raw = 465 + frac * 2151)."""
+  return (raw - 465) / 2151. if raw else 0.
+
+
+class TestBlipSmoothing17c:
+  SET_KPH = 108.                     # 30.0 m/s, the 17c highway set speed band (vCruise 104-112 km/h)
+  REENTRY_S = 1.0                    # chosen 0 -> hold time (see gas_interceptor.PEDAL_REENTRY_TIME_S)
+  RAW_TOL = 2                        # DBC quantization / rounding of one send slot, raw counts
+
+  def _ci(self):
+    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
+    return CarInterface(CP, CP_SP)
+
+  def _run(self, CI, series, long_active=True):
+    """series: iterable of (accel, v_ego, v_cruise_kph) per 100 Hz frame -> [(raw, enable)] per 50 Hz send slot."""
+    out = []
+    for i, (accel, v, vc) in enumerate(series):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = CC.longActive = long_active
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = float(vc)
+      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
+      cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+      if cmd:
+        raw, _, en, _ = _cmd_fields(cmd[0])
+        out.append((raw, en))
+    return out
+
+  def _dither_minute(self, v_amp, v_mid_over_set, ask_amp=0.3):
+    """60 s: ask = ask_amp * sin(2 pi 1 Hz t) (plan micro-ask dither), vEgo = set + v_mid + v_amp * sin(2 pi 0.2 t)."""
+    vs = self.SET_KPH * CV.KPH_TO_MS
+    n = int(60. / DT_CTRL)
+    return [(ask_amp * np.sin(2 * np.pi * 1.0 * k * DT_CTRL),
+             vs + v_mid_over_set + v_amp * np.sin(2 * np.pi * 0.2 * k * DT_CTRL), self.SET_KPH) for k in range(n)]
+
+  @staticmethod
+  def _per_10s(slots):
+    """[(enable transitions, max upward raw step)] per 10 s window (500 send slots)."""
+    out = []
+    for w in range(0, len(slots), 500):
+      s = slots[max(0, w - 1):w + 500]
+      out.append((sum(a[1] != b[1] for a, b in zip(s, s[1:], strict=False)),
+                  max([b[0] - a[0] for a, b in zip(s, s[1:], strict=False) if b[1] and a[1]] + [0])))
+    return out
+
+  def test_chatter_at_release_boundary(self):
+    # the brief's core case: ask dithering +-0.3 at ~1 Hz, vEgo +-0.3 m/s through the release boundary (set + 0.5) at
+    # highway speed. Pre-fix: every ask zero-crossing while above set + 0.5 toggles exact-zero coast <-> hold (dozens of
+    # ENABLE transitions per 10 s, each re-entry a 0 -> hold ramp). With the fix: the release latches once fired and
+    # holds the coast (the car is above its set speed and the plan never asks deliberately), so <= 1 transition/minute.
+    CI = self._ci()
+    slots = self._run(CI, self._dither_minute(v_amp=0.3, v_mid_over_set=0.5))
+    trans = sum(a[1] != b[1] for a, b in zip(slots, slots[1:], strict=False))
+    assert trans <= 2, trans
+    assert all(t <= 2 for t, _ in self._per_10s(slots)), self._per_10s(slots)
+
+  def test_chatter_through_set_and_boundary_bounded(self):
+    # wider dither that also crosses the set speed itself (vEgo set - 0.1 .. set + 0.9): the latch re-arms at the set
+    # speed and fires again above set + 0.5, i.e. at most ONE coast <-> hold cycle per 5 s speed oscillation (<= 2
+    # ENABLE transitions per 5 s), never the per-ask-zero-crossing toggling; every rise from 0 back toward the hold is the
+    # soft recovery (no upward step above hold(v) * DT_slot / REENTRY_S while below the hold).
+    CI = self._ci()
+    series = self._dither_minute(v_amp=0.5, v_mid_over_set=0.4)
+    slots = self._run(CI, series)
+    per = self._per_10s(slots)
+    assert all(t <= 4 for t, _ in per), per
+    hold_raw = 2151 * gi.get_hold_command(self.SET_KPH * CV.KPH_TO_MS + 0.9)
+    # one slot may straddle the hold as the command crosses it: the first frame still soft, the second at the normal
+    # rate (review #1 removed the `hold` cap, so the crossing no longer parks at the hold)
+    soft_step = (hold_raw * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL
+                 + 2151 * gi.get_pedal_rate_up(self.SET_KPH * CV.KPH_TO_MS + 0.9) * DT_CTRL)
+    for (r0, e0), (r1, e1) in zip(slots, slots[1:], strict=False):
+      if e1 and (not e0 or r0 - 465 < hold_raw - self.RAW_TOL) and r1 > r0:
+        assert r1 - (r0 if e0 else 465) <= soft_step, (r0, r1, soft_step)
+
+  def test_reentry_from_release_is_soft_and_monotonic(self):
+    # released (above set, ask 0) -> the car coasts down to the set speed -> the plan asks a small +0.2: the command
+    # returns from exact zero to the hold MONOTONICALLY, no slot-to-slot jump above hold/REENTRY_S, reaching the hold
+    # within REENTRY_S (+ one slot) - not the old 0.25 s snap. Above the hold the unchanged jerk rate takes it on to the
+    # law's target.
+    CI = self._ci()
+    vs = self.SET_KPH * CV.KPH_TO_MS
+    pre = [(0.0, vs + 1.0 - k * 0.01, self.SET_KPH) for k in range(100)]          # coast 31.0 -> 30.0 m/s, ask 0
+    assert all(en == 0 for _, en in self._run(CI, pre)[2:])                         # released the whole descent
+    post = self._run(CI, [(0.2, vs - 0.05, self.SET_KPH)] * 200)                    # at set, ask +0.2
+    raws = [r if en else 465 for r, en in post]
+    hold_raw = 465 + 2151 * gi.get_hold_command(vs - 0.05)
+    soft_step = (hold_raw - 465) * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL
+    assert all(b >= a for a, b in zip(raws, raws[1:], strict=False)), raws[:60]
+    below = [(a, b) for a, b in zip(raws, raws[1:], strict=False) if a < hold_raw - self.RAW_TOL]
+    assert below and max(b - a for a, b in below) <= soft_step, (max(b - a for a, b in below), soft_step)
+    t_hold = next(i for i, r in enumerate(raws) if r >= hold_raw - self.RAW_TOL) * 2 * DT_CTRL
+    assert 0.9 * self.REENTRY_S <= t_hold <= self.REENTRY_S + 0.05, t_hold
+    target_raw = 465 + 2151 * gi.get_pedal_command(0.2, vs - 0.05)
+    assert abs(raws[-1] - target_raw) <= self.RAW_TOL, (raws[-1], target_raw)
+
+  def test_reentry_reaches_target_while_speed_rising(self):
+    # REVIEW #1 (BLOCKING, 2026-10-29): the soft rise must not be capped at the MOVING hold value. Pre-fix the
+    # `min(..., hold)` cap re-engaged every frame once gas reached hold(v) with vEgo rising (hold(v_now) > gas_last by
+    # ~1e-5), so the command rode the hold instead of climbing to the law target (scale*ask + hold): any sub-0.5 ask
+    # during a speed rise lagged indefinitely (the lane's own closed loop: 308 s vs 7.1 s of gas-below-target over
+    # 729 s). Fixed: soft 0 -> hold in REENTRY_S, then the normal rate above the hold.
+    # Bound: REENTRY_S + (target - hold)/rate_up + 1 slot.
+    for v0 in (20., 12.):
+      for ask in (0.3, 0.45):
+        CI = self._ci()
+        raws = [r if en else 465 for r, en in
+                self._run(CI, [(ask, v0 + 0.1 * k * DT_CTRL, self.SET_KPH) for k in range(600)])]   # 6 s, v +0.6 m/s
+        target = gi.get_pedal_command(ask, v0)
+        hold = gi.get_hold_command(v0)
+        target_raw = 465 + 2151 * target
+        assert target_raw > 465 + 2151 * hold + 4 * self.RAW_TOL                                  # non-vacuous
+        t_bound = self.REENTRY_S + (target - hold) / gi.get_pedal_rate_up(v0) + 0.1
+        reached = next((i for i, r in enumerate(raws) if r >= target_raw - self.RAW_TOL), None)
+        assert reached is not None, (v0, ask, raws[40:130])          # pre-fix: pinned at hold(v), never reached
+        assert reached * 2 * DT_CTRL <= t_bound + 0.02, (v0, ask, reached * 2 * DT_CTRL, t_bound)
+
+  def test_reentry_after_law_clip_is_soft(self):
+    # the other source of 0 -> hold snaps: an ask below -hold/scale clips the law to exactly 0 (planner-asked coast),
+    # then the ask returns to ~0. Below the set speed (no release involved) the rise back to the hold is the soft one.
+    CI = self._ci()
+    v = self.SET_KPH * CV.KPH_TO_MS - 0.5
+    self._run(CI, [(0.0, v, self.SET_KPH)] * 150)                                   # settled on the hold
+    clip = self._run(CI, [(-0.8, v, self.SET_KPH)] * 50)
+    assert clip[-1] == (0, 0)                                                       # lift is still immediate
+    back = [r if en else 465 for r, en in self._run(CI, [(0.0, v, self.SET_KPH)] * 150)]
+    hold_raw = 465 + 2151 * gi.get_hold_command(v)
+    soft_step = (hold_raw - 465) * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL
+    assert max(b - a for a, b in zip(back, back[1:], strict=False)) <= soft_step
+    t_hold = next(i for i, r in enumerate(back) if r >= hold_raw - self.RAW_TOL) * 2 * DT_CTRL
+    assert t_hold >= 0.9 * self.REENTRY_S, t_hold                                   # pre-fix: ~0.25 s
+
+  def test_deliberate_ask_keeps_jerk_rate(self):
+    # a deliberate ask (>= 0.5 m/s^2: lead pulling away, merge) from a zero command keeps the UNCHANGED jerk-rate rise,
+    # byte-for-byte the pre-17c limiter: smoothing must not cost real pull authority.
+    CI = self._ci()
+    v = 25.
+    slots = self._run(CI, [(1.0, v, self.SET_KPH)] * 60)
+    g, expect = 0., []
+    for k in range(60):
+      g = min(gi.get_pedal_command(1.0, v), g + gi.get_pedal_rate_up(v) * DT_CTRL)
+      if k % 2 == 0:
+        _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), g, 0)
+        expect.append((d[0] << 8) | d[1])
+    assert [r for r, _ in slots] == expect
+
+  def test_route_16a_setdown_still_releases_promptly_and_coasts_to_set(self):
+    # route 16a: holding 78 km/h on hold_cmd, the owner lowers the set speed to 72 -> the release fires on the FIRST frame
+    # (unchanged entry), and with the hysteresis it now holds the exact-zero coast all the way down to the set speed
+    # (pre-fix it re-applied hold_cmd at 72 km/h + 0.5 m/s and the car hovered/chattered there, as at 17c 19:57:51).
+    CI = self._ci()
+    v0 = 78. * CV.KPH_TO_MS
+    held = self._run(CI, [(0.0, v0, 80.)] * 100)
+    assert held[-1][1] == 1                                                         # on the hold below set 80
+    n = 400                                                                         # 78 -> 71.3 km/h in 4 s, ask ~0
+    coast = self._run(CI, [(0.0, v0 - k * (v0 - 71.3 * CV.KPH_TO_MS) / n, 72.) for k in range(n)])
+    v_at = [v0 - 2 * i * (v0 - 71.3 * CV.KPH_TO_MS) / n for i in range(len(coast))]
+    assert coast[0] == (0, 0)                                                       # first slot after the set-down
+    assert all(c == (0, 0) for c, v in zip(coast, v_at, strict=False) if v > 72. * CV.KPH_TO_MS), coast[:5]
+    assert CI.CC.gas < gi.get_hold_command(71.3 * CV.KPH_TO_MS)                     # re-armed, ramping softly at set
+
+  def test_latch_inert_on_positive_deliberate_ask_and_disengage(self):
+    vs = self.SET_KPH * CV.KPH_TO_MS
+    CI = self._ci()
+    self._run(CI, [(0.0, vs + 1.0, self.SET_KPH)] * 20)
+    assert CI.CC.overspeed_released
+    self._run(CI, [(0.6, vs + 1.0, self.SET_KPH)] * 2)                              # deliberate ask breaks the latch
+    assert not CI.CC.overspeed_released and CI.CC.gas > 0.
+    CI = self._ci()
+    self._run(CI, [(0.0, vs + 1.0, self.SET_KPH)] * 20)
+    self._run(CI, [(0.0, vs + 1.0, self.SET_KPH)] * 2, long_active=False)           # disengage clears it
+    assert not CI.CC.overspeed_released
+    for vc in (gi.V_CRUISE_UNSET_KPH, 0.):                                          # unset set speed never latches
+      CI = self._ci()
+      self._run(CI, [(0.0, vs + 1.0, vc)] * 20)
+      assert not CI.CC.overspeed_released and CI.CC.gas > 0.
+
+  def test_launch_and_low_speed_unchanged(self):
+    # the soft recovery is gated off below 25 mph and while launching: the standstill launch and a 6-10 m/s rolling
+    # recovery are byte-identical to the pre-17c limiter.
+    for v, accel in ((0., 1.2), (2., 0.3), (6., 0.0), (10., 0.2)):
+      CI = self._ci()
+      slots = self._run(CI, [(accel, v, 72.)] * 80)
+      g, launching, expect = 0., False, []
+      for k in range(80):
+        launching = accel > 0. and v <= gi.LAUNCH_RAMP_V_MAX
+        g = min(gi.get_pedal_command(accel, v), g + gi.get_pedal_rate_up(v, launching) * DT_CTRL)
+        if k % 2 == 0:
+          _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), g, 0)
+          expect.append((d[0] << 8) | d[1])
+      assert [r for r, _ in slots] == expect, (v, accel)
