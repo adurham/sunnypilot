@@ -3580,7 +3580,8 @@ class Test17cStandstillHold(unittest.TestCase):
       self.assertLessEqual(max(d for _, d, _ in sent), HYUNDAI_FCA11_LONG_MAX_DEC, "never above the panda gate")
 
   def test_standstill_hold_is_above_the_deployed_tier_cap_for_standard(self):
-    """The owner's tier: the deployed hold was the tier cap 20; the new hold is 30 (+10 LSB ~ +0.96 m/s^2 fitted)."""
+    """The owner's tier: the deployed hold was the tier cap 20; the new hold is 30 (the hold REQUEST is x1.5 IF
+    DecCmd -> pressure is linear at standstill — unverified; no LSB -> bar map exists, so no decel claim here)."""
     old, _ = self._run(self._brake(False), self._stop_rows(), fl.PERSONALITY_STANDARD)
     new, _ = self._run(self._brake(True), self._stop_rows(), fl.PERSONALITY_STANDARD)
     self.assertEqual(20, old[-1][1])

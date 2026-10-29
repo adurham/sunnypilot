@@ -749,7 +749,8 @@ FCA11_FEEL_FIX_0051 = True
 # 18-26 s. The DCT car crept anyway: stop 2 (mono 16662.8-16665.0) went 0 -> 0.165 m/s at 20 LSB (net +0.14 m/s^2, one +0.46
 # sample), CarState.standstill dropping False for ~0.8 s, while CYL_PRES read 0.0 (the injection is downstream of the
 # master-cylinder sensor). FCA11_HOLD_LOST_KPH (2 km/h) is far above that creep, so brakeNow never fired.
-# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: every wheel <= 0.375 km/h) inside the hold band
+# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: WHL_SPD_FL and WHL_SPD_RR <= 0.375 km/h —
+# two wheels on this CAN platform, not every wheel; carstate.py:117) inside the hold band
 # of an open episode, the band's CEILING becomes max(tier cap, FCA11_STANDSTILL_HOLD_LSB) instead of the tier cap. Nothing
 # else in the band changes: the request map, the 8 LSB band floor and the +RATE_STEP-over-the-last-SENT-frame limiter are the
 # same lines, so the extra LSB arrive by the planner's own stopping ramp (ask -0.85 -> -2.0 over ~1.1 s after standstill on
@@ -761,9 +762,13 @@ FCA11_FEEL_FIX_0051 = True
 # whole-band gate (<= 3 km/h) would add up to ~1 m/s^2 while still ROLLING into the stop - the final-metre grab the owner's
 # "smoothness first" directive forbids. The episode-open clear means a re-brake while rolling in the band after a launch
 # starts at the tier cap again (the latch never carries from one stop into a moving episode).
-# THE NUMBER (30) and its arithmetic: the fitted moving plant (FCA11_SHAPE_K 9.6 m/s^2 per 100 LSB, BITE 0.74) gives
-# +10 LSB (20 -> 30) ~= +0.96 m/s^2 of extra delivered decel, against a measured creep of 0.14 m/s^2 net (0.46 peak): ~7x the
-# net and ~2x the peak. 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
+# THE NUMBER (30) and its arithmetic — RESTATED AT INTEGRATION (laneB-REVIEW #2): the hold REQUEST is x1.5 (20 -> 30 LSB)
+# IF the ESC maps DecCmd -> pressure linearly at standstill. That map is UNVERIFIED: no LSB -> bar / hold-force calibration
+# exists for this car. The only numbers on disk are MOVING-plant fits and they disagree: (a) the shape K (9.6 m/s^2 per
+# 100 LSB, BITE 0.74) extrapolated to v = 0 gives +10 LSB ~ +0.96 m/s^2; (b) FORK row 91's sustained moving holds measure
+# 20 LSB -> 2.28 and 30 LSB -> 3.64 m/s^2, i.e. +1.36. Neither is a standstill number: at v = 0 decel is not the quantity
+# being commanded, hold FORCE is, and the creep (0.14 m/s^2 net, 0.46 peak) is a force-balance problem, not a decel one.
+# 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
 # cap == the highest level ever exercised on this car (0.30 g rolling scaling pulses, 2.03 m/s^2 delivered). It is NOT yet
 # proven at standstill: no production episode on disk exceeded 20 (891 episodes, 7 pulls), and the LSB -> bar / hold-force
 # calibration the drive report asks for has NOT been done; the moving-plant K is an extrapolation at v = 0. Revisit this one

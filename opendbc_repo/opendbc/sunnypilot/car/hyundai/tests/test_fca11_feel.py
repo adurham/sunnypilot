@@ -224,6 +224,10 @@ class TestCoastFirst(unittest.TestCase):
     # pinned in test_fca11_long.py::Test17cStandstillHold). With that switch off the 0049 identity holds at every band
     # speed; with it on the identity still holds wherever the car is NOT at standstill and wherever the ask never asks
     # past the tier cap.
+    # FAIL-BEFORE HONESTY (laneB-REVIEW #6): this AMENDED test is NOT fail-before evidence. Run against the deployed
+    # 096fbddc source it fails with AttributeError on FCA11_STANDSTILL_HOLD_ENABLED (the switch does not exist there),
+    # not on a semantic assertion. The real fail-before is Test17cStandstillHold (9 of its 13 fail on the deployed
+    # source); the 4 that pass there are invariance tests and are supposed to pass on both.
     prev = fl.FCA11_STANDSTILL_HOLD_ENABLED
     for hold_on in (False, True):
       fl.FCA11_STANDSTILL_HOLD_ENABLED = hold_on

@@ -1,8 +1,8 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index c0b67237a5..58c2ad0d83 100644
+index c0b67237a5..664ded9329 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -742,6 +742,47 @@ FCA11_FEEL_LEAD_LOSS_TAPER_S = 1.0   # then the floor ramps to 0 (~1 LSB per 0.1
+@@ -742,6 +742,52 @@ FCA11_FEEL_LEAD_LOSS_TAPER_S = 1.0   # then the floor ramps to 0 (~1 LSB per 0.1
  # Kill switch for (a)+(b)+(c): False restores the 0049/0050 feel layer byte-for-byte (read once per instance).
  FCA11_FEEL_FIX_0051 = True
  
@@ -13,7 +13,8 @@ index c0b67237a5..58c2ad0d83 100644
 +# 18-26 s. The DCT car crept anyway: stop 2 (mono 16662.8-16665.0) went 0 -> 0.165 m/s at 20 LSB (net +0.14 m/s^2, one +0.46
 +# sample), CarState.standstill dropping False for ~0.8 s, while CYL_PRES read 0.0 (the injection is downstream of the
 +# master-cylinder sensor). FCA11_HOLD_LOST_KPH (2 km/h) is far above that creep, so brakeNow never fired.
-+# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: every wheel <= 0.375 km/h) inside the hold band
++# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: WHL_SPD_FL and WHL_SPD_RR <= 0.375 km/h —
++# two wheels on this CAN platform, not every wheel; carstate.py:117) inside the hold band
 +# of an open episode, the band's CEILING becomes max(tier cap, FCA11_STANDSTILL_HOLD_LSB) instead of the tier cap. Nothing
 +# else in the band changes: the request map, the 8 LSB band floor and the +RATE_STEP-over-the-last-SENT-frame limiter are the
 +# same lines, so the extra LSB arrive by the planner's own stopping ramp (ask -0.85 -> -2.0 over ~1.1 s after standstill on
@@ -25,9 +26,13 @@ index c0b67237a5..58c2ad0d83 100644
 +# whole-band gate (<= 3 km/h) would add up to ~1 m/s^2 while still ROLLING into the stop - the final-metre grab the owner's
 +# "smoothness first" directive forbids. The episode-open clear means a re-brake while rolling in the band after a launch
 +# starts at the tier cap again (the latch never carries from one stop into a moving episode).
-+# THE NUMBER (30) and its arithmetic: the fitted moving plant (FCA11_SHAPE_K 9.6 m/s^2 per 100 LSB, BITE 0.74) gives
-+# +10 LSB (20 -> 30) ~= +0.96 m/s^2 of extra delivered decel, against a measured creep of 0.14 m/s^2 net (0.46 peak): ~7x the
-+# net and ~2x the peak. 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
++# THE NUMBER (30) and its arithmetic — RESTATED AT INTEGRATION (laneB-REVIEW #2): the hold REQUEST is x1.5 (20 -> 30 LSB)
++# IF the ESC maps DecCmd -> pressure linearly at standstill. That map is UNVERIFIED: no LSB -> bar / hold-force calibration
++# exists for this car. The only numbers on disk are MOVING-plant fits and they disagree: (a) the shape K (9.6 m/s^2 per
++# 100 LSB, BITE 0.74) extrapolated to v = 0 gives +10 LSB ~ +0.96 m/s^2; (b) FORK row 91's sustained moving holds measure
++# 20 LSB -> 2.28 and 30 LSB -> 3.64 m/s^2, i.e. +1.36. Neither is a standstill number: at v = 0 decel is not the quantity
++# being commanded, hold FORCE is, and the creep (0.14 m/s^2 net, 0.46 peak) is a force-balance problem, not a decel one.
++# 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
 +# cap == the highest level ever exercised on this car (0.30 g rolling scaling pulses, 2.03 m/s^2 delivered). It is NOT yet
 +# proven at standstill: no production episode on disk exceeded 20 (891 episodes, 7 pulls), and the LSB -> bar / hold-force
 +# calibration the drive report asks for has NOT been done; the moving-plant K is an extrapolation at v = 0. Revisit this one
@@ -50,7 +55,7 @@ index c0b67237a5..58c2ad0d83 100644
  
  def feel_gentle_gain(accel: float) -> float:
    """0051: the gentle-ask strength scale on the feel target: GENTLE_GAIN at/above GAIN_FADE_ACCEL, linear to 1.0 at the HARD
-@@ -1240,6 +1281,9 @@ class Fca11LongBrake:
+@@ -1240,6 +1286,9 @@ class Fca11LongBrake:
      self._feel_slope = 0.0             # EMA of d(ask)/dt over SENT frames (m/s^3), episode-local
      self._feel_prev_ask: float | None = None
      self._feel_in_hold_band = False    # hold-band latch (ENTER <= 3 km/h or standstill, EXIT >= 5 km/h)
@@ -60,7 +65,7 @@ index c0b67237a5..58c2ad0d83 100644
      self._feel_cal_prev = False        # previous frame's cal_on (a cal->planner hand-off re-seeds the ramp)
      self._feel_dwell = 0               # consecutive frames of (ok AND ask <= the deployed -0.5 onset): the dwell escape
      self._feel_dwell_slow = 0          # the same, AND vEgo < FCA11_FEEL_DWELL_SLOW_MPS on every counted frame (crawl escape)
-@@ -1787,6 +1831,7 @@ class Fca11LongBrake:
+@@ -1787,6 +1836,7 @@ class Fca11LongBrake:
      self._feel_slope_ant = 0.0         # 0051: the slow (anticipation-only) slope EMA
      self._feel_peak = float(seed)      # 0051: the re-rise deadband reference restarts with the episode
      self._feel_ll_frame = None         # 0051: no lead-loss hold survives into a new episode
@@ -68,7 +73,7 @@ index c0b67237a5..58c2ad0d83 100644
  
    def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
                     v_mps=None) -> int:
-@@ -1827,9 +1872,18 @@ class Fca11LongBrake:
+@@ -1827,9 +1877,18 @@ class Fca11LongBrake:
        self._feel_in_hold_band = True
      elif v_kph >= FCA11_FEEL_HOLD_EXIT_KPH:
        self._feel_in_hold_band = False
@@ -88,7 +93,7 @@ index c0b67237a5..58c2ad0d83 100644
      """0049: the raw CR_VSM_DecCmd the OLD-LAW feel layer requests for one 100 Hz frame (planner ask, moving).
  
      State advances only on the 50 Hz SENT slot (the ramp + slope are per SENT frame); a non-send frame re-offers the
-@@ -1845,11 +1899,15 @@ class Fca11LongBrake:
+@@ -1845,11 +1904,15 @@ class Fca11LongBrake:
        # no longer steps the level. An ask the deployed request takes ABOVE the floor still commands what it commanded
        # (max(), never min()): the standstill hold is not weakened. Gated on meas_inverse so the 0054 kill switch still
        # restores the pre-0054 map byte-for-byte.
@@ -106,7 +111,7 @@ index c0b67237a5..58c2ad0d83 100644
        if frame % FCA11_SEND_EVERY == 0:
          self._feel_acc = float(dec)
          self._feel_prev_ask = accel
-@@ -2400,7 +2458,8 @@ class Fca11LongBrake:
+@@ -2400,7 +2463,8 @@ class Fca11LongBrake:
            self._feel_reset()
          elif self._feel_cal_prev:
            self._feel_reset(float(max(self._dec_last_sent, FCA11_FEEL_FLOOR_LSB)))
@@ -117,10 +122,10 @@ index c0b67237a5..58c2ad0d83 100644
          if not self.braking:
            self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
-index 76b7004cab..bbc4a1fb7f 100644
+index 76b7004cab..6422f15845 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
-@@ -220,11 +220,23 @@ class TestCoastFirst(unittest.TestCase):
+@@ -220,11 +220,27 @@ class TestCoastFirst(unittest.TestCase):
      self.assertEqual([(0, STEP, 3)], sent)
  
    def test_hold_band_runs_the_deployed_law_byte_identical(self):
@@ -133,6 +138,10 @@ index 76b7004cab..bbc4a1fb7f 100644
 +    # pinned in test_fca11_long.py::Test17cStandstillHold). With that switch off the 0049 identity holds at every band
 +    # speed; with it on the identity still holds wherever the car is NOT at standstill and wherever the ask never asks
 +    # past the tier cap.
++    # FAIL-BEFORE HONESTY (laneB-REVIEW #6): this AMENDED test is NOT fail-before evidence. Run against the deployed
++    # 096fbddc source it fails with AttributeError on FCA11_STANDSTILL_HOLD_ENABLED (the switch does not exist there),
++    # not on a semantic assertion. The real fail-before is Test17cStandstillHold (9 of its 13 fail on the deployed
++    # source); the 4 that pass there are invariance tests and are supposed to pass on both.
 +    prev = fl.FCA11_STANDSTILL_HOLD_ENABLED
 +    for hold_on in (False, True):
 +      fl.FCA11_STANDSTILL_HOLD_ENABLED = hold_on
@@ -150,10 +159,10 @@ index 76b7004cab..bbc4a1fb7f 100644
    def test_hold_band_uses_deployed_open(self):
      for v in (0.5, 0.8):   # m/s (<= 3 km/h)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index 8b3acd1d95..cbbe4e75ba 100644
+index 8b3acd1d95..9b7fde658c 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-@@ -3491,3 +3491,217 @@ class Test0053CameraHandback(unittest.TestCase):
+@@ -3491,3 +3491,218 @@ class Test0053CameraHandback(unittest.TestCase):
      self.assertTrue(b.cam_brake and b.fca11_divergence)
      self.assertFalse(b._refused_cut, "re-attributed to the camera hand-back")
      self.assertFalse(b.fca11_unavailable)
@@ -246,7 +255,8 @@ index 8b3acd1d95..cbbe4e75ba 100644
 +      self.assertLessEqual(max(d for _, d, _ in sent), HYUNDAI_FCA11_LONG_MAX_DEC, "never above the panda gate")
 +
 +  def test_standstill_hold_is_above_the_deployed_tier_cap_for_standard(self):
-+    """The owner's tier: the deployed hold was the tier cap 20; the new hold is 30 (+10 LSB ~ +0.96 m/s^2 fitted)."""
++    """The owner's tier: the deployed hold was the tier cap 20; the new hold is 30 (the hold REQUEST is x1.5 IF
++    DecCmd -> pressure is linear at standstill — unverified; no LSB -> bar map exists, so no decel claim here)."""
 +    old, _ = self._run(self._brake(False), self._stop_rows(), fl.PERSONALITY_STANDARD)
 +    new, _ = self._run(self._brake(True), self._stop_rows(), fl.PERSONALITY_STANDARD)
 +    self.assertEqual(20, old[-1][1])
