@@ -742,6 +742,47 @@ FCA11_FEEL_LEAD_LOSS_TAPER_S = 1.0   # then the floor ramps to 0 (~1 LSB per 0.1
 # Kill switch for (a)+(b)+(c): False restores the 0049/0050 feel layer byte-for-byte (read once per instance).
 FCA11_FEEL_FIX_0051 = True
 
+# *** 17c: STANDSTILL HOLD above the personality tier cap (route 17c, owner note "need higher hold to prevent creep") ***
+# WHAT THE CAR DID (route 17c, standard tier, wsSTOP/drive-17c/REPORT.md Note 1): every FCA11-held stop ran the FEEL hold
+# band below, where LongControl's stopping ramp drives the ask to -2.0 (FCA11_A_MAX_MSS2), the deployed request maps that to
+# dec_cmd_from_accel(-2.0) = 30 and the TIER CLAMP cuts it to the personality cap - 20 LSB for standard - held CONSTANT for
+# 18-26 s. The DCT car crept anyway: stop 2 (mono 16662.8-16665.0) went 0 -> 0.165 m/s at 20 LSB (net +0.14 m/s^2, one +0.46
+# sample), CarState.standstill dropping False for ~0.8 s, while CYL_PRES read 0.0 (the injection is downstream of the
+# master-cylinder sensor). FCA11_HOLD_LOST_KPH (2 km/h) is far above that creep, so brakeNow never fired.
+# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: every wheel <= 0.375 km/h) inside the hold band
+# of an open episode, the band's CEILING becomes max(tier cap, FCA11_STANDSTILL_HOLD_LSB) instead of the tier cap. Nothing
+# else in the band changes: the request map, the 8 LSB band floor and the +RATE_STEP-over-the-last-SENT-frame limiter are the
+# same lines, so the extra LSB arrive by the planner's own stopping ramp (ask -0.85 -> -2.0 over ~1.1 s after standstill on
+# all 17c stops -> 13 -> 30 at ~15 LSB/s, the last 10 LSB of it after the car is already stationary) and never faster than
+# +RATE_STEP per sent frame. It is a ceiling, not a floor: a weaker ask at standstill commands exactly what it commanded.
+# WHY A LATCH (set on standstill, cleared only by the band's unchanged EXIT >= FCA11_FEEL_HOLD_EXIT_KPH, an episode (re)open,
+# longActive off or a disable): a per-frame standstill gate would drop 30 -> 20 exactly while the car creeps (the 17c
+# specimen flipped standstill False for 0.8 s mid-creep), i.e. it would weaken the hold at the one moment it is needed. A
+# whole-band gate (<= 3 km/h) would add up to ~1 m/s^2 while still ROLLING into the stop - the final-metre grab the owner's
+# "smoothness first" directive forbids. The episode-open clear means a re-brake while rolling in the band after a launch
+# starts at the tier cap again (the latch never carries from one stop into a moving episode).
+# THE NUMBER (30) and its arithmetic: the fitted moving plant (FCA11_SHAPE_K 9.6 m/s^2 per 100 LSB, BITE 0.74) gives
+# +10 LSB (20 -> 30) ~= +0.96 m/s^2 of extra delivered decel, against a measured creep of 0.14 m/s^2 net (0.46 peak): ~7x the
+# net and ~2x the peak. 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
+# cap == the highest level ever exercised on this car (0.30 g rolling scaling pulses, 2.03 m/s^2 delivered). It is NOT yet
+# proven at standstill: no production episode on disk exceeded 20 (891 episodes, 7 pulls), and the LSB -> bar / hold-force
+# calibration the drive report asks for has NOT been done; the moving-plant K is an extrapolation at v = 0. Revisit this one
+# constant when that calibration exists. VALID RANGE [PERSONALITY_MAX_DEC[STANDARD] (20), HYUNDAI_FCA11_LONG_MAX_DEC (30)]:
+# below 20 it is a no-op for standard (the tier the owner drives), above 30 the panda refuses the frame (pinned by tests,
+# and clamped again at use by fca11_standstill_hold_lsb()).
+# PERSONALITY POLICY: ONE level for every tier (relaxed 12 -> 30, standard 20 -> 30, aggressive 30 unchanged). A standstill
+# hold is stop-KEEPING, not a feel dial: the car is stationary, so the level is not felt as decel, and a tier that holds less
+# creeps more (relaxed's 12 is the weakest hold of all). Same ruling as the pedal hold feedforward (G3, FORK.md #47).
+# Exit hysteresis, FCA11_HOLD_LOST_KPH, the alerts and the moving law are untouched. False restores the deployed band
+# byte-for-byte (read once per instance).
+FCA11_STANDSTILL_HOLD_ENABLED = True
+FCA11_STANDSTILL_HOLD_LSB = 30
+
+
+def fca11_standstill_hold_lsb() -> int:
+  """17c: the standstill hold ceiling (raw CR_VSM_DecCmd), clamped to the panda gate so no edit can make it unsendable."""
+  return int(min(HYUNDAI_FCA11_LONG_MAX_DEC, FCA11_STANDSTILL_HOLD_LSB))
+
 
 def feel_gentle_gain(accel: float) -> float:
   """0051: the gentle-ask strength scale on the feel target: GENTLE_GAIN at/above GAIN_FADE_ACCEL, linear to 1.0 at the HARD
@@ -1240,6 +1281,9 @@ class Fca11LongBrake:
     self._feel_slope = 0.0             # EMA of d(ask)/dt over SENT frames (m/s^3), episode-local
     self._feel_prev_ask: float | None = None
     self._feel_in_hold_band = False    # hold-band latch (ENTER <= 3 km/h or standstill, EXIT >= 5 km/h)
+    # 17c: the standstill-hold latch (FCA11_STANDSTILL_HOLD_*). Feel path only, read once like every other law switch.
+    self.standstill_hold = self.feel and bool(FCA11_STANDSTILL_HOLD_ENABLED)
+    self._feel_standstill_hold = False  # set at standstill in the band; cleared by band EXIT / episode (re)open / reset
     self._feel_cal_prev = False        # previous frame's cal_on (a cal->planner hand-off re-seeds the ramp)
     self._feel_dwell = 0               # consecutive frames of (ok AND ask <= the deployed -0.5 onset): the dwell escape
     self._feel_dwell_slow = 0          # the same, AND vEgo < FCA11_FEEL_DWELL_SLOW_MPS on every counted frame (crawl escape)
@@ -1787,6 +1831,7 @@ class Fca11LongBrake:
     self._feel_slope_ant = 0.0         # 0051: the slow (anticipation-only) slope EMA
     self._feel_peak = float(seed)      # 0051: the re-rise deadband reference restarts with the episode
     self._feel_ll_frame = None         # 0051: no lead-loss hold survives into a new episode
+    self._feel_standstill_hold = False  # 17c: nor a standstill hold (re-set at once if the car is still at standstill)
 
   def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
                    v_mps=None) -> int:
@@ -1827,9 +1872,18 @@ class Fca11LongBrake:
       self._feel_in_hold_band = True
     elif v_kph >= FCA11_FEEL_HOLD_EXIT_KPH:
       self._feel_in_hold_band = False
+      self._feel_standstill_hold = False   # 17c: the standstill hold leaves with the band (the UNCHANGED exit hysteresis)
     return self._feel_in_hold_band
 
-  def _feel_level(self, accel: float, frame: int, personality=PERSONALITY_STANDARD, v_kph=None) -> int:
+  def _feel_band_clamp(self, dec: int, personality) -> int:
+    """17c: the hold band's clamp. Not latched -> clamp_dec_cmd (the deployed tier clamp, byte-for-byte). Latched at
+    standstill -> the same clamp with the ceiling raised to max(tier cap, the standstill hold level)."""
+    if not self._feel_standstill_hold:
+      return clamp_dec_cmd(dec, personality)
+    return max(1, min(max(personality_max_dec(personality), fca11_standstill_hold_lsb()), dec))
+
+  def _feel_level(self, accel: float, frame: int, personality=PERSONALITY_STANDARD, v_kph=None,
+                  standstill: bool = False) -> int:
     """0049: the raw CR_VSM_DecCmd the OLD-LAW feel layer requests for one 100 Hz frame (planner ask, moving).
 
     State advances only on the 50 Hz SENT slot (the ramp + slope are per SENT frame); a non-send frame re-offers the
@@ -1845,11 +1899,15 @@ class Fca11LongBrake:
       # no longer steps the level. An ask the deployed request takes ABOVE the floor still commands what it commanded
       # (max(), never min()): the standstill hold is not weakened. Gated on meas_inverse so the 0054 kill switch still
       # restores the pre-0054 map byte-for-byte.
-      dec = clamp_dec_cmd(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
+      # 17c: at TRUE standstill the band's ceiling (both tier clamps below) is raised to the standstill hold level, latched
+      # until the band exits / the episode re-opens (FCA11_STANDSTILL_HOLD_*). The +RATE_STEP limiter is unchanged.
+      if self.standstill_hold and standstill:
+        self._feel_standstill_hold = True
+      dec = self._feel_band_clamp(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
       if self.meas_inverse:
         band_floor = fca11_floor_lsb(None if v_kph is None else v_kph / 3.6)
         dec = max(dec, min(band_floor, personality_max_dec(personality)))
-      dec = clamp_dec_cmd(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
+      dec = self._feel_band_clamp(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
       if frame % FCA11_SEND_EVERY == 0:
         self._feel_acc = float(dec)
         self._feel_prev_ask = accel
@@ -2400,7 +2458,8 @@ class Fca11LongBrake:
           self._feel_reset()
         elif self._feel_cal_prev:
           self._feel_reset(float(max(self._dec_last_sent, FCA11_FEEL_FLOOR_LSB)))
-        dec_cmd = self._feel_level(accel, frame, personality, v_kph_now)
+        dec_cmd = self._feel_level(accel, frame, personality, v_kph_now,
+                                   standstill=bool(getattr(CS.out, "standstill", False)))
       elif self.affine_gain and not cal_on:
         if not self.braking:
           self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
