@@ -71,6 +71,10 @@ class CarParamsSP:
   # (the deployed law: fca11Brake as today, fca11AffineGain forced False) and V3 is computed + logged alongside, NEVER
   # sent. Coupled with custom.capnp CarParamsSP.fca11Shadow @8.
   fca11Shadow: bool = auto_field()
+  # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+  # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+  # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+  pedalDeliveryLaw: bool = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 

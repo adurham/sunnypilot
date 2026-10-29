@@ -251,6 +251,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // next-ignition; for fresh-route data. The wire stays OLD-LAW (the deployed law): HyundaiFca11Brake keeps its meaning,
     // HyundaiFca11AffineGain is ignored (opendbc setup_interfaces). Writes /data/fca11-log/fca11-shadow.jsonl. Default OFF.
     {"HyundaiFca11Shadow", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
+    // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
+    // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
+    // armed (opendbc setup_interfaces). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
+    // OFF (the default) = the deployed pedal law, byte for byte.
+    {"HyundaiPedalDeliveryLaw", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
     // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may

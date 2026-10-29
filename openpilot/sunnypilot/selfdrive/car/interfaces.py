@@ -171,4 +171,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11Shadow param unknown to libparams (not rebuilt?); FCA11 shadow mode stays disabled")
 
+  # fork (17c delivery): measured-inverse pedal law for negative asks + a pedal-path ask filter. Same stale-libparams
+  # guard: a missing key leaves the law OFF (the deployed linear law). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiPedalDeliveryLaw": params.get("HyundaiPedalDeliveryLaw", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiPedalDeliveryLaw param unknown to libparams (not rebuilt?); the deployed pedal law stays active")
+
   return params_list

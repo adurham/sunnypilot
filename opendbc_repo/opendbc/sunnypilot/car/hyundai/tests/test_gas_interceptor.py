@@ -1786,3 +1786,252 @@ class TestBlipSmoothing17c:
           _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), g, 0)
           expect.append((d[0] << 8) | d[1])
       assert [r for r, _ in slots] == expect, (v, accel)
+
+
+def _get_ci_delivery(delivery: bool, pedal=REM, id_set: str | None = None):
+  """CarInterface with the pedal armed and the 17c delivery law (HyundaiPedalDeliveryLaw) on/off."""
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = {**BASE_FINGERPRINT, **pedal}
+  CarInterface = interfaces[CAR_UNDER_TEST]
+  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  params_list: list = [{"HyundaiGasInterceptor": True}]
+  if delivery:
+    params_list.append({"HyundaiPedalDeliveryLaw": True})
+  if id_set is not None:
+    params_list.append({"HyundaiGasInterceptorIDSet": id_set})
+  setup_interfaces(CarInterface, CP, CP_SP, params_list)
+  return CarInterface, CP, CP_SP
+
+
+class TestPedalDelivery17c:
+  """17c delivery: measured-inverse negative branch + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF)."""
+  SET_KPH = 108.      # 30 m/s, the 17c highway band
+  RAW_TOL = 2         # one send slot of DBC quantization, raw counts
+
+  def _ci(self, delivery=True):
+    CarInterface, CP, CP_SP = _get_ci_delivery(delivery)
+    assert CP_SP.pedalDeliveryLaw is delivery
+    return CarInterface(CP, CP_SP)
+
+  def _run(self, CI, series):
+    """[(accel, v_ego, v_cruise_kph)] per 100 Hz frame -> [(raw, enable)] per 50 Hz send slot."""
+    out = []
+    for i, (accel, v, vc) in enumerate(series):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = CC.longActive = True
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = float(vc)
+      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
+      cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+      if cmd:
+        raw, _, en, _ = _cmd_fields(cmd[0])
+        out.append((raw, en))
+    return out
+
+  # ---- the switch ---------------------------------------------------------------------------------------------------
+  def test_param_defaults_off_and_reads_the_key(self):
+    _, _, off = _get_ci_delivery(False)
+    assert off.pedalDeliveryLaw is False
+    assert off.enableGasInterceptor is True                  # the delivery key never gates the pedal feature
+    # True / "1" / b"1" arm it (the 0018 truthy contract); junk, "0", absent stay OFF
+    for val, want in ((True, True), ("1", True), (b"1", True), (False, False), ("0", False), ("true", False), (2, False)):
+      fingerprint = {i: {} for i in range(8)}
+      fingerprint[0] = {**BASE_FINGERPRINT, **REM}
+      CarInterface = interfaces[CAR_UNDER_TEST]
+      CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+      CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+      setup_interfaces(CarInterface, CP, CP_SP,
+                       [{"HyundaiGasInterceptor": True}, {"HyundaiPedalDeliveryLaw": val}])
+      assert CP_SP.pedalDeliveryLaw is want, (val, CP_SP.pedalDeliveryLaw)
+    # absent key -> OFF, and every other CarParamsSP field is untouched
+    _, _, ref = _get_ci_delivery(False)
+    _, _, absent = _get_ci_delivery(False)
+    assert ref == absent and absent.pedalDeliveryLaw is False
+
+  def test_off_is_the_deployed_law_bit_for_bit(self):
+    # exercises the whole pipeline: launch ramp, hold, shallow ask dither, deep clip, recovery
+    CI = self._ci(delivery=False)
+    vs = self.SET_KPH * CV.KPH_TO_MS
+    series = ([(1.2, 1.0, self.SET_KPH)] * 40 +
+              [(0.0, 18.0, self.SET_KPH)] * 60 +
+              [(-0.05 if k % 4 else -0.20, 25.0, self.SET_KPH) for k in range(400)] +
+              [(-0.9, vs, self.SET_KPH)] * 40 +
+              [(0.2, vs, self.SET_KPH)] * 100)
+    got = self._run(CI, series)
+    g, expect = 0., []
+    for k, (accel, v, _) in enumerate(series):
+      launching = accel > 0. and v <= gi.LAUNCH_RAMP_V_MAX
+      g = gi.rate_limit_pedal_command(gi.get_pedal_command(accel, v), g, v, launching,
+                                      reentry=accel < gi.OVERSPEED_EXIT_ACCEL)
+      if k % 2 == 0:
+        _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), g, 0)
+        expect.append((d[0] << 8 | d[1], d[4] >> 7))
+    assert got == expect
+    # the filter is never advanced and the controller never enters the new branch
+    assert CI.CC.delivery_law is False and CI.CC.delivery_ask == 0.
+
+  # ---- the law ------------------------------------------------------------------------------------------------------
+  def test_drop_table_is_monotone_and_anchored(self):
+    assert list(gi.DELIVERY_ACCEL_BP) == sorted(gi.DELIVERY_ACCEL_BP)
+    assert list(gi.DELIVERY_PEDAL_DROP) == sorted(gi.DELIVERY_PEDAL_DROP)          # monotone in |ask|
+    assert len(gi.DELIVERY_ACCEL_BP) == len(gi.DELIVERY_PEDAL_DROP)
+    drops = [gi.get_delivery_pedal_drop(-a, 22.) for a in np.arange(0., 0.6, 0.002)]
+    assert all(b >= a - 1e-12 for a, b in zip(drops, drops[1:], strict=False))     # monotone in |ask|
+    assert gi.get_delivery_pedal_drop(0., 22.) == 0.                               # anchor: a = 0 -> no drop
+    # ... and steeper than the linear law's 0.36 pedal/(m/s^2) over the measured plateau
+    lin = gi.PEDAL_SCALE_HIGHWAY * 0.20
+    assert gi.get_delivery_pedal_drop(-0.20, 22.) > 1.2 * lin
+    # the low-speed part is the law's existing speed schedule, never MORE pedal drop than the highway table
+    assert gi.get_delivery_pedal_drop(-0.20, 12.) < gi.get_delivery_pedal_drop(-0.20, 22.)
+    assert gi.get_delivery_pedal_drop(-0.20, 0.) < gi.get_delivery_pedal_drop(-0.20, 12.)
+
+  def test_zero_ask_is_exactly_the_hold_at_every_speed(self):
+    for v in np.arange(0., 36., 0.5):
+      for p in (gi.PERSONALITY_AGGRESSIVE, gi.PERSONALITY_STANDARD, gi.PERSONALITY_RELAXED):
+        assert gi.get_delivery_pedal_command(0., v, p) == gi.get_pedal_command(0., v, p)
+        assert gi.get_delivery_pedal_command(0., v, p) == gi.get_hold_command(v, p)
+
+  def test_positive_asks_are_the_unchanged_linear_law(self):
+    for v in (0., 5., 12., 22., 30., 35.):
+      for p in (gi.PERSONALITY_AGGRESSIVE, gi.PERSONALITY_STANDARD, gi.PERSONALITY_RELAXED):
+        for ask in (0.01, 0.1, 0.35, 0.8, 1.5):
+          assert gi.get_delivery_pedal_command(ask, v, p) == gi.get_pedal_command(ask, v, p)
+
+  def test_negative_branch_is_monotone_in_the_ask(self):
+    asks = np.arange(-0.55, 0.001, 0.005)
+    for v in (0., 6., 12., 18., 22., 25., 30., 35.):
+      cmds = [gi.get_delivery_pedal_command(a, v) for a in asks]
+      assert all(b >= a - 1e-12 for a, b in zip(cmds, cmds[1:], strict=False)), v     # deeper ask -> less pedal
+      assert all(0. <= c <= gi.MAX_INTERCEPTOR_GAS for c in cmds), v
+
+  def test_shallow_ask_lifts_more_than_the_linear_law(self):
+    # the point of the fix: over the shallow-negative band the pedal must sit LOWER than the linear law's (the linear
+    # law under-lifted by +0.10..+0.13 m/s^2 there, see FINDINGS-delivery.md), and the gap must grow with |ask| over
+    # the plateau and then hand back to an exact zero at the cliff.
+    for v in (22., 25., 30.):
+      gaps = []
+      for ask in (-0.05, -0.08, -0.11, -0.14, -0.18, -0.22, -0.25):
+        new = gi.get_delivery_pedal_command(ask, v)
+        old = gi.get_pedal_command(ask, v)
+        assert new < old, (v, ask, new, old)
+        gaps.append(old - new)
+      assert max(gaps) >= 0.04, (v, gaps)                    # at least 4 points of pedal more lift somewhere
+      assert gi.get_delivery_pedal_command(-0.52, v) == 0.   # ... and the deep end is still the coast
+      assert gi.get_pedal_command(-0.52, v) == 0.
+      # Past the DEPLOYED law's own zero crossing the new law deliberately holds the measured plateau floor (a live
+      # ~1 % command) where the deployed law already coasts. That is the nearer of the two accelerations the plant can
+      # produce there (-0.29 live vs -0.79 pass-through; the cliff's midpoint is -0.54), and it is what stops the
+      # -0.35..-0.25 band from over-delivering.
+      cross = -gi.get_hold_command(v) / gi.get_pedal_scale(v)
+      assert abs(cross) < gi.DELIVERY_COAST_ACCEL - 0.02, (v, cross)
+      assert gi.get_pedal_command(cross - 0.02, v) == 0.
+      assert abs(gi.get_delivery_pedal_command(cross - 0.02, v) - gi.DELIVERY_PEDAL_FLOOR) < 1e-9
+
+  def test_floor_is_the_plateau_not_one_dbc_count(self):
+    # 0.27 < |ask| < 0.52 holds the measured plateau floor (a live ~1 % command) instead of creeping to 1 count
+    for v in (22., 25., 30.):
+      for ask in (-0.31, -0.35, -0.45, -0.51):
+        cmd = gi.get_delivery_pedal_command(ask, v)
+        assert abs(cmd - gi.DELIVERY_PEDAL_FLOOR) < 1e-9, (v, ask, cmd)
+
+  def test_deep_ask_is_exactly_zero_and_the_wire_frame_is_all_zero(self):
+    for v in (0., 12., 22., 30.):
+      for ask in (-0.52, -0.6, -1.0, -2.0):
+        assert gi.get_delivery_pedal_command(ask, v) == 0.
+    CI = self._ci()
+    slots = self._run(CI, [(-1.0, 30., self.SET_KPH)] * 40)
+    assert all(s == (0, 0) for s in slots)                   # all-zero ENABLE=0 frame = pass-through coast
+    # the FCA11 brake law owns asks <= -0.5, and at/above the coast threshold the pedal is the same exact zero
+    for ask in (-0.52, -0.55, -0.7, -1.5):
+      assert gi.get_delivery_pedal_command(ask, 30.) == gi.get_pedal_command(ask, 30.) == 0.
+
+  def test_standstill_negative_ask_commands_exactly_zero(self):
+    # no floor below the measured band: any <= 0 ask at a standstill/dead slow is EXACTLY 0 (no uncommanded motion)
+    for ask in (-0.01, -0.05, -0.15, -0.3, -0.51):
+      assert gi.get_delivery_pedal_command(ask, 0.) == 0., ask       # hold(0) = 0 and no floor below the band
+    for v in (0.5, 3., 5., 10., 17.9):
+      for ask in (-0.01, -0.05, -0.15, -0.3, -0.51):
+        cmd = gi.get_delivery_pedal_command(ask, v)
+        assert 0. <= cmd <= gi.get_pedal_command(ask, v) + 1e-12, (v, ask, cmd)
+
+  def test_ceiling_and_cap_hold_at_every_speed(self):
+    for v in np.arange(0., 36., 0.25):
+      for p in (gi.PERSONALITY_AGGRESSIVE, gi.PERSONALITY_STANDARD, gi.PERSONALITY_RELAXED):
+        ceil = gi.get_personality_ceiling(v, p)
+        assert ceil <= gi.MAX_INTERCEPTOR_GAS
+        for ask in np.arange(-0.6, 0.001, 0.01):
+          cmd = gi.get_delivery_pedal_command(ask, v, p)
+          assert 0. <= cmd <= ceil, (v, p, ask, cmd, ceil)
+
+  def test_personality_does_not_scale_the_negative_branch(self):
+    # the drop table is plant physics like the hold: aggressive and relaxed must not change a <= 0 command
+    for ask in (-0.05, -0.12, -0.25, -0.40):
+      s = gi.get_delivery_pedal_command(ask, 25., gi.PERSONALITY_STANDARD)
+      assert gi.get_delivery_pedal_command(ask, 25., gi.PERSONALITY_AGGRESSIVE) == s
+      assert gi.get_delivery_pedal_command(ask, 25., gi.PERSONALITY_RELAXED) == s
+    # the positive branch keeps its personality spread (unchanged)
+    assert (gi.get_delivery_pedal_command(0.5, 25., gi.PERSONALITY_AGGRESSIVE) >
+            gi.get_delivery_pedal_command(0.5, 25., gi.PERSONALITY_RELAXED))
+
+  # ---- the ask filter -----------------------------------------------------------------------------------------------
+  def test_filter_shape(self):
+    # deeper ask: applied on the SAME frame (a lift is never delayed)
+    assert gi.filter_delivery_ask(-0.20, 0.) == -0.20
+    assert gi.filter_delivery_ask(-0.50, -0.20) == -0.50
+    # shallower ask: approached with the 0.8 s time constant, so one 100 Hz frame is ~1.2 % of the step
+    step = gi.filter_delivery_ask(-0.10, -0.30) - (-0.30)
+    assert abs(step - 0.20 * (1. - np.exp(-DT_CTRL / gi.DELIVERY_ASK_TAU_S))) < 1e-12
+    assert step < 0.003
+    # after 0.8 s about 63 % of the step is taken, after 3 s ~95 %
+    a = -0.30
+    for _ in range(80):
+      a = gi.filter_delivery_ask(-0.10, a)
+    assert 0.60 * 0.20 <= (a + 0.30) <= 0.66 * 0.20, a
+    # positive asks pass through untouched (and re-seed the state, so a later dip is not stale)
+    assert gi.filter_delivery_ask(0.2, -0.4) == 0.2
+    assert gi.filter_delivery_ask(0.0, -0.4) == 0.0
+
+  def test_filter_attenuates_a_2hz_dither_through_the_controller(self):
+    vs = self.SET_KPH * CV.KPH_TO_MS
+    series = []
+    for k in range(1000):                                    # 10 s, 2 Hz: 0.25 s at -0.20, 0.25 s at -0.05
+      series.append((-0.20 if (k // 25) % 2 == 0 else -0.05, vs, self.SET_KPH))
+    out = {}
+    for delivery in (False, True):
+      CI = self._ci(delivery)
+      out[delivery] = [r for r, en in self._run(CI, series) if en]
+    p2p = {k: max(v) - min(v) for k, v in out.items()}
+    up = {k: sum(max(0, b - a) for a, b in zip(v, v[1:], strict=False)) for k, v in out.items()}
+    assert p2p[True] < 0.5 * p2p[False], p2p
+    assert up[True] < 0.5 * up[False], (up, p2p)
+
+  def test_filter_is_reset_on_disengage_and_on_the_coast(self):
+    CI = self._ci()
+    self._run(CI, [(-0.30, 30., self.SET_KPH)] * 100)
+    assert abs(CI.CC.delivery_ask - (-0.30)) < 1e-6
+    CC = structs.CarControl()                                # disengage clears it
+    CC.enabled = CC.latActive = CC.longActive = False
+    CI.update([])
+    CI.CS.out.vEgo, CI.CS.out.vCruise = 30., self.SET_KPH
+    CI.apply(CC.as_reader(), structs.CarControlSP(), 200 * int(DT_CTRL * 1e9))
+    assert CI.CC.delivery_ask == 0.
+    # re-engaging at a shallow ask responds from a clean state (no stale deep ask)
+    self._run(CI, [(-0.10, 30., self.SET_KPH)] * 2)
+    assert abs(CI.CC.delivery_ask - (-0.10)) < 1e-6
+
+  def test_rate_limiter_and_launch_are_unchanged_with_the_law_on(self):
+    # the new branch only replaces the LAW for a < 0: every positive-ask series (launch, hold, pull) is bit-identical
+    for series in ([(1.2, 0.5, self.SET_KPH)] * 40 + [(0.6, 6.0, self.SET_KPH)] * 40,
+                   [(0.3, 6.0, self.SET_KPH)] * 60,
+                   [(0.0, 6.0, self.SET_KPH)] * 50 + [(0.9, 25.0, self.SET_KPH)] * 50,
+                   [(1.5, 0.0, 72.)] * 80):
+      assert self._run(self._ci(), series) == self._run(self._ci(delivery=False), series)
+    # a FALL is still immediate with the law on: the ask filter never delays a lift
+    CI = self._ci()
+    self._run(CI, [(0.2, 30., self.SET_KPH)] * 200)
+    assert CI.CC.gas > 0.15
+    self._run(CI, [(-0.6, 30., self.SET_KPH)] * 2)
+    assert CI.CC.gas == 0.
