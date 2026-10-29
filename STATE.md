@@ -80,3 +80,4 @@
   check_patch_numbers.py exit 0; test_patch_number_guard.py 9 passed.
 - FORK.md draft row 93.
 - Next: commit, push-if-auth, report.
+- CP8: committed 577406fe62; pushed to adurham/fix/17c-standstill-hold (see ls-remote).
