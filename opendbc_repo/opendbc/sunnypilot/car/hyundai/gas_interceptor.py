@@ -302,13 +302,15 @@ def get_pedal_reentry_rate(v_ego: float) -> float:
 def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False,
                              reentry: bool = False) -> float:
   """Rise at most get_pedal_rate_up(v_ego, launching) * DT_CTRL per controller frame; fall immediately.
-  reentry=True (17c): while the last command is below the hold, the rise is limited to get_pedal_reentry_rate(v_ego) and
-  stops at the hold for this frame; inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
+  reentry=True (17c): while the last command is below the hold, the rise is limited to get_pedal_reentry_rate(v_ego);
+  the cap is that RATE, never the hold value itself (review #1: a `hold` term here pinned the climb whenever vEgo rose,
+  because hold(v_now) > gas_last by ~1e-5 re-entered the branch every frame). At/above the hold the normal rate takes
+  over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
   limit = gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL
   if reentry and not launching and v_ego >= PEDAL_REENTRY_V_MIN:
     hold = get_hold_command(v_ego)
     if gas_last < hold:
-      limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL, hold)
+      limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL)
   return min(gas, limit)
 
 

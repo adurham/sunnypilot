@@ -1566,7 +1566,8 @@ class TestOverSpeedRelease:
     assert max(slots) <= 465 + 0.12 * 2151 + 3, max(slots)
 
   def test_helper_boundary(self):
-    # the 0.5 m/s margin is the boundary: strictly above releases, exactly at it does not (no hysteresis)
+    # the 0.5 m/s margin is the boundary: strictly above releases, exactly at it does not (ENTRY is strict; the latch
+    # and its hysteresis govern the CONTINUATION, see over_speed_release_held)
     assert gi.OVERSPEED_RELEASE_MARGIN == 0.5
     base = self.KMH_SET * CV.KPH_TO_MS
     above = self.KMH_ABOVE * CV.KPH_TO_MS
@@ -1661,7 +1662,10 @@ class TestBlipSmoothing17c:
     per = self._per_10s(slots)
     assert all(t <= 4 for t, _ in per), per
     hold_raw = 2151 * gi.get_hold_command(self.SET_KPH * CV.KPH_TO_MS + 0.9)
-    soft_step = hold_raw * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL      # one send slot = 2 frames
+    # one slot may straddle the hold as the command crosses it: the first frame still soft, the second at the normal
+    # rate (review #1 removed the `hold` cap, so the crossing no longer parks at the hold)
+    soft_step = (hold_raw * 2 * DT_CTRL / self.REENTRY_S + self.RAW_TOL
+                 + 2151 * gi.get_pedal_rate_up(self.SET_KPH * CV.KPH_TO_MS + 0.9) * DT_CTRL)
     for (r0, e0), (r1, e1) in zip(slots, slots[1:], strict=False):
       if e1 and (not e0 or r0 - 465 < hold_raw - self.RAW_TOL) and r1 > r0:
         assert r1 - (r0 if e0 else 465) <= soft_step, (r0, r1, soft_step)
@@ -1686,6 +1690,27 @@ class TestBlipSmoothing17c:
     assert 0.9 * self.REENTRY_S <= t_hold <= self.REENTRY_S + 0.05, t_hold
     target_raw = 465 + 2151 * gi.get_pedal_command(0.2, vs - 0.05)
     assert abs(raws[-1] - target_raw) <= self.RAW_TOL, (raws[-1], target_raw)
+
+  def test_reentry_reaches_target_while_speed_rising(self):
+    # REVIEW #1 (BLOCKING, 2026-10-29): the soft rise must not be capped at the MOVING hold value. Pre-fix the
+    # `min(..., hold)` cap re-engaged every frame once gas reached hold(v) with vEgo rising (hold(v_now) > gas_last by
+    # ~1e-5), so the command rode the hold instead of climbing to the law target (scale*ask + hold): any sub-0.5 ask
+    # during a speed rise lagged indefinitely (the lane's own closed loop: 308 s vs 7.1 s of gas-below-target over
+    # 729 s). Fixed: soft 0 -> hold in REENTRY_S, then the normal rate above the hold.
+    # Bound: REENTRY_S + (target - hold)/rate_up + 1 slot.
+    for v0 in (20., 12.):
+      for ask in (0.3, 0.45):
+        CI = self._ci()
+        raws = [r if en else 465 for r, en in
+                self._run(CI, [(ask, v0 + 0.1 * k * DT_CTRL, self.SET_KPH) for k in range(600)])]   # 6 s, v +0.6 m/s
+        target = gi.get_pedal_command(ask, v0)
+        hold = gi.get_hold_command(v0)
+        target_raw = 465 + 2151 * target
+        assert target_raw > 465 + 2151 * hold + 4 * self.RAW_TOL                                  # non-vacuous
+        t_bound = self.REENTRY_S + (target - hold) / gi.get_pedal_rate_up(v0) + 0.1
+        reached = next((i for i, r in enumerate(raws) if r >= target_raw - self.RAW_TOL), None)
+        assert reached is not None, (v0, ask, raws[40:130])          # pre-fix: pinned at hold(v), never reached
+        assert reached * 2 * DT_CTRL <= t_bound + 0.02, (v0, ask, reached * 2 * DT_CTRL, t_bound)
 
   def test_reentry_after_law_clip_is_soft(self):
     # the other source of 0 -> hold snaps: an ask below -hold/scale clips the law to exactly 0 (planner-asked coast),
