@@ -76,6 +76,10 @@ class CarParamsSP:
   # onset, a decrease limit, a soft release ramp and the k="b" level trace, all on the FEEL path only. OFF = the deployed
   # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicRelease @10.
   fca11DynamicRelease: bool = auto_field()
+  # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+  # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+  # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+  pedalDeliveryLaw: bool = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 

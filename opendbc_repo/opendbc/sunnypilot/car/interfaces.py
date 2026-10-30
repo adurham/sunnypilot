@@ -189,6 +189,14 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
   # libparams) = the deployed law plus only the three UNCONDITIONAL 18x rules. Next ignition to take effect.
   if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicRelease")) and not shadow:
     CP_SP.fca11DynamicRelease = True
+  # 17c DELIVERY (HyundaiPedalDeliveryLaw, PERSISTENT BOOL, default "0" = OFF): the measured-inverse law for NEGATIVE
+  # accel asks (the car's pedal has a dead band the linear law is 2.5-3x too weak on, so shallow braking asks ran away
+  # at +0.06..+0.13 m/s^2) plus a one-sided filter on the pedal path so the plan's 2-4 Hz ask dither cannot reach the
+  # pedal. Same truthy parser and same "missing key on a stale libparams -> OFF" rule as the sibling Hyundai keys; it
+  # additionally rides the pedal feature (this whole function only runs with HyundaiGasInterceptor armed). Read at
+  # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
+  if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
+    CP_SP.pedalDeliveryLaw = True
 
 
 def _param_truthy(raw) -> bool:

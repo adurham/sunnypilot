@@ -261,6 +261,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // REGISTRATION ONLY in this tree: the key's reader (opendbc gas_interceptor) ships with the pedal-delivery lane
     // (commit f7282b49fd), which is not merged here; the entry exists so the compiled aarch64 libparams_c.so registers
     // both keys and the merge does not need a second deploy-blocking rebuild. Setting it here is INERT. Default OFF.
+    // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
+    // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
+    // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
+    // armed (opendbc setup_interfaces). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
+    // OFF (the default) = the deployed pedal law, byte for byte.
     {"HyundaiPedalDeliveryLaw", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.

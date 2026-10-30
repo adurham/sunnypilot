@@ -177,5 +177,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
     params_list.append({"HyundaiFca11DynamicRelease": params.get("HyundaiFca11DynamicRelease", return_default=True)})
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11DynamicRelease param unknown to libparams (not rebuilt?); the dynamic release stays OFF")
+  # fork (17c delivery): measured-inverse pedal law for negative asks + a pedal-path ask filter. Same stale-libparams
+  # guard: a missing key leaves the law OFF (the deployed linear law). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiPedalDeliveryLaw": params.get("HyundaiPedalDeliveryLaw", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiPedalDeliveryLaw param unknown to libparams (not rebuilt?); the deployed pedal law stays active")
 
   return params_list
