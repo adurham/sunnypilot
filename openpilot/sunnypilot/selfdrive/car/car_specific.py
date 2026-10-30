@@ -86,6 +86,15 @@ class CarSpecificEventsSP:
         elif self.CP_SP.fca11Brake and CS_SP.fca11CameraBraking:
           events_sp.add(EventNameSP.fca11CameraBraking)
 
+        # fork (17c FEEDBACK): the TRANSIENT driver-mark confirmation ("Marked GOOD" / "Marked BAD", 2 s). The car layer
+        # arms CarStateSP.driverMark for exactly MARK_ALERT_FRAMES after a burst of bookmark presses is typed, so this
+        # raises nothing on a drive in which the driver never marks anything, and it is a separate ordinal from every
+        # FCA11 braking alert above (36/37 vs 30-35) - it can never replace or mask them.
+        if getattr(CS_SP, "driverMark", 0) == 2:
+          events_sp.add(EventNameSP.driverMarkBad)
+        elif getattr(CS_SP, "driverMark", 0) == 1:
+          events_sp.add(EventNameSP.driverMarkGood)
+
     elif self.CP.brand == 'toyota':
       if self.CP.openpilotLongitudinalControl:
         if CS.cruiseState.standstill and not CS.brakePressed and self.CP_SP.enableGasInterceptor:
