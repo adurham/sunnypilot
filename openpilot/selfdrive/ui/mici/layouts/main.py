@@ -36,7 +36,9 @@ class MiciMainLayout(Scroller):
     self._home_layout = MiciHomeLayout()
     self._alerts_layout = MiciOffroadAlerts()
     self._settings_layout = SettingsLayout()
-    self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked)
+    # fork (0014): the second callback is the 17c FEEDBACK "marked BAD" gesture (a two-finger tap on the road view).
+    self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked,
+                                               bad_mark_callback=self._on_bad_mark)
     self._body_onroad_layout = BodyLayout()
 
     # Initialize widget rects
@@ -154,6 +156,14 @@ class MiciMainLayout(Scroller):
     for service in ('bookmarkButton', 'userBookmark'):
       msg = messaging.new_message(service, valid=True)
       self._pm.send(service, msg)
+
+  def _on_bad_mark(self):
+    # fork (0014, 17c FEEDBACK): the driver's BAD gesture (two-finger tap on the road view) publishes the button half
+    # ALONE. Upstream consumers only ever read `userBookmark` (selfdrived.py), so a lone `bookmarkButton` is invisible to
+    # every one of them - and "bookmarkButton without its userBookmark partner" is exactly what makes the verdict BAD in
+    # MarkTyping. One message, no new service, no new param, no new process.
+    msg = messaging.new_message('bookmarkButton', valid=True)
+    self._pm.send('bookmarkButton', msg)
 
   def _on_body_changed(self):
     self._car_onroad_layout.set_visible(not ui_state.is_body)

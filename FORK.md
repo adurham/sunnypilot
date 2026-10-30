@@ -2014,3 +2014,36 @@ from upstream and why — it is what keeps syncs debuggable and prevents silent 
   this file — should never conflict; keep fork-only code in fork-only paths when possible).
 - Device state as of 2026-10-02: commit `6611e937` ("sunnypilot prebuilt (fork main)"),
   branch `dev`, origin = this fork.
+
+## 2026-10-30 — driver marks: the two-finger BAD gesture (opendbc patch 0014)
+
+The owner drove build 3 (`f9e8f90337`) and rejected its gesture in one line: *"I can't take my eyes off the road for 2
+seconds to tap 1 second apart."* The press-count convention (1 press = GOOD, a 2nd within 2 s = BAD) asked a driver to
+count and to time a gesture while driving, which is not something a driver can do.
+
+- **GOOD is unchanged**: the bookmark swipe in from the right edge (upstream `mici.onroad.augmented_road_view.BookmarkIcon`),
+  and the original convention still sits on top of it (a 2nd press within 2 s stays BAD).
+- **BAD is new and is ONE action**: a **two-finger tap anywhere on the driving screen**. No counting, no timing, no need
+  to look at the screen. It is free because nothing in openpilot reacts to a second touch slot today
+  (`MAX_TOUCH_SLOTS = 2`, and no widget enables multi-touch), while a single-finger tap keeps its upstream meaning.
+- **How it travels**: the mici layout publishes **`bookmarkButton` ALONE** for a tap (upstream consumers only read
+  `userBookmark`, so a lone button half is invisible to openpilot), and `MarkTyping` types "bookmarkButton without its
+  `userBookmark` partner" as **BAD with source `touch2`**, immediately rather than after the 2 s burst window.
+
+Where it lives (fork-local where possible, exactly two upstream files touched — both already fork-edited in the same
+place: the `layouts/main.py` subclass-swap block, so a later upstream sync resolves them as normal conflicts):
+
+| file | role |
+|---|---|
+| `openpilot/sunnypilot/fork/mark_gesture.py` | the pure rule + `TouchSession` (no pyray), so the gesture is testable anywhere |
+| `openpilot/selfdrive/ui/sunnypilot/mici/onroad/bookmark_icon.py` | `BookmarkIconSP`: feeds real mouse events to `TouchSession`, publishes through the callback |
+| `openpilot/selfdrive/ui/sunnypilot/mici/onroad/augmented_road_view.py` | installs `BookmarkIconSP` (fork-local file, existing subclass swap) |
+| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` (upstream) | carries `bad_mark_callback` (2 lines) |
+| `openpilot/selfdrive/ui/mici/layouts/main.py` (upstream) | `_on_bad_mark` publishes the lone button half (swap block) |
+| `openpilot/sunnypilot/fork/driver_mark_hook.py` | forwards WHICH service arrived; the typing types the gesture |
+| `opendbc …/hyundai/driver_mark.py` (**patch 0014**) | the two-gesture typing (lone `bookmarkButton` = bad/`touch2`) |
+
+Tests: 100 in the lane's four files (39 car layer incl. 10 for the tap, 23 glue, 17 gesture, 10 wiring), plus the pure
+`TouchSession` cases. The wiring test parses the UI files with AST instead of importing them: importing a mici UI module
+initialises raylib, which segfaults in a test process that already loaded msgq (that is why the gesture logic lives in a
+pyray-free module). Fail-before proof: `~/comma-sim/wsSTOP/fixes-17c/verify-gesture-lane-v2.sh`.

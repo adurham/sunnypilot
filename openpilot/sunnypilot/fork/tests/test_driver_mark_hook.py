@@ -379,3 +379,48 @@ class TestCarSpecificRaises(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTwoFingerTapThroughTheHook(TestDriverMarkHook):
+  """The BAD gesture end to end: the UI publishes `bookmarkButton` ALONE (layout `_on_bad_mark`), and the hook must
+  write a BAD k="m" record with source "touch2" and arm the BAD confirmation - no second press, no 2 s wait."""
+
+  def test_a_lone_bookmark_button_is_a_bad_record_within_a_quarter_second(self):
+    frame = self._tick(services=("bookmarkButton",))
+    self.assertEqual([], self._marks(), "not before its own press window closes")
+    for _ in range(30):                      # 0.3 s: past the 0.25 s window, far short of MARK_GAP_S (2.0 s)
+      frame = self._tick()
+    marks = self._marks()
+    self.assertEqual(1, len(marks), "one gesture, one record")
+    self.assertEqual("bad", marks[0]["verdict"])
+    self.assertEqual(dm.MARK_SOURCE_TOUCH2, marks[0]["source"])
+    self.assertEqual(1, self.hook.presses, "one press, and not half of a pair")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(frame), "the confirmation the owner sees is the BAD one")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, dm.MARK_GAP_S,
+                    "the tap must be typed on its own window, not by the bookmark burst window")
+
+  def test_a_tap_needs_no_second_press(self):
+    self._tick(services=("bookmarkButton",))
+    for _ in range(240):                     # 2.4 s: well past MARK_GAP_S, so a burst would have been decided by now
+      self._tick()
+    self.assertEqual(1, len(self._marks()), "exactly one record, and nothing waiting on a second press")
+
+  def test_a_tap_does_not_make_a_neighbouring_swipe_bad(self):
+    self._tick(services=("bookmarkButton",))            # the tap
+    for _ in range(100):                                 # +1.0 s
+      self._tick()
+    self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})
+
+  def test_a_swipe_then_a_tap_is_still_good_then_bad(self):
+    self._press_of_four_messages(("userBookmark", "bookmarkButton", "userBookmark", "bookmarkButton"))
+    self._tick(services=("bookmarkButton",))             # the tap, ~2.1 s after the swipe
+    for _ in range(240):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})

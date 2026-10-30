@@ -39,7 +39,6 @@ REAL_MIN_INTER_PRESS_GAP_S = 49.79
 REAL_BAD_GESTURE_S = 1.0
 
 
-
 def _real_camera_frame(dec=0, alive=5):
   b = bytearray(8)
 
@@ -109,35 +108,35 @@ class TestMarkTyping(unittest.TestCase):
     t, seqs = self._burst([10.0])
     self.assertEqual(1, seqs[0] is not None and t.open_presses)
     self.assertEqual([], t.poll(int(11.9 * S)), "a press is never typed before the window closes")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.05 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.05 * S)))
 
   def test_double_press_is_bad_including_the_first(self):
     t, _ = self._burst([10.0, 11.0])
     self.assertEqual([], t.poll(int(11.5 * S)))
-    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(13.1 * S)))
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(13.1 * S)))
 
   def test_two_presses_five_seconds_apart_are_two_goods(self):
     t, _ = self._burst([10.0, 15.0])
     out = []
     out += t.poll(int(12.1 * S))
     out += t.poll(int(17.1 * S))
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
 
   def test_the_ui_pair_counts_once(self):
     # the UI publishes userBookmark AND bookmarkButton per press, back to back
     t, seqs = self._burst([10.0, 10.002])
     self.assertIsNotNone(seqs[0])
     self.assertIsNone(seqs[1], "the other half of the same press must not become a second press")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
 
   def test_burst_of_three_is_all_bad(self):
     t, _ = self._burst([10.0, 11.0, 12.0])
-    self.assertEqual([(0, "bad", 3), (1, "bad", 3), (2, "bad", 3)], t.poll(int(14.1 * S)))
+    self.assertEqual([(0, "bad", 3, "bookmark_double"), (1, "bad", 3, "bookmark_double"), (2, "bad", 3, "bookmark_double")], t.poll(int(14.1 * S)))
 
   def test_a_later_press_closes_the_previous_burst_immediately(self):
     t, _ = self._burst([10.0, 20.0])   # press 2 arrives while burst 1 is still open (poll was never called)
     out = t.poll(int(22.1 * S))
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
 
   def test_boundary_just_inside_the_gap_is_a_burst(self):
     t, _ = self._burst([10.0, 11.99])
@@ -145,7 +144,7 @@ class TestMarkTyping(unittest.TestCase):
 
   def test_boundary_just_outside_the_gap_is_two_marks(self):
     t, _ = self._burst([10.0, 12.01])
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], t.poll(int(14.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], t.poll(int(14.1 * S)))
 
   def test_source_names(self):
     self.assertEqual("bookmark_single", dm.mark_source(1))
@@ -173,20 +172,20 @@ class TestRealPressSpacing(unittest.TestCase):
     self.assertEqual(1, sum(s is not None for s in seqs), "the four messages are ONE press, not four")
     self.assertEqual(1, t.open_presses)
     self.assertEqual([], t.poll(int(12.0 * S)), "still inside the burst window: nothing typed yet")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
 
   def test_pair_guard_collapses_one_millisecond(self):
     t, seqs = self._msgs(10.0, [0.0, 0.001])
     self.assertIsNotNone(seqs[0])
     self.assertIsNone(seqs[1], "1 ms is the same press")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
 
   def test_pair_guard_does_not_collapse_a_quarter_second(self):
     # at exactly the guard value the comparison is strict (<), so the message IS a new press - the boundary is
     # asserted rather than implied: a future widening of MARK_PAIR_DEDUP_S has to argue with this test.
     t, seqs = self._msgs(10.0, [0.0, dm.MARK_PAIR_DEDUP_S])
     self.assertIsNotNone(seqs[1], "0.25 s apart is a NEW press, not the other half of a pair")
-    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(12.5 * S)),
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(12.5 * S)),
                      "and a real second press 0.25 s later is a burst, not two marks")
 
   def test_the_guard_is_far_below_the_slowest_message_and_the_fastest_real_press(self):
@@ -206,7 +205,7 @@ class TestRealPressSpacing(unittest.TestCase):
     # the owner's intended "negative": two presses ~1.0 s apart
     t, seqs = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S])
     self.assertEqual([0, 1], [s for s in seqs if s is not None])
-    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(13.1 * S)),
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(13.1 * S)),
                      "every press of the burst is typed bad, the first included")
 
   def test_presses_forty_nine_seconds_apart_are_two_goods(self):
@@ -214,13 +213,13 @@ class TestRealPressSpacing(unittest.TestCase):
     t, _ = self._msgs(10.0, [0.0, REAL_MIN_INTER_PRESS_GAP_S])
     out = t.poll(int(12.1 * S))
     out += t.poll(int((10.0 + REAL_MIN_INTER_PRESS_GAP_S + 2.1) * S))
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
 
   def test_burst_of_three_one_second_apart_is_all_bad(self):
     # the fastest honest rule for 3+ presses: the burst IS the message, so every press of it is typed bad.
     t, _ = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S, 2 * REAL_BAD_GESTURE_S])
     self.assertEqual([], t.poll(int(13.9 * S)))
-    self.assertEqual([(0, "bad", 3), (1, "bad", 3), (2, "bad", 3)], t.poll(int(14.1 * S)))
+    self.assertEqual([(0, "bad", 3, "bookmark_double"), (1, "bad", 3, "bookmark_double"), (2, "bad", 3, "bookmark_double")], t.poll(int(14.1 * S)))
 
 
 class TestLevelWindow(unittest.TestCase):
@@ -427,3 +426,76 @@ class TestAlertWindow(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTwoFingerTap(unittest.TestCase):
+  """The BAD gesture the owner can actually make while driving: a two-finger tap = `bookmarkButton` ALONE.
+
+  The bookmark swipe publishes the pair, the tap publishes only the button half (the UI's `_on_bad_mark`). Everything
+  below is about that one difference, and about the tap being ONE action: no counting, no second press, no waiting.
+  """
+
+  def test_a_tap_is_bad_immediately_and_says_so(self):
+    t = dm.MarkTyping()
+    self.assertEqual(0, t.press(int(10.0 * S), "bookmarkButton"))
+    self.assertEqual([], t.poll(int(10.2 * S)), "still inside the press window")
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(10.3 * S)),
+                     "typed as soon as its own press window closes - not after MARK_GAP_S")
+
+  def test_a_tap_needs_no_second_action(self):
+    t = dm.MarkTyping()
+    t.press(int(10.0 * S), "bookmarkButton")
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(10.3 * S)))
+    self.assertEqual([], t.poll(int(12.5 * S)), "nothing else is typed afterwards")
+
+  def test_a_tap_and_a_swipe_do_not_contaminate_each_other(self):
+    t = dm.MarkTyping()
+    t.press(int(10.0 * S), "bookmarkButton")                 # tap
+    self.assertIsNotNone(t.press(int(11.0 * S), "userBookmark"))   # swipe, its partner 0.1 ms later
+    t.press(int(11.0 * S + 100), "bookmarkButton")
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(11.3 * S)))
+    self.assertEqual([(1, "good", 1, "bookmark_single")], t.poll(int(13.2 * S)))
+
+  def test_a_swipe_and_a_tap_do_not_contaminate_each_other(self):
+    t = dm.MarkTyping()
+    t.press(int(10.0 * S), "bookmarkButton")
+    t.press(int(10.0 * S + 100), "userBookmark")
+    t.press(int(11.0 * S), "bookmarkButton")                 # the tap, 1 s later
+    self.assertEqual([(1, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(11.3 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.2 * S)))
+
+  def test_a_tap_never_joins_an_open_burst(self):
+    t = dm.MarkTyping()
+    t.press(int(10.0 * S), "userBookmark")
+    t.press(int(10.0 * S + 100), "bookmarkButton")
+    t.press(int(10.5 * S), "bookmarkButton")                 # the tap, INSIDE MARK_GAP_S of the swipe
+    self.assertEqual([(1, "bad", 1, dm.MARK_SOURCE_TOUCH2), (0, "good", 1, "bookmark_single")],
+                     t.poll(int(13.0 * S)),
+                     "the tap is its own record; it neither joins the burst nor makes the swipe bad")
+
+  def test_the_pair_is_never_a_tap_whatever_the_order(self):
+    for order in (("bookmarkButton", "userBookmark"), ("userBookmark", "bookmarkButton")):
+      with self.subTest(order=order):
+        t = dm.MarkTyping()
+        t.press(int(10.0 * S), order[0])
+        t.press(int(10.0 * S + 100), order[1])
+        self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.0 * S)))
+
+  def test_the_button_alone_inside_the_window_is_not_a_tap_yet(self):
+    # the same first message, but the partner arrives 0.1 s later (inside the 0.25 s window): a bookmark press
+    t = dm.MarkTyping()
+    t.press(int(10.0 * S), "bookmarkButton")
+    t.press(int(10.1 * S), "userBookmark")
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.0 * S)))
+
+  def test_the_tap_source_is_its_own_name(self):
+    self.assertEqual("touch2", dm.MARK_SOURCE_TOUCH2)
+    self.assertNotIn(dm.MARK_SOURCE_TOUCH2, (dm.mark_source(1), dm.mark_source(2)),
+                     "the record must never confuse the two-finger tap with a bookmark press")
+
+  def test_the_services_are_the_ui_pair(self):
+    self.assertEqual(("userBookmark", "bookmarkButton"), dm.MARK_SERVICES)
+
+  def test_an_unknown_service_is_refused(self):
+    with self.assertRaises(ValueError):
+      dm.MarkTyping().press(int(10.0 * S), "bookmark")
