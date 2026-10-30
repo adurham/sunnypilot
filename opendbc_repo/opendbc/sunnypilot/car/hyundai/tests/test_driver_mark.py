@@ -28,6 +28,17 @@ from opendbc.sunnypilot.car.hyundai import fca11_long as fl
 
 S = 1_000_000_000
 
+# ---- the numbers MEASURED on the car (route 181: 7 known presses, read from BOTH the rlog and the qlog) -------------
+# One press publishes FOUR messages - userBookmark x2 + bookmarkButton x2, the duplication being rlog+qlog - and the
+# largest gap WITHIN one press was 0.106 ms. The smallest gap between two DISTINCT presses on that drive was 49.79 s.
+# The owner's intended "bad" gesture is two presses about 1.0 s apart. These are observations, not invented bounds:
+# they are what makes the 0.25 s pair guard safe (0.25 s / 0.106 ms ~= 2360x margin) and they are pinned below so that
+# a later tweak to the guard cannot silently swallow the gesture it exists to keep.
+REAL_INTRA_PRESS_GAP_S = 0.000106
+REAL_MIN_INTER_PRESS_GAP_S = 49.79
+REAL_BAD_GESTURE_S = 1.0
+
+
 
 def _real_camera_frame(dec=0, alive=5):
   b = bytearray(8)
@@ -140,6 +151,76 @@ class TestMarkTyping(unittest.TestCase):
     self.assertEqual("bookmark_single", dm.mark_source(1))
     self.assertEqual("bookmark_double", dm.mark_source(2))
     self.assertEqual("bookmark_double", dm.mark_source(3))
+
+
+class TestRealPressSpacing(unittest.TestCase):
+  """The route-181 measurements, typed through the pure state machine.
+
+  The service NAME never reaches ``MarkTyping`` (both services land in the same ``press()`` call), so the four messages
+  of one press are pinned here as a TIME pattern; the rlog/qlog message order is pinned in the glue file, where the
+  two services are actually distinguished.
+  """
+
+  def _msgs(self, t0_s, offsets_s):
+    """Feed one message per offset (in nanoseconds, exactly as ``int(x * 1e9)`` would truncate on the car)."""
+    t = dm.MarkTyping()
+    return t, [t.press(int(round((t0_s + o) * S))) for o in offsets_s]
+
+  def test_four_messages_of_one_press_collapse_to_one_press(self):
+    # route 181: one press = 4 messages, the largest measured gap inside it 0.106 ms
+    g = REAL_INTRA_PRESS_GAP_S
+    t, seqs = self._msgs(10.0, [0.0, 0.00005, 0.00005 + g, 0.00005 + 2 * g])
+    self.assertEqual(1, sum(s is not None for s in seqs), "the four messages are ONE press, not four")
+    self.assertEqual(1, t.open_presses)
+    self.assertEqual([], t.poll(int(12.0 * S)), "still inside the burst window: nothing typed yet")
+    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+
+  def test_pair_guard_collapses_one_millisecond(self):
+    t, seqs = self._msgs(10.0, [0.0, 0.001])
+    self.assertIsNotNone(seqs[0])
+    self.assertIsNone(seqs[1], "1 ms is the same press")
+    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+
+  def test_pair_guard_does_not_collapse_a_quarter_second(self):
+    # at exactly the guard value the comparison is strict (<), so the message IS a new press - the boundary is
+    # asserted rather than implied: a future widening of MARK_PAIR_DEDUP_S has to argue with this test.
+    t, seqs = self._msgs(10.0, [0.0, dm.MARK_PAIR_DEDUP_S])
+    self.assertIsNotNone(seqs[1], "0.25 s apart is a NEW press, not the other half of a pair")
+    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(12.5 * S)),
+                     "and a real second press 0.25 s later is a burst, not two marks")
+
+  def test_the_guard_is_far_below_the_slowest_message_and_the_fastest_real_press(self):
+    self.assertGreater(dm.MARK_PAIR_DEDUP_S / REAL_INTRA_PRESS_GAP_S, 2000,
+                       "0.25 s vs the measured 0.106 ms intra-press gap: ~2360x, the measured margin")
+    self.assertGreaterEqual(REAL_BAD_GESTURE_S / dm.MARK_PAIR_DEDUP_S, 4.0,
+                            "the owner's 1.0 s bad gesture must stay >=4x clear of the guard")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, REAL_MIN_INTER_PRESS_GAP_S,
+                    "and so must the closest two distinct presses ever measured")
+
+  def test_the_typing_constants_are_pinned(self):
+    self.assertEqual(2.0, dm.MARK_GAP_S, "the burst window is 2.0 s; changing it is a gesture change")
+    self.assertEqual(0.25, dm.MARK_PAIR_DEDUP_S, "the pair guard is 0.25 s; changing it is a gesture change")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, dm.MARK_GAP_S)
+
+  def test_the_real_bad_gesture_is_two_bad_presses(self):
+    # the owner's intended "negative": two presses ~1.0 s apart
+    t, seqs = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S])
+    self.assertEqual([0, 1], [s for s in seqs if s is not None])
+    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(13.1 * S)),
+                     "every press of the burst is typed bad, the first included")
+
+  def test_presses_forty_nine_seconds_apart_are_two_goods(self):
+    # the closest two distinct presses on route 181 - far outside MARK_GAP_S, so two separate verdicts
+    t, _ = self._msgs(10.0, [0.0, REAL_MIN_INTER_PRESS_GAP_S])
+    out = t.poll(int(12.1 * S))
+    out += t.poll(int((10.0 + REAL_MIN_INTER_PRESS_GAP_S + 2.1) * S))
+    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+
+  def test_burst_of_three_one_second_apart_is_all_bad(self):
+    # the fastest honest rule for 3+ presses: the burst IS the message, so every press of it is typed bad.
+    t, _ = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S, 2 * REAL_BAD_GESTURE_S])
+    self.assertEqual([], t.poll(int(13.9 * S)))
+    self.assertEqual([(0, "bad", 3), (1, "bad", 3), (2, "bad", 3)], t.poll(int(14.1 * S)))
 
 
 class TestLevelWindow(unittest.TestCase):
@@ -293,6 +374,40 @@ class TestInert(unittest.TestCase):
         marked.on_driver_mark("bad", "bookmark_double", marked.mark_snapshot(cs, now_nanos=f, frame=f, engaged=True))
       b.append([(int(s.address), bytes(s.dat)) for s in marked.update(_cc(ask), cs, f)])
     self.assertEqual(a, b, "a mark must not touch a single CanData byte of the law's output")
+
+
+class TestWriterUnavailable(unittest.TestCase):
+  """A mark whose writer cannot exist must still be inert: no record, no exception, confirmation unaffected."""
+
+  def setUp(self):
+    self._env = os.environ.get("FCA11_LOG_DIR")
+    self.tmp = tempfile.mkdtemp(prefix="fca11mark-nowrite-")
+
+  def tearDown(self):
+    if self._env is None:
+      os.environ.pop("FCA11_LOG_DIR", None)
+    else:
+      os.environ["FCA11_LOG_DIR"] = self._env
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_uncreatable_log_dir_raises_nothing_and_writes_nothing(self):
+    # "no log dir": the parent of the configured dir is a FILE, so ShadowLogger's makedirs fails with ENOTDIR and the
+    # writer stays disabled - the same inertness as FCA11_LOG_DIR="0", reached the way a bad path reaches it.
+    blocker = os.path.join(self.tmp, "not-a-dir")
+    with open(blocker, "w") as f:
+      f.write("")
+    unwritable = os.path.join(blocker, "fca11-log")
+    os.environ["FCA11_LOG_DIR"] = unwritable
+    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    snap = brake.mark_snapshot(_CS(), now_nanos=1, frame=7)
+    rec = brake.on_driver_mark("good", "bookmark_single", snap)
+    self.assertEqual("good", rec["verdict"], "the record is still built for the caller")
+    self.assertEqual(dm.MARK_CODE_GOOD, brake.mark_alert_code(7), "the confirmation never depends on the writer")
+    self.assertFalse(os.path.exists(unwritable), "nothing may be created")
+    self.assertFalse(os.path.exists(os.path.join(unwritable, "fca11-shadow.jsonl")))
+    # and a second mark on the dead writer is still inert
+    brake.on_driver_mark("bad", "bookmark_double", brake.mark_snapshot(_CS(), now_nanos=2, frame=9))
+    self.assertEqual(dm.MARK_CODE_BAD, brake.mark_alert_code(9))
 
 
 class TestAlertWindow(unittest.TestCase):

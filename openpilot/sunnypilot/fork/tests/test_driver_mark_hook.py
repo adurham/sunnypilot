@@ -138,6 +138,8 @@ class TestDriverMarkHook(unittest.TestCase):
     self.assertEqual(2, self.hook.presses)
 
   def test_two_presses_five_seconds_apart_are_two_goods(self):
+    # five seconds is > 2.5x MARK_GAP_S, i.e. unambiguously outside the burst window (real press gaps are far wider)
+    self.assertGreater(5.0, 2 * dm.MARK_GAP_S, "the spacing below is not a burst by any reading of the constant")
     self._frame(press=True)
     for _ in range(500):
       self._frame()
@@ -148,6 +150,128 @@ class TestDriverMarkHook(unittest.TestCase):
     self.assertEqual(2, len(marks))
     self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
     self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  # ---- the route-181 measurements: 4 messages per press, sub-ms inside, >=49.79 s between, ~1.0 s = the bad gesture --
+  def _tick(self, dt_s=0.01, services=(), ask=0.0):
+    """One card tick with exactly these services ``updated`` (each message gets its own tick, so the real sub-ms
+    spacing between the four messages of ONE press can be reproduced - ``_frame`` can only do a whole press at once).
+    """
+    self.t += int(round(dt_s * S))
+    frame = self.t // int(0.01 * S)
+    self.law.update(_cc(ask), self.cs, frame)
+    for name in services:
+      self.sm.updated[name] = True
+    self.hook.step(self.sm, self.CI, self.cs, self.t)
+    for name in services:
+      self.sm.updated[name] = False
+    return frame
+
+  def _press_of_four_messages(self, order):
+    """One press as the car logs it: 4 messages, 0.05 ms and 0.106 ms apart, in the given service order
+    (rlog and qlog duplicate each service, so BOTH orders occur on a real drive)."""
+    g = 0.000106
+    self._tick(services=(order[0],))
+    self._tick(dt_s=0.00005, services=(order[1],))
+    self._tick(dt_s=g, services=(order[2],))
+    self._tick(dt_s=g, services=(order[3],))
+    for _ in range(210):
+      self._tick()
+    return self._marks()
+
+  def test_one_press_of_four_messages_is_one_good_record_userbookmark_first(self):
+    marks = self._press_of_four_messages(("userBookmark", "bookmarkButton", "userBookmark", "bookmarkButton"))
+    self.assertEqual(1, self.hook.presses, "four messages, ONE press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_one_press_of_four_messages_is_one_good_record_bookmarkbutton_first(self):
+    marks = self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    self.assertEqual(1, self.hook.presses, "the service order must not matter: it is the same press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_the_real_bad_gesture_is_two_bad_records_and_a_bad_confirmation(self):
+    # the owner's intended "negative": two presses ~1.0 s apart. Both must be BAD, and the confirmation the owner sees
+    # must be the BAD one (a GOOD confirmation here would tell him the opposite of what he meant).
+    self._tick(services=("userBookmark",))
+    self._tick(dt_s=0.00005, services=("bookmarkButton",))
+    for _ in range(99):
+      self._tick()
+    self._tick(services=("userBookmark",))                     # +1.00 s
+    self._tick(dt_s=0.000106, services=("bookmarkButton",))
+    self.assertEqual([], self._marks(), "nothing is typed while the burst is still open")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks), "every press of the burst is recorded")
+    self.assertEqual(["bad", "bad"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double", "bookmark_double"], [m["source"] for m in marks])
+    self.assertEqual(2, self.hook.presses, "two presses, not four messages")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last), "the confirmation is the BAD one")
+
+  def test_presses_49_79s_apart_are_two_good_records(self):
+    # the closest two DISTINCT presses on route 181: 49.79 s. Far outside MARK_GAP_S -> two separate good verdicts.
+    self.assertGreater(49.79, dm.MARK_GAP_S * 20, "the spacing below is not a burst by any reading of the constant")
+    self._tick(services=("userBookmark",))
+    self._tick(dt_s=0.00005, services=("bookmarkButton",))
+    for _ in range(4980):                                      # 49.8 s of card frames
+      self._tick()
+    self._tick(services=("userBookmark",))
+    self._tick(dt_s=0.00005, services=("bookmarkButton",))
+    for _ in range(210):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  def test_burst_of_three_one_second_apart_is_three_bad_records(self):
+    # 3+ presses: the fastest honest rule is that the burst IS the message, so EVERY press of it is typed bad. If the
+    # implementation ever types anything else here, this test is the thing that says so.
+    for _ in range(3):
+      self._tick(services=("userBookmark",))
+      self._tick(dt_s=0.00005, services=("bookmarkButton",))
+      for _ in range(99):
+        self._tick()
+    self.assertEqual([], self._marks(), "one burst: nothing is typed until it closes")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(3, len(marks))
+    self.assertEqual(["bad"] * 3, [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double"] * 3, [m["source"] for m in marks])
+    self.assertEqual(3, self.hook.presses)
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last))
+
+  def test_disabled_log_dir_press_writes_nothing_and_raises_nothing(self):
+    os.environ["FCA11_LOG_DIR"] = "0"
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "logging disabled -> no record")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last), "the owner must still SEE that it landed")
+
+  def test_unwritable_log_dir_press_writes_nothing_and_raises_nothing(self):
+    # "no log dir" reached the way a bad path reaches it: the configured dir's parent is a FILE, so the writer cannot
+    # open at all. The press path must swallow it - a log must never take card down.
+    blocker = os.path.join(self.dir, "not-a-dir")
+    with open(blocker, "w") as f:
+      f.write("")
+    os.environ["FCA11_LOG_DIR"] = os.path.join(blocker, "fca11-log")
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "a writer that cannot open writes nothing")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last))
+    self.assertFalse(os.path.exists(os.path.join(blocker, "fca11-log")))
 
   def test_the_ui_pair_is_one_press(self):
     self._frame(press=True, second_service=True)     # userBookmark + bookmarkButton, same tick
