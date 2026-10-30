@@ -789,6 +789,116 @@ def fca11_standstill_hold_lsb() -> int:
   return int(min(HYUNDAI_FCA11_LONG_MAX_DEC, FCA11_STANDSTILL_HOLD_LSB))
 
 
+# *** 18x: ROLLING-RELEASE HOLD — the "creep" the owner still feels, and the ONE threshold that owns it ***
+# THE MEASUREMENT (routes 181/182, BRAKE-REVIEW-opus.md §1): 18 releases happened while the car was STILL ROLLING at
+# 0.4-3.8 m/s, every single one at the deployed exit threshold (ask > FCA11_BRAKE_RELEASE_ACCEL = -0.30), each with a lead
+# 4-16 m ahead. In 17 of the 18 the car did not stop within 3 s and re-accelerated by +0.20 to +0.46 m/s^2 on the
+# re-enabled pedal (23-30 % of floor releases re-open within 6 s). This is NOT the standstill hold: at 30 LSB the car
+# moved 0-1.6 cm over 12 holds. The law was letting go at the exact moment the planner was easing its ask while a lead
+# was still ahead, and the driver felt the car creep toward it.
+# THE RULE: below FCA11_ROLLING_RELEASE_V_MAX with a lead INSIDE FCA11_ROLLING_RELEASE_LEAD_M, an OPEN episode is held
+# until the ask rises above FCA11_ROLLING_RELEASE_ACCEL (-0.10) instead of -0.30. It is the release threshold and nothing
+# else: the onset rule (-0.5 / the feel open -0.60), the min-on, the speed floor, the level law and every safety veto are
+# untouched, and every `ok == False` (driver brake/gas, gear, pedal fault, stale/no camera, camera braking, divergence,
+# blocked_until_resume) still releases on the SAME frame because `ok` is still ANDed into `holding`. The lead test uses
+# CS.fca11_lead_drel_m (carcontroller.py writes it every controller frame from CC_SP.leadOne; None = no lead) and falls
+# back to the presence of CS.fca11_lead_one, which is written on the same line of the same frame - a missing DISTANCE
+# with a lead present therefore keeps the brake (the conservative direction for this rule).
+# WHY 4 m/s: the planner's own release in a stop approach happens in the last 3.8 m/s of the approach (all 18 measured
+# releases sit below it); above that the deployed threshold is the right one and is untouched.
+# WHY 20 m: every one of the 18 releases had the lead at 4-16 m. Beyond 20 m the lead is not the reason the ask is easing,
+# so the deployed -0.30 stands.
+FCA11_ROLLING_RELEASE_V_MAX = 4.0          # m/s: below this the rolling-release rule is armed
+FCA11_ROLLING_RELEASE_LEAD_M = 20.0        # m: ... while a lead is at or inside this distance
+FCA11_ROLLING_RELEASE_ACCEL = -0.10       # m/s^2: the exit threshold in that regime (deployed: -0.30)
+
+# *** 18x (b): THE CRAWL BAND — the other half of the owner's "creep", and it is NOT about the lead ***
+# THE OWNER'S WORDS (route 182, measured after the first brief): "when I've just barely got the brake pressed and the engine is
+# able to slightly overpower the brakes and it creaks and groans and moves just the tiniest amount forward".
+# THE MEASUREMENT (route 182, TCU_DCT13 0x162 Clutch_Driving_Tq, 1147 frames at 0.05 < v < 1.6 m/s with the law active,
+# foot off the pedals):
+#   our LSB = 0     537 frames (47 %)  clutch torque +26.0 Nm, rpm 935, v ~1.00 m/s   <- the engine's creep torque is live
+#   our LSB = 6-7   161 frames         clutch torque -20.0 Nm, v 1.38 m/s            <- the clutch is OPEN, creep torque gone
+#   (that bin hides the per-level boundary - the owner's decision is therefore 7, not 6, see FCA11_CRAWL_MIN_LSB)
+#   our LSB = 8-10  319 frames         clutch torque -20.0 Nm, v 0.57 m/s
+#   our LSB = 11-20 129 frames         clutch torque -20.0 Nm, v 0.07 m/s
+#   the driver's own light brake at crawl (6078 frames): +13.0 Nm, v 0.64 m/s
+# WHAT IS PROVABLE: the driveline delivers creep torque (+13..+26 Nm) whenever the commanded level is below the level that
+# closes the clutch, and at >= 6 LSB the clutch torque reads -20 Nm (creep torque gone). The hydraulic pressure behind
+# that is NOT observable (CYL_PRES reads 0.0 bar through every held frame), so nothing here claims what the calipers do.
+# THE RULE, three parts, all in the 0 < v < FCA11_CRAWL_V_MAX band:
+#   (0) THE ONSET RULE IS UNTOUCHED: a shallow crawl ask (-0.2 .. -0.6) still does NOT open an episode. Opening one
+#       would command >= 6 LSB (~1 m/s^2) and stop a car that the planner is only coasting, which is the opposite of
+#       "smoothness first". The crawl rule below is about the RELEASE and the LEVEL of an episode that is already open -
+#       i.e. exactly the "brake is on but too light" state the owner described.
+#   (1) A STOP IN PROGRESS IS NEVER RELEASED: while an episode is open below the crawl speed, the exit threshold is
+#       FCA11_CRAWL_RELEASE_ACCEL (-0.10, the same one the rolling rule uses) - the law does not go to the 0 LSB state
+#       while the planner is still asking for a decel and the car is still rolling.
+#   (2) NO HALF-APPLIED LEVEL: an open episode at crawl commands at least FCA11_CRAWL_MIN_LSB (7 LSB - the first level at
+#       which the measured clutch is unambiguously open). The 4 LSB floor of the deployed law sits exactly in the
+#       half-applied band, which is why it never closed the clutch. 1-6 LSB is never commanded at crawl.
+#   (3) A GENUINE ROLL-FREE STAYS FREE: if the ask rises above -0.10 (the planner genuinely wants to move), the episode is
+#       released at 0 and a FCA11_CRAWL_RELEASE_HOLDOFF_S window keeps it released, so the law cannot chatter back into a
+#       7 LSB re-application two frames later. A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) ignores the hold-off, so a real
+#       stop is never delayed.
+# SAFETY: every `ok` veto still releases on the same frame; the hold-off only gates the ONSET (it can never keep or
+# extend a brake, only decline to start one); the floor only ever RAISES the command inside an episode that is already
+# open. The standstill hold band (<= 3 km/h) is untouched: its floor is already 8 and its 30 LSB ceiling/timing do not
+# change (see the 17c block above).
+FCA11_CRAWL_V_MAX = 2.0                   # m/s: the measured crawl band
+FCA11_CRAWL_RELEASE_ACCEL = -0.10         # m/s^2: an open episode is not released at crawl below this ask
+# WHY 7, NOT 6 (owner decision, 2026-10-29): the route-182 per-LEVEL medians put 6 LSB at Clutch_Driving_Tq = 0.0 Nm - i.e.
+# exactly ON the open/closed boundary, the transition sample - and 5 LSB at -9.0 Nm against a released-state +12..13 Nm;
+# 7 LSB reads -20.0 Nm, the same as every level above it, i.e. the clutch is unambiguously open and the creep torque is
+# gone. 6 is the boundary, not yet open; one more LSB costs ~+0.1 m/s^2 of commanded brake at crawl.
+FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguously OPEN clutch (-20 Nm, creep torque gone)
+FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
+FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+
+# *** 18x: GAS HOLD-OFF FOR THE PANDA'S OWN BRAKE/THROTTLE WINDOW (BRAKE_THROTTLE_EXCL_US = 100 ms) ***
+# THE DEFECT (routes 181/182): 44/45 (181) and 49/55 (182) releases had a 90-130 ms GAP in the accepted 0x700 gas
+# stream. Mechanism: the panda refuses any non-zero GAS_COMMAND within 100 ms of the last ACTUATING 0x38D, while the car
+# layer resumed non-zero gas on the very next frame after ours went passive, so those frames were stripped. No pedal
+# fault ever resulted (fca11Unavailable = 0 frames on both routes) - it is a hand-over quality defect, and the owner feels
+# it as the launch/hand-over not being smooth ("smoothness first").
+# THE FIX: after the last actuating frame, hold the gas command at EXACTLY 0 for the same 100 ms, so no frame is refused
+# and the 0x700 counter never gaps. Implemented as `braking` (the attribute gas_interceptor.py reads) staying True for
+# the window while `_actuating` - the flag the whole law uses - drops on the release frame as it always did. THE 0x38D
+# STREAM IS NOT TOUCHED AT ALL: same actuating frames, same passive close frame, same frame numbers. Only the pedal is
+# muted for 100 ms instead of being stripped for 90-130 ms.
+FCA11_GAS_WINDOW_HOLD_S = 0.10             # == the panda's BRAKE_THROTTLE_EXCL_US
+FCA11_GAS_WINDOW_HOLD_FRAMES = 10          # controller frames at 100 Hz
+
+# *** 18x: DYNAMIC RELEASE (param HyundaiFca11DynamicRelease -> CP_SP.fca11DynamicRelease, DEFAULT OFF) ***
+# ONE switch for the owner's "brakes need to be dynamic, gradual increase and decrease", minus the calibration drive
+# (the owner's ruling: no scripted calibration drives, the car cannot be forced). ON does four things, all on the FEEL
+# path (the deployed request path), all OFF = byte-for-byte today:
+#   (a) GENTLE ONSET: when the law's OWN target for the ask is <= FCA11_MEAS_FLOOR_LSB (4 LSB, i.e. every ask from about
+#       -0.30 to -0.85, which today is a one-frame step to 4), the episode STARTS at FCA11_DYN_GENTLE_FIRST_LSB and climbs
+#       to the target at the existing comfort rise rate (0.19 LSB per sent frame at the low band ~ 0.32 s 1 -> 4). A HARD
+#       ask (target > 4 LSB) keeps the deployed first frame AND the deployed rise, so a real stop is never slower.
+#   (b) DECREASE LIMIT: a level decrease is at most FCA11_DYN_DECREASE_LSB_PER_SENT (0.3) per SENT frame ~ 1.5 m/s^3,
+#       instead of one-frame drops.
+#   (c) SOFT RELEASE RAMP: on a release (the ask eased, or min-on ended - never a safety veto, see _update_law) the level
+#       is ramped to 0 at the same rate (4 -> 0 in 0.27 s); a release from the standstill hold (>= 8 LSB) ramps at
+#       FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT so 30 -> 0 takes FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s, 1.2 LSB per
+#       sent frame). Gas is 0 for the whole ramp (the ramp frames are actuating frames) AND for the 100 ms window after.
+#   (d) LEVEL TRACE: one k="b" record per SENT actuating frame (level + measured aEgo + ask + vEgo) in the FCA11 shadow
+#       log file, so a normal stop on the next drive answers "do 1-3 LSB produce graded braking or nothing" from the
+#       ordinary drives: see _log_dyn_send and BRAKE-BUILD-REPORT.md §"what the next drive must show".
+# WHAT RIDES IT: nothing in this module can be turned on by an env var; the flag is read ONCE from CP_SP (getattr, so an
+# un-wired CP_SP - including every existing test double and the deployed build - is OFF).
+FCA11_DYN_RELEASE_ENABLED = True             # code-level kill switch for the whole (a)-(d) build
+FCA11_DYN_GENTLE_FIRST_LSB = 1               # (a) the first SENT level of a GENTLE episode (was 4)
+FCA11_DYN_DECREASE_LSB_PER_SENT = 0.3        # (b)/(c) ~1.5 m/s^3 at the measured low-band slope 0.26 m/s^2 per LSB
+FCA11_DYN_STANDSTILL_HOLD_LSB = 8            # (c) a release from at/above this level is a standstill/stop-band hold
+FCA11_DYN_STANDSTILL_RELEASE_S = 0.5         # (c) 30 -> 0 in exactly this long (30 / 25 sent frames = 1.2 LSB/frame)
+FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT = (FCA11_STANDSTILL_HOLD_LSB /
+                                              (FCA11_DYN_STANDSTILL_RELEASE_S / FCA11_SHAPE_SENT_DT))
+FCA11_DYN_DECREASE_MAX_DROP_LSB = 1           # the largest single-frame step the comfort rate may render as
+FCA11_DYN_STANDSTILL_MAX_DROP_LSB = 2        # ... and the standstill rate, so 30 -> 0 still fits in 0.5 s
+
+
 def feel_gentle_gain(accel: float) -> float:
   """0051: the gentle-ask strength scale on the feel target: GENTLE_GAIN at/above GAIN_FADE_ACCEL, linear to 1.0 at the HARD
   bypass, 1.0 at/below it. Always in (0, 1]: the feel target can only get LOWER (authority invariant kept)."""
@@ -1180,7 +1290,14 @@ class Fca11LongBrake:
     # setup_interfaces already forces fca11AffineGain False; re-applied here so V3 can never actuate in Shadow.
     _refuse_affine_env()
     self.affine_gain = affine_gain_enabled(CP_SP) and not self.shadow
-    self.braking = False               # an FCA11 actuating frame was sent THIS frame
+    # 18x: `_actuating` is "an FCA11 actuating frame was sent THIS frame" - the flag the whole law reads. The public
+    # `braking` (a property, see its docstring) additionally covers the panda's own 100 ms gas window, which is what
+    # gas_interceptor.py consumes; splitting them is what lets the pedal be held at 0 exactly as long as the panda
+    # refuses gas WITHOUT touching the 0x38D stream.
+    self._actuating = False           # an FCA11 actuating frame was sent THIS frame
+    self._gas_guard_left = 0          # 18x: controller frames left in the post-actuation gas hold-off
+    self._in_rel_ramp = False         # 18x: a soft release ramp is running THIS frame (the alerts must not read it as a lost hold)
+    self._crawl_rel_frame: int | None = None  # 18x (b): frame of the last release at crawl speed (onset hold-off)
     self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
     # G9b/0042: split the cut the way the panda does. _driver_cut (brake / gear != D) re-arms on the resume
     # edge but clears on the first clean engaged frame; _pedal_cut (pedal fault, 0042) is fail-closed and NOT
@@ -1299,6 +1416,18 @@ class Fca11LongBrake:
     # "enabled AND not the 0043 shaping law AND not Shadow", so this flag can never reach the shaped law, cal, the
     # shadow core or a disabled instance. OFF -> the pre-0054 request map and release rule, byte-for-byte.
     self.meas_inverse = bool(FCA11_FEEL_ENABLED) and bool(FCA11_MEAS_INVERSE) and self.feel
+    # 18x: the DYNAMIC-RELEASE build (FCA11_DYN_*). Read ONCE, from CP_SP only, DEFAULT OFF. `getattr` (not an attribute
+    # access) is deliberate: the field is wired in the superproject (param HyundaiFca11DynamicRelease -> capnp
+    # CarParamsSP.fca11DynamicRelease -> structs.CarParamsSP), and this tree must stay OFF - byte-for-byte the deployed
+    # law - for every CP_SP that does not carry it, including every existing test double and the car as it is today.
+    # Scoped to the FEEL path like meas_inverse: it can never reach the shaped law, cal, or the Shadow core.
+    self.dynamic_release = bool(FCA11_DYN_RELEASE_ENABLED) and self.feel and \
+        bool(getattr(CP_SP, "fca11DynamicRelease", False))
+    self._rel_acc: float | None = None  # 18x: the release ramp's level accumulator (None = no ramp in progress)
+    self._rel_sent = 0                 # 18x: the last level the ramp put on the wire (1-2 LSB per sent frame, enforced)
+    self._rel_fast = False             # 18x: this ramp is a standstill release (the 0.5 s rate), latched at its start
+    self._dyn_log = None                # 18x: the k="b" per-sent-frame channel (created below, only when ON)
+    self._dyn_n = 0                    # 18x: records written (diagnostics)
     self._feel_slope_ant = 0.0         # slow EMA of d(ask)/dt (anticipation only; FCA11_FEEL_SLOPE_ALPHA_0051)
     self._feel_peak = 0.0              # episode peak of the feel accumulator (re-rise deadband reference)
     self._feel_lead_prev = False       # previous frame's lead presence (edge detector)
@@ -1356,6 +1485,45 @@ class Fca11LongBrake:
     # out, and the diagnostic state tuple it carried. Written by _shadow_record only; read by nothing else.
     self._sh_idle_last_frame: int | None = None
     self._sh_diag_prev: dict | None = None
+    # 18x: the k="b" LEVEL TRACE channel (dynamic release ON only). It reuses the shadow log's FILE and channel pattern
+    # (one JSONL stream of k=<kind> records, written by fca11_shadow_log.ShadowLogger - no new file format, no new
+    # module): when Shadow already opened the stream we share that writer (one writer per path, never two), otherwise we
+    # open the same stream with our own header. OFF -> no logger is created and no record is ever written.
+    if self.dynamic_release and not self._core:
+      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
+      self._dyn_log = self.shadow_log
+      if self._dyn_log is None:
+        self._dyn_log = fca11_shadow_log.ShadowLogger(header=dict(
+          note="FCA11 DYNAMIC-RELEASE trace (k=b): one record per SENT actuating 0x38D with the level actually on the "
+               "wire and the measured aEgo, so the low levels (1-3 LSB) can be read from ordinary drives",
+          dyn_gentle_first_lsb=FCA11_DYN_GENTLE_FIRST_LSB,
+          dyn_decrease_lsb_per_sent=FCA11_DYN_DECREASE_LSB_PER_SENT,
+          dyn_standstill_decrease_lsb_per_sent=FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT,
+          gas_window_hold_frames=FCA11_GAS_WINDOW_HOLD_FRAMES,
+          rolling_release_accel=FCA11_ROLLING_RELEASE_ACCEL, rolling_release_v_max=FCA11_ROLLING_RELEASE_V_MAX,
+          rolling_release_lead_m=FCA11_ROLLING_RELEASE_LEAD_M))
+
+  # ---- 18x: the gas-facing flag ----
+
+  @property
+  def braking(self) -> bool:
+    """True while the pedal must stay at EXACTLY 0 (gas_interceptor.py reads this), which is _actuating OR the panda's
+    own 100 ms gas window after the last actuating frame (FCA11_GAS_WINDOW_HOLD_*).
+
+    The split matters: `_actuating` is "an actuating 0x38D went out this frame" - the flag every piece of the law uses
+    (episode state, holding, the feel ramp, the echo attribution, the div/probation guard, the logs). `braking` adds the
+    window the panda enforces anyway (BRAKE_THROTTLE_EXCL_US), so the car layer stops offering gas frames the panda
+    would strip: today the pedal resumed on the frame after ours went passive and the panda refused 90-130 ms of it on
+    44/45 (181) and 49/55 (182) releases. The 0x38D stream is untouched by this: same actuating frames, same passive
+    close frame, same frame numbers - only the pedal is muted instead of being refused.
+    """
+    return bool(self._actuating or self._gas_guard_left > 0)
+
+  @property
+  def episode_open(self) -> bool:
+    """The DEPLOYED meaning of `braking`: an actuating 0x38D went out this frame (True on a non-send frame inside an
+    episode too, as it always was). Use this - not `braking` - for "is the brake episode open/closed"."""
+    return bool(self._actuating)
 
   # ---- window ----
 
@@ -1424,7 +1592,7 @@ class Fca11LongBrake:
     hold (aEgo ~ 0 at a red light, where delivering ~0 net decel is correct) and 'hold_lost' fired on openpilot's own
     launches (the arm ignored whether we were still holding). Both are gated here: no_response requires MOVING above
     5 km/h with a real, SUSTAINED command, and hold_lost disarms the instant we stop commanding the hold - so a
-    planner launch (planner releases braking -> self.braking False) can never arm it.
+    planner launch (planner releases braking -> self._actuating False) can never arm it.
     """
     if not self.enabled:
       self.supervise_stop = self.stop_complete = self.brake_now = False
@@ -1439,7 +1607,7 @@ class Fca11LongBrake:
     standstill = bool(getattr(CS.out, "standstill", False))
     moving = bool(v_kph > FCA11_NORESPONSE_MIN_KPH and not standstill)
     commanding = bool(dec_cmd >= FCA11_NORESPONSE_MIN_LSB)
-    holding_cmd = bool(self.braking and dec_cmd > 0)   # STILL commanding the hold this frame
+    holding_cmd = bool(self._actuating and dec_cmd > 0)   # STILL commanding the hold this frame
 
     # Hard clears: driver brake / gear != D / driver gas end the alert at once (never a latch). On a planner launch
     # v > 0 is expected, so these two conditions are what take a standing brake_now down; the self-heal (c) covers
@@ -1471,10 +1639,12 @@ class Fca11LongBrake:
     # (a hold established at a stop that then creeps is exactly the lost condition). DISARM the instant the hold is
     # broken - we stop braking (a planner release / launch), the command drops below 8 LSB, gear != D, or the driver
     # brakes/gases. Fires only while the hold is STILL commanded and the car moves anyway with no driver gas.
-    arm_now = bool(self.braking and dec_cmd > 0 and (v_kph <= FCA11_STOP_KPH or standstill))
+    # 18x: a release ramp is us ENDING the hold, never losing it, so it can neither arm nor fire hold_lost.
+    arm_now = bool(self._actuating and dec_cmd > 0 and not self._in_rel_ramp and
+                   (v_kph <= FCA11_STOP_KPH or standstill))
     if arm_now:
       self._hold_lost_armed = True
-    elif (not self.braking or dec_cmd < FCA11_NORESPONSE_MIN_LSB or
+    elif (not self._actuating or dec_cmd < FCA11_NORESPONSE_MIN_LSB or self._in_rel_ramp or
           CS.out.gearShifter != structs.CarState.GearShifter.drive or bool(CS.out.brakePressed) or gas):
       self._hold_lost_armed = False
     hold_lost = bool(self._hold_lost_armed and holding_cmd and v_kph > FCA11_HOLD_LOST_KPH and not gas)
@@ -1506,8 +1676,8 @@ class Fca11LongBrake:
         self.brake_now = True
         self.brake_now_reason = "hold_lost"
 
-    self.supervise_stop = bool(self.braking and v_kph <= FCA11_SUPERVISE_KPH)
-    self.stop_complete = bool(self.braking and (v_kph <= FCA11_STOP_KPH or standstill))
+    self.supervise_stop = bool(self._actuating and v_kph <= FCA11_SUPERVISE_KPH)
+    self.stop_complete = bool(self._actuating and (v_kph <= FCA11_STOP_KPH or standstill))
     self.low_speed_alert = self.supervise_stop   # alias
     # 0042 v2: while FCA11-long is UNAVAILABLE (the panda refuses every actuating frame for the rest of the
     # ignition: pedal-fault latch / echo-confirmed refusal wall; 0053: no longer the camera), the three 0040/0041 alerts
@@ -1532,7 +1702,7 @@ class Fca11LongBrake:
     v_kph = float(CS.out.vEgo) * 3.6
     wheel_kph = getattr(CS, "fca11_wheel_min_kph", None)
     if dec_cmd >= 1:
-      if not self.braking:
+      if not self._actuating:
         self.log.begin(frame, v_kph, wheel_kph)
       self.log.note_frame(frame, dec_cmd, v_kph, wheel_kph, getattr(CS.out, "aEgo", None),
                           bool(CS.out.standstill), FCA11_STOP_KPH)
@@ -1583,11 +1753,11 @@ class Fca11LongBrake:
     # be refused on EVERY frame until the planner released (a silent loss of the rest of the brake). Dropping our own
     # reference to 0 makes the next frame RATE_STEP, which the panda accepts, and the ramp climbs back in ~150 ms.
     # It can only ever LOWER the command.
-    if self.braking and any(int(src) == 192 and len(dat) == 8 and dat[1] != 0 for src, dat in echoes):
+    if self._actuating and any(int(src) == 192 and len(dat) == 8 and dat[1] != 0 for src, dat in echoes):
       self._dec_last_sent = 0
     # 0040: count the PANDA's own refusals of our ACTUATING frames (src 192 = the TX hook rejected it) for the
     # episode log - the firmware's verdict is the ground truth on whether the ESC was ever asked.
-    if self.log.enabled and self.braking:
+    if self.log.enabled and self._actuating:
       self.log.note_panda_refusal(sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0))
     # 0042 (B): echo-based refusal surfacing. The panda's verdict on our in-flight frames is the ground truth. A
     # REFUSED ACTUATING echo (src 192) while braking extends the consecutive streak; an ACCEPTED ACTUATING echo
@@ -1606,7 +1776,7 @@ class Fca11LongBrake:
     owned = self._camera_owns_refusal()
     if owned:
       refused = 0
-      if self.braking:
+      if self._actuating:
         self._refused_streak = 0
     # 0053 divergence guard: an ACCEPTED 0x38D of any shape arms it (the panda is in FCA11-long and taking frames) and
     # breaks a refused-passive streak; a REFUSED PASSIVE echo while we believe the camera is NOT braking extends it.
@@ -1622,9 +1792,9 @@ class Fca11LongBrake:
         self._divergence_event()
     # 0053 probation: the first FCA11_PROBATION_ECHOES actuating echoes after a resume also run a CUMULATIVE refusal
     # count (an accepted echo does not reset it). Fed only by real braking: no probe decel is ever sent for it.
-    if self._probation_left > 0 and (accepted or (refused and self.braking)):
-      n = accepted + (refused if self.braking else 0)
-      self._probation_refused += refused if self.braking else 0
+    if self._probation_left > 0 and (accepted or (refused and self._actuating)):
+      n = accepted + (refused if self._actuating else 0)
+      self._probation_refused += refused if self._actuating else 0
       self._probation_left = max(0, self._probation_left - n)
       if self._probation_refused >= FCA11_PROBATION_REFUSED_CUT:
         self._probation_cut = True
@@ -1648,7 +1818,7 @@ class Fca11LongBrake:
       self._refused_streak = 0
       self._refused_cut = False
       self._pedal_cut = False
-    elif refused and self.braking:
+    elif refused and self._actuating:
       # 16a: `refused` is zero here whenever the camera owns the tick's refusals (see _camera_owns_refusal, which also
       # zeroes the streak), so this increment can only ever count refusals the hand-back does NOT explain.
       was = self._refused_streak
@@ -1667,7 +1837,7 @@ class Fca11LongBrake:
     for src, dat in echoes:
       if bytes(dat) != pending:
         continue
-      if int(src) == 192 and not self.braking:
+      if int(src) == 192 and not self._actuating:
         # the close frame was REFUSED: the panda episode is STILL OPEN. Re-owe it (a later send slot retries).
         # 0035: never while braking again - re-owing then would force the live brake off for a slot (a silent
         # mid-brake truncation); the new episode's own release will owe its own close frame.
@@ -1837,6 +2007,9 @@ class Fca11LongBrake:
     self._feel_peak = float(seed)      # 0051: the re-rise deadband reference restarts with the episode
     self._feel_ll_frame = None         # 0051: no lead-loss hold survives into a new episode
     self._feel_standstill_hold = False  # 17c: nor a standstill hold (re-set at once if the car is still at standstill)
+    self._rel_acc = None               # 18x: nor a release ramp (a re-opened episode starts from the wire, not mid-ramp)
+    self._rel_sent = 0
+    self._rel_fast = False
 
   def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
                    v_mps=None) -> int:
@@ -1870,6 +2043,103 @@ class Fca11LongBrake:
       self._feel_ll_frame = None
       return 0.0
     return float(self._feel_ll_lsb) * (1.0 - frac)
+
+  def _low_speed_release_accel(self, v_mps: float, CS) -> float:
+    """18x: the ask threshold above which an OPEN episode releases, at low speed.
+
+    - v < FCA11_CRAWL_V_MAX (2 m/s): FCA11_CRAWL_RELEASE_ACCEL (-0.10) - a stop in progress is never released (the
+      clutch-torque measurement, see the FCA11_CRAWL_* block). No lead is needed: the creep happens with or without one.
+    - FCA11_CRAWL_V_MAX <= v < FCA11_ROLLING_RELEASE_V_MAX (4 m/s) AND a lead at or inside FCA11_ROLLING_RELEASE_LEAD_M:
+      the same -0.10 (17 of the 18 measured rolling drop-outs on 181/182 never stopped within 3 s).
+    - otherwise the deployed FCA11_BRAKE_RELEASE_ACCEL (-0.30), byte-for-byte.
+    The lead is the one the car layer publishes every controller frame (CS.fca11_lead_drel_m, carcontroller.py), with a
+    fall back to the presence of CS.fca11_lead_one (written on the same line of the same frame): a lead whose DISTANCE is
+    missing keeps the brake, the conservative direction for a "do not creep toward the car in front" rule. A CS without
+    either attribute (a unit double, an old replay) reads as no lead -> the deployed threshold."""
+    if v_mps < FCA11_CRAWL_V_MAX:
+      return FCA11_CRAWL_RELEASE_ACCEL
+    if v_mps >= FCA11_ROLLING_RELEASE_V_MAX:
+      return FCA11_BRAKE_RELEASE_ACCEL
+    d = getattr(CS, "fca11_lead_drel_m", None)
+    if d is None:
+      return FCA11_ROLLING_RELEASE_ACCEL if getattr(CS, "fca11_lead_one", None) is not None else FCA11_BRAKE_RELEASE_ACCEL
+    try:
+      d = float(d)
+    except (TypeError, ValueError):
+      return FCA11_BRAKE_RELEASE_ACCEL
+    return FCA11_ROLLING_RELEASE_ACCEL if 0.0 < d <= FCA11_ROLLING_RELEASE_LEAD_M else FCA11_BRAKE_RELEASE_ACCEL
+
+  def _dyn_first_lsb(self, accel: float, personality, v_kph) -> int:
+    """18x (a): the first SENT level of a NEW episode. OFF (or a HARD ask) = FCA11_FEEL_FIRST_LSB (4, the deployed onset
+    frame). ON with the law's OWN target for this ask at/below the measured 4 LSB floor = FCA11_DYN_GENTLE_FIRST_LSB (1),
+    so the episode climbs 1 -> target at the existing comfort rise rate instead of stepping straight to 4. The target is
+    the same function _feel_level uses (same gentle gain, same speed-indexed floor input), so "gentle" here means exactly
+    "the level this episode is going to sit at anyway is <= 4 LSB". A target > 4 (a real stop) keeps the deployed first
+    frame, so no stop is ever slower than it is today."""
+    if not self.dynamic_release:
+      return FCA11_FEEL_FIRST_LSB
+    v_mps = None if v_kph is None else v_kph / 3.6
+    gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
+    target = self._feel_target(accel, accel, personality, gain_speed, v_mps)
+    return FCA11_DYN_GENTLE_FIRST_LSB if target <= FCA11_MEAS_FLOOR_LSB else FCA11_FEEL_FIRST_LSB
+
+  def _dyn_release_level(self, frame: int, prev_sent: int, standstill: bool = False) -> int:
+    """18x (c): the level (raw CR_VSM_DecCmd) for ONE frame of a soft release ramp; 0 = the ramp is over, close now.
+
+    The ramp starts from the level that is actually on the wire (``prev_sent``) and decreases by
+    FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame (4 -> 0 in 0.27 s), or by
+    FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT when it started from a standstill/stop-band hold (>= 8 LSB, 30 -> 0 in
+    FCA11_DYN_STANDSTILL_RELEASE_S = 0.5 s). It only ever LOWERS the command, it is capped by nothing else, and it never
+    exceeds the panda's gate. Non-send frames do not advance it (they are not transmitted). Nothing here is a safety
+    path: the CALLER decides whether a ramp is allowed at all (see _update_law), and every veto closes immediately."""
+    if self._rel_acc is None:
+      if prev_sent <= 0:
+        return 0                     # nothing on the wire -> there is nothing to ramp
+      self._rel_acc = float(prev_sent)
+      self._rel_sent = int(prev_sent)
+      # the rate is latched at the start of the ramp: a release from the standstill/stop-band hold gets the 0.5 s ramp,
+      # every other release the 0.3 LSB/frame comfort rate (from the 4 LSB floor that is 0.27 s).
+      self._rel_fast = bool(standstill)
+    if frame % FCA11_SEND_EVERY != 0:
+      return int(self._rel_sent)
+    step = (FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT if self._rel_fast
+            else FCA11_DYN_DECREASE_LSB_PER_SENT)
+    self._rel_acc = max(0.0, self._rel_acc - step)
+    # The emitted integer may never be more than max_drop LSB below the previous one, whatever the float accumulator does
+    # (rounding a 1.2 LSB step lands on a 2 LSB jump on the frames where the accumulator sits just above an integer). It
+    # only ever keeps the level HIGHER for a frame or two - slower to release, the safe direction - and it still walks to
+    # 0 because the bound is relative. The comfort rate is bounded at 1 LSB (= 0.1 m/s^2 per 20 ms); the standstill rate
+    # allows 2 so that 30 -> 0 still lands inside FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s): at 50 Hz a uniform 1 LSB/frame
+    # would take 0.6 s, and 0.2 m/s^2 is still 15x smaller than the deployed one-frame 30 -> 0 (3.0 m/s^2).
+    max_drop = FCA11_DYN_STANDSTILL_MAX_DROP_LSB if step > 1.0 else FCA11_DYN_DECREASE_MAX_DROP_LSB
+    level = max(int(round(self._rel_acc)), self._rel_sent - max_drop)
+    level = max(0, min(fca11_standstill_hold_lsb(), level))
+    self._rel_sent = level
+    return level
+
+  def _log_dyn_send(self, CS, frame: int, dec_cmd: int, accel: float, v_kph: float) -> None:
+    """18x (d): one k="b" record per SENT actuating frame - the level actually on the wire and the measured aEgo, in the
+    FCA11 shadow log's own JSONL stream (same file, same channel pattern, no new format). This is the instrument that
+    answers, from ORDINARY drives and with no calibration protocol, whether 1-3 LSB produce graded braking: with the
+    dynamic release ON every gentle stop now walks 1 -> 2 -> 3 -> 4 and every sent frame carries the level next to the
+    aEgo it produced. Inert (no I/O) when the param is off or the log dir is disabled."""
+    if self._dyn_log is None:
+      return
+    try:
+      self._dyn_log.write(dict(
+        k="b", t_wall=time.time(), frame=int(frame), ep=int(self._sh_episode_id),
+        dec_lsb=int(dec_cmd), a_ego=float(getattr(CS.out, "aEgo", 0.0) or 0.0), v_ego=float(CS.out.vEgo),
+        v_kph=float(v_kph), ask_mps2=float(accel), gas_pressed=bool(CS.out.gasPressed),
+        standstill=bool(getattr(CS.out, "standstill", False)),
+        lead_drel_m=getattr(CS, "fca11_lead_drel_m", None), last_sent=int(self._dec_last_sent),
+        # 18x (b): the driveline's creep torque, so the next drive can prove the clutch is open through the hold and only
+        # engages when we intend to roll. Published by the car layer as CS.fca11_clutch_tq_nm (TCU_DCT13 0x162,
+        # Clutch_Driving_Tq, raw10-512 Nm); None until that one line lands in carstate_ext.py.
+        clutch_tq_nm=getattr(CS, "fca11_clutch_tq_nm", None)))
+      self._dyn_n += 1
+    except Exception:
+      self._dyn_log = None           # a broken log must never affect the law
+      return
 
   def _feel_update_band(self, v_kph: float, CS) -> bool:
     """0049: update + return the hold-band latch (ENTER <= FCA11_FEEL_HOLD_BAND_KPH or standstill; EXIT >= EXIT_KPH)."""
@@ -1954,11 +2224,28 @@ class Fca11LongBrake:
           self._feel_target(accel, accel, personality, gain_speed, v_mps) < prev + FCA11_FEEL_RERISE_LSB):
         new_acc = prev
     else:
-      new_acc = float(target)          # decreases are immediate (the safe direction)
+      # 18x (b): with the dynamic release ON a decrease is limited to FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame
+      # (~1.5 m/s^3) instead of dropping in one frame. It can only ever LOWER the level more slowly - never raise it, never
+      # hold it above the honest target - and the floor below still applies. OFF = the deployed one-frame decrease.
+      if self.dynamic_release:
+        new_acc = max(float(target), prev - FCA11_DYN_DECREASE_LSB_PER_SENT)
+      else:
+        new_acc = float(target)        # decreases are immediate (the safe direction)
     # 0055: the mid-episode floor is the SPEED-INDEXED one on the measured law (so a level the deadband held at 4 cannot
     # lag under a floor that has since risen to 6-8); off the measured path it stays the 0049 constant 4. Never 0: 0 is
     # the release, and a release is the caller's job (see the FCA11_MEAS_* block).
-    new_acc = max(float(fca11_floor_lsb(v_mps) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB), new_acc, ll_floor)
+    # 18x (a): with the dynamic release ON, a GENTLE target (<= the 4 LSB floor the episode is going to sit at anyway)
+    # lowers the floor to FCA11_DYN_GENTLE_FIRST_LSB, which is what lets the gentle onset start at 1 and climb instead of
+    # being lifted straight back to 4 by this line. A target > 4 LSB keeps the deployed floor, i.e. the deployed level.
+    floor = float(fca11_floor_lsb(v_mps) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB)
+    if self.dynamic_release and target <= FCA11_MEAS_FLOOR_LSB:
+      floor = min(floor, float(FCA11_DYN_GENTLE_FIRST_LSB))
+    # 18x (b) (d): at crawl the level is never in the half-applied 1-5 LSB band: the measured clutch reads -20 Nm (creep
+    # torque closed) from 6 LSB, and 4 LSB - the deployed moving floor - reads +26 Nm with the car still rolling. This can
+    # only RAISE a command inside an episode that is already open; it never opens one and never survives a release.
+    if v_mps is not None and v_mps < FCA11_CRAWL_V_MAX:
+      floor = max(floor, float(FCA11_CRAWL_MIN_LSB))
+    new_acc = max(floor, new_acc, ll_floor)
     if self.feel_fix:
       self._feel_peak = max(self._feel_peak, new_acc)
     # the panda contract caps the SENT value at +RATE_STEP over the last SENT frame (0 at an episode open -> the first
@@ -2147,7 +2434,7 @@ class Fca11LongBrake:
       camera_warn=(_get_bits(dat, CAM_ACT_WARN_BITS[0], CAM_ACT_WARN_BITS[1]) if dat is not None else None),
       cam_hex=(dat.hex() if dat is not None else None),
       oldlaw_armed=bool(self.enabled), oldlaw_cmd_lsb=int(o.oldlaw_cmd_lsb), oldlaw_send=bool(o.oldlaw_send),
-      oldlaw_braking=bool(self.braking), oldlaw_instant_lsb=int(o.oldlaw_instant_lsb),
+      oldlaw_braking=bool(self._actuating), oldlaw_instant_lsb=int(o.oldlaw_instant_lsb),
       v3_ok=bool(o.v3_ok), v3_wouldbe_lsb=o.v3_wouldbe_lsb, v3_send_wouldbe=bool(o.v3_send_wouldbe),
       v3_target_lsb=((int(cap) if v3._shape_in_hold_band else
                       int(shape_dec_cmd_from_extra(max(0.0, -min(accel_law, FCA11_BRAKE_ONSET_ACCEL)), cap)))
@@ -2166,7 +2453,7 @@ class Fca11LongBrake:
       v3_alert_bits_wouldbe=(int(v3.supervise_stop) | (int(v3.stop_complete) << 1) | (int(v3.brake_now) << 2)) if o.v3_ok else None,
     )
     if self.shadow_log is not None:
-      window = bool(v3_braking or self.braking or cam_req or (long_active and accel_law <= FCA11_BRAKE_RELEASE_ACCEL))
+      window = bool(v3_braking or self._actuating or cam_req or (long_active and accel_law <= FCA11_BRAKE_RELEASE_ACCEL))
       if window or not idle_due:
         self.shadow_log.frame(rec, window)        # the windowed 50 Hz trace, byte-for-byte as before
       else:
@@ -2183,8 +2470,15 @@ class Fca11LongBrake:
   def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
     """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
     sends: list[CanData] = []
+    # 18x: the gas window ages out one controller frame per frame, on EVERY frame (including a disabled one and one with
+    # longActive off): it is a fact about the panda's BRAKE_THROTTLE_EXCL_US, not about our episode.
+    if self._gas_guard_left > 0:
+      self._gas_guard_left -= 1
+    # 18x: this frame's release-ramp state (only ever read by _alerts, so a ramp in progress cannot be mistaken for a
+    # LOST hold - see arm_now there). Set by the else branch below.
+    self._in_rel_ramp = False
     if not self.enabled:
-      self.braking = False
+      self._actuating = False
       self.low_speed_alert = False
       # 0040: the three alerts and the logger are all inert when the feature is off.
       self.supervise_stop = self.stop_complete = self.brake_now = False
@@ -2236,7 +2530,7 @@ class Fca11LongBrake:
 
     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
     # pattern as fca11_now_nanos: the controller writes a CS attribute the class later reads).
-    CS._fca11_braking_now = self.braking
+    CS._fca11_braking_now = self._actuating
 
     # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
     # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
@@ -2318,9 +2612,9 @@ class Fca11LongBrake:
       # R7-D: a mid-episode longActive drop must still close the FCA11 episode with a passive frame. We cannot
       # send it here (longActive is off), so we OWE it: the first longActive send slot back emits it before any
       # new actuation. An episode that never opened owes nothing.
-      if self.braking:
+      if self._actuating:
         self._release_pending = True
-      self.braking = False
+      self._actuating = False
       self._cal_frames = 0
       self._dec_last_sent = 0
       # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
@@ -2384,9 +2678,18 @@ class Fca11LongBrake:
     # beyond zero-throttle coast (open at FCA11_FEEL_OPEN_ACCEL, -0.60 by default); the release rule below is unchanged
     # (that is the hysteresis). Off the feel path / in the hold band the deployed -0.5 is used, byte-identical.
     open_accel = FCA11_BRAKE_ONSET_ACCEL
-    if self.feel and not self._feel_update_band(v_kph_now, CS):
+    # the hold-band latch is stepped on EVERY feel frame (it has its own exit hysteresis and clears the standstill latch);
+    # the crawl rule below only changes the THRESHOLD used on this frame.
+    in_band = bool(self.feel and self._feel_update_band(v_kph_now, CS))
+    crawl = bool(float(CS.out.vEgo) < FCA11_CRAWL_V_MAX)
+    if self.feel and not in_band:
       open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
     ask = bool(ok and accel <= open_accel)
+    # 18x: ROLLING-RELEASE HOLD (see the FCA11_ROLLING_RELEASE_* block). Below 4 m/s with a lead at or inside 20 m an OPEN
+    # episode is held until the ask is above -0.10 instead of -0.30: 17 of the 18 measured rolling drop-outs on 181/182
+    # never stopped within 3 s. Only the THRESHOLD changes - `ok` (every veto), the onset rule and the min-on are as
+    # they were, and above 4 m/s or without a lead this is the deployed -0.30 exactly.
+    release_accel = self._low_speed_release_accel(float(CS.out.vEgo), CS)
     self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
     _slow = bool(float(CS.out.vEgo) < FCA11_FEEL_DWELL_SLOW_MPS)
     self._feel_dwell_slow = self._feel_dwell_slow + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL and _slow) else 0
@@ -2408,8 +2711,12 @@ class Fca11LongBrake:
       onset = True   # 0049 dwell escape (feel path only; `ok` is part of the dwell count): a SUSTAINED small ask opens
     if self.feel and self._feel_dwell_slow >= FCA11_FEEL_DWELL_SLOW_FRAMES:
       onset = True   # cycle 1 crawl escape: the same sustained ask opens after 0.7 s while every counted frame was slow
-    holding = bool(self.braking and ok and
-                   (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+    if crawl and onset and self._crawl_rel_frame is not None and \
+        (frame - self._crawl_rel_frame) < FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES and \
+        accel > FCA11_ONSET_BYPASS_ACCEL:
+      onset = False   # 18x (b): a crawl release stays released for 0.5 s (a HARD ask still opens at once)
+    holding = bool(self._actuating and ok and
+                   (accel <= release_accel or self._on_frames < FCA11_MIN_ON_FRAMES))
     want_brake = bool(onset or holding or cal_on)
     # 0035: the G7 budget-edge stop and the 3 s cooldown hold-off that used to sit here are DELETED with the
     # panda's budget/cooldown. The only things that end a brake are the planner/cal release above and the `ok`
@@ -2435,7 +2742,7 @@ class Fca11LongBrake:
     # BEFORE an episode never arms it. Inert off the fix (CS without the lead attribute reads as no lead -> never an edge).
     if self.feel_fix:
       lead_now = getattr(CS, "fca11_lead_one", None) is not None
-      if (self._feel_lead_prev and not lead_now and want_brake and self.braking and not cal_on and
+      if (self._feel_lead_prev and not lead_now and want_brake and self._actuating and not cal_on and
           not self._feel_in_hold_band and self._dec_last_sent > 0):
         self._feel_ll_frame = self._feel_ll_hold_from = frame
         self._feel_ll_lsb = int(self._dec_last_sent)
@@ -2447,6 +2754,15 @@ class Fca11LongBrake:
     dec_cmd_now = 0   # 0040: the level COMMANDED this frame (0 = no actuating frame); feeds the alerts + logger
 
     if want_brake:
+      # 18x (D2): a frame that ACTUATES belongs to an episode that is (again) open, so NO release ramp may survive it: the
+      # next release must re-seed from the level actually on the wire (_rel_acc is cleared in _feel_reset only, and that is
+      # skipped while the episode stays open). Without this, an interrupted ramp left a stale accumulator/rate behind and the
+      # next release continued from it - emitting a level ABOVE the wire (e.g. 20 from a wire at 8) on a release frame, where
+      # the normal-episode +RATE_STEP cap does not apply, so the panda's rise gate refused every ramp frame (>= 3 ->
+      # _refused_cut -> fca11Unavailable, with real re-asks refused meanwhile). See _dyn_release_level.
+      self._rel_acc = None
+      self._rel_sent = 0
+      self._rel_fast = False
       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
       # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
       self._cal_active = bool(cal_on and ok)
@@ -2459,14 +2775,16 @@ class Fca11LongBrake:
       if self.feel and not cal_on:
         # 0049: the OLD-LAW feel layer (coast-first / lag-aware onset ramp / anticipatory release); see FCA11_FEEL_*.
         # A (re)opened episode starts at the first-frame level; a cal->planner hand-off re-seeds at the last SENT level.
-        if not self.braking:
-          self._feel_reset()
+        if not self._actuating:
+          # 18x: ON + a GENTLE ask seeds the ramp at 1 LSB (and _feel_level's floor follows it down), so the episode
+          # CLIMBS to its target instead of stepping to 4 on its first frame. OFF / a hard ask = the deployed 4.
+          self._feel_reset(float(self._dyn_first_lsb(accel, personality, v_kph_now)))
         elif self._feel_cal_prev:
           self._feel_reset(float(max(self._dec_last_sent, FCA11_FEEL_FLOOR_LSB)))
         dec_cmd = self._feel_level(accel, frame, personality, v_kph_now,
                                    standstill=bool(getattr(CS.out, "standstill", False)))
       elif self.affine_gain and not cal_on:
-        if not self.braking:
+        if not self._actuating:
           self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
         dec_cmd = self._shape_level(accel_ask, v_kph_now, CS, frame, personality)
       else:
@@ -2539,38 +2857,94 @@ class Fca11LongBrake:
         # +2*RATE_STEP, so the panda refused every actuating frame after the first. The reference must
         # advance ONLY on frames actually sent (the panda's last-accepted frame).
         self._dec_last_sent = dec_cmd
-      self.braking = True
+      self._actuating = True
+      self._gas_guard_left = 0          # 18x: an actuating frame re-arms the panda's window; the guard restarts at the edge
       self._sent_this_episode = True
       dec_cmd_now = dec_cmd   # 0040: the level COMMANDED this frame (feeds the alerts + logger)
+      # 18x (d): the level-on-the-wire trace (no-op unless the dynamic release is ON).
+      if frame % FCA11_SEND_EVERY == 0:
+        self._log_dyn_send(CS, frame, dec_cmd, accel, v_kph_now)
     else:
       # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
       # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
       # without this the panda's act_active stays latched across brakes (round-5 N1).
-      was_braking = self.braking
-      self.braking = False
-      self._dec_last_sent = 0
+      was_braking = self._actuating
+      prev_sent = self._dec_last_sent
+      self._actuating = False
       self._sent_this_episode = False
       dec_cmd_now = 0   # 0040: no actuating frame this frame
-      if was_braking:
-        # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
-        self._release_pending = True
-      # 0053: while the camera is braking (or the divergence latch holds) NOTHING of ours goes out on 0x38D, not even
-      # the passive close frame (the panda refuses it then, and the camera's own frame is what the ESC must see). The
-      # close frame stays OWED and goes out on the first send slot after the hand-back releases.
-      if self._release_pending and not withhold:
-        sends += self._passive_frame(CS, frame)
-        if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
-          self._release_pending = False
-          if self._echo_wired:
-            # 0030 (D2-iii): record the frame we just put on the wire and wait for the pandad echo (observe_echo):
-            # refused (src 192) RE-OWES the close frame so the hand-back is retried.
-            self._pending_echo = bytes(sends[-1].dat)
-            self._pending_echo_frame = frame
-            self._echo_rejected = False
+      # 18x (c): DYNAMIC RELEASE RAMP (opt-in). A SOFT release ramps the level to 0 over a few sent frames instead of
+      # dropping it in one (4 -> 0 = +0.8 m/s^2 step; 30 -> 0 at a standstill release is the launch lurch). The ramp is
+      # still a RELEASE, so every safety path is excluded EXPLICITLY here and still cuts on THIS frame exactly as today:
+      #   * ok == False - driver brake / driver gas / the gas hold-off / gear != D / pedal fault / no or stale camera /
+      #     camera_braking / the divergence latch / blocked_until_resume (the veto list of fca11_ok);
+      #   * withhold (cam_brake, or the divergence latch again) - the camera owns 0x38D, we send nothing;
+      #   * an OWED close frame (_release_pending) - the hand-back must go out first, in this frame;
+      #   * the refusal-attribution hold (_attrib_hold) - it exists to make the passive close frame the next thing the
+      #     panda judges;
+      #   * the BRAKE NOW alert (ESC non-response / hold lost) - an alarm must never be answered by a slow release;
+      #   * cal (a scripted hold is a test tool, not a feel path);
+      #   * an episode that is not open (was_braking False) - nothing to ramp.
+      # The final frame of the ramp is the ordinary passive close below (level 0 -> the panda hand-back), so the close
+      # frame, its frame number and the echo re-owe are the deployed ones.
+      ramp = 0
+      if self.dynamic_release and was_braking and ok and not cal_on and not withhold and \
+          not self._release_pending and self._attrib_hold == 0 and not self.brake_now:
+        ramp = self._dyn_release_level(frame, prev_sent,
+                                       standstill=bool(getattr(CS.out, "standstill", False)) or self._feel_standstill_hold)
+      if ramp > 0:
+        # one more ACTUATING frame at the ramped level: the episode stays open, the pedal stays at exactly 0 (braking),
+        # and the panda's rate reference follows the decaying command down. A re-ask during the ramp does NOT reset the
+        # feel ramp (_actuating stays True) and it continues from where the wire is, so it cannot jump.
+        assert cam is not None   # ok == True guarantees a fresh camera frame (fca11_ok)
+        t_cam, dat = cam
+        self._feel_acc = float(ramp)
+        if frame % FCA11_SEND_EVERY == 0:
+          cam_alive = (dat[4] >> 3) & 0xF
+          m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+          sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
+          self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
+          self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
+        self._actuating = True
+        self._in_rel_ramp = True
+        self._sent_this_episode = True
+        dec_cmd_now = ramp
+      if ramp <= 0:
+        # 18x (D1): the panda's last ACCEPTED frame is the passive close (level 0) ONLY when the episode really ends on
+        # THIS frame. Zeroing it on every non-braking frame (as the deployed law did) left the reference at 0 across the
+        # NON-SEND frames of a release ramp, so a re-ask landing on the next SEND frame was capped at 0 + RATE_STEP: a
+        # 16 -> 4 (reviewer: 22 -> 4) drop, ~0.6..1.8 m/s^2 of brake gone in one sent frame mid-episode, exactly what the
+        # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
+        # stays on the last level actually SENT (restored on the send slot above).
+        self._dec_last_sent = 0
+        self._rel_acc = None                  # 18x: no ramp in progress once it is over (or was never allowed)
+        if was_braking:
+          # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+          self._release_pending = True
+          if float(CS.out.vEgo) < FCA11_CRAWL_V_MAX:
+            self._crawl_rel_frame = frame   # 18x (b): a crawl release stays a release for the hold-off window
+          # 18x: arm the 100 ms gas window from THIS frame (the last actuating one): frames N+1..N+10 hold gas at 0.
+          self._gas_guard_left = FCA11_GAS_WINDOW_HOLD_FRAMES
+        # 0053: while the camera is braking (or the divergence latch holds) NOTHING of ours goes out on 0x38D, not even
+        # the passive close frame (the panda refuses it then, and the camera's own frame is what the ESC must see). The
+        # close frame stays OWED and goes out on the first send slot after the hand-back releases.
+        if self._release_pending and not withhold:
+          sends += self._passive_frame(CS, frame)
+          if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
+            self._release_pending = False
+            if self._echo_wired:
+              # 0030 (D2-iii): record the frame we just put on the wire and wait for the pandad echo (observe_echo):
+              # refused (src 192) RE-OWES the close frame so the hand-back is retried.
+              self._pending_echo = bytes(sends[-1].dat)
+              self._pending_echo_frame = frame
+              self._echo_rejected = False
 
     self._feel_cal_prev = bool(cal_on)   # 0049: previous frame's cal_on, for the feel ramp's cal->planner re-seed
     # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
-    self._on_frames = self._on_frames + 1 if want_brake else 0
+    # 18x: the age keeps counting while a release RAMP is still sending actuating frames - without that the min-on term
+    # (`_on_frames < FCA11_MIN_ON_FRAMES`) reads the reset age as "a brand new episode" and re-opens the brake the ramp
+    # is closing. OFF: `_actuating` is False whenever want_brake is False, so this is exactly the deployed expression.
+    self._on_frames = self._on_frames + 1 if (want_brake or self._actuating) else 0
 
     # 0040: alert state (over this frame's braking) and the per-episode log (one line on the true -> false edge).
     self._alerts(CS, frame, v_kph_now, dec_cmd_now)

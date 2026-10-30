@@ -52,6 +52,9 @@ class CarStateExt:
     self.fca11_cam_frames: list[tuple[int, bytes]] = []   # 0053: every camera 0x38D of this tick (hand-back counter)
     self.fca11_now_nanos: int = 0
     self.fca11_lead_closing = False
+    # 18x (b): the driveline's creep torque (TCU_DCT13 0x162 Clutch_Driving_Tq, Nm). None = no frame this tick (or no
+    # such message on this platform). Read by the level trace (fca11_long._log_dyn_send) and never by the law itself.
+    self.fca11_clutch_tq_nm: float | None = None
     # 0029 CAL command mode: the lead's distance (the cal sequencer skips a rep when a lead is within
     # plan.conditions.min_lead_m), and the cal-hold flag the controller publishes so the gas
     # neutralization below reads it. Both are inert (False / None) unless cal mode is running.
@@ -211,6 +214,14 @@ class CarStateExt:
           self.fca11_cam_frame = (cap[0], bytes(cap[1]))
         # 0053: EVERY camera 0x38D of this tick, in order (the hand-back counts camera frames, like the panda)
         self.fca11_cam_frames = list(can_parsers[Bus.cam].captured_all.get(FCA11_ADDR, ()))
+        # 18x (b): the driveline's creep torque, TCU_DCT13 0x162 Clutch_Driving_Tq. The DBC applies the 10-bit raw's
+        # -512 Nm offset, so this is Nm as measured (+26 Nm = creep torque live, -20 Nm = clutch OPEN). Read from the
+        # all-frames view of THIS tick: no frame -> None, and a value outside a plausible driveline range (a silent bus
+        # leaves the parser at raw 0 = -512 Nm) -> None, so a missing frame can never be logged as a real torque.
+        # Purely additive: no existing CarState/CarStateSP field is read, written or reordered here.
+        tq_frames = cp.vl_all["TCU_DCT13"].get("Clutch_Driving_Tq", []) if "TCU_DCT13" in cp.vl_all else []
+        tq = float(tq_frames[-1]) if tq_frames else None
+        self.fca11_clutch_tq_nm = tq if (tq is not None and -100.0 <= tq <= 100.0) else None
 
       # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
       # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every

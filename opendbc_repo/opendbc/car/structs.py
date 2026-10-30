@@ -71,6 +71,15 @@ class CarParamsSP:
   # (the deployed law: fca11Brake as today, fca11AffineGain forced False) and V3 is computed + logged alongside, NEVER
   # sent. Coupled with custom.capnp CarParamsSP.fca11Shadow @8.
   fca11Shadow: bool = auto_field()
+  # 18x: DYNAMIC-RELEASE build (HyundaiFca11DynamicRelease, default OFF). Written ONLY by setup_interfaces from that param;
+  # read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = gentle 1 LSB
+  # onset, a decrease limit, a soft release ramp and the k="b" level trace, all on the FEEL path only. OFF = the deployed
+  # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicRelease @10.
+  fca11DynamicRelease: bool = auto_field()
+  # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+  # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+  # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+  pedalDeliveryLaw: bool = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 
