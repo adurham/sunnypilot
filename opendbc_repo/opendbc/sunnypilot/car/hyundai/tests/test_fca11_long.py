@@ -169,7 +169,7 @@ class _CS:
   """Minimal CarState double: the only attributes Fca11LongBrake reads."""
   def __init__(self, v_ego=20.0, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
                state=0, cam=None, now=0, lead_closing=False, a_ego=0.0, standstill=False, wheel_min_kph=None,
-               fault_seen=False):
+               fault_seen=False, lead_m=None, lead_one=None):
     self.out = structs.CarState()
     self.out.vEgo = v_ego
     self.out.gearShifter = gear
@@ -185,6 +185,11 @@ class _CS:
     self.fca11_now_nanos = now
     self.fca11_lead_closing = lead_closing
     self.fca11_wheel_min_kph = wheel_min_kph
+    # 18x: the lead the car layer publishes every controller frame (carcontroller.py writes both from CC_SP.leadOne;
+    # None = no lead). Absent by default -> every pre-18x test keeps the deployed release threshold.
+    if lead_m is not None or lead_one is not None:
+      self.fca11_lead_drel_m = lead_m
+      self.fca11_lead_one = lead_one
     self.fca11_echoes = []
 
 
@@ -214,42 +219,42 @@ class TestController(unittest.TestCase):
     for fca11, pedal in ((False, True), (True, False), (False, False)):
       b = self._brake(self._cp_sp(fca11, pedal))
       self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 0))
-      self.assertFalse(b.braking)
+      self.assertFalse(b.episode_open)
 
   def test_brakes_on_request_and_hard_zero_intent(self):
     b = self._brake(self._cp_sp())
     # G5: a hard ask (<= FCA11_ONSET_BYPASS_ACCEL = -1.2) bypasses the onset debounce and brakes on
     # the very first frame (no added latency to a genuine hard demand).
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     # G5: inside the min-on window an ask that rises above the release threshold KEEPS braking
     # (anti-flap) and the emitted command is floored at the onset value - never a 0 (a 0 mid-episode
     # would be an immediate release, defeating the hysteresis).
     sends = b.update(self._cc(-0.2), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertNotEqual([], sends)
     self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), 1)
     # after the min-on window elapses, an ask still above -0.30 releases.
     for f in range(2, fl.FCA11_MIN_ON_FRAMES + 6):
       b.update(self._cc(-0.2), _CS(cam=_cam()), f)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     # a WEAK fresh ask (above the release band, below the hard-ask bypass): brakes only after the
     # full 0.2 s onset debounce.
     b2 = self._brake(self._cp_sp())
     for f in range(fl.FCA11_ONSET_HOLD_FRAMES - 1):
       b2.update(self._cc(-0.7), _CS(cam=_cam()), f)
-      self.assertFalse(b2.braking, f)
+      self.assertFalse(b2.episode_open, f)
     b2.update(self._cc(-0.7), _CS(cam=_cam()), fl.FCA11_ONSET_HOLD_FRAMES - 1)
-    self.assertTrue(b2.braking)
+    self.assertTrue(b2.episode_open)
 
   def test_onset_debounce_kills_single_frame_ask(self):
     # a one-frame ask (above the hard-ask bypass) must not open an episode on its own...
     b = self._brake(self._cp_sp())
     b.update(self._cc(-0.7), _CS(cam=_cam()), 0)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     # ...and a single frame does not survive, so the counter resets on the next coast frame.
     b.update(self._cc(-0.2), _CS(cam=_cam()), 1)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertEqual(0, b._ask_frames)
 
   def test_min_on_never_overrides_safety(self):
@@ -257,23 +262,23 @@ class TestController(unittest.TestCase):
     # (a) driver brake -> the cut latch sets blocked_until_resume -> release on the SAME frame.
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     sends = b.update(self._cc(-2.0), _CS(cam=_cam(), brake=True), 1)
     self.assertTrue(b.blocked_until_resume)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertEqual([], sends)
     # (b) 0040: the speed floor is GONE - dropping to a crawl no longer releases; the brake holds DOWN THROUGH ZERO.
     b2 = self._brake(self._cp_sp())
     b2.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b2.braking)
+    self.assertTrue(b2.episode_open)
     b2.update(self._cc(-2.0), _CS(v_ego=fl.FCA11_STOP_KPH / 3.6, cam=_cam()), 1)
-    self.assertTrue(b2.braking, "0040: a crawl/standstill must KEEP braking (no floor)")
+    self.assertTrue(b2.episode_open, "0040: a crawl/standstill must KEEP braking (no floor)")
     # (c) a stale camera frame releases immediately, even inside the min-on window.
     b3 = self._brake(self._cp_sp())
     b3.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b3.braking)
+    self.assertTrue(b3.episode_open)
     b3.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9)), 1)
-    self.assertFalse(b3.braking)
+    self.assertFalse(b3.episode_open)
 
   def test_every_immediate_release_condition_still_fires_mid_episode(self):
     """Full safety-path audit: each veto must release on the SAME frame, inside the 0.6 s min-on window
@@ -281,7 +286,7 @@ class TestController(unittest.TestCase):
     def engaged_ctrl():
       b = self._brake(self._cp_sp())
       b.update(self._cc(-2.0), _CS(cam=_cam()), 0)     # hard ask opens immediately
-      assert b.braking
+      assert b.episode_open
       return b
 
     # gas pressed -> per-frame release (0038: no latch)
@@ -304,7 +309,7 @@ class TestController(unittest.TestCase):
     # 0053: a camera WARNING does NOT release (the owner policy; on the pre-0053 tree this released + latched)
     b = engaged_ctrl()
     self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(warn=2))), 2))
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     # no camera frame -> release
     b = engaged_ctrl()
     self.assertFalse(b.update(self._cc(-2.0), _CS(cam=None), 1))
@@ -313,17 +318,17 @@ class TestController(unittest.TestCase):
     self.assertFalse(b.update(self._cc(-2.0, long_active=False), _CS(cam=_cam()), 1))
     # toggle off mid-episode -> release (inert)
     b = fl.Fca11LongBrake(structs.CarParams(), self._cp_sp(fca11=False))
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
 
   def test_hysteresis_band_never_commands_zero_while_engaged(self):
     # while engaged, an ask anywhere in (onset, release] (or even above onset, during min-on) must
     # command a raw CR_VSM_DecCmd >= 1, so the ESC never sees a mid-episode release.
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     for accel in (-0.50, -0.40, -0.30, -0.10, 0.0, 0.5):
       sends = b.update(self._cc(accel), _CS(cam=_cam()), 0)
-      self.assertTrue(b.braking, accel)
+      self.assertTrue(b.episode_open, accel)
       self.assertNotEqual([], sends, accel)
       self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), 1, accel)
 
@@ -334,7 +339,7 @@ class TestController(unittest.TestCase):
     b = self._brake(self._cp_sp())
     sends = b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam()), 0)
     self.assertEqual(1, len(sends))
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), 1)
 
   def test_no_send_without_fresh_camera(self):
@@ -377,7 +382,7 @@ class TestController(unittest.TestCase):
     b.update(self._cc(-2.0), _CS(cam=_cam(), brake=True), 2)
     self.assertTrue(b.blocked_until_resume)
     b.update(self._cc(-2.0), _CS(cam=_cam()), 4)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     # disengage -> re-engage clears it
     b.update(self._cc(-2.0, engaged=False), _CS(cam=_cam()), 6)
     b.update(self._cc(-2.0, engaged=True), _CS(cam=_cam()), 8)
@@ -385,7 +390,7 @@ class TestController(unittest.TestCase):
     # 0035: the cut ENDED the episode with its passive frame (frame 2); there is NO cooldown, so the very
     # next send slot after the resume brakes again.
     self.assertNotEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), 10))
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
 
   def test_passive_release_frame_on_every_episode_end(self):
     """G7 (N1): every braking episode must end with exactly ONE passive 0x38D (the panda needs it to
@@ -394,13 +399,13 @@ class TestController(unittest.TestCase):
     # a hard ask opens an episode immediately (the -1.2 bypass)
     for f in range(0, 4):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     # release: the ask rises above -0.30; once the 0.6 s min-on has elapsed the episode ends on a
     # frame that must carry the passive mirror frame (all brake fields 0, Warn 0).
     released = None
     for f in range(4, 400):
       s = b.update(self._cc(-0.2), _CS(cam=_cam()), f)
-      if not b.braking:
+      if not b.episode_open:
         released = (f, s); break
     self.assertIsNotNone(released, "episode never released")
     f, s = released
@@ -430,7 +435,7 @@ class TestController(unittest.TestCase):
     ESC sees the camera's idle shape with our fields cleared."""
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)               # brake episode opens at a high level
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     t = 2
     for f in range(2, 40):                                     # keep the ask up; force a 50 Hz slot boundary
       out = b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), f)   # gas: override this frame
@@ -466,7 +471,7 @@ class TestController(unittest.TestCase):
       out = b.update(self._cc(accel), cs or _CS(cam=_cam()), f)
       act = [x for x in out if fl._get_bits(x.dat, 8, 8) > 0]
       sent += len(act)
-      if not b.braking or (f % fl.FCA11_SEND_EVERY == 0 and not act):
+      if not b.episode_open or (f % fl.FCA11_SEND_EVERY == 0 and not act):
         withheld += 1
     return withheld, sent
 
@@ -494,7 +499,7 @@ class TestController(unittest.TestCase):
       got = []
       for g in range(f, f + gap):
         got += b.update(self._cc(0.0), _CS(cam=_cam()), g)
-        self.assertFalse(b.braking, g)
+        self.assertFalse(b.episode_open, g)
       self.assertEqual(1, len([x for x in got if fl._get_bits(x.dat, 8, 8) == 0]), f"close frame, gap {gap}")
       f += gap
     withheld, _ = self._withheld(b, 400, start=f)
@@ -507,7 +512,7 @@ class TestController(unittest.TestCase):
     b = self._brake(self._cp_sp())
     self._withheld(b, 101)                                  # brake through frame 100
     self.assertEqual([], b.update(self._cc(0.0), _CS(cam=_cam()), 101))   # odd release: nothing sent yet
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     out = b.update(self._cc(-2.0), _CS(cam=_cam()), 102)   # re-ask on the next (even) slot
     self.assertEqual([0], [fl._get_bits(x.dat, 8, 8) for x in out], "the close frame goes out first")
     withheld, _ = self._withheld(b, 200, start=103)
@@ -532,7 +537,7 @@ class TestController(unittest.TestCase):
     b = self._brake(self._cp_sp(fca11=False))
     for f in range(0, 10):
       self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f), f)
-      self.assertFalse(b.braking, f)
+      self.assertFalse(b.episode_open, f)
 
   def test_camera_braking_hands_back_but_warning_does_not(self):
     """0053 (was test_camera_request_latches): a braking-class camera frame withholds every 0x38D; a warning does not."""
@@ -563,18 +568,18 @@ class TestController(unittest.TestCase):
     # FCA11_SUPERVISE_KPH (15 km/h). No lead gate any more (the floor it warned about is gone).
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(v_ego=13.0 / 3.6, cam=_cam()), 0)   # opens an episode at 13 km/h
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertTrue(b.supervise_stop)
     self.assertTrue(b.low_speed_alert)                              # retained alias
     b.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam()), 1)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertFalse(b.supervise_stop)
     b.update(self._cc(-2.0), _CS(v_ego=13.0 / 3.6, cam=_cam()), 2)
     self.assertTrue(b.supervise_stop)
     # not braking -> no supervise alert even at a crawl (the alert is conditioned on a commanded brake)
     b2 = self._brake(self._cp_sp())
     b2.update(self._cc(0.5), _CS(v_ego=5.0 / 3.6, cam=_cam()), 0)
-    self.assertFalse(b2.braking)
+    self.assertFalse(b2.episode_open)
     self.assertFalse(b2.supervise_stop)
 
   # *** 0040: stop-to-zero, no hold cap, the three alerts, and the per-episode logger ***
@@ -586,7 +591,7 @@ class TestController(unittest.TestCase):
     b = self._brake(self._cp_sp())
     s = b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True), 0)
     self.assertEqual(1, len(s), "a standstill request must still emit an actuating frame")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertTrue(b.stop_complete)
     self.assertGreaterEqual(fl._get_bits(s[0].dat, 8, 8), 1)
     # 30 s of a standstill hold: the car layer withholds NOTHING (no hold cap)
@@ -600,7 +605,7 @@ class TestController(unittest.TestCase):
     b.update(self._cc(-2.0), _CS(v_ego=10.0 / 3.6, cam=_cam()), 0)   # moving
     self.assertFalse(b.stop_complete)
     b.update(self._cc(-2.0), _CS(v_ego=0.2 / 3.6, cam=_cam()), 1)    # at a stop (<= 0.5 km/h)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertTrue(b.stop_complete)
     # standstill flag alone also counts (all wheels <= 0.375 km/h)
     b2 = self._brake(self._cp_sp())
@@ -626,7 +631,7 @@ class TestController(unittest.TestCase):
     b2 = self._brake(self._cp_sp())
     b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 0)
     b2.update(self._cc(-2.0), _CS(v_ego=20.0 / 3.6, cam=_cam(), a_ego=0.0), 2)
-    self.assertTrue(b2.braking)
+    self.assertTrue(b2.episode_open)
     self.assertFalse(b2.brake_now, "under 500 ms of non-response: not yet")
     b2._noresp_since = _t.monotonic() - 1.0
     b2._noresp_cmd_since = _t.monotonic() - 1.0
@@ -644,7 +649,7 @@ class TestController(unittest.TestCase):
     """0040: RED persistent BRAKE NOW when the car moves (v > 2 km/h) with no gas while we are holding a stop."""
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=-2.0), 0)   # establish the hold
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertFalse(b.brake_now)
     b.update(self._cc(-2.0), _CS(v_ego=3.0 / 3.6, cam=_cam(), a_ego=-2.0), 2)               # crept to 3 km/h, no gas
     self.assertTrue(b.brake_now)
@@ -754,16 +759,16 @@ class TestG8FrameContract(unittest.TestCase):
     b = self._brake()
     for f in range(0, 61):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     f_rel = 61  # odd: not a 50 Hz send slot
     s_rel = b.update(self._cc(-0.2), _CS(cam=_cam()), f_rel)
-    self.assertFalse(b.braking, "min-on elapsed, ask above release -> releases on the odd frame")
+    self.assertFalse(b.episode_open, "min-on elapsed, ask above release -> releases on the odd frame")
     self.assertEqual([], s_rel, "odd release frame emits nothing (passive is on the 50 Hz slot)")
     f_pas = f_rel + 1
     s_pas = b.update(self._cc(-0.2), _CS(cam=_cam()), f_pas)
     self.assertEqual(1, len([x for x in s_pas if fl._get_bits(x.dat, 8, 8) == 0]), "passive on the next send slot")
     s_new = b.update(self._cc(-2.0), _CS(cam=_cam()), f_pas + 2)
-    self.assertTrue(b.braking, "re-brake on the next send slot is commanded (0035: no cooldown)")
+    self.assertTrue(b.episode_open, "re-brake on the next send slot is commanded (0035: no cooldown)")
     self.assertEqual([fl.HYUNDAI_FCA11_LONG_RATE_STEP], [fl._get_bits(x.dat, 8, 8) for x in s_new],
                      "and restarts at the onset step, exactly what the panda's onset rule allows")
 
@@ -772,11 +777,11 @@ class TestG8FrameContract(unittest.TestCase):
     b = self._brake()
     for f in range(0, 4):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     # longActive drops mid-episode: no frame may go out, but a passive frame is OWED
     s = b.update(self._cc(-2.0, long_active=False), _CS(cam=_cam()), 4)
     self.assertEqual([], s)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertTrue(b._release_pending, "the longActive-off exit owes the passive frame")
     # another longActive-off frame keeps owing (no re-arm)
     self.assertEqual([], b.update(self._cc(-2.0, long_active=False), _CS(cam=_cam()), 5))
@@ -812,14 +817,14 @@ class TestG8FrameContract(unittest.TestCase):
     # host frame after the hand-back releases - and only then can a new episode actuate.
     b = self._brake()
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     got = []
     f = 1
     for _ in range(10):
       got += [(f, fl._get_bits(x.dat, 8, 8)) for x in b.update(self._cc(-2.0), _CS(cam=(0, _real_camera_frame(dec=9))), f)]
       f += 1
     self.assertEqual([], got, "nothing of ours on 0x38D while the camera brakes")
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertTrue(b._release_pending, "the close frame is OWED, not dropped")
     while True:                       # the update that RELEASES the hand-back may itself send (the owed close)
       out = [(f, fl._get_bits(x.dat, 8, 8)) for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f)]
@@ -838,7 +843,7 @@ class TestG8FrameContract(unittest.TestCase):
       for exit_f in (1, 2):  # odd and even exit frames: the passive must appear either way
         b = self._brake()
         b.update(self._cc(-2.0), _CS(cam=_cam()), 0)   # hard ask opens an episode immediately
-        self.assertTrue(b.braking, name)
+        self.assertTrue(b.episode_open, name)
         got = []
         for f in range(exit_f, exit_f + 4):
           for x in b.update(self._cc(-2.0), cs, f):
@@ -866,7 +871,7 @@ class TestG8FrameContract(unittest.TestCase):
     b = self._brake(off)
     for f in range(0, 6):
       self.assertEqual([], b.update(self._cc(-2.0), _CS(cam=_cam()), f), f)
-      self.assertFalse(b.braking, f)
+      self.assertFalse(b.episode_open, f)
 
 
 class TestG9bDriverCutRearm(unittest.TestCase):
@@ -903,9 +908,9 @@ class TestG9bDriverCutRearm(unittest.TestCase):
     assertNotEqual([]) fails."""
     b = self._brake(self._cp_sp())
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)               # brake episode opens (hard ask)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     b.update(self._cc(-2.0), _CS(gas=True, cam=_cam()), 2)     # driver escapes with the gas: per-frame release
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertFalse(b.blocked_until_resume, "gas never latches on the car layer either")
     # the pedal releases and the driver cruises for a while (well past the 0.5 s hold-off = 50 frames)
     b.update(self._cc(-0.2), _CS(gas=False, cam=_cam()), 3)    # release edge stamped here
@@ -915,7 +920,7 @@ class TestG9bDriverCutRearm(unittest.TestCase):
     # a NEW brake request arrives, still the SAME engagement, no new resume edge
     sends = b.update(self._cc(-2.0), _CS(gas=False, cam=_cam()), 200)
     self.assertNotEqual([], sends, "a new brake event after a gas escape must be sent")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
 
   def test_gas_holdoff_blocks_for_50_frames_then_allows(self):
     """0038: the only post-release delay is the ~0.5 s (50-frame) hold-off, and it clears on ELAPSED TIME alone
@@ -982,7 +987,7 @@ class TestG9bDriverCutRearm(unittest.TestCase):
     releases and the hold-off elapses (no disengage/re-engage, no resume edge), a fresh request is served."""
     b = self._brake(self._cp_sp())
     b.update(self._cc(), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     b.update(self._cc(), _CS(gas=True, cam=_cam()), 2)
     self.assertFalse(b.blocked_until_resume)
     # the release is stamped on frame 3; hold off for the next 50 frames, then serve a fresh request
@@ -1108,7 +1113,7 @@ class TestPersonalityStrength(unittest.TestCase):
       cc.enabled = cc.longActive = True
       cc.actuators.accel = -2.0
       self.assertEqual([], b.update(cc, _CS(cam=_cam()), 0, p), p)
-      self.assertFalse(b.braking, p)
+      self.assertFalse(b.episode_open, p)
       self.assertEqual(0, b._dec_last_sent, p)         # no state mutation
       self.assertEqual([], b.update(cc, _CS(cam=_cam()), 2), p)  # kwarg omitted -> default standard, still inert
 
@@ -1255,7 +1260,7 @@ class TestCalModeGate(unittest.TestCase):
       # and through update(): a planner ask with no plan behaves exactly as today (planner-driven)
       b2 = self._brake(self._cp_sp(), d)
       s = b2.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-      self.assertTrue(b2.braking)                 # the planner ask still brakes
+      self.assertTrue(b2.episode_open)                 # the planner ask still brakes
       self.assertFalse(b2._cal_active)            # ...but it is NOT a cal hold
       # the planner path is unchanged: its first SENT frame is the production +RATE_STEP rate limit
       self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, fl._get_bits(s[0].dat, 8, 8))
@@ -1270,7 +1275,7 @@ class TestCalModeGate(unittest.TestCase):
       cs = _CalCS(cam=_cam())
       for f in range(0, 1200, 2):
         self.assertEqual([], b.update(self._cc(0.0), cs, f), f)
-        self.assertFalse(b.braking, f)
+        self.assertFalse(b.episode_open, f)
         self.assertFalse(b._cal_active, f)
 
   def test_malformed_plan_is_inert(self):
@@ -1472,10 +1477,10 @@ class TestCalModeActuation(unittest.TestCase):
         # a rep becomes due after band_stable_s (0.5 s = 50 frames) and holds 2.2 s
         for f in range(0, 200):
           b.update(cc, cs, f)
-        self.assertTrue(b.braking, bad)
+        self.assertTrue(b.episode_open, bad)
         cut = _CalCS(v_ego=60 / 3.6, cam=_cam(), **bad)
         b.update(cc, cut, 200)
-        self.assertFalse(b.braking, bad)
+        self.assertFalse(b.episode_open, bad)
         self.assertEqual(latches, b.blocked_until_resume, bad)
 
   def test_cal_holds_and_moves_on_when_a_rep_completes(self):
@@ -1577,7 +1582,7 @@ class TestCalModeActuation(unittest.TestCase):
       cc.actuators.accel = -2.0
       cs = _CalCS(v_ego=60 / 3.6, cam=_cam())
       b.update(cc, cs, 0)
-      self.assertTrue(b.braking)
+      self.assertTrue(b.episode_open)
       self.assertFalse(b._cal_active)
       # with a due plan: a cal hold sets _cal_active
       _write_plan(d, _cal_plan([(60, 25)]))
@@ -1720,7 +1725,7 @@ class TestCalModeActuation(unittest.TestCase):
     out = []
     for f in range(start, start + frames):
       decs = [fl._get_bits(x.dat, 8, 8) for x in b.update(cc, cs, f)]
-      out.append((f, b.braking, decs, b._cal_active))
+      out.append((f, b.episode_open, decs, b._cal_active))
     return out
 
   def test_f8_arming_is_budget_free_right_after_a_long_planner_brake(self):
@@ -1976,10 +1981,10 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
     (frame, passive_dat) of the single passive close frame."""
     for f in range(0, 6):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)        # hard ask (<= -1.2) opens immediately
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     for f in range(6, 400):
       s = b.update(self._cc(-0.2), _CS(cam=_cam()), f)    # ask above -0.30 -> release after min-on
-      if not b.braking:
+      if not b.episode_open:
         if not s:
           s = b.update(self._cc(-0.2), _CS(cam=_cam()), f + 1)
         p = [x for x in s if int(x.address) == fl.FCA11_ADDR and fl._get_bits(x.dat, 8, 8) == 0]
@@ -2012,7 +2017,7 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
     self.assertIsNone(b._pending_echo)
     for f in range(f_emit + 1, f_emit + 400):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
-      self.assertTrue(b.braking, f)
+      self.assertTrue(b.episode_open, f)
 
   def test_refused_close_echo_arriving_after_a_rebrake_never_cuts_it(self):
     """0035: a REFUSED-close echo that lands after the next brake has already started must NOT re-owe the close
@@ -2021,12 +2026,12 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
     b.observe_echo([])
     f_emit, dat = self._emit_close(b)
     b.update(self._cc(-2.0), _CS(cam=_cam()), f_emit + 2)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     b.observe_echo([(192, dat)])                           # late refusal of the OLD close frame
     self.assertFalse(b._release_pending)
     for f in range(f_emit + 3, f_emit + 200):
       b.update(self._cc(-2.0), _CS(cam=_cam()), f)
-      self.assertTrue(b.braking, f)
+      self.assertTrue(b.episode_open, f)
 
   def test_refused_actuating_echo_restarts_the_ramp(self):
     """0035: if the panda REFUSES an actuating frame mid-brake (e.g. its onset rule after a >100 ms stream gap), the
@@ -2047,7 +2052,7 @@ class Test0030EchoConfirmedClose(unittest.TestCase):
       decs += [x.dat[1] for x in b.update(self._cc(-2.0), _CS(cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE)]
     self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, decs[0], "the ramp restarts at the onset step")
     self.assertEqual(30, decs[-1], "and climbs back to the ask")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
 
   def test_unwired_emits_the_close_and_records_no_echo(self):
     """Guard: without an observe_echo call the close frame is still emitted once and nothing waits on an echo."""
@@ -2154,7 +2159,7 @@ class Test0041AlertGating(unittest.TestCase):
     for f in range(300):                       # 3 s of a standstill hold
       self._tick(b, cc, cs, f)
       self.assertFalse(b.brake_now, f"BRAKE NOW fired at a standstill hold @frame {f}")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertTrue(b.stop_complete)
 
   def test_brake_now_does_not_fire_on_openpilot_auto_launch(self):
@@ -2165,7 +2170,7 @@ class Test0041AlertGating(unittest.TestCase):
     # 1) a REAL stop hold (seconds long, as at a red light): armed, nothing fires
     for f in range(300):
       self._tick(b, self._cc(-2.0), _CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=-2.0), f)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertTrue(b._hold_lost_armed)
     self.assertFalse(b.brake_now)
     # 2) openpilot LAUNCHES: ask > 0 for the whole phase, the driver NEVER touches the gas
@@ -2783,7 +2788,7 @@ class Test0043ShapedLaw(unittest.TestCase):
     # moving at 4 km/h (ask warmed open) does NOT enter the band (4 > 3)
     b = self._brake(True)
     self._sent(b, -0.73, 40, cs=_CS(v_ego=4.0 / 3.6, cam=_cam()))
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertFalse(b._shape_in_hold_band)
     # a standstill hold ENTERS; once in, creeping to 3.5 / 4.5 km/h (below EXIT) KEEPS the cap
     b2 = self._brake(True)
@@ -2838,10 +2843,10 @@ class Test0043ShapedLaw(unittest.TestCase):
     hysteresis band keeps emitting >= the floor while braking."""
     b = self._brake(True)
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     for accel in (-2.0, -1.0, -0.5, -0.4, -0.31):
       sends = b.update(self._cc(accel), _CS(cam=_cam()), 0)
-      self.assertTrue(b.braking, accel)
+      self.assertTrue(b.episode_open, accel)
       self.assertTrue(any(fl._get_bits(s.dat, 8, 8) >= fl.FCA11_SHAPE_FLOOR_LSB for s in sends), accel)
 
   def test_hysteresis_min_on_and_release_still_hold(self):
@@ -2849,17 +2854,17 @@ class Test0043ShapedLaw(unittest.TestCase):
     -0.30 keeps braking through the 0.6 s min-on, then releases with exactly one passive close frame."""
     b = self._brake(True)
     b.update(self._cc(-2.0), _CS(cam=_cam()), 0)       # hard ask opens
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     sends = b.update(self._cc(-0.1), _CS(cam=_cam()), 2)
-    self.assertTrue(b.braking, "inside min-on the shaped episode keeps braking")
+    self.assertTrue(b.episode_open, "inside min-on the shaped episode keeps braking")
     self.assertNotEqual([], sends)
     self.assertGreaterEqual(fl._get_bits(sends[0].dat, 8, 8), fl.FCA11_SHAPE_FLOOR_LSB)
     got = []
     for f in range(4, 500):
       got += [fl._get_bits(s.dat, 8, 8) for s in b.update(self._cc(-0.1), _CS(cam=_cam()), f)]
-      if not b.braking:
+      if not b.episode_open:
         break
-    self.assertFalse(b.braking, "an ask above -0.30 releases after min-on")
+    self.assertFalse(b.episode_open, "an ask above -0.30 releases after min-on")
     self.assertEqual(1, sum(1 for d in got if d == 0), "exactly one passive close frame")
 
   def test_reopen_restarts_at_the_floor(self):
@@ -2869,9 +2874,9 @@ class Test0043ShapedLaw(unittest.TestCase):
     f = 200
     for f in range(200, 500):                          # release
       b.update(self._cc(0.5), _CS(cam=_cam()), f)
-      if not b.braking:
+      if not b.episode_open:
         break
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     act = [d for _, d in self._sent(b, -2.0, 10, start=f + 1) if d > 0]
     self.assertTrue(act)
     self.assertEqual(fl.FCA11_SHAPE_FLOOR_LSB, act[0], f"a re-open starts at the floor, got {act}")
@@ -2990,14 +2995,14 @@ class TestFca11PedalCutLatch(_RefusalBrakeMixin, unittest.TestCase):
       out = [x for f in range(1, 40) for x in b.update(self._cc(-2.0), _CS(state=0, cam=_cam()), f)
              if fl._get_bits(x.dat, 8, 8) > 0]
       self.assertTrue(out, st)
-      self.assertTrue(b.braking, st)
+      self.assertTrue(b.episode_open, st)
       self.assertTrue(b._pedal_cut, st)                 # still latched (sticky: a clean state does not clear it)
 
   def test_no_latch_on_accepted_states(self):
     for st in (0, 4, 5):
       b = self._brake()
       self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 0), st)
-      self.assertTrue(b.braking, st)
+      self.assertTrue(b.episode_open, st)
       self.assertFalse(b._pedal_cut, st)
       self.assertFalse(b.fca11_unavailable, st)
       self.assertNotEqual([], b.update(self._cc(-2.0), _CS(state=st, cam=_cam()), 2), st)
@@ -3027,7 +3032,7 @@ class TestFca11PedalCutLatch(_RefusalBrakeMixin, unittest.TestCase):
       self.assertFalse(b._pedal_cut, st)
       self.assertFalse(b.fca11_unavailable, st)
       self.assertTrue(sent, st)
-      self.assertTrue(b.braking, st)
+      self.assertTrue(b.episode_open, st)
 
   def test_latch_is_not_rearmed_by_a_resume_edge(self):
     # unlike _driver_cut, the pedal latch is FAIL-CLOSED: a disengage/re-engage resume edge does NOT clear it
@@ -3122,7 +3127,7 @@ class TestFca11PedalCutLatch(_RefusalBrakeMixin, unittest.TestCase):
     bl.update(self._cc(-2.0, long_active=False), _CS(state=3, cam=_cam()), 0)
     self.assertTrue(bl._pedal_cut)
     sv, sc, bn = open_hold_and_trigger(bl, start=1)
-    self.assertTrue(bl.braking, "the mirror keeps sending, so the alert conditions genuinely hold")
+    self.assertTrue(bl.episode_open, "the mirror keeps sending, so the alert conditions genuinely hold")
     self.assertTrue(bl.fca11_unavailable)
     self.assertFalse(sv, "superviseStop must be suppressed while unavailable")
     self.assertFalse(sc, "stopComplete must be suppressed while unavailable")
@@ -3139,8 +3144,8 @@ class TestFca11RefusedCutSurfacing(_RefusalBrakeMixin, unittest.TestCase):
   def test_streak_trips_at_three_refusals(self):
     self.assertEqual(3, fl.FCA11_REFUSED_STREAK_CUT)
     b = self._brake()
-    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)          # brake episode opens (self.braking True)
-    self.assertTrue(b.braking)
+    b.update(self._cc(-2.0), _CS(cam=_cam()), 0)          # brake episode opens (self.episode_open True)
+    self.assertTrue(b.episode_open)
     self.assertFalse(b._refused_cut)
     b.observe_echo([(192, self._act())])                  # streak 1
     self.assertFalse(b._refused_cut)
@@ -3151,7 +3156,7 @@ class TestFca11RefusedCutSurfacing(_RefusalBrakeMixin, unittest.TestCase):
     b.update(self._cc(-2.0), _CS(cam=_cam()), 2)          # recompute fca11_unavailable
     self.assertTrue(b.fca11_unavailable)
     # ... and the flag does NOT suppress sends (ground truth stays live)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
 
   def test_does_not_trip_at_two_refusals(self):
     b = self._brake()
@@ -3177,7 +3182,7 @@ class TestFca11RefusedCutSurfacing(_RefusalBrakeMixin, unittest.TestCase):
   def test_refusals_counted_only_while_braking(self):
     # a refused actuating echo while NOT braking must not extend the streak (only our live brake frames count)
     b = self._brake()
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     for _ in range(5):
       b.observe_echo([(192, self._act())])
     self.assertEqual(0, b._refused_streak)
@@ -3302,7 +3307,7 @@ class Test0053CameraHandback(unittest.TestCase):
     f = 0
     for _ in range(10):
       self.assertNotEqual([], self._step(b, idle, f)); f += 2
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     for _ in range(5):                                                 # the camera brakes for 100 ms
       self.assertEqual([], self._step(b, brk, f)); f += 2
     self.assertTrue(b.cam_brake)
@@ -3706,3 +3711,572 @@ class Test17cStandstillHold(unittest.TestCase):
     b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
     self.assertFalse(b.feel)
     self.assertFalse(b.standstill_hold)
+
+
+# *** 18x: ROLLING-RELEASE HOLD, the GAS WINDOW, and the DYNAMIC-RELEASE param (Fca11DynamicRelease, DEFAULT OFF) ***
+#
+# WHAT IS PROVEN HERE, AND HOW:
+#   * OFF is the deployed law, frame for frame: the golden DecCmd stream below was produced by running this exact
+#     scenario through opendbc/sunnypilot/car/hyundai/fca11_long.py as deployed on the car (tree fix17c-integrated @
+#     126af78a10 == build dcb94aea9a) and pasting the output. Any change to the OFF path that alters one sent level
+#     fails the test.
+#   * every new behaviour has a test that fails if the behaviour is removed (the assertion IS the behaviour).
+#   * the safety paths are enumerated one by one with the param ON.
+
+def _cp_sp(fca11=True, pedal=True, dyn=None):
+  """CarParamsSP double. ``dyn`` None = the field is absent (the deployed build and every pre-18x double), True/False =
+  the param as the superproject will write it."""
+  cp_sp = structs.CarParamsSP()
+  cp_sp.fca11Brake = fca11
+  cp_sp.enableGasInterceptor = pedal
+  if dyn is not None:
+    setattr(cp_sp, "fca11DynamicRelease", dyn)
+  return cp_sp
+
+
+def _cc(accel=0.0, engaged=True, long_active=True):
+  cc = structs.CarControl()
+  cc.enabled = engaged
+  cc.longActive = long_active
+  cc.actuators.accel = accel
+  return cc
+
+
+def _decs(sends):
+  return [fl._get_bits(s.dat, 8, 8) for s in sends]
+
+
+def _drive_scenario(f):
+  """The identity scenario (frame -> ask, vEgo, standstill, brakePressed, gasPressed, gear, fresh camera). One
+  continuous 600-frame drive touching: a hard onset + 16 LSB hold, an ask-driven release, the coast-first dwell escape at
+  -0.65, the -0.25 hysteresis release, a band entry at 1 m/s, a standstill hold to 30 LSB, a standstill release, a driver
+  GAS veto, a re-ask after the hold-off, a stale camera and a gear-out-of-D cut. No lead is published, so the 18x
+  rolling-release rule is inert here and the whole stream is the deployed one."""
+  drive, neutral = structs.CarState.GearShifter.drive, structs.CarState.GearShifter.neutral
+  if f < 100:
+    return -2.0, 20.0, False, False, False, drive, True
+  if f < 160:
+    return -0.2, 20.0, False, False, False, drive, True
+  if f < 220:
+    return -0.65, 18.0, False, False, False, drive, True
+  if f < 260:
+    return -0.25, 18.0, False, False, False, drive, True
+  if f < 320:
+    return (-0.9 if f < 290 else -1.3), 12.0, False, False, False, drive, True
+  if f < 380:
+    return -1.0, 1.0, False, False, False, drive, True
+  if f < 440:
+    return -2.0, 0.0, True, False, False, drive, True
+  if f < 460:
+    return 0.5, 0.0, True, False, False, drive, True
+  if f < 480:
+    return -2.0, 0.0, True, False, True, drive, True
+  if f < 560:
+    return -0.7, 10.0, False, False, False, drive, True
+  if f < 580:
+    return -2.0, 8.0, False, False, False, drive, False
+  return -2.0, 8.0, False, False, False, neutral, True
+
+
+_DEPLOYED_STREAM = """
+4 8 12 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16 16
+16 16 16 16 16 16 16 16 16 16 16 16 16 0 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 0 4 4 4 4
+4 8 9 9 9 9 9 9 9 9 9 9 9 9 9 9 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 8 12 16 20 24 28 30
+30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 0 4 4 4 4 4 0
+"""
+
+
+class Test18xOffIsTheDeployedLaw(unittest.TestCase):
+  """The default (param absent / False) path must be the deployed law byte-for-byte."""
+
+  def _run(self, dyn):
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn))
+    out = []
+    for f in range(600):
+      ask, v, st, brk, gas, gear, cam_ok = _drive_scenario(f)
+      cam = _cam() if cam_ok else (0, _real_camera_frame())
+      cs = _CS(v_ego=v, cam=cam, standstill=st, brake=brk, gas=gas, gear=gear,
+               now=int(0.2 * 1e9) if not cam_ok else 0)
+      for s in b.update(_cc(ask), cs, f):
+        out.append((f, fl._get_bits(s.dat, 8, 8)))
+    return b, out
+
+  def test_param_absent_is_off(self):
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    self.assertFalse(b.dynamic_release)
+    self.assertIsNone(b._dyn_log, "OFF must not open the level-trace channel")
+
+  def test_param_false_is_off(self):
+    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=False)).dynamic_release)
+
+  def test_off_reproduces_the_deployed_command_stream_frame_for_frame(self):
+    """GOLDEN. Provenance: the same scenario run through the DEPLOYED fca11_long.py (fix17c-integrated @ 126af78a10, the
+    build on the car dcb94aea9a) produced exactly this (frame, level) sequence - 169 sent frames. It fails on ANY change
+    to the OFF path: an extra/missing frame, or a different level on any frame."""
+    b, out = self._run(dyn=None)
+    self.assertFalse(b.dynamic_release)
+    want = list(out)
+    self.assertEqual(len(_DEPLOYED_STREAM.split()), len(want), "sent-frame COUNT changed")
+    self.assertEqual([d for _, d in want], [int(x) for x in _DEPLOYED_STREAM.split()], "a SENT LEVEL changed")
+    # ... and the frames themselves are the 50 Hz send slots, in order, as deployed.
+    self.assertEqual([f for f, _ in want], sorted(f for f, _ in want))
+    self.assertTrue(all(f % fl.FCA11_SEND_EVERY == 0 for f, _ in want))
+
+  def test_off_and_param_false_are_the_same_stream(self):
+    _, a = self._run(dyn=None)
+    _, c = self._run(dyn=False)
+    self.assertEqual(a, c)
+
+  def test_off_never_writes_the_dynamic_trace(self):
+    d = tempfile.mkdtemp()
+    old = os.environ.get("FCA11_LOG_DIR")
+    try:
+      os.environ["FCA11_LOG_DIR"] = d
+      self._run(dyn=False)
+      # the episode log (episodes.jsonl) is NOT this feature; the point is that no level TRACE is opened/written
+      trace = [f for f in os.listdir(d) if "shadow" in f] if os.path.isdir(d) else []
+      self.assertEqual([], trace, "OFF must not open the level-trace channel")
+    finally:
+      if old is None:
+        os.environ.pop("FCA11_LOG_DIR", None)
+      else:
+        os.environ["FCA11_LOG_DIR"] = old
+      import shutil
+      shutil.rmtree(d, ignore_errors=True)
+
+
+class Test18xRollingReleaseHold(unittest.TestCase):
+  """Below 4 m/s with a lead inside 20 m an OPEN episode releases at -0.10 instead of -0.30 (the 17/18 rolling drop-outs
+  on routes 181/182). Removing FCA11_ROLLING_RELEASE_ACCEL (or the lead test) fails these."""
+
+  def _episode(self, lead_m=None, lead_one=None, v=1.5, ease_to=-0.25, frames=160, cs_extra=None):
+    """Open a hard episode (ask -2.0 for 80 frames) then ease to ``ease_to``; return (released_at, b)."""
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    kw = {} if (lead_m is None and lead_one is None) else {"lead_m": lead_m, "lead_one": lead_one}
+    for f in range(frames):
+      ask = -2.0 if f < 80 else ease_to
+      cs = _CS(v_ego=v, cam=_cam(), **(kw if cs_extra is None else {**kw, **cs_extra}))
+      b.update(_cc(ask), cs, f)
+      if f >= 80 and not b.episode_open:
+        return f, b
+    return None, b
+
+  # NOTE: v = 3.0 m/s here - inside the ROLLING band (2..4 m/s) and ABOVE the crawl band, so the lead is the only thing
+  # that decides the release. The crawl band (v < 2 m/s) holds at -0.10 with or without a lead and is covered below.
+  def test_rolling_release_with_a_lead_10m_keeps_the_brake(self):
+    # the deployed law releases at the -0.30 exit; with a lead at 10 m and 3 m/s the episode is HELD
+    self.assertIsNone(self._episode(lead_m=10.0, v=3.0)[0], "a lead inside 20 m at 3 m/s must hold the brake")
+
+  def test_without_a_lead_the_deployed_threshold_still_releases(self):
+    self.assertEqual(80, self._episode(lead_m=None, v=3.0)[0])
+
+  def test_a_lead_further_than_20m_still_releases(self):
+    self.assertEqual(80, self._episode(lead_m=25.0, v=3.0)[0])
+
+  def test_at_and_above_4mps_the_deployed_threshold_still_releases(self):
+    self.assertEqual(80, self._episode(lead_m=8.0, v=fl.FCA11_ROLLING_RELEASE_V_MAX)[0])
+    self.assertEqual(80, self._episode(lead_m=8.0, v=12.0)[0])
+
+  def test_the_rule_ends_at_the_10_threshold_not_before(self):
+    # an ask that is still below -0.10 keeps braking even with the lead; an ask above -0.10 releases
+    self.assertIsNone(self._episode(lead_m=10.0, v=3.0, ease_to=-0.12)[0])
+    self.assertEqual(80, self._episode(lead_m=10.0, v=3.0, ease_to=-0.08)[0])
+
+  def test_a_lead_with_no_distance_keeps_the_brake(self):
+    # carcontroller.py writes both attributes on the same frame; if only the presence is readable, hold (conservative)
+    self.assertIsNone(self._episode(lead_m=None, lead_one=object(), v=3.0)[0])
+
+  def test_a_far_lead_object_with_a_distance_releases(self):
+    self.assertEqual(80, self._episode(lead_m=40.0, lead_one=object(), v=3.0)[0])
+
+  # *** 18x (b): the CRAWL band (v < 2 m/s) - no lead needed, and the level never lands in 1-5 LSB ***
+  def test_crawl_holds_the_brake_with_or_without_a_lead(self):
+    for lead in (None, 10.0):
+      self.assertIsNone(self._episode(lead_m=lead, v=1.5)[0], lead)
+
+  def test_crawl_still_releases_on_a_genuine_roll_free(self):
+    # an ask ABOVE -0.10 is the planner genuinely wanting to move: the episode releases (and stays released, below)
+    self.assertEqual(80, self._episode(lead_m=10.0, v=1.5, ease_to=-0.05)[0])
+
+  def test_crawl_level_is_never_in_the_half_applied_band(self):
+    """1-5 LSB at crawl is the state the clutch-torque measurement shows with the creep torque live. An open crawl
+    episode must command >= FCA11_CRAWL_MIN_LSB on every sent frame (after the panda's +RATE_STEP onset ramp)."""
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    levels = []
+    for f in range(160):
+      ask = -2.0 if f < 80 else -0.30
+      cs = _CS(v_ego=1.5, cam=_cam(), lead_m=10.0)
+      b.update(_cc(ask), cs, f)
+      if b.episode_open and f >= 22:      # the first two sent frames are the panda's onset ramp (4, then 6)
+        levels.append(b._dec_last_sent)
+    self.assertTrue(levels)
+    self.assertGreaterEqual(min(levels), fl.FCA11_CRAWL_MIN_LSB, "no 1-5 LSB frame at crawl")
+    self.assertLessEqual(max(levels), fl.HYUNDAI_FCA11_LONG_MAX_DEC)
+
+  def test_a_crawl_release_stays_released_for_the_holdoff(self):
+    """No re-application chatter: after a crawl release a shallow ask cannot re-open the brake for 0.5 s; a HARD ask
+    still opens on the spot (a real stop is never delayed)."""
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    for f in range(70):
+      b.update(_cc(-2.0), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), f)
+    self.assertTrue(b.episode_open)
+    b.update(_cc(-0.05), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), 70)     # genuine roll-free -> release
+    self.assertFalse(b.episode_open)
+    # a shallow ask immediately after: no re-open inside the hold-off
+    for f in range(71, 71 + fl.FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES - 2):
+      b.update(_cc(-0.30), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), f)
+      self.assertFalse(b.episode_open, f)
+    # a HARD ask ignores the hold-off
+    b.update(_cc(-2.0), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), 71 + fl.FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES)
+    self.assertTrue(b.episode_open)
+
+  def test_every_safety_veto_still_releases_on_the_same_frame_with_a_lead(self):
+    """The rolling rule only moves the THRESHOLD. Every veto (ok == False) must still cut on the frame it fires, exactly
+    as it does without a lead - proven by comparing the release frame of each veto with and without the lead."""
+    cases = [
+      ("driver_brake", dict(brake=True)),
+      ("driver_gas", dict(gas=True)),
+      ("gear", dict(gear=structs.CarState.GearShifter.park)),
+      ("stale_camera", dict(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9))),
+      ("pedal_fault", dict(state=1)),
+    ]
+    for name, extra in cases:
+      with_lead, b1 = self._episode_full(lead_m=10.0, extra=extra)
+      no_lead, b2 = self._episode_full(lead_m=None, extra=extra)
+      self.assertIsNotNone(with_lead, name)
+      self.assertEqual(no_lead, with_lead, f"{name}: the veto must cut on the same frame with and without a lead")
+      self.assertFalse(b1.episode_open, name)
+
+  def _episode_full(self, lead_m, extra):
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    base = {"v_ego": 1.5, "cam": _cam()}
+    if lead_m is not None:
+      base["lead_m"] = lead_m
+    for f in range(80):
+      b.update(_cc(-2.0), _CS(**base), f)
+    assert b.episode_open
+    for f in range(80, 100):
+      cs = _CS(**{**base, **extra})
+      b.update(_cc(-2.0), cs, f)
+      if not b.episode_open:
+        return f, b
+    return None, b
+
+  def test_camera_braking_with_a_lead_releases_on_the_same_frame(self):
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    for f in range(80):
+      b.update(_cc(-2.0), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), f)
+    self.assertTrue(b.episode_open)
+    cam_braking = (0, _real_camera_frame(dec=5, cmd_act=1, warn=3))
+    b.update(_cc(-2.0), _CS(v_ego=1.5, cam=cam_braking, lead_m=10.0), 80)
+    self.assertFalse(b.episode_open, "the camera braking class must win over the rolling-release hold")
+
+
+class Test18xGasWindow(unittest.TestCase):
+  """100 ms of gas = 0 after the last actuating frame (the panda refuses gas inside BRAKE_THROTTLE_EXCL_US anyway, and the
+  car layer used to hand it a non-zero frame that got stripped: 44/45 and 49/55 releases on 181/182)."""
+
+  def _release_episode(self, dyn=False):
+    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn))
+    seq = []
+    for f in range(160):
+      ask = -2.0 if f < 80 else -0.1
+      s = b.update(_cc(ask), _CS(v_ego=20.0, cam=_cam()), f)
+      seq.append((f, _decs(s), b.episode_open, b.braking))
+    return b, seq
+
+  def test_constants_match_the_panda_window(self):
+    self.assertAlmostEqual(fl.FCA11_GAS_WINDOW_HOLD_S, 0.10)
+    self.assertEqual(fl.FCA11_GAS_WINDOW_HOLD_FRAMES, int(round(fl.FCA11_GAS_WINDOW_HOLD_S * 100)))
+    self.assertEqual(fl.FCA11_GAS_WINDOW_HOLD_FRAMES, 10)
+
+  def test_pedal_is_held_at_zero_for_exactly_100ms_after_the_last_actuating_frame(self):
+    b, seq = self._release_episode(dyn=False)
+    rel = next(f for f, d, eo, br in seq if not eo)
+    # the last ACTUATING frame is the send slot before the release
+    self.assertGreater(_decs([x for x in []]), []) if False else None
+    held = [f for f, d, eo, br in seq if br]
+    self.assertIn(rel - 1, held, "the frame before the release is the last actuating one")
+    # ... and `braking` (what gas_interceptor.py reads) stays True through 10 frames = 100 ms of them, then drops
+    for k in range(fl.FCA11_GAS_WINDOW_HOLD_FRAMES):
+      self.assertTrue(dict((f, br) for f, d, eo, br in seq)[rel + k], f"gas must be 0 at frame {rel + k}")
+    self.assertFalse(dict((f, br) for f, d, eo, br in seq)[rel + fl.FCA11_GAS_WINDOW_HOLD_FRAMES],
+                     "the window must END after 100 ms (no stuck pedal inhibit)")
+    self.assertFalse(b.braking)
+
+  def test_the_gas_window_adds_no_brake_frame(self):
+    """The whole point of doing it in `braking` rather than in the frame: the 0x38D stream is untouched. The passive close
+    frame lands on the release frame itself (as deployed) and nothing of ours goes out during the window."""
+    _, off = self._release_episode(dyn=False)
+    rel = next(f for f, d, eo, br in off if not eo)
+    self.assertEqual([0], dict((f, d) for f, d, eo, br in off if d)[rel], "one passive hand-back on the release frame")
+    for f, d, eo, br in off:
+      if rel < f <= rel + fl.FCA11_GAS_WINDOW_HOLD_FRAMES:
+        self.assertEqual([], d, f"no 0x38D of ours may follow the close frame inside the gas window (frame {f})")
+
+  def test_a_rebrake_clears_the_window(self):
+    """A new actuating frame re-arms the panda's window from that frame, so the guard restarts at the next release and can
+    never hold the pedal through a live brake."""
+    b, seq = self._release_episode(dyn=False)
+    rel = next(f for f, d, eo, br in seq if not eo)
+    self.assertTrue(dict((f, br) for f, d, eo, br in seq)[rel], "the pedal is held on the release frame itself")
+    b.update(_cc(-2.0), _CS(v_ego=20.0, cam=_cam()), rel + 1)
+    self.assertTrue(b.episode_open)
+    self.assertTrue(b.braking)
+
+
+class Test18xDynamicRelease(unittest.TestCase):
+  """The opt-in build: gentle onset from 1 LSB, a 0.3 LSB/sent-frame decrease limit, a release ramp, and the level trace.
+  Default OFF (proven above)."""
+
+  def _brake(self, dyn=True):
+    return fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn))
+
+  def test_flag_is_scoped_to_the_feel_path(self):
+    self.assertTrue(self._brake(True).dynamic_release)
+    # an affine/shaped instance has no feel path -> the flag can never reach it
+    cp_sp = structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=True)
+    setattr(cp_sp, "fca11DynamicRelease", True)
+    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+    self.assertFalse(b.feel)
+    self.assertFalse(b.dynamic_release)
+    # a disabled instance neither
+    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False, dyn=True)).dynamic_release)
+
+  def test_gentle_ask_first_sent_frame_is_1_lsb_and_hard_ask_is_unchanged(self):
+    """THE OWNER'S TEST: ON + a gentle ask (the target is <= 4 LSB) starts at 1 LSB; ON + a hard ask keeps the deployed
+    first frame (4 LSB), so a real stop is never slower than today."""
+    def first_frames(dyn, ask):
+      b = self._brake(dyn)
+      out = []
+      for f in range(60):
+        out += [(f, d) for d in _decs(b.update(_cc(ask), _CS(v_ego=15.0, cam=_cam()), f))]
+      return out
+
+    gentle_on = first_frames(True, -0.65)
+    gentle_off = first_frames(False, -0.65)
+    self.assertEqual(4, gentle_off[0][1], "OFF (deployed): the first sent frame is 4")
+    self.assertEqual(1, gentle_on[0][1], "ON: a gentle episode starts at 1 LSB")
+    # and it CLIMBS to the same level the deployed law jumps to, at the existing rise rate (never past it)
+    on_levels = [d for _, d in gentle_on]
+    off_levels = [d for _, d in gentle_off]
+    self.assertLessEqual(max(on_levels), max(off_levels), "ON must never command more than the deployed law")
+    self.assertEqual(4, max(on_levels))
+    self.assertIn(1, on_levels)
+    self.assertTrue(all(b >= a for a, b in zip(on_levels, on_levels[1:])), "the gentle onset only climbs")
+    # HARD ask: identical first frame AND identical stream (no slowing of a real stop)
+    self.assertEqual(first_frames(False, -2.0), first_frames(True, -2.0))
+
+  def test_gentle_onset_never_commands_more_than_the_deployed_law_on_any_frame(self):
+    for ask in (-0.60, -0.65, -0.70, -0.75, -0.79):
+      _, on_s = self._stream(True, ask)
+      _, off_s = self._stream(False, ask)
+      on = [d for f, d in on_s]
+      off = [d for f, d in off_s]
+      self.assertLessEqual(max(on), max(off), ask)
+      self.assertLessEqual(len(on), len(off) + 2, ask)
+
+  def _stream(self, dyn, ask, frames=120, v=15.0, lead_m=None, ease_at=None, ease_to=None):
+    b = self._brake(dyn)
+    out = []
+    for f in range(frames):
+      a = ask if (ease_at is None or f < ease_at) else ease_to
+      out += [(f, d) for d in _decs(b.update(_cc(a), _CS(v_ego=v, cam=_cam(), lead_m=lead_m), f))]
+    return b, out
+
+  def test_decrease_is_limited_instead_of_a_one_frame_drop(self):
+    """OFF drops 16 -> 0 in ONE sent frame; ON walks it down. The rate is 0.3 LSB per SENT frame below 8 LSB and the
+    standstill rate (1.2) at/above it, so a single rounded step can never exceed 1.2 LSB, and the release takes >= 10
+    sent frames instead of 1."""
+    def levels(dyn, v=20.0, standstill=False):
+      b = self._brake(dyn)
+      decs = []
+      for f in range(240):
+        ask = -2.0 if f < 80 else 0.5
+        s = b.update(_cc(ask), _CS(v_ego=v, cam=_cam(), standstill=standstill), f)
+        if s:
+          decs.append(fl._get_bits(s[0].dat, 8, 8))
+      return decs
+
+    off = levels(False)
+    on = levels(True)
+    self.assertEqual(16, max(off))
+    self.assertEqual(16, max(on))
+    off_drops = [a - c for a, c in zip(off, off[1:]) if c < a]
+    on_drops = [a - c for a, c in zip(on, on[1:]) if c < a]
+    self.assertEqual([16], off_drops, "the deployed law drops the whole level in one frame")
+    # a MOVING release (no standstill) runs at the comfort rate: 1 LSB per sent frame at most
+    self.assertLessEqual(max(on_drops), fl.FCA11_DYN_DECREASE_MAX_DROP_LSB)
+    self.assertGreaterEqual(len(on_drops), 10, f"the release must be ramped, not dropped ({len(on_drops)} steps)")
+    # below the standstill-class level the rate is the 0.3 comfort limit: 4 -> 0 at <= 1 LSB per sent frame
+    low = levels(True, v=20.0)
+    self.assertIn(0, low)
+    # ... and a release from 4 LSB takes at least 10 sent frames (0.2 s), never one
+    b = self._brake(True)
+    lv = []
+    for f in range(200):
+      ask = -0.65 if f < 60 else 0.5
+      s = b.update(_cc(ask), _CS(v_ego=10.0, cam=_cam()), f)
+      if s:
+        lv.append(fl._get_bits(s[0].dat, 8, 8))
+    uniq = [x for i, x in enumerate(lv) if i == 0 or lv[i - 1] != x]
+    self.assertEqual([4, 3, 2, 1, 0], uniq[-5:], "4 -> 0 must walk down, one LSB at a time")
+    steps = [a - c for a, c in zip(lv, lv[1:])]
+    self.assertLessEqual(max(steps), fl.FCA11_DYN_DECREASE_MAX_DROP_LSB, "the comfort rate may never step > 1 LSB")
+
+  def test_standstill_release_ramps_30_to_0_in_half_a_second_with_the_pedal_at_zero(self):
+    b = self._brake(True)
+    seq = []
+    for f in range(280):
+      ask = -2.0 if f < 150 else 0.5
+      s = b.update(_cc(ask), _CS(v_ego=0.0, cam=_cam(), standstill=True), f)
+      seq.append((f, _decs(s), b.episode_open, b.braking))
+    # the hold is at 30 before the release...
+    self.assertEqual(30, [d[0] for f, d, eo, br in seq if d and f < 150][-1], "the hold level is 30")
+    # ... then the level walks 30 -> 0 with no frame off the ramp
+    levels = [d[0] for f, d, eo, br in seq if d and f >= 150]
+    self.assertEqual(0, levels[-1], "the ramp must reach 0 (that is what closes the episode)")
+    self.assertEqual(29, levels[0], "the first step off 30 costs 1 LSB, not the whole level")
+    n_sent = len(levels) - 1
+    self.assertLessEqual(n_sent, 27, f"30 -> 0 must take <= 0.54 s of sent frames, took {n_sent}")
+    self.assertGreaterEqual(n_sent, 20, f"30 -> 0 must be a RAMP, not a drop ({n_sent} frames)")
+    self.assertLessEqual(n_sent, int(round(fl.FCA11_DYN_STANDSTILL_RELEASE_S / fl.FCA11_SHAPE_SENT_DT)) + 2,
+                         "the standstill release must fit inside FCA11_DYN_STANDSTILL_RELEASE_S")
+    steps = [a - c for a, c in zip(levels, levels[1:])]
+    self.assertTrue(all(1 <= st <= fl.FCA11_DYN_STANDSTILL_MAX_DROP_LSB for st in steps),
+                    f"1-2 LSB at a time, never the deployed 30-LSB cliff: {steps}")
+    # gas at exactly 0 for every frame of the ramp AND the 100 ms window after the last actuating frame
+    rel = next(f for f, d, eo, br in seq if f > 150 and not eo)
+    for f, d, eo, br in seq:
+      if 150 <= f < rel + fl.FCA11_GAS_WINDOW_HOLD_FRAMES:
+        self.assertTrue(br, f"pedal must be held at 0 through the ramp and its window (frame {f})")
+
+  def test_the_standstill_rise_is_exactly_as_fast_as_the_deployed_law(self):
+    """THE OWNER'S CONSTRAINT: the dynamic build must NOT slow the rise to the standstill hold. The 10-13 -> 30 LSB take-up
+    is where the car moves 0-1.6 cm, so any slower rising edge there would make the creep worse. Proven by running the same
+    drive on both builds: the frame at which 30 LSB is first commanded, and every level before it, must be identical."""
+    def rise(dyn):
+      b = self._brake(dyn)
+      seq = []
+      for f in range(200):
+        ask = -1.0 if f < 60 else -2.0
+        v = 1.0 if f < 60 else 0.0
+        st = f >= 60
+        s = b.update(_cc(ask), _CS(v_ego=v, cam=_cam(), standstill=st), f)
+        seq.append((f, _decs(s), b.episode_open))
+      first30 = next(f for f, d, eo in seq if d and d[0] == 30)
+      window = [(f, d) for f, d, eo in seq if first30 - 40 <= f <= first30]
+      return first30, window
+
+    f_off, win_off = rise(False)
+    f_on, win_on = rise(True)
+    self.assertEqual(f_off, f_on, "the standstill hold level must be reached on the SAME frame as the deployed law")
+    self.assertEqual(win_off, win_on, "no slower component may be added inside the standstill hold band")
+
+  def test_every_safety_path_still_cuts_immediately_with_the_param_on(self):
+    """Enumerated: the ramp must never apply to a veto. Each case: an open episode, then the veto frame must NOT carry a
+    ramped actuating frame and the episode must be closed on that frame."""
+    def opened(n=70):
+      """An episode older than the 0.6 s min-on (60 frames), so the ask alone decides the release."""
+      b = self._brake(True)
+      for f in range(n):
+        b.update(_cc(-2.0), _CS(v_ego=20.0, cam=_cam()), f)
+      assert b.episode_open
+      return b
+
+    vetos = {
+      "driver_brake": dict(brake=True),
+      "driver_gas": dict(gas=True),
+      "gear_not_d": dict(gear=structs.CarState.GearShifter.park),
+      "pedal_fault": dict(state=1),
+      "stale_camera": dict(cam=(0, _real_camera_frame()), now=int(0.2 * 1e9)),
+      "camera_braking": dict(cam=(0, _real_camera_frame(dec=4, cmd_act=1, warn=3))),
+      "gas_holdoff": dict(gas=False),
+    }
+    for name, extra in vetos.items():
+      b = opened()
+      if name == "gas_holdoff":
+        b._gas_release_frame = 39            # the pedal released on the previous frame -> 50-frame hold-off
+      base = {"v_ego": 20.0, "cam": _cam()}
+      s = b.update(_cc(-2.0), _CS(**{**base, **extra}), 40)
+      self.assertFalse(b.episode_open, name)
+      self.assertNotIn(True, [d > 0 for d in _decs(s)], f"{name}: an actuating frame must not be sent on a veto")
+      self.assertIsNone(b._rel_acc, f"{name}: no ramp may be left armed")
+
+    # BRAKE NOW (ESC non-response / hold lost): the alert must never be answered with a slow release. The ask EASES so
+    # the release itself is the soft one; the positive control (no alert) ramps on exactly the same frame.
+    b = opened()
+    b.brake_now = True
+    s = b.update(_cc(-0.1), _CS(v_ego=20.0, cam=_cam()), 70)
+    self.assertFalse(b.episode_open)
+    self.assertIsNone(b._rel_acc, "BRAKE NOW must not start a ramp")
+    self.assertEqual([], [d for d in _decs(s) if d > 0])
+    ctrl = opened()
+    ctrl.update(_cc(-0.1), _CS(v_ego=20.0, cam=_cam()), 70)
+    self.assertTrue(ctrl.episode_open, "control: without the alert the same frame is a RAMPED release")
+    self.assertIsNotNone(ctrl._rel_acc)
+
+    # the refusal-attribution hold
+    b = opened()
+    b._attrib_hold = 3
+    s = b.update(_cc(-2.0), _CS(v_ego=20.0, cam=_cam()), 70)
+    self.assertFalse(b.episode_open)
+    self.assertEqual([], [d for d in _decs(s) if d > 0])
+
+    # a longActive drop mid-episode owes the close frame and cuts at once
+    b = opened()
+    s = b.update(_cc(-2.0, long_active=False), _CS(v_ego=20.0, cam=_cam()), 70)
+    self.assertFalse(b.episode_open)
+    self.assertTrue(b._release_pending)
+    self.assertEqual([], _decs(s))
+
+    # disable mid-episode
+    b = opened()
+    b.enabled = False
+    s = b.update(_cc(-2.0), _CS(v_ego=20.0, cam=_cam()), 70)
+    self.assertFalse(b.episode_open)
+    self.assertEqual([], _decs(s))
+
+  def test_a_normal_gentle_release_still_ends_in_one_passive_frame(self):
+    b = self._brake(True)
+    passive = 0
+    for f in range(200):
+      ask = -0.65 if f < 60 else 0.5
+      for s in b.update(_cc(ask), _CS(v_ego=10.0, cam=_cam()), f):
+        if fl._get_bits(s.dat, 8, 8) == 0:
+          passive += 1
+    self.assertEqual(1, passive, "exactly one passive hand-back frame per episode, as deployed")
+    self.assertFalse(b.episode_open)
+    self.assertFalse(b.braking)
+
+  def test_level_trace_writes_level_and_measured_aego_per_sent_frame(self):
+    d = tempfile.mkdtemp()
+    old = os.environ.get("FCA11_LOG_DIR")
+    try:
+      os.environ["FCA11_LOG_DIR"] = d
+      b = self._brake(True)
+      for f in range(80):
+        b.update(_cc(-0.65), _CS(v_ego=12.0, cam=_cam(), a_ego=-0.42), f)
+      b._dyn_log.flush()
+      recs = []
+      path = os.path.join(d, "fca11-shadow.jsonl")
+      self.assertTrue(os.path.exists(path), "the trace goes into the FCA11 shadow log's own file")
+      with open(path) as fh:
+        for line in fh:
+          rec = json.loads(line)
+          if rec.get("k") == "b":
+            recs.append(rec)
+      self.assertGreater(len(recs), 10)
+      run = [r["dec_lsb"] for r in recs]
+      uniq = [x for i, x in enumerate(run) if i == 0 or run[i - 1] != x]
+      self.assertEqual([1, 2, 3, 4], uniq[:4], "the gentle stop must walk 1 -> 2 -> 3 -> 4 LSB on the wire")
+      self.assertTrue(all("a_ego" in r and "dec_lsb" in r for r in recs))
+      self.assertAlmostEqual(-0.42, recs[0]["a_ego"], places=6)
+      self.assertTrue(all(r["v_ego"] == 12.0 for r in recs))
+    finally:
+      if old is None:
+        os.environ.pop("FCA11_LOG_DIR", None)
+      else:
+        os.environ["FCA11_LOG_DIR"] = old
+      import shutil
+      shutil.rmtree(d, ignore_errors=True)

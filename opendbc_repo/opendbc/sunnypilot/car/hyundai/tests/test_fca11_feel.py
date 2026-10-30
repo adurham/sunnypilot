@@ -174,7 +174,7 @@ class TestCoastFirst(unittest.TestCase):
     b = _brake(True)
     asks = ([-0.55] * 80 + [-0.2] * 20) * 3   # 0.8 s small asks with gaps: transients, never a sustained 1 s
     self.assertEqual([], _run(b, asks))
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     old = _brake(False)
     self.assertTrue(any(d > 0 for _, d, _ in _run(old, asks)), "the pre-0049 law opens on -0.55")
 
@@ -182,9 +182,9 @@ class TestCoastFirst(unittest.TestCase):
     b = _brake(True)
     for f in range(fl.FCA11_FEEL_DWELL_FRAMES - 1):
       b.update(_cc(-0.55), _CS(cam=_cam()), f)
-      self.assertFalse(b.braking, f)
+      self.assertFalse(b.episode_open, f)
     b.update(_cc(-0.55), _CS(cam=_cam()), fl.FCA11_FEEL_DWELL_FRAMES - 1)
-    self.assertTrue(b.braking, "a sustained -0.55 opens after the dwell")
+    self.assertTrue(b.episode_open, "a sustained -0.55 opens after the dwell")
     sent = _run(b, [-0.55] * 100, start=fl.FCA11_FEEL_DWELL_FRAMES)
     for x, y in zip(sent, sent[1:], strict=False):
       self.assertLessEqual(y[1] - x[1], 1, "and ramps softly")
@@ -192,31 +192,31 @@ class TestCoastFirst(unittest.TestCase):
   def test_dwell_counts_only_ok_frames(self):
     b = _brake(True)
     _run(b, [-0.55] * 150, cs_fn=lambda f: _CS(cam=_cam(), gas=True))
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertEqual(0, b._feel_dwell)
 
   def test_ask_past_threshold_opens_after_the_same_debounce(self):
     b = _brake(True)
     for f in range(fl.FCA11_ONSET_HOLD_FRAMES - 1):
       b.update(_cc(-0.62), _CS(cam=_cam()), f)
-      self.assertFalse(b.braking, f)
+      self.assertFalse(b.episode_open, f)
     b.update(_cc(-0.62), _CS(cam=_cam()), fl.FCA11_ONSET_HOLD_FRAMES - 1)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
 
   def test_hysteresis_release_rule_unchanged(self):
     """Once open, the deployed release rule (-0.30 + min-on) governs: an ask easing to -0.45 STAYS braking."""
     b = _brake(True)
     _run(b, [-0.8] * 30)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     _run(b, [-0.45] * 200, start=30)
-    self.assertTrue(b.braking, "inside the hysteresis band the episode stays open")
+    self.assertTrue(b.episode_open, "inside the hysteresis band the episode stays open")
     _run(b, [-0.2] * 2, start=230)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
 
   def test_hard_ask_opens_on_first_frame(self):
     b = _brake(True)
     sent = _run(b, [-1.5])
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertEqual([(0, STEP, 3)], sent)
 
   def test_hold_band_runs_the_deployed_law_byte_identical(self):
@@ -295,7 +295,7 @@ class TestAnticipatoryRelease(unittest.TestCase):
     b = _brake(True)
     _run(b, [-0.9] * 200)
     sent = _run(b, [-0.36] * 40, start=200)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertLessEqual(sent[-1][1], 6, "inside the release band the level follows the 0.67 inverse (5-6), not 8")
     old = _brake(False)
     _run(old, [-0.9] * 200)
@@ -392,11 +392,11 @@ class TestContractWithFeel(unittest.TestCase):
       for odd in (0, 1):
         b = _brake(True)
         _run(b, [-0.8] * (100 + odd))
-        self.assertTrue(b.braking, name)
+        self.assertTrue(b.episode_open, name)
         start = 100 + odd
         ask = -0.1 if name == "release" else -0.8
         got = _run(b, [ask] * 6, start=start, cs_fn=cs_fn)
-        self.assertFalse(b.braking, name)
+        self.assertFalse(b.episode_open, name)
         self.assertEqual(1, len([g for g in got if g[1] == 0]), f"{name}@{odd}: {got}")
         self.assertEqual([], [g for g in got if g[1] > 0], f"{name}: no actuation after the exit")
     # longActive-off: owed and delivered on the first frame back, before any actuation
@@ -413,10 +413,10 @@ class TestContractWithFeel(unittest.TestCase):
     camera frames - first the owed passive close frame, then a fresh soft onset."""
     b = _brake(True)
     _run(b, [-0.8] * 100)
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertNotEqual([], _run(b, [-0.8] * 10, start=100, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(warn=2)))),
                         "a warning keeps openpilot braking")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertEqual([], _run(b, [-0.8] * 4, start=110, cs_fn=lambda f: _CS(cam=(0, _real_camera_frame(dec=7)))))
     self.assertTrue(b.cam_brake)
     self.assertFalse(b.blocked_until_resume)
@@ -455,7 +455,7 @@ class TestContractWithFeel(unittest.TestCase):
     b = _brake(True)
     _run(b, [-1.0] * 200)
     _run(b, [-0.1] * 70, start=200)
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     sent = _run(b, [-1.0] * 30, start=270)
     self.assertEqual(STEP, [d for _, d, _ in sent if d > 0][0])
 

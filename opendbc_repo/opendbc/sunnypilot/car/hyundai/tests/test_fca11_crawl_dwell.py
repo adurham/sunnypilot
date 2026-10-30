@@ -27,7 +27,7 @@ def _first_open(b, asks, v_fn, start=0, gas_fn=None):
   for i, a in enumerate(asks):
     f = start + i
     b.update(_cc(a), _CS(v_ego=v_fn(f), cam=_cam(), gas=bool(gas_fn and gas_fn(f))), f)
-    if b.braking:
+    if b.episode_open:
       return f
   return None
 
@@ -85,7 +85,7 @@ class TestCrawlDwell(unittest.TestCase):
       return 1.25 + 0.25 * f / len(asks)
     b = _brake(True)
     self.assertEqual(SLOW - 1, _first_open(b, asks, v), "opens inside the first 74-frame run (log: 15:50:37.99)")
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     # the deployed gate never opened here (74 < 100, 68 < 100, 14 < 20 at <= -0.60)
     prev = fl.FCA11_FEEL_DWELL_SLOW_FRAMES
     fl.FCA11_FEEL_DWELL_SLOW_FRAMES = 10 ** 9
@@ -101,16 +101,16 @@ class TestCrawlDwell(unittest.TestCase):
     _first_open(b, asks[:SLOW], lambda f: CRAWL)
     for i, a in enumerate(asks[SLOW:], start=SLOW):
       b.update(_cc(a), _CS(v_ego=CRAWL, cam=_cam()), i)
-      self.assertTrue(b.braking, i)
+      self.assertTrue(b.episode_open, i)
 
   def test_feel_off_has_no_crawl_escape(self):
     b = _brake(False)
     _first_open(b, [-0.40] * 150, lambda f: CRAWL)    # above -0.5: the pre-0049 law never opens, neither does the escape
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertEqual(0, b._feel_dwell_slow)
     b = _brake(False)
     _first_open(b, [-0.55] * 150, lambda f: CRAWL)     # the pre-0049 law opens at 0.2 s; the crawl counter never runs
-    self.assertTrue(b.braking)
+    self.assertTrue(b.episode_open)
     self.assertEqual(0, b._feel_dwell_slow)
 
   def test_disengage_clears_the_counter(self):
@@ -120,7 +120,7 @@ class TestCrawlDwell(unittest.TestCase):
     b.update(_cc(-0.55, long_active=False), _CS(v_ego=CRAWL, cam=_cam()), SLOW)
     self.assertEqual(0, b._feel_dwell_slow)
     self.assertIsNone(_first_open(b, [-0.55] * (SLOW - 1), lambda f: CRAWL, start=SLOW + 1))
-    self.assertFalse(b.braking)
+    self.assertFalse(b.episode_open)
     self.assertEqual(2 * SLOW, _first_open(b, [-0.55], lambda f: CRAWL, start=2 * SLOW), "a fresh 70 after re-engage")
 
   def test_feature_disable_clears_the_counter(self):
