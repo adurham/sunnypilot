@@ -629,6 +629,11 @@ class GasInterceptorCarController:
     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
     # ever LOWER gasPressed toward the truth = 0.
     CS.fca11_cal_active = bool(self.fca11_brake._cal_active)
+    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD") armed by
+    # Fca11LongBrake.on_driver_mark for 2 s. Same 1-frame pattern as the flags above: CarStateExt copies it into
+    # CarStateSP.driverMark on the NEXT frame and car_specific.py raises the alert. 0 on every frame of a drive in
+    # which the driver never marked anything.
+    CS.fca11_mark = self.fca11_brake.mark_alert_code(frame)
 
     # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.

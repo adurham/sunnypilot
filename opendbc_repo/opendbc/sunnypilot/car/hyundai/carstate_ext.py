@@ -68,6 +68,9 @@ class CarStateExt:
     self.fca11_unavailable = False
     self.fca11_camera_braking = False   # 0053: transient camera hand-back (written by the controller each frame)
     self.fca11_divergence = False       # 0053: Python <-> panda disagreement on the camera hand-back
+    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
+    # controller each frame from Fca11LongBrake.mark_alert_code and mirrored onto CarStateSP.driverMark for the alert.
+    self.fca11_mark = 0
     # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
     # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
     # ESC do below 12 km/h / at standstill". None = not published this frame.
@@ -284,6 +287,10 @@ class CarStateExt:
     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
+    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
+    # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
+    # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
+    ret_sp.driverMark = int(getattr(self, "fca11_mark", 0))
 
   # ------------------------------------------------------------------ 0034 wheel consent gesture
   def register_wheel_brake(self, brake) -> None:

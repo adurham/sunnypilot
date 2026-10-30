@@ -1,0 +1,660 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 2ba53e5875..aed26d06ed 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -210,6 +210,11 @@ class CarStateSP:
+   superviseStop: bool = auto_field()
+   stopComplete: bool = auto_field()
+   brakeNow: bool = auto_field()
++  # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
++  # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
++  # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
++  # CarStateSP.driverMark (@20).
++  driverMark: int = auto_field()
+   # 0047: CLU13 CF_Clu_FuelLevel - fuel-tank level in percent (KDMLink-validated 16-bit sender
+   # decode; see sunnypilot/car/hyundai/fuel_level.py); 0.0 = not decoded / no valid frame yet.
+   # Coupled with custom.capnp CarStateSP.
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 8d336a7139..4c2d132000 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -68,6 +68,9 @@ class CarStateExt:
+     self.fca11_unavailable = False
+     self.fca11_camera_braking = False   # 0053: transient camera hand-back (written by the controller each frame)
+     self.fca11_divergence = False       # 0053: Python <-> panda disagreement on the camera hand-back
++    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
++    # controller each frame from Fca11LongBrake.mark_alert_code and mirrored onto CarStateSP.driverMark for the alert.
++    self.fca11_mark = 0
+     # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
+     # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
+     # ESC do below 12 km/h / at standstill". None = not published this frame.
+@@ -284,6 +287,10 @@ class CarStateExt:
+     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
+     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
+     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
++    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
++    # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
++    # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
++    ret_sp.driverMark = int(getattr(self, "fca11_mark", 0))
+ 
+   # ------------------------------------------------------------------ 0034 wheel consent gesture
+   def register_wheel_brake(self, brake) -> None:
+diff --git a/opendbc/sunnypilot/car/hyundai/driver_mark.py b/opendbc/sunnypilot/car/hyundai/driver_mark.py
+new file mode 100644
+index 0000000000..25b05ef539
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/driver_mark.py
+@@ -0,0 +1,125 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++17c FEEDBACK MARKER: the driver's verdict on a felt event, typed by BOOKMARK PRESS COUNT.
++
++WHY
++The owner marks felt events with the on-screen bookmark button; what lands in the log is a bare
++``userBookmark``/``bookmarkButton`` pair with no verdict and no state, so a review has to guess what each press meant
++(route 17c: 15 presses, one of them ``19:13:21 bookmark x2`` that the review read as ONE event). The originally
++planned trigger - the steering-wheel star button - was proven to reach none of the logged CAN buses. The bookmark
++pair is the mark mechanism that does land (recorded in rlog AND qlog).
++
++THE GESTURE (PLAN-NEXT "Feedback"): 1 press = GOOD, 2 rapid presses = BAD. Every press of a burst is typed with the
++burst's verdict, the first included - the burst IS the message.
++
++TYPING IS DEFERRED, NEVER CORRECTED. An isolated press is only KNOWN isolated MARK_GAP_S later, so the record is
++written at burst close while the state snapshot is frozen AT THE PRESS (the caller buffers ``mark_snapshot()`` per
++press). Cost: a "good" record and its on-screen confirmation appear ~2.0 s after the press; a "bad" burst appears at
++the second press. Nothing is ever rewritten, so a record stream read in time order can never show a verdict flip.
++
++WHAT LIVES HERE: the pure typing state machine + the level-window statistics. No I/O, no messaging, no car state - so
++both are testable against a fake clock. The write path is one function, ``Fca11LongBrake.on_driver_mark(verdict,
++source, snapshot)``, so a future wheel-button trigger is a caller change and not a law change.
++"""
++
++# A second press within this many seconds of the previous one makes a BURST (verdict "bad").
++MARK_GAP_S = 2.0
++# The UI publishes userBookmark AND bookmarkButton per press, back to back, so one press is a PAIR of messages. A
++# message arriving this soon after the previous COUNTED press is the other half of that pair and is not a new press.
++# (The shortest meaningful second press in this lane is 1.0 s, so a 0.25 s guard cannot eat a real verdict.)
++MARK_PAIR_DEDUP_S = 0.25
++# "our own level over the last 5 s": the controller runs at 100 Hz, so 5 s is 500 frames.
++MARK_LEVEL_WINDOW_FRAMES = 500
++# the on-screen confirmation is transient: 2 s at 100 Hz.
++MARK_ALERT_FRAMES = 200
++# CarStateSP.driverMark codes
++MARK_CODE_NONE = 0
++MARK_CODE_GOOD = 1
++MARK_CODE_BAD = 2
++MARK_VERDICT_CODE = {"good": MARK_CODE_GOOD, "bad": MARK_CODE_BAD}
++
++# Every k="m" record carries exactly these keys (plus "k"/"verdict"/"source"); the tests assert the whole set.
++MARK_SNAPSHOT_FIELDS = (
++  "t_wall", "t_mono_ns", "frame", "ep",
++  "lsb_cmd", "braking", "ask_mps2", "a_ego_mps2", "v_ego_mps",
++  "standstill", "gas_pressed", "brake_pressed", "personality",
++  "clutch_tq_nm", "lead_present", "lead_drel_m", "lead_vrel_mps",
++  "engaged", "long_active", "armed",
++  "lsb_min", "lsb_max", "lsb_mean", "lsb_frames",
++)
++
++
++def level_window_stats(samples, frame_now: int, window_frames: int = MARK_LEVEL_WINDOW_FRAMES) -> dict:
++  """min/max/mean/frames of OUR OWN commanded level over the last ``window_frames`` controller frames.
++
++  ``samples`` is an iterable of ``(frame, lsb)`` for frames that actually SENT an actuating 0x38D (the same population
++  the k="b" trace records), oldest first. No samples in the window -> ``min/max/mean`` are null and ``frames`` is 0:
++  null, never 0, so "we sent nothing" can never be read as "we commanded zero".
++  """
++  lo = frame_now - window_frames
++  lv = [int(l) for f, l in samples if lo <= f <= frame_now]
++  if not lv:
++    return dict(lsb_min=None, lsb_max=None, lsb_mean=None, lsb_frames=0)
++  return dict(lsb_min=min(lv), lsb_max=max(lv), lsb_mean=round(sum(lv) / len(lv), 2), lsb_frames=len(lv))
++
++
++class MarkTyping:
++  """Press-count typing. Pure: it only ever sees a monotonic clock in ns.
++
++  ``press(t_ns)`` -> the press's sequence id, or None when the message is the other half of a PAIR (the UI publishes
++  two services per press). ``poll(t_ns)`` -> the bursts that CLOSED at this clock, as ``(seq, verdict, n_presses)``,
++  oldest first; every press of a closed burst is reported exactly once, in press order.
++  """
++
++  def __init__(self, gap_s: float = MARK_GAP_S, dedup_s: float = MARK_PAIR_DEDUP_S):
++    self._gap_ns = int(gap_s * 1e9)
++    self._dedup_ns = int(dedup_s * 1e9)
++    self._open: list[int] = []        # sequence ids of the presses in the OPEN burst
++    self._last_press_ns: int | None = None
++    self._last_counted_ns: int | None = None
++    self._seq = 0
++    self._done: list[tuple[int, str, int]] = []
++
++  @property
++  def open_presses(self) -> int:
++    return len(self._open)
++
++  def press(self, t_ns: int) -> int | None:
++    """Register one press MESSAGE. Returns the press seq id, or None if it is a duplicate half of the same press."""
++    t_ns = int(t_ns)
++    if self._last_counted_ns is not None and (t_ns - self._last_counted_ns) < self._dedup_ns:
++      return None
++    # a press further away than the gap closes the open burst first (it cannot retro-join it)
++    if self._open and self._last_press_ns is not None and (t_ns - self._last_press_ns) > self._gap_ns:
++      self._finalize()
++    seq = self._seq
++    self._seq += 1
++    self._open.append(seq)
++    self._last_press_ns = t_ns
++    self._last_counted_ns = t_ns
++    return seq
++
++  def poll(self, t_ns: int) -> list[tuple[int, str, int]]:
++    """Close the open burst if MARK_GAP_S has elapsed since its last press; return (and clear) the closed bursts."""
++    if self._open and self._last_press_ns is not None and (int(t_ns) - self._last_press_ns) > self._gap_ns:
++      self._finalize()
++    out, self._done = self._done, []
++    return out
++
++  def _finalize(self) -> None:
++    n = len(self._open)
++    if not n:
++      return
++    verdict = "bad" if n >= 2 else "good"
++    self._done.extend((seq, verdict, n) for seq in self._open)
++    self._open = []
++    self._last_press_ns = None
++
++
++def mark_source(n_presses: int) -> str:
++  """The record's ``source``: the mechanism + the burst shape the press count produced."""
++  return "bookmark_single" if n_presses <= 1 else "bookmark_double"
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index c307475d21..de586d3d32 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -54,12 +54,13 @@ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+ """
+ import os
+ import time
++from collections import deque
+ from dataclasses import dataclass
+ 
+ from opendbc.car import structs
+ from opendbc.car.hyundai.hyundaican import hyundai_checksum
+ from opendbc.car.can_definitions import CanData
+-from opendbc.sunnypilot.car.hyundai import cal_mode
++from opendbc.sunnypilot.car.hyundai import cal_mode, driver_mark
+ from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP,
+                                                    HYUNDAI_FCA11_PEDAL_STATE_OK, HYUNDAI_FCA11_CAM_BRAKE_MASK,
+                                                    HYUNDAI_FCA11_CAM_WARN_MASK, HYUNDAI_FCA11_CAM_QUIET_FRAMES)
+@@ -1502,6 +1503,16 @@ class Fca11LongBrake:
+           gas_window_hold_frames=FCA11_GAS_WINDOW_HOLD_FRAMES,
+           rolling_release_accel=FCA11_ROLLING_RELEASE_ACCEL, rolling_release_v_max=FCA11_ROLLING_RELEASE_V_MAX,
+           rolling_release_lead_m=FCA11_ROLLING_RELEASE_LEAD_M))
++    # 17c FEEDBACK (k="m"): the driver's verdict channel. Same writer discipline as the k="b" channel above - share the
++    # shadow writer when it exists, else the dynamic-release one, else open the same stream lazily on the FIRST mark
++    # (so an idle drive opens no file and writes nothing). See driver_mark.py for the gesture and the typing rules.
++    self._mark_log = None              # resolved by _mark_writer(); never a second writer on the same path
++    self._mark_alert = driver_mark.MARK_CODE_NONE   # 0 none, 1 "marked GOOD", 2 "marked BAD" (CarStateSP.driverMark)
++    self._mark_alert_until = -1        # controller frame the current confirmation expires on
++    self._lsb_hist = deque(maxlen=driver_mark.MARK_LEVEL_WINDOW_FRAMES)  # (frame, lsb) of SENT actuating frames
++    self._frame_last = 0               # last controller frame seen by update() (the record's frame reference)
++    self._ask_last = 0.0               # the planner ask consumed this frame, clipped to FCA11_A_MAX_MSS2
++    self._personality_last = 0         # raw LongitudinalPersonality of the last frame
+ 
+   # ---- 18x: the gas-facing flag ----
+ 
+@@ -2141,6 +2152,87 @@ class Fca11LongBrake:
+       self._dyn_log = None           # a broken log must never affect the law
+       return
+ 
++  # ---- 17c FEEDBACK: the driver's verdict (k="m") ----
++
++  @property
++  def frame_now(self) -> int:
++    """The last controller frame update() saw - the frame reference a driver mark is typed against."""
++    return int(self._frame_last)
++
++  def _note_sent_level(self, frame: int, lsb: int) -> None:
++    """Remember the level actually SENT this frame (the k="b" population), so a mark can report the last 5 s of our
++    own level. A bounded deque push: no I/O, no send-path read, nothing that can change a CanData byte."""
++    self._lsb_hist.append((int(frame), int(lsb)))
++
++  def _mark_writer(self):
++    """The writer for the k="m" channel: the SAME stream (fca11-shadow.jsonl) and the SAME one-writer-per-path rule as
++    the k="b" channel - share the shadow writer, else the dynamic-release one, else open our own header. Opened LAZILY
++    (first mark only) so an idle drive touches no file; None when the log dir is disabled."""
++    if self._mark_log is None:
++      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
++      self._mark_log = self.shadow_log if self.shadow_log is not None else self._dyn_log
++      if self._mark_log is None:
++        self._mark_log = fca11_shadow_log.ShadowLogger(header=dict(
++          note=("FCA11 DRIVER-MARK trace (k=m): one record per driver verdict (1 bookmark press = good, 2 rapid presses " +
++                "= bad; every press of a burst carries the burst's verdict). " +
++                "The snapshot is frozen at the PRESS instant (t_wall/t_mono_ns); the record lands when the burst closes."),
++          mark_gap_s=driver_mark.MARK_GAP_S, mark_pair_dedup_s=driver_mark.MARK_PAIR_DEDUP_S,
++          mark_level_window_frames=driver_mark.MARK_LEVEL_WINDOW_FRAMES))
++    return self._mark_log
++
++  def mark_snapshot(self, CS, now_nanos: int, frame: int | None = None,
++                    engaged: bool = False, long_active: bool = False) -> dict:
++    """Freeze the state a driver mark is about, AT THE PRESS. Nothing here is invented: every field is what the law and
++    the car layer hold on this frame. Lead fields follow the k="f" trace convention (vRel = vLead - vEgo, negative =
++    closing; absent lead => lead_present False and every lead value null, never 0)."""
++    f = self.frame_now if frame is None else int(frame)
++    lead = getattr(CS, "fca11_lead_one", None)
++    rec = dict(
++      t_wall=time.time(), t_mono_ns=int(now_nanos), frame=f, ep=int(self._sh_episode_id),
++      # our commanded level: the last level that went ON THE WIRE (the panda's reference), and whether we are actuating
++      lsb_cmd=int(self._dec_last_sent), braking=bool(self._actuating),
++      ask_mps2=round(float(self._ask_last), 4),
++      a_ego_mps2=float(getattr(CS.out, "aEgo", 0.0) or 0.0), v_ego_mps=float(CS.out.vEgo),
++      standstill=bool(getattr(CS.out, "standstill", False)),
++      gas_pressed=bool(CS.out.gasPressed), brake_pressed=bool(CS.out.brakePressed),
++      personality=int(self._personality_last),
++      clutch_tq_nm=getattr(CS, "fca11_clutch_tq_nm", None),
++      lead_present=lead is not None,
++      lead_drel_m=getattr(CS, "fca11_lead_drel_m", None) if lead is not None else None,
++      lead_vrel_mps=getattr(CS, "fca11_lead_vrel_mps", None) if lead is not None else None,
++      engaged=bool(engaged), long_active=bool(long_active), armed=bool(self.enabled),
++    )
++    rec.update(driver_mark.level_window_stats(list(self._lsb_hist), f))
++    return rec
++
++  def on_driver_mark(self, verdict: str, source: str, snapshot: dict) -> dict:
++    """THE write path for a driver verdict. One function, so a future wheel-button (or any other) trigger is a caller
++    change and never a law change.
++
++    Writes one k="m" record (schema 2) into the FCA11 shadow stream and arms the transient on-screen confirmation. Inert
++    when the log dir is disabled (no record, no exception) - but the CONFIRMATION is independent of logging: the owner
++    must still see that his press landed. A broken log can never take card down (the writer swallows OSErrors; the
++    record build is wrapped here).
++    """
++    code = driver_mark.MARK_VERDICT_CODE.get(verdict, driver_mark.MARK_CODE_NONE)
++    # arm the confirmation first: it must never depend on the log succeeding
++    self._mark_alert = code
++    self._mark_alert_until = self.frame_now + driver_mark.MARK_ALERT_FRAMES
++    rec = dict(snapshot, k="m", verdict=verdict, source=source)
++    try:
++      w = self._mark_writer()
++      if w is not None:
++        w.write(rec)
++        w.flush()   # a mark is a driver event, not a 50 Hz stream: it must survive an abrupt end of drive
++    except Exception:  # a broken mark log must never affect the law or card
++      self._mark_log = None
++    return rec
++
++  def mark_alert_code(self, frame: int) -> int:
++    """CarStateSP.driverMark for this frame: the confirmation code while its 2 s window is open, else 0. Read by
++    GasInterceptorCarController.create_gas_command and surfaced by the superproject (car_specific -> events)."""
++    return int(self._mark_alert) if int(frame) < self._mark_alert_until else driver_mark.MARK_CODE_NONE
++
+   def _feel_update_band(self, v_kph: float, CS) -> bool:
+     """0049: update + return the hold-band latch (ENTER <= FCA11_FEEL_HOLD_BAND_KPH or standstill; EXIT >= EXIT_KPH)."""
+     if bool(getattr(CS.out, "standstill", False)) or v_kph <= FCA11_FEEL_HOLD_BAND_KPH:
+@@ -2258,6 +2350,11 @@ class Fca11LongBrake:
+   # ---- 0045 SHADOW: V3 computed post-send + logged, never sent ----
+ 
+   def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
++    # 17c FEEDBACK: latch the frame-local facts a driver mark may be typed against later in the same step (the press is
++    # seen in card's carState phase, the snapshot must describe THIS frame). Three assignments, no effect on the law.
++    self._frame_last = int(frame)
++    self._ask_last = float(min(float(CC.actuators.accel), FCA11_A_MAX_MSS2))
++    self._personality_last = int(personality)
+     sends = self._update_law(CC, CS, frame, personality)
+     if self.shadow:   # 0045 SEAM: capture the V3 inputs only; V3 runs in v3_post_send() AFTER the send, never on the wire
+       self._v3_pending = (float(CC.actuators.accel), bool(CC.enabled), bool(CC.longActive), CS, int(frame), personality, tuple(sends))
+@@ -2864,6 +2961,7 @@ class Fca11LongBrake:
+       # 18x (d): the level-on-the-wire trace (no-op unless the dynamic release is ON).
+       if frame % FCA11_SEND_EVERY == 0:
+         self._log_dyn_send(CS, frame, dec_cmd, accel, v_kph_now)
++        self._note_sent_level(frame, dec_cmd)   # 17c FEEDBACK: the 5 s level window a driver mark reads back
+     else:
+       # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
+       # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
+@@ -2905,6 +3003,7 @@ class Fca11LongBrake:
+           sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
+           self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
+           self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
++          self._note_sent_level(frame, ramp)  # 17c FEEDBACK: a SENT ramp frame is part of the 5 s level window too
+         self._actuating = True
+         self._in_rel_ramp = True
+         self._sent_this_episode = True
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 99e14b3425..1e20ac5f86 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -629,6 +629,11 @@ class GasInterceptorCarController:
+     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
+     # ever LOWER gasPressed toward the truth = 0.
+     CS.fca11_cal_active = bool(self.fca11_brake._cal_active)
++    # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD") armed by
++    # Fca11LongBrake.on_driver_mark for 2 s. Same 1-frame pattern as the flags above: CarStateExt copies it into
++    # CarStateSP.driverMark on the NEXT frame and car_specific.py raises the alert. 0 on every frame of a drive in
++    # which the driver never marked anything.
++    CS.fca11_mark = self.fca11_brake.mark_alert_code(frame)
+ 
+     # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
+     # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
+new file mode 100644
+index 0000000000..d77fa0cd0d
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
+@@ -0,0 +1,314 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++17c FEEDBACK marker (k="m") unit tests - car layer.
++
++Covers, per BRIEF-FEEDBACK-marker.md:
++  * the pure typing state machine (1 press -> good; 2 presses <= 2.0 s -> BOTH bad; 2 presses 5 s apart -> two goods;
++    the UI's per-press PAIR of messages counts ONCE; a burst of 3 is all bad);
++  * the 5 s level window (null, never 0, when nothing was sent);
++  * the record: EVERY field of a k="m" line asserted from a synthetic CS, plus lead/clutch pass-through;
++  * logging disabled -> no record, no file, no exception (and the confirmation still arms);
++  * the 2 s confirmation code window;
++  * NO mark -> no k="m" at all (negative control) and no file created (idle = no I/O);
++  * marks fired mid-drive do not change a single CanData byte of the law's output.
++"""
++import json
++import os
++import shutil
++import tempfile
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import driver_mark as dm
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++
++S = 1_000_000_000
++
++
++def _real_camera_frame(dec=0, alive=5):
++  b = bytearray(8)
++
++  def setb(start, length, val):
++    for i in range(length):
++      pos = start + i
++      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++  setb(0, 1, 1)          # prefill
++  setb(3, 2, 3)          # warn = 3 (no warning)
++  setb(8, 8, dec)        # CR_VSM_DecCmd
++  setb(18, 2, 2)         # FCA_Status
++  setb(23, 4, alive)     # CR_FCA_Alive
++  return bytes(b)
++
++
++class _CS:
++  """Minimal CarState double: the attributes the law reads, plus the ones a mark snapshots."""
++
++  def __init__(self, v_ego=20.0, a_ego=0.0, brake=False, gas=False, standstill=False, cam=None,
++               lead_m=None, lead_vrel=None, clutch_tq=None, lead_one=None):
++    self.out = structs.CarState()
++    self.out.vEgo = v_ego
++    self.out.aEgo = a_ego
++    self.out.gearShifter = structs.CarState.GearShifter.drive
++    self.out.brakePressed = brake
++    self.out.gasPressed = gas
++    self.out.standstill = standstill
++    self.interceptor_state = 0
++    self.interceptor_fault_seen = False
++    self.fca11_cam_frame = cam
++    self.fca11_now_nanos = 0
++    self.fca11_lead_closing = False
++    self.fca11_wheel_min_kph = None
++    self.fca11_echoes = []
++    self.fca11_clutch_tq_nm = clutch_tq
++    if lead_m is not None or lead_one is not None:
++      self.fca11_lead_drel_m = lead_m
++      self.fca11_lead_vrel_mps = lead_vrel
++      self.fca11_lead_one = lead_one if lead_one is not None else object()
++
++
++def _cc(accel=0.0, enabled=True, long_active=True):
++  cc = structs.CarControl()
++  cc.enabled = enabled
++  cc.longActive = long_active
++  cc.actuators.accel = accel
++  return cc
++
++
++def _cp_sp(fca11=True, pedal=True, dyn=False):
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = fca11
++  cp_sp.enableGasInterceptor = pedal
++  cp_sp.fca11DynamicRelease = dyn
++  return cp_sp
++
++
++class TestMarkTyping(unittest.TestCase):
++  """The gesture, on a fake clock. Pure - no car, no log."""
++
++  def _burst(self, times_s):
++    t = dm.MarkTyping()
++    seqs = [t.press(int(x * S)) for x in times_s]
++    return t, seqs
++
++  def test_single_press_is_good_only_after_the_gap(self):
++    t, seqs = self._burst([10.0])
++    self.assertEqual(1, seqs[0] is not None and t.open_presses)
++    self.assertEqual([], t.poll(int(11.9 * S)), "a press is never typed before the window closes")
++    self.assertEqual([(0, "good", 1)], t.poll(int(12.05 * S)))
++
++  def test_double_press_is_bad_including_the_first(self):
++    t, _ = self._burst([10.0, 11.0])
++    self.assertEqual([], t.poll(int(11.5 * S)))
++    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(13.1 * S)))
++
++  def test_two_presses_five_seconds_apart_are_two_goods(self):
++    t, _ = self._burst([10.0, 15.0])
++    out = []
++    out += t.poll(int(12.1 * S))
++    out += t.poll(int(17.1 * S))
++    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
++
++  def test_the_ui_pair_counts_once(self):
++    # the UI publishes userBookmark AND bookmarkButton per press, back to back
++    t, seqs = self._burst([10.0, 10.002])
++    self.assertIsNotNone(seqs[0])
++    self.assertIsNone(seqs[1], "the other half of the same press must not become a second press")
++    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
++
++  def test_burst_of_three_is_all_bad(self):
++    t, _ = self._burst([10.0, 11.0, 12.0])
++    self.assertEqual([(0, "bad", 3), (1, "bad", 3), (2, "bad", 3)], t.poll(int(14.1 * S)))
++
++  def test_a_later_press_closes_the_previous_burst_immediately(self):
++    t, _ = self._burst([10.0, 20.0])   # press 2 arrives while burst 1 is still open (poll was never called)
++    out = t.poll(int(22.1 * S))
++    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
++
++  def test_boundary_just_inside_the_gap_is_a_burst(self):
++    t, _ = self._burst([10.0, 11.99])
++    self.assertEqual("bad", t.poll(int(14.1 * S))[0][1])
++
++  def test_boundary_just_outside_the_gap_is_two_marks(self):
++    t, _ = self._burst([10.0, 12.01])
++    self.assertEqual([(0, "good", 1), (1, "good", 1)], t.poll(int(14.1 * S)))
++
++  def test_source_names(self):
++    self.assertEqual("bookmark_single", dm.mark_source(1))
++    self.assertEqual("bookmark_double", dm.mark_source(2))
++    self.assertEqual("bookmark_double", dm.mark_source(3))
++
++
++class TestLevelWindow(unittest.TestCase):
++  def test_window_stats(self):
++    samples = [(100, 4), (200, 8), (400, 2), (900, 30)]
++    st = dm.level_window_stats(samples, 600)     # window = frames 100..600 (frame 900 is NEWER than frame_now)
++    self.assertEqual(dict(lsb_min=2, lsb_max=8, lsb_mean=round(14 / 3, 2), lsb_frames=3), st)
++    st = dm.level_window_stats([], 600)
++    self.assertEqual(dict(lsb_min=None, lsb_max=None, lsb_mean=None, lsb_frames=0), st,
++                     "no sent frame in the window -> null, never 0")
++
++
++class TestMarkRecord(unittest.TestCase):
++  def setUp(self):
++    self.dir = tempfile.mkdtemp(prefix="fca11mark-")
++    self._env = os.environ.get("FCA11_LOG_DIR")
++    os.environ["FCA11_LOG_DIR"] = self.dir
++    self.brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++
++  def tearDown(self):
++    if self._env is None:
++      os.environ.pop("FCA11_LOG_DIR", None)
++    else:
++      os.environ["FCA11_LOG_DIR"] = self._env
++    shutil.rmtree(self.dir, ignore_errors=True)
++
++  def _records(self):
++    p = os.path.join(self.dir, "fca11-shadow.jsonl")
++    if not os.path.exists(p):
++      return []
++    with open(p) as f:
++      return [json.loads(line) for line in f if line.strip()]
++
++  def test_every_snapshot_field_is_populated(self):
++    cs = _CS(v_ego=12.5, a_ego=-0.42, gas=False, brake=False, clutch_tq=37.5,
++             lead_m=24.0, lead_vrel=-1.75)
++    snap = self.brake.mark_snapshot(cs, now_nanos=123_456_789, frame=4242, engaged=True, long_active=True)
++    self.assertEqual(set(dm.MARK_SNAPSHOT_FIELDS), set(snap))
++    self.assertEqual(4242, snap["frame"])
++    self.assertEqual(123456789, snap["t_mono_ns"])
++    self.assertAlmostEqual(12.5, snap["v_ego_mps"])
++    self.assertAlmostEqual(-0.42, snap["a_ego_mps2"])
++    self.assertFalse(snap["gas_pressed"])
++    self.assertFalse(snap["brake_pressed"])
++    self.assertFalse(snap["standstill"])
++    self.assertAlmostEqual(37.5, snap["clutch_tq_nm"])
++    self.assertTrue(snap["lead_present"])
++    self.assertAlmostEqual(24.0, snap["lead_drel_m"])
++    self.assertAlmostEqual(-1.75, snap["lead_vrel_mps"])
++    self.assertTrue(snap["engaged"])
++    self.assertTrue(snap["long_active"])
++    self.assertTrue(snap["armed"])
++    self.assertEqual(0, snap["lsb_cmd"])
++    self.assertFalse(snap["braking"])
++    self.assertEqual(0, snap["lsb_frames"])
++    self.assertIsNone(snap["lsb_min"])
++    self.assertIsNone(snap["lsb_max"])
++    self.assertIsNone(snap["lsb_mean"])
++    self.assertIsInstance(snap["t_wall"], float)
++
++  def test_no_lead_means_null_never_zero(self):
++    snap = self.brake.mark_snapshot(_CS(), now_nanos=1, frame=1)
++    self.assertFalse(snap["lead_present"])
++    self.assertIsNone(snap["lead_drel_m"])
++    self.assertIsNone(snap["lead_vrel_mps"])
++
++  def test_asked_and_personality_come_from_the_frame_the_law_saw(self):
++    self.brake.update(_cc(-1.5), _CS(cam=(0, _real_camera_frame())), 7, personality=2)   # 2 = relaxed (raw)
++    snap = self.brake.mark_snapshot(_CS(), now_nanos=1)
++    self.assertEqual(7, snap["frame"], "frame defaults to the last controller frame")
++    self.assertAlmostEqual(-1.5, snap["ask_mps2"])
++    self.assertEqual(2, snap["personality"])
++
++  def test_record_lands_in_the_shared_stream_with_every_field(self):
++    snap = self.brake.mark_snapshot(_CS(), now_nanos=5, frame=9, engaged=True, long_active=False)
++    rec = self.brake.on_driver_mark("good", "bookmark_single", snap)
++    on_disk = [r for r in self._records() if r["k"] == "m"]
++    self.assertEqual(1, len(on_disk))
++    self.assertEqual(on_disk[0], json.loads(json.dumps(rec)))
++    self.assertEqual({"k", "verdict", "source", "schema"} | set(dm.MARK_SNAPSHOT_FIELDS), set(on_disk[0]))
++    self.assertEqual("good", on_disk[0]["verdict"])
++    self.assertEqual("bookmark_single", on_disk[0]["source"])
++    self.assertEqual(2, on_disk[0]["schema"])
++
++  def test_level_window_is_wired_to_the_send_path(self):
++    # drive real actuating frames: the level the law puts on the wire must reach the mark's 5 s window
++    cs = _CS(cam=(0, _real_camera_frame()))
++    for f in range(0, 60, 2):
++      self.brake.update(_cc(-2.0), cs, f)
++    self.assertTrue(self.brake._lsb_hist, "a sent frame must be remembered")
++    snap = self.brake.mark_snapshot(cs, now_nanos=1, frame=58)
++    self.assertGreater(snap["lsb_frames"], 0)
++    self.assertGreater(snap["lsb_max"], 0)
++    self.assertEqual(int(self.brake._dec_last_sent), snap["lsb_cmd"])
++    self.assertTrue(snap["braking"])
++
++  def test_share_the_writer_never_two(self):
++    # the dynamic-release channel opens the stream first; the mark must ride the SAME writer (one header, one file)
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=True))
++    self.assertIsNotNone(brake._dyn_log)
++    brake.update(_cc(-2.0), _CS(cam=(0, _real_camera_frame())), 0)
++    brake.on_driver_mark("bad", "bookmark_double", brake.mark_snapshot(_CS(), now_nanos=1, frame=2))
++    recs = self._records()
++    self.assertEqual(1, len([r for r in recs if r["k"] == "hdr"]), "one writer per path: never a second header")
++    self.assertEqual(1, len([r for r in recs if r["k"] == "m"]))
++
++
++class TestInert(unittest.TestCase):
++  def setUp(self):
++    self.dir = tempfile.mkdtemp(prefix="fca11mark-off-")
++    self._env = os.environ.get("FCA11_LOG_DIR")
++
++  def tearDown(self):
++    if self._env is None:
++      os.environ.pop("FCA11_LOG_DIR", None)
++    else:
++      os.environ["FCA11_LOG_DIR"] = self._env
++    shutil.rmtree(self.dir, ignore_errors=True)
++
++  def test_logging_disabled_no_record_no_exception_but_the_confirmation_still_arms(self):
++    os.environ["FCA11_LOG_DIR"] = "0"
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = brake.on_driver_mark("bad", "bookmark_double", brake.mark_snapshot(_CS(), now_nanos=1, frame=3))
++    self.assertEqual("bad", rec["verdict"], "the record is still built (the caller can log it), it just is not written")
++    self.assertEqual(dm.MARK_CODE_BAD, brake.mark_alert_code(3), "the owner must still SEE that the mark landed")
++
++  def test_negative_control_no_mark_no_record_and_no_file(self):
++    os.environ["FCA11_LOG_DIR"] = self.dir
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    cs = _CS(cam=(0, _real_camera_frame()))
++    for f in range(300):
++      brake.update(_cc(-2.0 if f < 150 else 0.0), cs, f)
++    self.assertFalse(os.path.exists(os.path.join(self.dir, "fca11-shadow.jsonl")),
++                     "no shadow channel, no dynamic channel and no mark -> card must not open the mark stream at all")
++    # the pre-existing episode logger (fca11_log, not this lane) may write its own file; nothing may carry a mark
++    for name in os.listdir(self.dir):
++      with open(os.path.join(self.dir, name)) as fh:
++        self.assertNotIn('"k":"m"', fh.read(), f"no k=m record may exist in {name}")
++    self.assertEqual(dm.MARK_CODE_NONE, brake.mark_alert_code(299), "an idle drive raises no confirmation")
++
++  def test_marks_never_change_a_byte_of_the_law_output(self):
++    os.environ["FCA11_LOG_DIR"] = "0"   # keep the log out of the comparison
++    asks = [-2.0, -1.8, -1.2, -0.9, -0.6, -0.4, -0.2, 0.0, 0.5, -3.0] * 12
++    plain = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    marked = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    a, b = [], []
++    for f, ask in enumerate(asks):
++      cs = _CS(v_ego=18.0 - 0.02 * f, cam=(0, _real_camera_frame(dec=0)))
++      a.append([(int(s.address), bytes(s.dat)) for s in plain.update(_cc(ask), cs, f)])
++      if f % 10 == 0:   # mark in the middle of the drive, as the driver would
++        marked.on_driver_mark("bad", "bookmark_double", marked.mark_snapshot(cs, now_nanos=f, frame=f, engaged=True))
++      b.append([(int(s.address), bytes(s.dat)) for s in marked.update(_cc(ask), cs, f)])
++    self.assertEqual(a, b, "a mark must not touch a single CanData byte of the law's output")
++
++
++class TestAlertWindow(unittest.TestCase):
++  def test_confirmation_is_2s_then_silent(self):
++    os.environ["FCA11_LOG_DIR"] = "0"
++    try:
++      brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++      brake.update(_cc(), _CS(), 1000)
++      brake.on_driver_mark("good", "bookmark_single", brake.mark_snapshot(_CS(), now_nanos=1))
++      self.assertEqual(dm.MARK_CODE_GOOD, brake.mark_alert_code(1000))
++      self.assertEqual(dm.MARK_CODE_GOOD, brake.mark_alert_code(1000 + dm.MARK_ALERT_FRAMES - 1))
++      self.assertEqual(dm.MARK_CODE_NONE, brake.mark_alert_code(1000 + dm.MARK_ALERT_FRAMES))
++      self.assertEqual(200, dm.MARK_ALERT_FRAMES, "2 s at the 100 Hz controller rate")
++    finally:
++      os.environ.pop("FCA11_LOG_DIR", None)
++
++
++if __name__ == "__main__":
++  unittest.main()

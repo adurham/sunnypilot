@@ -210,6 +210,11 @@ class CarStateSP:
   superviseStop: bool = auto_field()
   stopComplete: bool = auto_field()
   brakeNow: bool = auto_field()
+  # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
+  # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
+  # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
+  # CarStateSP.driverMark (@20).
+  driverMark: int = auto_field()
   # 0047: CLU13 CF_Clu_FuelLevel - fuel-tank level in percent (KDMLink-validated 16-bit sender
   # decode; see sunnypilot/car/hyundai/fuel_level.py); 0.0 = not decoded / no valid frame yet.
   # Coupled with custom.capnp CarStateSP.
