@@ -55,10 +55,11 @@ class _CS:
 
 
 class _SM:
-  """Just the two things the hook touches: sm.updated[...] and sm['carControl']."""
+  """The three things the hook touches: sm.updated[...], sm.logMonoTime[...] and sm['carControl']."""
 
   def __init__(self):
     self.updated = dict.fromkeys(("userBookmark", "bookmarkButton", "carControl"), False)
+    self.logMonoTime = dict.fromkeys(("userBookmark", "bookmarkButton"), 0)
     self._cc = SimpleNamespace(enabled=True, longActive=True)
 
   def __getitem__(self, name):
@@ -95,12 +96,18 @@ class TestDriverMarkHook(unittest.TestCase):
 
   # ---- helpers ----------------------------------------------------------------------------------------------
   def _frame(self, dt_s=0.01, press=False, second_service=False, ask=0.0):
-    """One card tick: optional press message(s), then the hook step. The law is ticked like controls_update would."""
+    """One card tick: optional press message(s), then the hook step. The law is ticked like controls_update would.
+
+    Both halves of a pair land in ONE tick here, i.e. with the same logMonoTime - the tie case. On the car the two
+    messages are ~0.1 ms apart and the order is the signature; a tie therefore reads as the swipe (GOOD), never as BAD.
+    """
     self.t += int(dt_s * S)
     frame = self.t // int(0.01 * S)
     self.law.update(_cc(ask), self.cs, frame)
     self.sm.updated["userBookmark"] = bool(press)
     self.sm.updated["bookmarkButton"] = bool(press and second_service)
+    self.sm.logMonoTime["userBookmark"] = self.t
+    self.sm.logMonoTime["bookmarkButton"] = self.t
     self.hook.step(self.sm, self.CI, self.cs, self.t)
     self.sm.updated["userBookmark"] = self.sm.updated["bookmarkButton"] = False
     return frame
@@ -138,6 +145,8 @@ class TestDriverMarkHook(unittest.TestCase):
     self.assertEqual(2, self.hook.presses)
 
   def test_two_presses_five_seconds_apart_are_two_goods(self):
+    # five seconds is > 2.5x MARK_GAP_S, i.e. unambiguously outside the burst window (real press gaps are far wider)
+    self.assertGreater(5.0, 2 * dm.MARK_GAP_S, "the spacing below is not a burst by any reading of the constant")
     self._frame(press=True)
     for _ in range(500):
       self._frame()
@@ -148,6 +157,131 @@ class TestDriverMarkHook(unittest.TestCase):
     self.assertEqual(2, len(marks))
     self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
     self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  # ---- the route-181 measurements: 4 messages per press, sub-ms inside, >=49.79 s between, ~1.0 s = the bad gesture --
+  def _tick(self, dt_s=0.01, services=(), ask=0.0):
+    """One card tick with exactly these services ``updated`` (each message gets its own tick, so the real sub-ms
+    spacing between the four messages of ONE press can be reproduced - ``_frame`` can only do a whole press at once).
+    """
+    self.t += int(round(dt_s * S))
+    frame = self.t // int(0.01 * S)
+    self.law.update(_cc(ask), self.cs, frame)
+    for name in services:
+      self.sm.updated[name] = True
+      self.sm.logMonoTime[name] = self.t      # each message carries its own publish time: that is the order the hook reads
+    self.hook.step(self.sm, self.CI, self.cs, self.t)
+    for name in services:
+      self.sm.updated[name] = False
+    return frame
+
+  def _press_of_four_messages(self, order):
+    """One press as the car logs it: 4 messages, 0.05 ms and 0.106 ms apart, in the given service order
+    (rlog and qlog duplicate each service, so BOTH orders occur on a real drive)."""
+    g = 0.000106
+    self._tick(services=(order[0],))
+    self._tick(dt_s=0.00005, services=(order[1],))
+    self._tick(dt_s=g, services=(order[2],))
+    self._tick(dt_s=g, services=(order[3],))
+    for _ in range(210):
+      self._tick()
+    return self._marks()
+
+  def test_four_messages_bookmarkbutton_first_is_one_good_record(self):
+    # the SWIPE's order (upstream's): button half first. Four messages because rlog+qlog each carry the pair.
+    marks = self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    self.assertEqual(1, self.hook.presses, "four messages, ONE press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_four_messages_userbookmark_first_is_the_two_finger_tap(self):
+    # the TAP's order (this fork's): bookmark half first is a bookmark, bookmark FIRST is the mark. Same four messages.
+    marks = self._press_of_four_messages(("userBookmark", "bookmarkButton", "userBookmark", "bookmarkButton"))
+    self.assertEqual(1, self.hook.presses, "still ONE press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("bad", marks[0]["verdict"])
+    self.assertEqual(dm.MARK_SOURCE_TOUCH2, marks[0]["source"])
+
+  def test_the_real_bad_gesture_is_two_bad_records_and_a_bad_confirmation(self):
+    # the owner's intended "negative": two presses ~1.0 s apart. Both must be BAD, and the confirmation the owner sees
+    # must be the BAD one (a GOOD confirmation here would tell him the opposite of what he meant).
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(99):
+      self._tick()
+    self._tick(services=("bookmarkButton",))                     # +1.00 s
+    self._tick(dt_s=0.000106, services=("userBookmark",))
+    self.assertEqual([], self._marks(), "nothing is typed while the burst is still open")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks), "every press of the burst is recorded")
+    self.assertEqual(["bad", "bad"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double", "bookmark_double"], [m["source"] for m in marks])
+    self.assertEqual(2, self.hook.presses, "two presses, not four messages")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last), "the confirmation is the BAD one")
+
+  def test_presses_49_79s_apart_are_two_good_records(self):
+    # the closest two DISTINCT presses on route 181: 49.79 s. Far outside MARK_GAP_S -> two separate good verdicts.
+    self.assertGreater(49.79, dm.MARK_GAP_S * 20, "the spacing below is not a burst by any reading of the constant")
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(4980):                                      # 49.8 s of card frames
+      self._tick()
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(210):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  def test_burst_of_three_one_second_apart_is_three_bad_records(self):
+    # 3+ presses: the fastest honest rule is that the burst IS the message, so EVERY press of it is typed bad. If the
+    # implementation ever types anything else here, this test is the thing that says so.
+    for _ in range(3):
+      self._tick(services=("bookmarkButton",))
+      self._tick(dt_s=0.00005, services=("userBookmark",))
+      for _ in range(99):
+        self._tick()
+    self.assertEqual([], self._marks(), "one burst: nothing is typed until it closes")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(3, len(marks))
+    self.assertEqual(["bad"] * 3, [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double"] * 3, [m["source"] for m in marks])
+    self.assertEqual(3, self.hook.presses)
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last))
+
+  def test_disabled_log_dir_press_writes_nothing_and_raises_nothing(self):
+    os.environ["FCA11_LOG_DIR"] = "0"
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "logging disabled -> no record")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last), "the owner must still SEE that it landed")
+
+  def test_unwritable_log_dir_press_writes_nothing_and_raises_nothing(self):
+    # "no log dir" reached the way a bad path reaches it: the configured dir's parent is a FILE, so the writer cannot
+    # open at all. The press path must swallow it - a log must never take card down.
+    blocker = os.path.join(self.dir, "not-a-dir")
+    with open(blocker, "w") as f:
+      f.write("")
+    os.environ["FCA11_LOG_DIR"] = os.path.join(blocker, "fca11-log")
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "a writer that cannot open writes nothing")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last))
+    self.assertFalse(os.path.exists(os.path.join(blocker, "fca11-log")))
 
   def test_the_ui_pair_is_one_press(self):
     self._frame(press=True, second_service=True)     # userBookmark + bookmarkButton, same tick
@@ -255,3 +389,65 @@ class TestCarSpecificRaises(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTwoFingerTapThroughTheHook(TestDriverMarkHook):
+  """The BAD gesture end to end: the UI publishes the pair in the REVERSED order (layout `_on_bad_mark`: userBookmark
+  first), and the hook must write a BAD k="m" record with source "touch2" and arm the BAD confirmation - no second press,
+  no 2 s wait."""
+
+  def _tap(self, dt_s=0.01):
+    """One two-finger tap as it reaches card: the reversed pair, ~0.1 ms apart."""
+    self._tick(dt_s, services=("userBookmark",))
+    self._tick(0.000106, services=("bookmarkButton",))
+
+  def test_a_reversed_pair_is_a_bad_record_within_a_quarter_second(self):
+    frame = self._tick(services=("userBookmark",))
+    self._tick(0.000106, services=("bookmarkButton",))
+    self.assertEqual([], self._marks(), "not before its own press window closes")
+    for _ in range(30):                      # 0.3 s: past the 0.25 s window, far short of MARK_GAP_S (2.0 s)
+      frame = self._tick()
+    marks = self._marks()
+    self.assertEqual(1, len(marks), "one gesture, one record")
+    self.assertEqual("bad", marks[0]["verdict"])
+    self.assertEqual(dm.MARK_SOURCE_TOUCH2, marks[0]["source"])
+    self.assertEqual(1, self.hook.presses, "one press, and not half of a pair")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(frame), "the confirmation the owner sees is the BAD one")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, dm.MARK_GAP_S,
+                    "the tap must be typed on its own window, not by the bookmark burst window")
+
+  def test_a_tap_needs_no_second_press(self):
+    self._tap()
+    for _ in range(240):                     # 2.4 s: well past MARK_GAP_S, so a burst would have been decided by now
+      self._tick()
+    self.assertEqual(1, len(self._marks()), "exactly one record, and nothing waiting on a second press")
+
+  def test_a_lone_half_through_the_hook_is_a_good_record(self):
+    # a dropped message must never invent a BAD verdict: one half alone stays a bookmark press
+    self._tick(services=("userBookmark",))
+    for _ in range(240):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(1, len(marks))
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_a_tap_does_not_make_a_neighbouring_swipe_bad(self):
+    self._tap()                                          # the tap
+    for _ in range(100):                                 # +1.0 s
+      self._tick()
+    self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})
+
+  def test_a_swipe_then_a_tap_is_still_good_then_bad(self):
+    self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    self._tap()                                          # the tap, ~2.1 s after the swipe
+    for _ in range(240):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})

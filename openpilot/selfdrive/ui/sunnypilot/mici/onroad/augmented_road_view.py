@@ -15,16 +15,19 @@ It must be visually invisible and must not interfere with anything the base view
 pending: the prompt widget processes no touch events at all when hidden (it is set not-visible), and
 on release it is guarded exactly like the bookmark swipe (``augmented_road_view.py:182-184``).
 """
-import pyray as rl
 
 from openpilot.selfdrive.ui.mici.onroad.augmented_road_view import AugmentedRoadView
+from openpilot.selfdrive.ui.sunnypilot.mici.onroad.bookmark_icon import BookmarkIconSP
 from openpilot.selfdrive.ui.sunnypilot.mici.onroad.cal_consent_widget import CalConsentWidget
 from openpilot.selfdrive.ui.ui_state import ui_state
 
 
 class AugmentedRoadViewSP(AugmentedRoadView):
-  def __init__(self, bookmark_callback=None, *args, **kwargs):
-    super().__init__(bookmark_callback, *args, **kwargs)
+  def __init__(self, bookmark_callback=None, bad_mark_callback=None, *args, **kwargs):
+    super().__init__(bookmark_callback, bad_mark_callback, *args, **kwargs)
+    # fork (17c FEEDBACK): swap in the bookmark icon that also knows the two-finger BAD tap. The upstream class and its
+    # swipe are untouched - this is the same subclass-swap pattern the consent widget uses.
+    self._bookmark_icon = BookmarkIconSP(bookmark_callback, bad_mark_callback)
     self._cal_consent = CalConsentWidget()
     # Only take part in rendering / touch when a rep is genuinely pending (or briefly, "firing...").
     self._cal_consent.set_visible(lambda: self._cal_consent.is_prompting())

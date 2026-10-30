@@ -2173,9 +2173,12 @@ class Fca11LongBrake:
       self._mark_log = self.shadow_log if self.shadow_log is not None else self._dyn_log
       if self._mark_log is None:
         self._mark_log = fca11_shadow_log.ShadowLogger(header=dict(
-          note=("FCA11 DRIVER-MARK trace (k=m): one record per driver verdict (1 bookmark press = good, 2 rapid presses " +
-                "= bad; every press of a burst carries the burst's verdict). " +
-                "The snapshot is frozen at the PRESS instant (t_wall/t_mono_ns); the record lands when the burst closes."),
+          note=("FCA11 DRIVER-MARK trace (k=m): one record per driver verdict, by SOURCE. GOOD = the bookmark swipe "
+                "(the UI's pair, button half first); a SECOND press within mark_gap_s also reads bad, the original "
+                "burst convention kept on top of the swipe. BAD = a TWO-FINGER TAP (source touch2), one action, sent as "
+                "the same pair in the REVERSED order (userBookmark first) and typed immediately. " +
+                "The snapshot is frozen at the PRESS instant (t_wall/t_mono_ns); a swipe's record lands when the burst "
+                "closes, a tap's as soon as its press window closes."),
           mark_gap_s=driver_mark.MARK_GAP_S, mark_pair_dedup_s=driver_mark.MARK_PAIR_DEDUP_S,
           mark_level_window_frames=driver_mark.MARK_LEVEL_WINDOW_FRAMES))
     return self._mark_log

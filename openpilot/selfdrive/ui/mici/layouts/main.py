@@ -36,7 +36,9 @@ class MiciMainLayout(Scroller):
     self._home_layout = MiciHomeLayout()
     self._alerts_layout = MiciOffroadAlerts()
     self._settings_layout = SettingsLayout()
-    self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked)
+    # fork (0014): the second callback is the 17c FEEDBACK "marked BAD" gesture (a two-finger tap on the road view).
+    self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked,
+                                               bad_mark_callback=self._on_bad_mark)
     self._body_onroad_layout = BodyLayout()
 
     # Initialize widget rects
@@ -152,6 +154,17 @@ class MiciMainLayout(Scroller):
 
   def _on_bookmark_clicked(self):
     for service in ('bookmarkButton', 'userBookmark'):
+      msg = messaging.new_message(service, valid=True)
+      self._pm.send(service, msg)
+
+  def _on_bad_mark(self):
+    # fork (0014, 17c FEEDBACK): the driver's BAD gesture (two-finger tap on the road view) publishes the SAME pair the
+    # bookmark swipe does, in the REVERSED ORDER (`userBookmark` first; upstream's `_on_bookmark_clicked` always sends
+    # `bookmarkButton` first). That order IS the signature - no new service, no new param, no new process - and the mark
+    # hook, which reads each message's own logMonoTime, types "userBookmark first" as BAD while the swipe's order stays
+    # GOOD. Order rather than message count on purpose: card's SubMaster coalesces several messages of one service inside
+    # a cycle, so a count is not observable there. A dropped half stays a bookmark press, never an invented BAD verdict.
+    for service in ('userBookmark', 'bookmarkButton'):
       msg = messaging.new_message(service, valid=True)
       self._pm.send(service, msg)
 

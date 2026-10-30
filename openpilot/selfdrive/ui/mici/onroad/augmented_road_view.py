@@ -157,9 +157,16 @@ class BookmarkIcon(Widget):
 
 
 class AugmentedRoadView(CameraView):
-  def __init__(self, bookmark_callback=None, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_NARROW_ROAD):
+  # fork (0014, 17c FEEDBACK): bad_mark_callback is the second, single-action gesture ("marked BAD" = a two-finger tap).
+  # The base class only CARRIES it - the gesture itself lives in the fork-local BookmarkIconSP the sunnypilot on-road
+  # view installs (openpilot/selfdrive/ui/sunnypilot/mici/onroad/bookmark_icon.py), so an unswapped base view behaves
+  # exactly as upstream: no callback, no gesture, and the bookmark swipe unchanged. Keyword-safe: every caller in the
+  # tree passes its arguments by name.
+  def __init__(self, bookmark_callback=None, bad_mark_callback=None,
+               stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_NARROW_ROAD):
     super().__init__("camerad", stream_type)
     self._bookmark_callback = bookmark_callback
+    self._bad_mark_callback = bad_mark_callback
     self._set_placeholder_color(rl.BLACK)
 
     self.device_camera: DeviceCameraConfig | None = None

@@ -17,8 +17,11 @@ publication, so the trigger is two extra subscription names here and nothing new
 service, no new param.
 
 HOW IT RUNS (every card frame, 100 Hz, before state_publish)
-1. a press message (either service) -> MarkTyping.press(), which drops the other half of the pair (0.25 s guard) and
-   returns a sequence id for a REAL press;
+0. WHICH GESTURE: the bookmark swipe publishes the two services back to back (one bookmark press); the two-finger tap
+   publishes ``bookmarkButton`` alone (see openpilot/sunnypilot/fork/mark_gesture.py). The typing rules read that
+   difference, so the hook only has to forward the service name;
+1. a press message (either service) -> MarkTyping.press(service), which drops the other half of the pair (0.25 s guard)
+   and returns a sequence id for a REAL press;
 2. the snapshot for that press is frozen immediately (`law.mark_snapshot`) and buffered - it must describe the PRESS,
    not the moment the verdict is known;
 3. MarkTyping.poll() closes a burst once 2.0 s pass with no further press and returns (seq, verdict, n_presses); the
@@ -30,8 +33,9 @@ confirmation appear ~2 s after the press, and no record is ever rewritten.
 """
 from opendbc.sunnypilot.car.hyundai import driver_mark
 
-# the pair the UI publishes per press (either one alone is a press; together they are ONE press)
-MARK_SERVICES = ("userBookmark", "bookmarkButton")
+# the services the UI can publish per press (together they are ONE bookmark press; bookmarkButton ALONE is the
+# two-finger tap). The canonical tuple lives with the typing rules so the UI adapter and this hook cannot drift apart.
+MARK_SERVICES = driver_mark.MARK_SERVICES
 
 
 def law_of(CI):
@@ -52,17 +56,26 @@ class DriverMarkHook:
     law = law_of(CI)
     if law is None:
       return   # no law object -> nothing owns a k="m" writer and every snapshot field would be meaningless
-    if sm.updated[MARK_SERVICES[0]] or sm.updated[MARK_SERVICES[1]]:
-      seq = self._typing.press(int(now_nanos))
+    # Both halves are fed in, each with its OWN publish time (logMonoTime) rather than the frame clock: which half came
+    # first is what separates the two-finger tap (userBookmark first) from the bookmark swipe (bookmarkButton first), and
+    # card's SubMaster can hand both over in one cycle. The state snapshot below still uses now_nanos - it must describe
+    # the state at the press, and a sub-millisecond difference in the press clock does not change that.
+    # Reversed (button half first) on purpose: the typing keeps the EARLIEST timestamp as the press's first service, so
+    # the order here only decides a tie - two messages published inside the same nanosecond, effectively impossible, and
+    # if it ever happened the swipe's own order (GOOD) is the safe reading rather than an invented BAD verdict.
+    for service in reversed(MARK_SERVICES):
+      if not sm.updated[service]:
+        continue
+      seq = self._typing.press(int(sm.logMonoTime[service]), service)
       if seq is not None:
         self.presses += 1
         cc = sm["carControl"]
         # frozen AT THE PRESS: the driver is marking what he just felt, not what the car will be doing 2 s later
         self._snaps[seq] = law.mark_snapshot(CS, int(now_nanos), engaged=bool(cc.enabled),
                                             long_active=bool(cc.longActive))
-    for seq, verdict, n_presses in self._typing.poll(int(now_nanos)):
+    for seq, verdict, _n_presses, source in self._typing.poll(int(now_nanos)):
       snap = self._snaps.pop(seq, None)
       if snap is None:
         continue
-      law.on_driver_mark(verdict, driver_mark.mark_source(n_presses), snap)
+      law.on_driver_mark(verdict, source, snap)
       self.marks += 1

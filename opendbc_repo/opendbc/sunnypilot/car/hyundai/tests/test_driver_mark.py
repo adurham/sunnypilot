@@ -28,6 +28,16 @@ from opendbc.sunnypilot.car.hyundai import fca11_long as fl
 
 S = 1_000_000_000
 
+# ---- the numbers MEASURED on the car (route 181: 7 known presses, read from BOTH the rlog and the qlog) -------------
+# One press publishes FOUR messages - userBookmark x2 + bookmarkButton x2, the duplication being rlog+qlog - and the
+# largest gap WITHIN one press was 0.106 ms. The smallest gap between two DISTINCT presses on that drive was 49.79 s.
+# The owner's intended "bad" gesture is two presses about 1.0 s apart. These are observations, not invented bounds:
+# they are what makes the 0.25 s pair guard safe (0.25 s / 0.106 ms ~= 2360x margin) and they are pinned below so that
+# a later tweak to the guard cannot silently swallow the gesture it exists to keep.
+REAL_INTRA_PRESS_GAP_S = 0.000106
+REAL_MIN_INTER_PRESS_GAP_S = 49.79
+REAL_BAD_GESTURE_S = 1.0
+
 
 def _real_camera_frame(dec=0, alive=5):
   b = bytearray(8)
@@ -98,35 +108,35 @@ class TestMarkTyping(unittest.TestCase):
     t, seqs = self._burst([10.0])
     self.assertEqual(1, seqs[0] is not None and t.open_presses)
     self.assertEqual([], t.poll(int(11.9 * S)), "a press is never typed before the window closes")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.05 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.05 * S)))
 
   def test_double_press_is_bad_including_the_first(self):
     t, _ = self._burst([10.0, 11.0])
     self.assertEqual([], t.poll(int(11.5 * S)))
-    self.assertEqual([(0, "bad", 2), (1, "bad", 2)], t.poll(int(13.1 * S)))
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(13.1 * S)))
 
   def test_two_presses_five_seconds_apart_are_two_goods(self):
     t, _ = self._burst([10.0, 15.0])
     out = []
     out += t.poll(int(12.1 * S))
     out += t.poll(int(17.1 * S))
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
 
   def test_the_ui_pair_counts_once(self):
     # the UI publishes userBookmark AND bookmarkButton per press, back to back
     t, seqs = self._burst([10.0, 10.002])
     self.assertIsNotNone(seqs[0])
     self.assertIsNone(seqs[1], "the other half of the same press must not become a second press")
-    self.assertEqual([(0, "good", 1)], t.poll(int(12.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
 
   def test_burst_of_three_is_all_bad(self):
     t, _ = self._burst([10.0, 11.0, 12.0])
-    self.assertEqual([(0, "bad", 3), (1, "bad", 3), (2, "bad", 3)], t.poll(int(14.1 * S)))
+    self.assertEqual([(0, "bad", 3, "bookmark_double"), (1, "bad", 3, "bookmark_double"), (2, "bad", 3, "bookmark_double")], t.poll(int(14.1 * S)))
 
   def test_a_later_press_closes_the_previous_burst_immediately(self):
     t, _ = self._burst([10.0, 20.0])   # press 2 arrives while burst 1 is still open (poll was never called)
     out = t.poll(int(22.1 * S))
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], out)
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
 
   def test_boundary_just_inside_the_gap_is_a_burst(self):
     t, _ = self._burst([10.0, 11.99])
@@ -134,12 +144,82 @@ class TestMarkTyping(unittest.TestCase):
 
   def test_boundary_just_outside_the_gap_is_two_marks(self):
     t, _ = self._burst([10.0, 12.01])
-    self.assertEqual([(0, "good", 1), (1, "good", 1)], t.poll(int(14.1 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], t.poll(int(14.1 * S)))
 
   def test_source_names(self):
     self.assertEqual("bookmark_single", dm.mark_source(1))
     self.assertEqual("bookmark_double", dm.mark_source(2))
     self.assertEqual("bookmark_double", dm.mark_source(3))
+
+
+class TestRealPressSpacing(unittest.TestCase):
+  """The route-181 measurements, typed through the pure state machine.
+
+  The service NAME never reaches ``MarkTyping`` (both services land in the same ``press()`` call), so the four messages
+  of one press are pinned here as a TIME pattern; the rlog/qlog message order is pinned in the glue file, where the
+  two services are actually distinguished.
+  """
+
+  def _msgs(self, t0_s, offsets_s):
+    """Feed one message per offset (in nanoseconds, exactly as ``int(x * 1e9)`` would truncate on the car)."""
+    t = dm.MarkTyping()
+    return t, [t.press(int(round((t0_s + o) * S))) for o in offsets_s]
+
+  def test_four_messages_of_one_press_collapse_to_one_press(self):
+    # route 181: one press = 4 messages, the largest measured gap inside it 0.106 ms
+    g = REAL_INTRA_PRESS_GAP_S
+    t, seqs = self._msgs(10.0, [0.0, 0.00005, 0.00005 + g, 0.00005 + 2 * g])
+    self.assertEqual(1, sum(s is not None for s in seqs), "the four messages are ONE press, not four")
+    self.assertEqual(1, t.open_presses)
+    self.assertEqual([], t.poll(int(12.0 * S)), "still inside the burst window: nothing typed yet")
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
+
+  def test_pair_guard_collapses_one_millisecond(self):
+    t, seqs = self._msgs(10.0, [0.0, 0.001])
+    self.assertIsNotNone(seqs[0])
+    self.assertIsNone(seqs[1], "1 ms is the same press")
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(12.1 * S)))
+
+  def test_pair_guard_does_not_collapse_a_quarter_second(self):
+    # at exactly the guard value the comparison is strict (<), so the message IS a new press - the boundary is
+    # asserted rather than implied: a future widening of MARK_PAIR_DEDUP_S has to argue with this test.
+    t, seqs = self._msgs(10.0, [0.0, dm.MARK_PAIR_DEDUP_S])
+    self.assertIsNotNone(seqs[1], "0.25 s apart is a NEW press, not the other half of a pair")
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(12.5 * S)),
+                     "and a real second press 0.25 s later is a burst, not two marks")
+
+  def test_the_guard_is_far_below_the_slowest_message_and_the_fastest_real_press(self):
+    self.assertGreater(dm.MARK_PAIR_DEDUP_S / REAL_INTRA_PRESS_GAP_S, 2000,
+                       "0.25 s vs the measured 0.106 ms intra-press gap: ~2360x, the measured margin")
+    self.assertGreaterEqual(REAL_BAD_GESTURE_S / dm.MARK_PAIR_DEDUP_S, 4.0,
+                            "the owner's 1.0 s bad gesture must stay >=4x clear of the guard")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, REAL_MIN_INTER_PRESS_GAP_S,
+                    "and so must the closest two distinct presses ever measured")
+
+  def test_the_typing_constants_are_pinned(self):
+    self.assertEqual(2.0, dm.MARK_GAP_S, "the burst window is 2.0 s; changing it is a gesture change")
+    self.assertEqual(0.25, dm.MARK_PAIR_DEDUP_S, "the pair guard is 0.25 s; changing it is a gesture change")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, dm.MARK_GAP_S)
+
+  def test_the_real_bad_gesture_is_two_bad_presses(self):
+    # the owner's intended "negative": two presses ~1.0 s apart
+    t, seqs = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S])
+    self.assertEqual([0, 1], [s for s in seqs if s is not None])
+    self.assertEqual([(0, "bad", 2, "bookmark_double"), (1, "bad", 2, "bookmark_double")], t.poll(int(13.1 * S)),
+                     "every press of the burst is typed bad, the first included")
+
+  def test_presses_forty_nine_seconds_apart_are_two_goods(self):
+    # the closest two distinct presses on route 181 - far outside MARK_GAP_S, so two separate verdicts
+    t, _ = self._msgs(10.0, [0.0, REAL_MIN_INTER_PRESS_GAP_S])
+    out = t.poll(int(12.1 * S))
+    out += t.poll(int((10.0 + REAL_MIN_INTER_PRESS_GAP_S + 2.1) * S))
+    self.assertEqual([(0, "good", 1, "bookmark_single"), (1, "good", 1, "bookmark_single")], out)
+
+  def test_burst_of_three_one_second_apart_is_all_bad(self):
+    # the fastest honest rule for 3+ presses: the burst IS the message, so every press of it is typed bad.
+    t, _ = self._msgs(10.0, [0.0, REAL_BAD_GESTURE_S, 2 * REAL_BAD_GESTURE_S])
+    self.assertEqual([], t.poll(int(13.9 * S)))
+    self.assertEqual([(0, "bad", 3, "bookmark_double"), (1, "bad", 3, "bookmark_double"), (2, "bad", 3, "bookmark_double")], t.poll(int(14.1 * S)))
 
 
 class TestLevelWindow(unittest.TestCase):
@@ -295,6 +375,40 @@ class TestInert(unittest.TestCase):
     self.assertEqual(a, b, "a mark must not touch a single CanData byte of the law's output")
 
 
+class TestWriterUnavailable(unittest.TestCase):
+  """A mark whose writer cannot exist must still be inert: no record, no exception, confirmation unaffected."""
+
+  def setUp(self):
+    self._env = os.environ.get("FCA11_LOG_DIR")
+    self.tmp = tempfile.mkdtemp(prefix="fca11mark-nowrite-")
+
+  def tearDown(self):
+    if self._env is None:
+      os.environ.pop("FCA11_LOG_DIR", None)
+    else:
+      os.environ["FCA11_LOG_DIR"] = self._env
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_uncreatable_log_dir_raises_nothing_and_writes_nothing(self):
+    # "no log dir": the parent of the configured dir is a FILE, so ShadowLogger's makedirs fails with ENOTDIR and the
+    # writer stays disabled - the same inertness as FCA11_LOG_DIR="0", reached the way a bad path reaches it.
+    blocker = os.path.join(self.tmp, "not-a-dir")
+    with open(blocker, "w") as f:
+      f.write("")
+    unwritable = os.path.join(blocker, "fca11-log")
+    os.environ["FCA11_LOG_DIR"] = unwritable
+    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    snap = brake.mark_snapshot(_CS(), now_nanos=1, frame=7)
+    rec = brake.on_driver_mark("good", "bookmark_single", snap)
+    self.assertEqual("good", rec["verdict"], "the record is still built for the caller")
+    self.assertEqual(dm.MARK_CODE_GOOD, brake.mark_alert_code(7), "the confirmation never depends on the writer")
+    self.assertFalse(os.path.exists(unwritable), "nothing may be created")
+    self.assertFalse(os.path.exists(os.path.join(unwritable, "fca11-shadow.jsonl")))
+    # and a second mark on the dead writer is still inert
+    brake.on_driver_mark("bad", "bookmark_double", brake.mark_snapshot(_CS(), now_nanos=2, frame=9))
+    self.assertEqual(dm.MARK_CODE_BAD, brake.mark_alert_code(9))
+
+
 class TestAlertWindow(unittest.TestCase):
   def test_confirmation_is_2s_then_silent(self):
     os.environ["FCA11_LOG_DIR"] = "0"
@@ -312,3 +426,113 @@ class TestAlertWindow(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+class TestTwoFingerTap(unittest.TestCase):
+  """The BAD gesture the owner can actually make while driving: a TWO-FINGER TAP = the pair with `userBookmark` FIRST.
+
+  The bookmark swipe publishes the pair `bookmarkButton` first (upstream's order); the tap publishes the same pair in the
+  REVERSED order (the layout's `_on_bad_mark`). That order is the signature, and everything below is about it - plus the
+  one action property: no counting, no second press, no waiting.
+  """
+
+  @staticmethod
+  def _swipe(t, at_s, gap_ns=100):
+    """The GOOD gesture as the typing sees it: the pair with the button half first (upstream's order)."""
+    t.press(int(at_s * S), "bookmarkButton")
+    t.press(int(at_s * S) + gap_ns, "userBookmark")
+
+  @staticmethod
+  def _tap(t, at_s, gap_ns=100):
+    """The BAD gesture as the typing sees it: the pair with `userBookmark` first (the reverse)."""
+    t.press(int(at_s * S), "userBookmark")
+    t.press(int(at_s * S) + gap_ns, "bookmarkButton")
+
+  def test_a_tap_is_bad_immediately_and_says_so(self):
+    t = dm.MarkTyping()
+    self._tap(t, 10.0)
+    self.assertEqual([], t.poll(int(10.2 * S)), "still inside the press window")
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(10.3 * S)),
+                     "typed as soon as its own press window closes - not after MARK_GAP_S")
+
+  def test_a_tap_needs_no_second_action(self):
+    t = dm.MarkTyping()
+    self._tap(t, 10.0)
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(10.3 * S)))
+    self.assertEqual([], t.poll(int(12.5 * S)), "nothing else is typed afterwards")
+
+  def test_the_swipe_order_is_never_a_tap(self):
+    t = dm.MarkTyping()
+    self._swipe(t, 10.0)
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.0 * S)))
+
+  def test_a_lone_half_is_a_bookmark_press_not_a_tap(self):
+    # a dropped message must never invent a BAD verdict the driver did not make: one half = a bookmark press (good)
+    for service in ("userBookmark", "bookmarkButton"):
+      with self.subTest(service=service):
+        t = dm.MarkTyping()
+        t.press(int(10.0 * S), service)
+        self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.0 * S)))
+
+  def test_a_tap_and_a_swipe_do_not_contaminate_each_other(self):
+    t = dm.MarkTyping()
+    self._tap(t, 10.0)
+    self._swipe(t, 11.0)
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(11.3 * S)))
+    self.assertEqual([(1, "good", 1, "bookmark_single")], t.poll(int(13.2 * S)))
+
+  def test_a_swipe_and_a_tap_do_not_contaminate_each_other(self):
+    t = dm.MarkTyping()
+    self._swipe(t, 10.0)
+    self._tap(t, 11.0)
+    self.assertEqual([(1, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t.poll(int(11.3 * S)))
+    self.assertEqual([(0, "good", 1, "bookmark_single")], t.poll(int(13.2 * S)))
+
+  def test_a_tap_never_joins_an_open_burst(self):
+    t = dm.MarkTyping()
+    self._swipe(t, 10.0)
+    self._tap(t, 10.5)                       # inside MARK_GAP_S of the swipe
+    self.assertEqual([(1, "bad", 1, dm.MARK_SOURCE_TOUCH2), (0, "good", 1, "bookmark_single")],
+                     t.poll(int(13.0 * S)),
+                     "the tap is its own record; it neither joins the burst nor makes the swipe bad")
+
+  def test_the_message_order_is_what_decides(self):
+    # the same two services, the two orders, two verdicts - and the earliest message wins whatever order the caller uses
+    t_a = dm.MarkTyping()
+    t_a.press(int(10.0 * S) + 100, "bookmarkButton")          # offered in reverse call order...
+    t_a.press(int(10.0 * S), "userBookmark")                  # ...but userBookmark is genuinely EARLIER
+    self.assertEqual([(0, "bad", 1, dm.MARK_SOURCE_TOUCH2)], t_a.poll(int(13.0 * S)))
+
+  def test_the_tap_source_is_its_own_name(self):
+    self.assertEqual("touch2", dm.MARK_SOURCE_TOUCH2)
+    self.assertNotIn(dm.MARK_SOURCE_TOUCH2, (dm.mark_source(1), dm.mark_source(2)),
+                     "the record must never confuse the two-finger tap with a bookmark press")
+
+  def test_the_services_are_the_ui_pair(self):
+    self.assertEqual(("userBookmark", "bookmarkButton"), dm.MARK_SERVICES,
+                     "MARK_SERVICES[0] is the tap's first half: changing this order flips every verdict")
+
+  def test_an_unknown_service_is_refused(self):
+    with self.assertRaises(ValueError):
+      dm.MarkTyping().press(int(10.0 * S), "bookmark")
+
+
+class TestStreamHeader(TestMarkRecord):
+  """The k="m" stream's own header note is what a later review reads to know what a press MEANT - so it is pinned here.
+
+  It went stale once already: after the gesture changed, the header still described the press-count convention only,
+  which is exactly the kind of record that makes a review mis-read the data it is looking at.
+  """
+
+  def test_the_header_names_both_gestures_and_the_sources(self):
+    # the first RECORD opens the stream and writes the header (the writer is lazy: an idle drive touches no file)
+    cs = _CS(v_ego=12.5, a_ego=-0.42, gas=False, brake=False, clutch_tq=37.5, lead_m=24.0, lead_vrel=-1.75)
+    snap = self.brake.mark_snapshot(cs, now_nanos=123_456_789, frame=4242, engaged=True, long_active=True)
+    self.brake.on_driver_mark("bad", dm.MARK_SOURCE_TOUCH2, snap)
+    hdr = [r for r in self._records() if r.get("k") == "hdr"]
+    self.assertEqual(1, len(hdr), "the header is written once, when the stream opens")
+    note = hdr[0]["note"]
+    self.assertIn("TWO-FINGER", note, "the header must describe the BAD gesture the driver actually makes")
+    self.assertIn(dm.MARK_SOURCE_TOUCH2, note)
+    self.assertIn("swipe", note.lower(), "and the GOOD one")
+    self.assertEqual(dm.MARK_GAP_S, hdr[0]["mark_gap_s"])
+    self.assertEqual(dm.MARK_PAIR_DEDUP_S, hdr[0]["mark_pair_dedup_s"])
