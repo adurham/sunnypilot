@@ -3899,18 +3899,24 @@ class Test18xRollingReleaseHold(unittest.TestCase):
     self.assertEqual(80, self._episode(lead_m=10.0, v=1.5, ease_to=-0.05)[0])
 
   def test_crawl_level_is_never_in_the_half_applied_band(self):
-    """1-5 LSB at crawl is the state the clutch-torque measurement shows with the creep torque live. An open crawl
-    episode must command >= FCA11_CRAWL_MIN_LSB on every sent frame (after the panda's +RATE_STEP onset ramp)."""
+    """1-6 LSB at crawl is the state the clutch-torque measurement shows with the creep torque live. An open crawl
+    episode must command >= the LITERAL 7 on every sent frame (after the panda's +RATE_STEP onset ramp).
+
+    Pinned to the literal on purpose (gate review M4): asserting ``>= fl.FCA11_CRAWL_MIN_LSB`` pins nothing - setting the
+    constant to 1 left this test green. 7 is the owner's call: at 6 the measured clutch reads exactly 0.0 Nm (the
+    open/closed boundary sample); at 7 it reads -20 Nm, i.e. unambiguously open."""
+    self.assertEqual(7, fl.FCA11_CRAWL_MIN_LSB, "the owner's crawl floor is 7 LSB, not 6")
     b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
     levels = []
     for f in range(160):
       ask = -2.0 if f < 80 else -0.30
       cs = _CS(v_ego=1.5, cam=_cam(), lead_m=10.0)
       b.update(_cc(ask), cs, f)
-      if b.episode_open and f >= 22:      # the first two sent frames are the panda's onset ramp (4, then 6)
+      if b.episode_open and f >= 22:      # the first sent frames are the panda's +RATE_STEP onset ramp
         levels.append(b._dec_last_sent)
     self.assertTrue(levels)
-    self.assertGreaterEqual(min(levels), fl.FCA11_CRAWL_MIN_LSB, "no 1-5 LSB frame at crawl")
+    self.assertGreaterEqual(min(levels), 7, "no 1-6 LSB frame at crawl (literal, not the constant)")
+    self.assertIn(7, levels, "the crawl floor IS 7 (the level the measurement shows with the clutch open)")
     self.assertLessEqual(max(levels), fl.HYUNDAI_FCA11_LONG_MAX_DEC)
 
   def test_a_crawl_release_stays_released_for_the_holdoff(self):
@@ -3929,6 +3935,34 @@ class Test18xRollingReleaseHold(unittest.TestCase):
     # a HARD ask ignores the hold-off
     b.update(_cc(-2.0), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), 71 + fl.FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES)
     self.assertTrue(b.episode_open)
+
+  def test_a_crawl_release_holdoff_delays_a_06_reask_by_exactly_its_frames(self):
+    """M6 (gate review §8): the sibling test re-asks at -0.30, which is ABOVE the -0.10 crawl release threshold and can
+    therefore never re-open the brake - with the hold-off's arming dead it stayed green. A -0.60 ask IS an onset ask
+    (the coast-first open threshold), so it re-opens the moment the onset debounce has run: without the hold-off at
+    release + FCA11_ONSET_HOLD_FRAMES (20; measured on the above-crawl control below), with it at exactly
+    release + FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES (50)."""
+    def reopen(v_release):
+      b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+      for f in range(70):
+        b.update(_cc(-2.0), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), f)
+      self.assertTrue(b.episode_open)
+      b.update(_cc(-0.05), _CS(v_ego=v_release, cam=_cam(), lead_m=10.0), 70)   # genuine roll-free -> release
+      self.assertFalse(b.episode_open)
+      for f in range(71, 181):
+        b.update(_cc(-0.60), _CS(v_ego=1.5, cam=_cam(), lead_m=10.0), f)
+        if b.episode_open:
+          return f
+      return None
+
+    # CONTROL: the same -0.60 re-ask after a release ABOVE the crawl band (the arming never fires) re-opens as soon as
+    # the onset debounce allows: 20 frames. That is what the hold-off has to delay, not a -0.30 ask that never re-opens.
+    self.assertEqual(90, reopen(v_release=12.0), "control: a -0.60 re-ask re-opens at release + ONSET_HOLD_FRAMES")
+    self.assertEqual(70 + fl.FCA11_ONSET_HOLD_FRAMES, reopen(v_release=12.0))
+    # ... and after a CRAWL release it is held off for exactly the configured window: 70 + 50 = 120.
+    self.assertEqual(50, fl.FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES)
+    self.assertEqual(120, reopen(v_release=1.0), "the crawl hold-off must delay the -0.60 re-open to release + 50")
+    self.assertEqual(70 + fl.FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES, reopen(v_release=1.0))
 
   def test_every_safety_veto_still_releases_on_the_same_frame_with_a_lead(self):
     """The rolling rule only moves the THRESHOLD. Every veto (ok == False) must still cut on the frame it fires, exactly
@@ -3997,11 +4031,13 @@ class Test18xGasWindow(unittest.TestCase):
     self.assertGreater(_decs([x for x in []]), []) if False else None
     held = [f for f, d, eo, br in seq if br]
     self.assertIn(rel - 1, held, "the frame before the release is the last actuating one")
-    # ... and `braking` (what gas_interceptor.py reads) stays True through 10 frames = 100 ms of them, then drops
-    for k in range(fl.FCA11_GAS_WINDOW_HOLD_FRAMES):
-      self.assertTrue(dict((f, br) for f, d, eo, br in seq)[rel + k], f"gas must be 0 at frame {rel + k}")
-    self.assertFalse(dict((f, br) for f, d, eo, br in seq)[rel + fl.FCA11_GAS_WINDOW_HOLD_FRAMES],
-                     "the window must END after 100 ms (no stuck pedal inhibit)")
+    # ... and `braking` (what gas_interceptor.py reads) stays True through 10 frames = 100 ms of them, then drops.
+    # The loop bound is the LITERAL 10, not FCA11_GAS_WINDOW_HOLD_FRAMES: looping over the constant is vacuous at 0
+    # (gate review M3: `FCA11_GAS_WINDOW_HOLD_FRAMES = 0` left this test green).
+    by_frame = dict((f, br) for f, d, eo, br in seq)
+    for k in range(10):
+      self.assertTrue(by_frame[rel + k], f"gas must be 0 at frame {rel + k} (100 Hz: 10 frames = 100 ms)")
+    self.assertFalse(by_frame[rel + 10], "the window must END after 100 ms (no stuck pedal inhibit)")
     self.assertFalse(b.braking)
 
   def test_the_gas_window_adds_no_brake_frame(self):
@@ -4248,6 +4284,63 @@ class Test18xDynamicRelease(unittest.TestCase):
     self.assertEqual(1, passive, "exactly one passive hand-back frame per episode, as deployed")
     self.assertFalse(b.episode_open)
     self.assertFalse(b.braking)
+
+  # *** D1 / D2: the two gate-review defects in the interrupted-ramp corner (param ON only) ***
+  def _interrupted(self, ramp_frames, after_crawl=14, end=220):
+    """The reviewer's 100 Hz repro shape: a hard ask (-2.0, 16 LSB at the standard tier) at 15 m/s, a SOFT release so the
+    ramp opens, a re-ask, and an ease again. ``ramp_frames`` = how many ramp frames precede the re-ask. The re-ask is
+    taken at 0.5 m/s (the hold band), which is where the band law legitimately drops the wire in one frame - that is what
+    makes a stale accumulator sit ABOVE the wire."""
+    rows = [(f, -2.0, 15.0) for f in range(100)]
+    rows += [(f, 0.5, 15.0) for f in range(100, 100 + ramp_frames)]
+    rows += [(f, -0.4, 0.5) for f in range(100 + ramp_frames, 100 + ramp_frames + after_crawl)]
+    rows += [(f, 0.5, 0.5) for f in range(100 + ramp_frames + after_crawl, end)]
+    b = self._brake(True)
+    sent = []
+    for f, ask, v in rows:
+      for s in b.update(_cc(ask), _CS(v_ego=v, cam=_cam()), f):
+        sent.append((f, fl._get_bits(s.dat, 8, 8)))
+    return b, sent
+
+  def test_a_reask_after_a_nonsend_ramp_frame_cannot_drop_the_level(self):
+    """D1 (gate review §5): the +RATE_STEP reference must stay on the last level actually SENT through a release ramp.
+    It used to be zeroed on every non-actuating frame, so a re-ask landing on the SEND slot right after a NON-send ramp
+    frame was capped at 0 + RATE_STEP: the reviewer saw 22 -> 4 on the wire in one sent frame (~1.8 m/s^2 of brake gone
+    mid-episode), here 16 -> 4 (~0.55 m/s^2). It directly contradicted the ramp branch's own "cannot jump" note."""
+    b = self._brake(True)
+    sent = []
+    for f in range(130):
+      ask = -2.0 if f < 101 else (0.5 if f == 101 else -0.4)
+      for s in b.update(_cc(ask), _CS(v_ego=15.0, cam=_cam()), f):
+        sent.append((f, fl._get_bits(s.dat, 8, 8)))
+    held = dict(sent)
+    self.assertEqual(16, held[100], "the scenario's held level (standard tier, a -2.0 ask)")
+    self.assertEqual([], [d for f, d in sent if f == 101], "101 is a NON-send ramp frame (the trap)")
+    self.assertTrue(b.episode_open, "the ramp keeps the episode open, so the re-ask is not a new episode")
+    # THE DEFECT: the first sent frame after the re-ask fell 16 -> 4. Now it continues from the wire.
+    self.assertGreaterEqual(held[102], 15, f"the re-ask frame fell to {held[102]} LSB")
+    drops = [(a, c) for (fa, a), (fc, c) in zip(sent, sent[1:]) if c < a]
+    self.assertLessEqual(max(a - c for a, c in drops), fl.FCA11_DYN_DECREASE_MAX_DROP_LSB,
+                         f"no single sent frame may fall by more than the release limit: {drops}")
+
+  def test_a_reask_cannot_release_from_a_stale_accumulator(self):
+    """D2 (gate review §5): a re-ask must not leave the release ramp's accumulator behind. It was cleared only in
+    _feel_reset, which is skipped while the episode stays open, so the NEXT release continued from it - emitting a level
+    ABOVE the wire on a release frame, where the normal-episode +RATE_STEP cap does not apply. Measured here before the
+    fix: wire 8 -> 14 at the first ramp frame (+6 over the panda's gate), 14 14 14 13 13 13 refused, i.e. >= 3 consecutive
+    refusals = FCA11_REFUSED_STREAK_CUT -> a spurious _refused_cut / fca11Unavailable with real re-asks refused meanwhile.
+    Checked from every ramp depth, and against the panda's own rise gate on every sent frame."""
+    for ramp_frames in (1, 4, 8):
+      b, sent = self._interrupted(ramp_frames)
+      self.assertTrue(sent)
+      rises = [(fa, a, fc, c) for (fa, a), (fc, c) in zip(sent, sent[1:]) if c > a + fl.HYUNDAI_FCA11_LONG_RATE_STEP]
+      self.assertEqual([], rises, f"no sent frame may exceed the previous one by more than +RATE_STEP ({ramp_frames} ramp frames)")
+      # the scenario must actually exercise the corner: the crawl re-ask dropped the wire below the ramp's own level...
+      levels = [d for f, d in sent]
+      self.assertLess(min(levels), 10, f"the hold band must have dropped the wire ({levels})")
+      # ... and the release that follows it must start from THAT wire level, not from the stale accumulator.
+      last = sent[-1][1]
+      self.assertEqual(0, last, "the ramp still has to walk all the way to 0")
 
   def test_level_trace_writes_level_and_measured_aego_per_sent_frame(self):
     d = tempfile.mkdtemp()

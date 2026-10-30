@@ -181,6 +181,15 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
   if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11AffineGain")) and not shadow:   # 0045: Shadow wire = OLD-LAW
     CP_SP.fca11AffineGain = True
 
+  # 18x: the DYNAMIC-RELEASE build (HyundaiFca11DynamicRelease, PERSISTENT BOOL, default "0" = OFF): gentle 1 LSB onset,
+  # a per-sent-frame decrease limit, a soft release ramp and the k="b" level trace. Written HERE because the car layer
+  # only READS getattr(CP_SP, "fca11DynamicRelease", False) - without this writer the key was a no-op in every build
+  # (the 0043/0044 class the reachability guard exists for). Same truthy parser, same dependency: the dynamic release
+  # shapes FCA11 braking, so it is inert without HyundaiFca11Brake. OFF (the default, and every CP_SP built by an older
+  # libparams) = the deployed law plus only the three UNCONDITIONAL 18x rules. Next ignition to take effect.
+  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicRelease")) and not shadow:
+    CP_SP.fca11DynamicRelease = True
+
 
 def _param_truthy(raw) -> bool:
   """The fork's BOOL-param truthiness, EXACTLY the 0018 HyundaiFca11Brake expression (factored out by 0044 so the two

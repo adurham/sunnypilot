@@ -819,6 +819,7 @@ FCA11_ROLLING_RELEASE_ACCEL = -0.10       # m/s^2: the exit threshold in that re
 # foot off the pedals):
 #   our LSB = 0     537 frames (47 %)  clutch torque +26.0 Nm, rpm 935, v ~1.00 m/s   <- the engine's creep torque is live
 #   our LSB = 6-7   161 frames         clutch torque -20.0 Nm, v 1.38 m/s            <- the clutch is OPEN, creep torque gone
+#   (that bin hides the per-level boundary - the owner's decision is therefore 7, not 6, see FCA11_CRAWL_MIN_LSB)
 #   our LSB = 8-10  319 frames         clutch torque -20.0 Nm, v 0.57 m/s
 #   our LSB = 11-20 129 frames         clutch torque -20.0 Nm, v 0.07 m/s
 #   the driver's own light brake at crawl (6078 frames): +13.0 Nm, v 0.64 m/s
@@ -833,12 +834,12 @@ FCA11_ROLLING_RELEASE_ACCEL = -0.10       # m/s^2: the exit threshold in that re
 #   (1) A STOP IN PROGRESS IS NEVER RELEASED: while an episode is open below the crawl speed, the exit threshold is
 #       FCA11_CRAWL_RELEASE_ACCEL (-0.10, the same one the rolling rule uses) - the law does not go to the 0 LSB state
 #       while the planner is still asking for a decel and the car is still rolling.
-#   (2) NO HALF-APPLIED LEVEL: an open episode at crawl commands at least FCA11_CRAWL_MIN_LSB (6 LSB - the measured
-#       clutch-open level). The 4 LSB floor of the deployed law sits exactly in the half-applied band, which is why it
-#       never closed the clutch. 1-5 LSB is never commanded at crawl.
+#   (2) NO HALF-APPLIED LEVEL: an open episode at crawl commands at least FCA11_CRAWL_MIN_LSB (7 LSB - the first level at
+#       which the measured clutch is unambiguously open). The 4 LSB floor of the deployed law sits exactly in the
+#       half-applied band, which is why it never closed the clutch. 1-6 LSB is never commanded at crawl.
 #   (3) A GENUINE ROLL-FREE STAYS FREE: if the ask rises above -0.10 (the planner genuinely wants to move), the episode is
 #       released at 0 and a FCA11_CRAWL_RELEASE_HOLDOFF_S window keeps it released, so the law cannot chatter back into a
-#       6 LSB re-application two frames later. A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) ignores the hold-off, so a real
+#       7 LSB re-application two frames later. A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) ignores the hold-off, so a real
 #       stop is never delayed.
 # SAFETY: every `ok` veto still releases on the same frame; the hold-off only gates the ONSET (it can never keep or
 # extend a brake, only decline to start one); the floor only ever RAISES the command inside an episode that is already
@@ -846,8 +847,12 @@ FCA11_ROLLING_RELEASE_ACCEL = -0.10       # m/s^2: the exit threshold in that re
 # change (see the 17c block above).
 FCA11_CRAWL_V_MAX = 2.0                   # m/s: the measured crawl band
 FCA11_CRAWL_RELEASE_ACCEL = -0.10         # m/s^2: an open episode is not released at crawl below this ask
-FCA11_CRAWL_MIN_LSB = 6                   # LSB: the measured level at which the clutch reads -20 Nm (creep torque closed)
-FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 4-6 LSB)
+# WHY 7, NOT 6 (owner decision, 2026-10-29): the route-182 per-LEVEL medians put 6 LSB at Clutch_Driving_Tq = 0.0 Nm - i.e.
+# exactly ON the open/closed boundary, the transition sample - and 5 LSB at -9.0 Nm against a released-state +12..13 Nm;
+# 7 LSB reads -20.0 Nm, the same as every level above it, i.e. the clutch is unambiguously open and the creep torque is
+# gone. 6 is the boundary, not yet open; one more LSB costs ~+0.1 m/s^2 of commanded brake at crawl.
+FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguously OPEN clutch (-20 Nm, creep torque gone)
+FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
 FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
 
 # *** 18x: GAS HOLD-OFF FOR THE PANDA'S OWN BRAKE/THROTTLE WINDOW (BRAKE_THROTTLE_EXCL_US = 100 ms) ***
@@ -2749,6 +2754,15 @@ class Fca11LongBrake:
     dec_cmd_now = 0   # 0040: the level COMMANDED this frame (0 = no actuating frame); feeds the alerts + logger
 
     if want_brake:
+      # 18x (D2): a frame that ACTUATES belongs to an episode that is (again) open, so NO release ramp may survive it: the
+      # next release must re-seed from the level actually on the wire (_rel_acc is cleared in _feel_reset only, and that is
+      # skipped while the episode stays open). Without this, an interrupted ramp left a stale accumulator/rate behind and the
+      # next release continued from it - emitting a level ABOVE the wire (e.g. 20 from a wire at 8) on a release frame, where
+      # the normal-episode +RATE_STEP cap does not apply, so the panda's rise gate refused every ramp frame (>= 3 ->
+      # _refused_cut -> fca11Unavailable, with real re-asks refused meanwhile). See _dyn_release_level.
+      self._rel_acc = None
+      self._rel_sent = 0
+      self._rel_fast = False
       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
       # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
       self._cal_active = bool(cal_on and ok)
@@ -2857,7 +2871,6 @@ class Fca11LongBrake:
       was_braking = self._actuating
       prev_sent = self._dec_last_sent
       self._actuating = False
-      self._dec_last_sent = 0
       self._sent_this_episode = False
       dec_cmd_now = 0   # 0040: no actuating frame this frame
       # 18x (c): DYNAMIC RELEASE RAMP (opt-in). A SOFT release ramps the level to 0 over a few sent frames instead of
@@ -2897,6 +2910,13 @@ class Fca11LongBrake:
         self._sent_this_episode = True
         dec_cmd_now = ramp
       if ramp <= 0:
+        # 18x (D1): the panda's last ACCEPTED frame is the passive close (level 0) ONLY when the episode really ends on
+        # THIS frame. Zeroing it on every non-braking frame (as the deployed law did) left the reference at 0 across the
+        # NON-SEND frames of a release ramp, so a re-ask landing on the next SEND frame was capped at 0 + RATE_STEP: a
+        # 16 -> 4 (reviewer: 22 -> 4) drop, ~0.6..1.8 m/s^2 of brake gone in one sent frame mid-episode, exactly what the
+        # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
+        # stays on the last level actually SENT (restored on the send slot above).
+        self._dec_last_sent = 0
         self._rel_acc = None                  # 18x: no ramp in progress once it is over (or was never allowed)
         if was_braking:
           # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).

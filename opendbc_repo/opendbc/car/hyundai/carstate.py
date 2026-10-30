@@ -361,8 +361,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       # their own bus rates (measured on the owner's routes) so the parser tracks validity for them;
       # CarStateExt.update_telemetry reads them off this parser every frame. Legacy-CAN only (the CAN-FD
       # path never sees these messages and leaves the fields at 0).
+      # 18x (b): TCU_DCT13 0x162 Clutch_Driving_Tq - the driveline creep torque the crawl rule's level was chosen from
+      # (the k="b" level trace records it). Subscribed with a NaN rate = ignore_alive (opendbc/can/parser.py:161), so an
+      # optional instrument can NEVER time a parser out / make canValid flap, and its rate is whatever the TCU sends
+      # (measured ~7-15 Hz on the owner's routes, not 100). Empty frame -> carstate_ext publishes None.
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [(DRIVE_MODE_MSG, 10), ("EMS_453", 100), ("ESP_49D", 10),
-                                                         ("BATT_568", 20), ("N_MODE_4A0", 20)], 0),
+                                                         ("BATT_568", 20), ("N_MODE_4A0", 20),
+                                                         ("TCU_DCT13", float("nan"))], 0),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
     if CP_SP.enableGasInterceptor:

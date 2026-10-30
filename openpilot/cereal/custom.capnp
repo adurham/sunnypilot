@@ -382,6 +382,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
   fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
   fca11Shadow @8 :Bool;  # fork (0045): FCA11 SHADOW log-only mode (HyundaiFca11Shadow, default OFF); never sends; mirrors opendbc CarParamsSP
+  fca11DynamicRelease @10 :Bool;  # fork (18x): dynamic-release build - gentle 1 LSB onset, decrease limit, soft release ramp, k="b" trace (HyundaiFca11DynamicRelease, default OFF); mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
