@@ -6,13 +6,16 @@ See the LICENSE.md file in the root directory for more details.
 
 comma pedal (gas interceptor) longitudinal for Hyundai CAN non-SCC ICE cars.
 
-Driver-supervisory contract (there is NO brake actuator on these cars):
+Driver-supervisory contract (this module drives the pedal only - it never commands the brakes):
   - accel request >= 0  -> pedal command (throttle), capped at MAX_INTERCEPTOR_GAS
-  - accel request <  0  -> pedal command drops toward 0 = lift-off/coast, engine braking only, NEVER service brakes
+  - accel request <  0  -> pedal command drops toward 0 = lift-off/coast, engine braking only, this path NEVER touches
+    the service brakes. (The car has no brake actuator of openpilot's own, but the fork's FCA11-long layer -
+    fca11_long.py - can ask the factory camera/safety system to brake; while it does, the pedal here is hard-zeroed
+    and gas and brake are never commanded together. See FORK.md and the FCA11 design notes.)
   - No engage floor (minEnableSpeed = -1, like upstream Toyota interceptor cars): the pause/resume button engages at
     ANY speed, including a standstill. The up/down arrows only change the set speed and never engage (buttons-v3).
     Once engaged the throttle is never cut at low speed; it is only limited by LOW_SPEED_MAX_GAS (a throttle-strength
-    launch limit, not an engagement floor). openpilot can still never brake: the driver stops the car.
+    launch limit, not an engagement floor). Braking authority belongs to the driver (and, opt-in, to FCA11-long).
 """
 from collections import deque
 from dataclasses import dataclass
@@ -339,21 +342,37 @@ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
 #
 # THE LAW BELOW: for accel < 0 replace `scale(v)*accel + hold(v)` with the MEASURED inverse
 #   cmd = clip(hold(v) - DROP(v, |accel|), 0, ceiling(v))
-# where DROP is the measured pedal drop below the hold point (monotone, in pedal fraction), scaled below the highway
-# band by the law's own existing speed schedule (PEDAL_SCALE(v)/PEDAL_SCALE_HIGHWAY, i.e. 1.0 at >= 22 m/s and 0.46 at
-# 12 m/s where the measured gain is 2.2x stronger). It is anchored so that accel = 0 still gives exactly hold(v)
-# (DROP(0) = 0) and the ceiling / the interceptor cap are untouched: the positive branch calls the unchanged
-# get_pedal_command. DROP is a PHYSICS table (dead band, DFCO cliff), not a feel dial, so it is personality-invariant
-# like the hold.
+# where DROP is the measured pedal drop below the hold point (monotone, in pedal fraction), rescaled onto this
+# speed's own hold(v) so that accel = 0 still gives exactly hold(v) (DROP(0) = 0). It is a PHYSICS table (dead band,
+# DFCO cliff), not a feel dial, so it is personality-invariant like the hold. The positive branch calls the
+# unchanged get_pedal_command, and the ceiling / the interceptor cap are untouched.
+#
+# SPEED GATING (review C2/C3). The table was measured at v >= 18 m/s (65 km/h) only, and the pedal is far stronger
+# below that speed (the law's own schedule is 0.165 pedal/(m/s^2) at 12 m/s vs 0.36 at 22), so the table is NOT
+# extrapolated down there: at/below DELIVERY_BLEND_LO_V the delivered law IS the deployed law - the same function
+# call, not a min() and not an extrapolated table (at 12 m/s the table's flat top used to map ask -0.30 to EXACTLY
+# 0 pedal, a hard 40-65 km/h coast where the deployed law only coasts at -0.45..-0.54). Between
+# DELIVERY_BLEND_LO_V (16 m/s) and DELIVERY_BLEND_HI_V (20 m/s) the two laws are CROSS-FADED:
+#   cmd = (1 - w(v)) * get_pedal_command(a, v) + w(v) * delivery_inverse(a, v),   w = smoothstep((v - 16) / 4)
+# so there is no branch step in speed anywhere. (The pre-fix branch switched at exactly 18.0 m/s, where the floor
+# turned 0 -> 1.0 % pedal: at ask -0.40 that was 0 -> 1.0 % over 0.01 m/s, 108 ENABLE edges in 10 s on a set-speed
+# hover; review C3.) The fade is deliberately conservative below 18 m/s: both terms are >= 0, so the blend is 0
+# only where BOTH laws are, i.e. the fade itself adds no exact-zero coast below 18 m/s (on 17c the only extra zeros
+# left there come from the ask filter's hand-back: 0.1 s, where the deployed command was <= 4 % pedal).
 #
 # Three parts of the measured curve are deliberate:
 #  - |accel| <= 0.27: the measured inverse, 0 -> 0.115 pedal of drop.
-#  - 0.27 < |accel| < 0.52 at highway speed: the plateau's FLOOR, 1.0 % pedal (DELIVERY_PEDAL_FLOOR). A live
-#    0.4-2.5 % command has been measured to deliver -0.29 m/s^2 (the plateau), so the shallow-negative fix keeps a
-#    small live command instead of collapsing to a coast. The floor is also what keeps the command from creeping to
-#    1 DBC count (0.4 %) where the pedal's ENABLE bit would dither - the plateau is the right side of that cliff.
-#    The floor exists ONLY at v >= DELIVERY_FLOOR_V, the band it was measured in: at a standstill this car must
-#    command exactly 0 for any <= 0 ask (uncommanded motion), and 1 % pedal there would be exactly that.
+#  - 0.27 < |accel| < 0.52 at highway speed: the plateau's FLOOR, 1.0 % pedal (DELIVERY_PEDAL_FLOOR), faded in over
+#    18..20 m/s so the floor itself cannot step the command in speed either. A live 0.4-2.5 % command has been
+#    measured to deliver -0.29 m/s^2 (the plateau), so the shallow-negative fix keeps a small live command instead
+#    of collapsing to a coast; 1 % is 10x the 0.001 ENABLE threshold (1 wire count is ~0.046 % pedal, not the 0.4 %
+#    of the extract's bin), so the floor itself never dithers the pedal's ENABLE bit.
+#    THE FLOOR IS THE ONE PLACE THE NEW LAW COMMANDS MORE PEDAL THAN THE DEPLOYED ONE: above 18 m/s, for asks
+#    between the deployed law's own zero crossing (-0.376 @22 m/s, -0.430 @25, -0.490 @30) and -0.52, the deployed
+#    law already coasts (0 pedal = -0.79 m/s^2 pass-through) and the new law holds +1.0 % pedal (a live plateau
+#    command, -0.30 m/s^2) - i.e. LESS decel than today, not more. +1.0 % is the absolute maximum excess and it is
+#    only reached from 20 m/s up (less inside the fade). Everywhere else the new law is <= the deployed law, and
+#    below 18 m/s it is never above it.
 #  - |accel| >= 0.52: EXACTLY 0.0 - byte-identical to what the deployed law already does below about -0.34, so
 #    every deep ask still lifts the pedal fully and the gas/brake hand-over is unchanged (while the FCA11 brake law is
 #    braking, which it opens at ask <= -0.5, the brake path hard-zeroes the pedal anyway, so the wire is identical
@@ -362,18 +381,66 @@ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
 #    -0.79, so no ask in -0.52..0.52 can be served better than by one of them).
 #
 # AND THE ASK FILTER (the pedal path only): the plan's shallow asks dither at 2-4 Hz on 17c (9,509 runs of mean
-# 0.09 s, only 3 longer than 0.6 s). With a correct gain that dither would reach the pedal, so accel < 0 is passed
+# 0.09 s, only 3 longer than 0.6 s). With a correct gain that dither would reach the pedal, so the ask is passed
 # through a one-sided filter: a DEEPER ask is applied on the same frame (a lift is never delayed - the same rule as
-# the rate limiter below), a SHALLOWER ask is approached with a 0.8 s time constant, so one 0.09 s dither run can
-# re-apply at most ~11 % of the pedal it used to. Positive asks are NOT filtered (they keep the linear law).
+# the rate limiter below), a SHALLOWER ask is approached with a 0.8 s time constant. It advances on EVERY active
+# frame, including the frames on which the over-speed release, the FCA11 brake, the cal hold or the cam-brake force
+# the pedal to zero, and it is cleared only when longitudinal is NOT active (disengage / a new episode). Three
+# deliberate consequences (review C4):
+#  - a positive ask does NOT re-seed it. The state is a running minimum-with-decay of the ask stream, so an ask that
+#    dithers across zero (-0.25 <-> +0.02, the common set-speed hover) keeps the deep state and the next negative
+#    frame does not apply at full depth. Positive asks themselves still use the RAW plan value (the positive branch
+#    of the law is bit-identical to the deployed one).
+#  - a stale deep state can only ever give LESS pedal: it keeps the coast gate closed for about
+#    tau * ln(|stale| / 0.52) ~ 1 s after a -1.5 m/s^2 FCA11 episode, i.e. the hand-back from a brake episode or a
+#    coast is a gradual increase instead of a snap. That is the owner's "gradual" direction, and it is the reason
+#    the filter must NOT be re-seeded by a zero command.
+#  - and a fall inside the shallow band is RATE-LIMITED (get_pedal_rate_down, the mirror of the rise limit) because
+#    the inverse is 3.5-4.7x steeper than the linear law near ask -0.09, so that dither would otherwise arrive as
+#    downward pedal steps (review C5: 423 -> 670 steps > 0.01 per slot over the 17c drive, +58 %). The exact-zero
+#    coast at |ask| >= 0.52, and every release / FCA11 / cal / cam-brake / disengage zero, still falls immediately.
 DELIVERY_ACCEL_BP = [0., 0.05, 0.08, 0.11, 0.14, 0.18, 0.22, 0.27, 0.30]      # |accel ask|, m/s^2
 DELIVERY_PEDAL_DROP = [0.000, 0.021, 0.045, 0.086, 0.104, 0.108, 0.111, 0.115, 0.1344]  # pedal below hold(v)
 DELIVERY_PEDAL_HOLD_MEAS = 0.1414   # measured a=0 pedal on 17c (v >= 65 km/h) - the table's own hold anchor
 DELIVERY_PEDAL_FLOOR_MEAS = 0.0070  # the table's pedal at its last point (the bottom of the plateau)
 DELIVERY_PEDAL_FLOOR = 0.010     # pedal fraction the law HOLDS over 0.27..0.52 m/s^2 (the measured plateau floor)
-DELIVERY_FLOOR_V = 18.0          # m/s; the floor exists only in the measured band (>= 65 km/h)
+DELIVERY_FLOOR_V = 18.0          # m/s; the floor exists only in the measured band (>= 65 km/h) ...
+DELIVERY_FLOOR_RAMP_V = 20.0     # m/s; ... and is faded in over [DELIVERY_FLOOR_V, this] so it cannot step cmd
+DELIVERY_BLEND_LO_V = 16.0       # m/s; at/below this the delivered law is EXACTLY the deployed law
+DELIVERY_BLEND_HI_V = 20.0       # m/s; at/above this the measured inverse is used whole
 DELIVERY_COAST_ACCEL = 0.52      # m/s^2; at/above this |ask| the pedal command is EXACTLY 0.0 (coast as today)
 DELIVERY_ASK_TAU_S = 0.8         # s; time constant of the SHALLOWER-ask side of the pedal-path ask filter
+PEDAL_JERK_DOWN = 1.2            # m/s^3; the fall-rate jerk scale of the delivery law's shallow band. Halved vs the rise
+# (PEDAL_JERK_UP = 2.0) on purpose: the owner's complaint is about downward steps, and 1.2 gives a fall of at most
+# 0.86 % pedal per 20 ms send slot (1.2 * 0.36 * 2 * DT_CTRL at >= 22 m/s), i.e. under the 1 % step that is felt.
+
+
+def _smoothstep(x: float) -> float:
+  """0 below 0, 1 above 1, C1 in between."""
+  x = min(max(float(x), 0.), 1.)
+  return x * x * (3. - 2. * x)
+
+
+def get_delivery_blend_weight(v_ego: float) -> float:
+  """Weight of the measured inverse in the delivered law: 0 at/below DELIVERY_BLEND_LO_V (deployed law, exactly), 1
+  at/above DELIVERY_BLEND_HI_V, smoothstep between so the law is continuous in speed (review C3)."""
+  return _smoothstep((v_ego - DELIVERY_BLEND_LO_V) / (DELIVERY_BLEND_HI_V - DELIVERY_BLEND_LO_V))
+
+
+def get_delivery_floor(v_ego: float) -> float:
+  """The plateau floor (pedal fraction) the inverse holds over 0.27..0.52 m/s^2. Zero below DELIVERY_FLOOR_V (the
+  band it was measured in - at a standstill this car must command exactly 0 for any <= 0 ask) and faded in over
+  DELIVERY_FLOOR_V..DELIVERY_FLOOR_RAMP_V so the floor cannot step the command in speed."""
+  return DELIVERY_PEDAL_FLOOR * _smoothstep((v_ego - DELIVERY_FLOOR_V) / (DELIVERY_FLOOR_RAMP_V - DELIVERY_FLOOR_V))
+
+
+def get_pedal_rate_down(v_ego: float) -> float:
+  """Fall rate inside the delivery law's shallow band, pedal fraction per second: PEDAL_JERK_DOWN through the law's
+  own speed schedule, i.e. the mirror of get_pedal_rate_up (0.12/s at a standstill, 0.30/s at 18 m/s, 0.43/s from
+  22 m/s). Not personality-scaled, like the rise. Only the opt-in delivery law uses it, only for a LIVE target, and
+  the caller scales it by get_delivery_blend_weight so the limit - like the law it bounds - does not exist below the
+  blend band (where the command is the deployed law's, falls included)."""
+  return PEDAL_JERK_DOWN * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
 
 
 def get_delivery_pedal_drop(accel: float, v_ego: float) -> float:
@@ -382,40 +449,54 @@ def get_delivery_pedal_drop(accel: float, v_ego: float) -> float:
   The measured table spans the pedal range [DELIVERY_PEDAL_FLOOR_MEAS, DELIVERY_PEDAL_HOLD_MEAS] at the route's mean
   highway speed. It is mapped onto THIS speed's own [floor, hold(v)] span, so that (a) a = 0 still lands exactly on
   hold(v) (a drop of 0), (b) the table's last point still lands on the plateau floor at any speed, and (c) below the
-  measured band the drop shrinks with the law's own speed schedule (the pedal is far stronger there)."""
-  floor = DELIVERY_PEDAL_FLOOR if v_ego >= DELIVERY_FLOOR_V else 0.
+  measured band the drop shrinks with the law's own speed schedule (the pedal is far stronger there). The span cap
+  is what holds the floor: hold(v) - drop >= get_delivery_floor(v) by construction, so no separate max() is needed
+  (review C7)."""
+  floor = get_delivery_floor(v_ego)
   span = max(get_hold_command(v_ego) - floor, 0.)
   k = span / (DELIVERY_PEDAL_HOLD_MEAS - DELIVERY_PEDAL_FLOOR_MEAS)
   return min(k * float(np.interp(abs(accel), DELIVERY_ACCEL_BP, DELIVERY_PEDAL_DROP)), span)
 
 
 def filter_delivery_ask(accel: float, accel_prev: float, dt: float = DT_CTRL) -> float:
-  """One-sided filter for the pedal path. Deeper (more negative) asks apply immediately; a shallower ask is approached
-  with DELIVERY_ASK_TAU_S. Anything >= 0 (and anything not yet in the negative branch) is passed through untouched,
-  so the positive path and every deliberate ask keep the unfiltered law input."""
-  if accel >= 0. or accel <= accel_prev:
+  """One-sided filter for the pedal path: a running minimum-with-decay of the ask stream.
+
+  A DEEPER (more negative) ask applies on the same frame - a lift is never delayed. A SHALLOWER ask, INCLUDING one
+  that crosses zero, is approached with DELIVERY_ASK_TAU_S: the state is never re-seeded by a positive ask (that was
+  review C4.1 - a zero-crossing dither reset the filter on every positive frame and the next negative frame applied
+  at full depth). Callers advance it while longitudinal is active and clear it only on a disengage / new episode
+  (review C4.2 - it used to be cleared on every exact-zero command, i.e. after every coast and FCA11 hand-back).
+  A stale deep state can only ever command LESS pedal, so it is the conservative direction to keep."""
+  if accel <= accel_prev:
     return float(accel)
   return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / DELIVERY_ASK_TAU_S)))
 
 
+def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+  """The measured-inverse law alone (blend weight 1). Accelerator only: <= 0 means the plateau floor or a coast,
+  never brake."""
+  if accel >= 0.:
+    return get_pedal_command(accel, v_ego, personality)
+  if -accel >= DELIVERY_COAST_ACCEL:
+    return 0.
+  ceiling = get_personality_ceiling(v_ego, personality)
+  return float(np.clip(get_hold_command(v_ego) - get_delivery_pedal_drop(accel, v_ego), 0., ceiling))
+
+
 def get_delivery_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
-  """accel request -> pedal fraction, measured-inverse law for negative asks (the positive branch is exactly
-  get_pedal_command, i.e. the deployed linear law). Accelerator only: <= 0 means coast or a small live plateau
-  command, never brake."""
+  """accel request -> pedal fraction. The positive branch is exactly get_pedal_command (the deployed linear law);
+  the negative branch is the measured inverse cross-faded with the deployed law over DELIVERY_BLEND_LO_V ..
+  DELIVERY_BLEND_HI_V, and exactly the deployed law at/below the low end (review C2/C3)."""
   if accel >= 0.:
     return get_pedal_command(accel, v_ego, personality)
   ceiling = get_personality_ceiling(v_ego, personality)
-  if -accel >= DELIVERY_COAST_ACCEL:
-    return 0.
-  cmd = get_hold_command(v_ego, personality) - get_delivery_pedal_drop(accel, v_ego)
-  if v_ego >= DELIVERY_FLOOR_V:
-    cmd = max(cmd, min(DELIVERY_PEDAL_FLOOR, ceiling))
-  else:
-    # below the measured band the table is an extrapolation: take it only where it LIFTS more than the deployed law
-    # (never command more pedal than today - a low-speed over-gas would be uncommanded motion, and the launch regime
-    # is not what this fix measured).
-    cmd = min(cmd, get_pedal_command(accel, v_ego, personality))
-  return float(np.clip(cmd, 0., ceiling))
+  w = get_delivery_blend_weight(v_ego)
+  if w <= 0.:
+    return get_pedal_command(accel, v_ego, personality)
+  highway = get_delivery_pedal_command_highway(accel, v_ego, personality)
+  if w >= 1.:
+    return highway
+  return float(np.clip((1. - w) * get_pedal_command(accel, v_ego, personality) + w * highway, 0., ceiling))
 
 
 # *** pedal fault latch recovery (route 11c forensics, FORK.md #14) ***
@@ -504,6 +585,12 @@ class GasInterceptorCarController:
     # also clears any latched pedal fault (pedal firmware)
     # (no low-speed cut: a pause/resume engagement may start from a standstill; LOW_SPEED_MAX_GAS limits the launch)
     active = CC.longActive
+    # 17c delivery (opt-in): advance the pedal-path ask filter on EVERY active frame, ahead of the paths below that
+    # can zero or bypass the law (over-speed release, FCA11 brake, cal hold, cam-brake, gas override). It is cleared
+    # only by a disengage, so the hand-back from any of those zero states - and from a coast - is filtered as well
+    # (review C4.2; it used to be re-armed by every exact-zero command, i.e. exactly never where it mattered).
+    if self.delivery_law:
+      self.delivery_ask = filter_delivery_ask(CC.actuators.accel, self.delivery_ask) if active else 0.
 
     # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
     # command is hard-zeroed this frame (gas and brake are never commanded together) and the pedal stream keeps
@@ -583,12 +670,23 @@ class GasInterceptorCarController:
         # 17c: soft recovery up to the hold for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL); a deliberate ask keeps
         # the unchanged jerk-rate response (lead pulling away, merge). rate_limit_pedal_command gates it off below
         # PEDAL_REENTRY_V_MIN and while launching.
-        # 17c delivery (opt-in): the negative branch of the law is the measured inverse, and its ask is the FILTERED
-        # one (deeper asks still land on the same frame; the filter only slows the return toward 0). Positive asks
-        # and the deliberate-ask predicate above keep the RAW ask.
+        # 17c delivery (opt-in): the negative branch of the law is the measured inverse (cross-faded with the deployed
+        # law below 20 m/s, exactly the deployed law below 16 m/s), and its ask is the FILTERED one (deeper asks still
+        # land on the same frame; the filter only slows the return toward 0 and the hand-back from a coast/brake
+        # episode). Both are faded by the same weight as the law, so below 16 m/s the pedal path is the deployed one
+        # INCLUDING its ask and its fall behaviour. Positive asks - including exactly 0 - keep the RAW plan value, so
+        # that branch stays bit-identical to the deployed law too.
         if self.delivery_law:
-          self.delivery_ask = filter_delivery_ask(accel, self.delivery_ask)
-          pedal_target = get_delivery_pedal_command(self.delivery_ask, CS.out.vEgo, personality)
+          weight = get_delivery_blend_weight(CS.out.vEgo)
+          ask = accel + weight * (self.delivery_ask - accel) if accel < 0. else accel
+          pedal_target = get_delivery_pedal_command(ask, CS.out.vEgo, personality)
+          if accel < 0. and weight > 0. and pedal_target > 0.:
+            # review C5: the inverse is 3.5-4.7x steeper than the linear law near ask -0.09, so plan dither would
+            # arrive as downward pedal steps. A fall inside the shallow band (live target, |ask| < the coast
+            # threshold) is therefore bounded to get_pedal_rate_down(v), the mirror of the rise limit. An exact-zero
+            # target (coast at |ask| >= 0.52) and every release / FCA11 / cal / cam-brake / disengage zero, which
+            # never reach this line, still fall immediately.
+            pedal_target = max(pedal_target, self.gas - weight * get_pedal_rate_down(CS.out.vEgo) * DT_CTRL)
         else:
           pedal_target = get_pedal_command(accel, CS.out.vEgo, personality)
         self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
@@ -601,9 +699,10 @@ class GasInterceptorCarController:
       self.gas_launching = False
     if not active:
       self.overspeed_released = False
-    if not active or self.gas == 0.:
-      # 17c delivery: re-arm the ask filter whenever the pedal is not actually holding a live command (disengaged,
-      # released, FCA11 braking, cal, coast): a stale deep ask must never be re-applied after the gap.
+      # 17c delivery (opt-in): clear the pedal-path ask filter ONLY here - a disengage / new episode. It is
+      # deliberately NOT cleared when the command happens to be 0 (over-speed release, FCA11 brake, cal hold,
+      # cam-brake, deep-ask coast): those frames advance the filter above, and re-arming it there was the second hole
+      # review C4 found (the coast -> live hand-back is exactly the transition that snaps the throttle).
       self.delivery_ask = 0.
 
     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
