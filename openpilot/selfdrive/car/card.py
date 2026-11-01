@@ -23,6 +23,7 @@ from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
 
 from openpilot.sunnypilot.fork.fca11_shadow_hook import fca11_shadow_post_send
+from openpilot.sunnypilot.fork.driver_mark_hook import DriverMarkHook
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.fork.esc_diag import run_from_card as run_esc_diag_from_card
@@ -74,7 +75,8 @@ class Car:
 
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
-    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'] +
+                                  ['userBookmark', 'bookmarkButton'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -191,6 +193,10 @@ class Car:
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
+    # 17c FEEDBACK: the driver's bookmark verdict (k="m"). Inert until a bookmark press is seen; the record is written
+    # by the FCA11 law (one writer per path) and the 2 s confirmation rides CarStateSP.driverMark.
+    self.driver_mark_hook = DriverMarkHook()
+
   def state_update(self) -> tuple[car.CarState, custom.CarStateSP, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
 
@@ -214,6 +220,11 @@ class Car:
 
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
+
+    # 17c FEEDBACK: type any bookmark press of this tick (the UI publishes one PAIR per press) and write the verdict
+    # record at burst close. Two dict lookups per frame when nothing is pressed; the record path is the law's.
+    now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
+    self.driver_mark_hook.step(self.sm, self.CI, CS, now_nanos)
 
     self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'])
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)

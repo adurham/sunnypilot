@@ -40,6 +40,21 @@ Applied in ``LongitudinalPlanner.update`` to the FINAL e2e candidate, i.e. after
 and AccelBoost, immediately before the min() over the MPC / cruise / e2e candidates. An earlier stage therefore cannot
 raise it back, and it never touches the MPC or the cruise candidate. With the param off (default), ``update`` returns
 its input unchanged (identity), and nothing else in the planner differs.
+
+Stop line (route 185, owner: "braking at empty stop signs and stop lights still overshoots" -- and, told that the fix
+would also stop at yields and roundabouts, "I'd rather that then blowing through fucking stop signs")
+---------------------------------------------------------------------------------------------------------
+``commit_accel`` prices the plan's own stop point, but at the empty stops the plan does not stop: it falls to a creep
+plateau (1.6-2.5 m/s) and parks there, so the commitment only paid for reaching the creep speed. The ask stayed at
+0.4-0.9 m/s^2 eight seconds out, exploded to 3-4.8 m/s^2 two seconds out, and the car finished 2.5-2.9 m/s^2 past the
+plan's own point (measured +3.9 / +4.2 / +7.1 m on route 185). ``stop_line_accel`` recognises that plateau -- the rest
+of the plan stays at or below V_CREEP + V_END_TOL, does not climb back, and has stopped braking (V_FLAT_DECEL, which
+keeps a real stop that the 10 s horizon truncates on ``commit_accel``'s path) -- and returns the decel that ends the
+car AT that point (capped at A_FLOOR so this rule alone is never harsher than -2.5 m/s^2). When it returns a value the
+commitment takes the deeper of the two and weights it 1.0: the plan is stopping, the "did it slow down" weight curve is
+the wrong question. Everything else -- arming, the no-lead entry gate, J_IN/J_OUT ramps, release, reset -- is unchanged.
+This deliberately also stops at a yield/roundabout whose plan parks on a creep plateau; the owner prefers that.
+
 """
 import numpy as np
 
@@ -58,6 +73,22 @@ GAP_ENTER = 0.3          # m/s^2, arm when the model's instantaneous ask is this
 GAP_EXIT = 0.1           # m/s^2, disarm when the gap has closed to within this
 J_IN = 1.0               # m/s^3, deepening rate of delta (the single comfort knob; inside the owner's 1.4 reference)
 J_OUT = 1.4              # m/s^3, release rate of delta -- the owner's documented 1.4 m/s^3 comfort reference (FORK row 91)
+
+# stop line (route 185): the model's plan falls to a CREEP plateau (1.6-2.5 m/s) and parks there instead of planning a
+# stop. commit_accel() then only pays for reaching that creep speed, the ask stays shallow, and the car finishes the
+# stop past the model's own point with a 2.5-2.9 m/s^2 panic brake. When the plateau is terminal the point IS the
+# model's stop location, so the commitment aims at a full stop there instead.
+V_CREEP = 3.0            # m/s, a plan that never gets this slow is not planning a stop
+V_END_TOL = 0.5          # m/s, the rest of the plan must not climb back above the plateau by more than this
+V_RISE_TOL = 0.3         # m/s, ...nor above its own first plateau value by more than this
+V_TRUE_STOP = 1.0        # m/s, a plan that reaches this is a real stop plan: commit_accel owns it, this rule stands down
+V0_MIN = 4.0             # m/s, below this the car is already crawling / finishing the stop
+D_MIN = 3.0              # m, ignore plateau points this close to the car
+STOP_MARGIN = 1.0        # m, stop this far short of the plan's plateau point
+A_FLOOR = -2.5           # m/s^2, this rule never asks harder than this (the e2e candidate may still go deeper)
+V_FLAT_DECEL = 0.35      # m/s^2, the plan must have stopped braking at the plateau by this much (a truncated real stop
+                         # keeps braking hard at the horizon end and is left to commit_accel)
+
 
 
 def commit_accel(x, v, t) -> float:
@@ -83,6 +114,45 @@ def stop_weight(v) -> float:
   v_min = float(v.min())
   ratio = v_min / max(float(v[0]), 0.5)
   return float(np.interp(ratio, [R_FULL, R_NONE], [1., 0.]) * np.interp(v_min, [V_STOP_FULL, V_STOP_NONE], [1., 0.]))
+
+
+def stop_line_accel(x, v, t=None):
+  """Decel that ends the car AT the plan's own creep plateau, or None when the plan is not parking on one.
+
+  The plateau is the first plan point at <= V_CREEP. It counts as a stop point (rather than a curve, a slow zone, or a
+  real stop that the 10 s horizon simply cuts short) only when
+    * the rest of the plan stays at or below V_CREEP + V_END_TOL,
+    * it does not climb back above its own first plateau value by more than V_RISE_TOL, and
+    * the plan has stopped braking there: the tail's own decel is shallower than V_FLAT_DECEL. A uniform stop plan that
+      the horizon truncates (e.g. 17 m/s braking to a stop 100 m out still reads 2.55 m/s at 10 s) keeps braking at
+      the tail and is left to commit_accel(), which prices it exactly.
+  Returns max(-v0^2 / (2 * max(d - STOP_MARGIN, 1.0)), A_FLOOR) (<= 0), or None.
+  """
+  x = np.asarray(x, dtype=float)
+  v = np.clip(np.asarray(v, dtype=float), 0., None)
+  t = np.asarray(ModelConstants.T_IDXS if t is None else t, dtype=float)
+  if x.size < 4 or x.size != v.size or t.size != v.size or not (np.all(np.isfinite(x)) and np.all(np.isfinite(v))):
+    return None
+  v0 = float(v[0])
+  if v0 < V0_MIN or float(v.min()) <= V_TRUE_STOP:
+    return None
+  idx = np.where(v <= V_CREEP)[0]
+  if idx.size == 0:
+    return None
+  i0 = int(idx[0])
+  d = float(x[i0])
+  if d <= D_MIN:
+    return None
+  tail = v[i0:]
+  tail_dt = float(t[-1] - t[i0])
+  if tail.size < 3 or tail_dt < 0.5:               # too little plan left to call it a plateau
+    return None
+  if float(tail.max()) > V_CREEP + V_END_TOL or float(tail[-1]) > float(tail[0]) + V_RISE_TOL:
+    return None
+  if (float(tail[-1]) - float(tail[0])) / tail_dt < -V_FLAT_DECEL:
+    return None
+  return float(max(-(v0 * v0) / (2. * max(d - STOP_MARGIN, 1.0)), A_FLOOR))
+
 
 
 class StopCommit:
@@ -134,6 +204,12 @@ class StopCommit:
     t = ModelConstants.T_IDXS if plan_t is None or len(plan_t) != len(plan_x) else plan_t
     self.commit = commit_accel(plan_x, plan_v, t)
     self.weight = stop_weight(plan_v)
+    stop_line = stop_line_accel(plan_x, plan_v)
+    if stop_line is not None:
+      # the plan is parking on a creep plateau: the point is the model's stop location, so price a full stop there and
+      # let the commitment do its job (the weight curve asks "did the plan slow down", which is not the question here)
+      self.commit = min(self.commit, stop_line)
+      self.weight = 1.0
     gap = self.commit - e2e
     if not self.armed:
       self.armed = (v_ego >= V_ENTRY and self.lead_clear >= LEAD_CLEAR_FRAMES and self.weight > 0. and gap < -GAP_ENTER)

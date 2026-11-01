@@ -6643,7 +6643,7 @@ index 6b2837c4..e3e2f620 100644
  
  from opendbc.car import Bus, structs
  from opendbc.can.parser import CANParser
- from opendbc.car.hyundai.values import HyundaiFlags
+ from opendbc.car.hyundai.values import HyundaiFlags, CAR
 -from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 +from opendbc.sunnypilot.car.hyundai.gas_interceptor import GAS_INTERCEPTOR_BUS_KEY, HYUNDAI_GAS_INTERCEPTOR_THRESHOLD, \
 +                                                         PedalFaultMonitor, get_interceptor_gas, get_interceptor_ids

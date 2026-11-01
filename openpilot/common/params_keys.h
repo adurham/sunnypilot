@@ -251,6 +251,22 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // next-ignition; for fresh-route data. The wire stays OLD-LAW (the deployed law): HyundaiFca11Brake keeps its meaning,
     // HyundaiFca11AffineGain is ignored (opendbc setup_interfaces). Writes /data/fca11-log/fca11-shadow.jsonl. Default OFF.
     {"HyundaiFca11Shadow", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (18x): the DYNAMIC-RELEASE build of the FCA11 law - gentle 1 LSB onset, a per-sent-frame decrease limit, a soft
+    // release ramp, and the k="b" level trace (level + measured aEgo + ask, per sent frame, in the FCA11 shadow log file).
+    // Read at CarParams build time => takes effect at the NEXT ignition. Inert unless HyundaiFca11Brake is also ON
+    // (enforced in opendbc setup_interfaces). Default OFF; the three UNCONDITIONAL 18x rules (low-speed release hold,
+    // crawl floor, 100 ms gas window) are NOT behind this key and run on every build.
+    {"HyundaiFca11DynamicRelease", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
+    // REGISTRATION ONLY in this tree: the key's reader (opendbc gas_interceptor) ships with the pedal-delivery lane
+    // (commit f7282b49fd), which is not merged here; the entry exists so the compiled aarch64 libparams_c.so registers
+    // both keys and the merge does not need a second deploy-blocking rebuild. Setting it here is INERT. Default OFF.
+    // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
+    // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
+    // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
+    // armed (opendbc setup_interfaces). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
+    // OFF (the default) = the deployed pedal law, byte for byte.
+    {"HyundaiPedalDeliveryLaw", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
     // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may

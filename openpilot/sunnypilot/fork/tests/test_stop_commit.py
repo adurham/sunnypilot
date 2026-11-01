@@ -244,3 +244,69 @@ class TestPinnedConstants(OpenpilotTestCase):
     self.assertAlmostEqual(sc.commit_accel(x, v, t), expected, places=9)
     self.assertGreater(sc.commit_accel(x, v, t), -20.)   # the early-second value is about -28
 
+
+
+def creep_plan(v0, ramp_s, v_plateau=2.0):
+  """Model-like CREEP plan (route 185): ramp from v0 down to v_plateau over ramp_s, then park on the creep speed --
+  the model stops braking and crawls instead of planning a stop, so v never reaches V_TRUE_STOP."""
+  n = len(T)
+  k = int(np.searchsorted(T, ramp_s))
+  k = min(max(k, 2), n - 4)
+  v = np.full(n, v_plateau)
+  v[:k] = np.linspace(v0, v_plateau, k)
+  x = np.concatenate([[0.], np.cumsum(np.diff(T) * (v[1:] + v[:-1]) / 2.)])
+  return x, v
+
+
+class TestStopLine(OpenpilotTestCase):
+  """Route 185: the plan parks on a 1.6-2.5 m/s creep plateau; the commitment must price a full stop AT that point."""
+
+  def test_creep_plateau_is_priced_as_a_stop(self):
+    x, v = creep_plan(8.0, 4.0)
+    i0 = int(np.where(v <= sc.V_CREEP)[0][0])
+    expected = -(8.0 ** 2) / (2. * max(float(x[i0]) - sc.STOP_MARGIN, 1.0))
+    self.assertAlmostEqual(sc.stop_line_accel(x, v), max(expected, sc.A_FLOOR), places=9)
+
+  def test_plan_without_a_plateau_is_left_alone(self):
+    v = np.clip(15. - 1.5 * T, 6., None)             # curve slowdown, v_min 6 m/s
+    x = np.concatenate([[0.], np.cumsum(np.diff(T) * (v[1:] + v[:-1]) / 2.)])
+    self.assertIsNone(sc.stop_line_accel(x, v))
+
+  def test_plateau_that_climbs_back_is_not_a_stop(self):
+    x = np.linspace(0., 200., len(T))
+    v = np.where(T < 3.0, 8.0, np.interp(T, [3.0, 10.0], [2.0, 12.0]))
+    self.assertIsNone(sc.stop_line_accel(x, v))
+
+  def test_plateau_that_only_creeps_up_is_still_a_stop(self):
+    x = np.linspace(0., 200., len(T))
+    v = np.where(T < 3.0, 8.0, np.interp(T, [3.0, 10.0], [2.0, 2.2]))
+    self.assertIsNotNone(sc.stop_line_accel(x, v))
+
+  def test_crawling_speed_does_not_arm(self):
+    x, v = creep_plan(3.0, 4.0)                      # v0 below V0_MIN: the car is finishing the stop already
+    self.assertIsNone(sc.stop_line_accel(x, v))
+
+  def test_never_asks_harder_than_the_floor(self):
+    x = np.linspace(0., 200., len(T))
+    v = np.full(len(T), 2.0)
+    v[:2] = 12.0                                     # plateau ~10 m ahead at 12 m/s: -144/18 = -8 m/s^2 uncapped
+    self.assertEqual(sc.stop_line_accel(x, v), sc.A_FLOOR)
+
+  def test_real_stop_plan_is_left_to_commit_accel(self):
+    x, v, a = stop_plan(12., 40.)                    # plan reaches 0 m/s at 40 m: commit_accel prices this correctly
+    self.assertIsNone(sc.stop_line_accel(x, v))
+    self.assertAlmostEqual(sc.commit_accel(x, v, T), -a, delta=0.02 * a)
+
+  def test_update_deepens_the_ask_on_a_creep_plateau(self):
+    c = sc.StopCommit(params=FakeParams())
+    x, v = creep_plan(8.0, 4.0)
+    out = run(c, 60, -0.2, 8.0, plan=(x, v))
+    self.assertLess(out[-1], -1.0)                   # the stop requirement (~-0.86) has been reached
+    self.assertLessEqual(out[-1], -0.8)
+    self.assertTrue(c.armed)
+    self.assertAlmostEqual(c.weight, 1.0)
+
+  def test_param_off_is_identity_on_a_creep_plateau(self):
+    c = sc.StopCommit(params=FakeParams(enabled=False))
+    x, v = creep_plan(8.0, 4.0)
+    self.assertEqual(run(c, 60, -0.2, 8.0, plan=(x, v)), [-0.2] * 60)

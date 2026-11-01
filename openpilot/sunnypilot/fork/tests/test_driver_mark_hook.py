@@ -1,0 +1,453 @@
+"""17c FEEDBACK: the card-side driver-mark glue (fork/driver_mark_hook.py) end to end.
+
+Drives the REAL Fca11LongBrake through a fake SubMaster + fake car interface and asserts the k="m" records that land in
+a temporary FCA11 log dir - the brief's six required cases plus the pair-dedupe the UI's two-services-per-press forces.
+"""
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from opendbc.car import structs
+from opendbc.sunnypilot.car.hyundai import driver_mark as dm
+from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+from openpilot.sunnypilot.fork.driver_mark_hook import DriverMarkHook, law_of
+
+REPO = Path(__file__).resolve().parents[4]
+CARD = REPO / "openpilot" / "selfdrive" / "car" / "card.py"
+S = 1_000_000_000
+
+
+def _real_camera_frame(dec=0, alive=5):
+  b = bytearray(8)
+  def setb(start, length, val):
+    for i in range(length):
+      pos = start + i
+      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
+  setb(0, 1, 1)
+  setb(3, 2, 3)
+  setb(8, 8, dec)
+  setb(18, 2, 2)
+  setb(23, 4, alive)
+  return bytes(b)
+
+
+class _CS:
+  def __init__(self, cam=None):
+    self.out = structs.CarState()
+    self.out.vEgo = 20.0
+    self.out.aEgo = 0.0
+    self.out.gearShifter = structs.CarState.GearShifter.drive
+    self.out.brakePressed = False
+    self.out.gasPressed = False
+    self.out.standstill = False
+    self.interceptor_state = 0
+    self.interceptor_fault_seen = False
+    self.fca11_cam_frame = cam
+    self.fca11_now_nanos = 0
+    self.fca11_lead_closing = False
+    self.fca11_wheel_min_kph = None
+    self.fca11_echoes = []
+    self.fca11_clutch_tq_nm = None
+
+
+class _SM:
+  """The three things the hook touches: sm.updated[...], sm.logMonoTime[...] and sm['carControl']."""
+
+  def __init__(self):
+    self.updated = dict.fromkeys(("userBookmark", "bookmarkButton", "carControl"), False)
+    self.logMonoTime = dict.fromkeys(("userBookmark", "bookmarkButton"), 0)
+    self._cc = SimpleNamespace(enabled=True, longActive=True)
+
+  def __getitem__(self, name):
+    if name == "carControl":
+      return self._cc
+    raise KeyError(name)
+
+
+def _cp_sp(fca11=True):
+  cp_sp = structs.CarParamsSP()
+  cp_sp.fca11Brake = fca11
+  cp_sp.enableGasInterceptor = True
+  return cp_sp
+
+
+class TestDriverMarkHook(unittest.TestCase):
+  def setUp(self):
+    self.dir = tempfile.mkdtemp(prefix="fca11mark-hook-")
+    self._env = os.environ.get("FCA11_LOG_DIR")
+    os.environ["FCA11_LOG_DIR"] = self.dir
+    self.law = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+    self.CI = SimpleNamespace(CC=SimpleNamespace(fca11_brake=self.law))
+    self.sm = _SM()
+    self.hook = DriverMarkHook()
+    self.cs = _CS(cam=(0, _real_camera_frame()))
+    self.t = 0
+
+  def tearDown(self):
+    if self._env is None:
+      os.environ.pop("FCA11_LOG_DIR", None)
+    else:
+      os.environ["FCA11_LOG_DIR"] = self._env
+    shutil.rmtree(self.dir, ignore_errors=True)
+
+  # ---- helpers ----------------------------------------------------------------------------------------------
+  def _frame(self, dt_s=0.01, press=False, second_service=False, ask=0.0):
+    """One card tick: optional press message(s), then the hook step. The law is ticked like controls_update would.
+
+    Both halves of a pair land in ONE tick here, i.e. with the same logMonoTime - the tie case. On the car the two
+    messages are ~0.1 ms apart and the order is the signature; a tie therefore reads as the swipe (GOOD), never as BAD.
+    """
+    self.t += int(dt_s * S)
+    frame = self.t // int(0.01 * S)
+    self.law.update(_cc(ask), self.cs, frame)
+    self.sm.updated["userBookmark"] = bool(press)
+    self.sm.updated["bookmarkButton"] = bool(press and second_service)
+    self.sm.logMonoTime["userBookmark"] = self.t
+    self.sm.logMonoTime["bookmarkButton"] = self.t
+    self.hook.step(self.sm, self.CI, self.cs, self.t)
+    self.sm.updated["userBookmark"] = self.sm.updated["bookmarkButton"] = False
+    return frame
+
+  def _marks(self):
+    p = os.path.join(self.dir, "fca11-shadow.jsonl")
+    if not os.path.exists(p):
+      return []
+    with open(p) as f:
+      return [r for r in (json.loads(line) for line in f if line.strip()) if r["k"] == "m"]
+
+  # ---- the brief's cases ------------------------------------------------------------------------------------
+  def test_one_press_is_one_good_mark(self):
+    self._frame(press=True)
+    self.assertEqual([], self._marks(), "the verdict is not known before the gap closes")
+    for _ in range(210):
+      self._frame()
+    marks = self._marks()
+    self.assertEqual(1, len(marks))
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+    self.assertEqual(1, self.hook.presses)
+
+  def test_two_presses_one_second_apart_are_both_bad(self):
+    self._frame(press=True)
+    for _ in range(99):
+      self._frame()
+    self._frame(press=True)          # +1.00 s
+    for _ in range(210):
+      self._frame()
+    marks = self._marks()
+    self.assertEqual(2, len(marks), "every press of the burst is recorded")
+    self.assertEqual(["bad", "bad"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double", "bookmark_double"], [m["source"] for m in marks])
+    self.assertEqual(2, self.hook.presses)
+
+  def test_two_presses_five_seconds_apart_are_two_goods(self):
+    # five seconds is > 2.5x MARK_GAP_S, i.e. unambiguously outside the burst window (real press gaps are far wider)
+    self.assertGreater(5.0, 2 * dm.MARK_GAP_S, "the spacing below is not a burst by any reading of the constant")
+    self._frame(press=True)
+    for _ in range(500):
+      self._frame()
+    self._frame(press=True)
+    for _ in range(210):
+      self._frame()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  # ---- the route-181 measurements: 4 messages per press, sub-ms inside, >=49.79 s between, ~1.0 s = the bad gesture --
+  def _tick(self, dt_s=0.01, services=(), ask=0.0):
+    """One card tick with exactly these services ``updated`` (each message gets its own tick, so the real sub-ms
+    spacing between the four messages of ONE press can be reproduced - ``_frame`` can only do a whole press at once).
+    """
+    self.t += int(round(dt_s * S))
+    frame = self.t // int(0.01 * S)
+    self.law.update(_cc(ask), self.cs, frame)
+    for name in services:
+      self.sm.updated[name] = True
+      self.sm.logMonoTime[name] = self.t      # each message carries its own publish time: that is the order the hook reads
+    self.hook.step(self.sm, self.CI, self.cs, self.t)
+    for name in services:
+      self.sm.updated[name] = False
+    return frame
+
+  def _press_of_four_messages(self, order):
+    """One press as the car logs it: 4 messages, 0.05 ms and 0.106 ms apart, in the given service order
+    (rlog and qlog duplicate each service, so BOTH orders occur on a real drive)."""
+    g = 0.000106
+    self._tick(services=(order[0],))
+    self._tick(dt_s=0.00005, services=(order[1],))
+    self._tick(dt_s=g, services=(order[2],))
+    self._tick(dt_s=g, services=(order[3],))
+    for _ in range(210):
+      self._tick()
+    return self._marks()
+
+  def test_four_messages_bookmarkbutton_first_is_one_good_record(self):
+    # the SWIPE's order (upstream's): button half first. Four messages because rlog+qlog each carry the pair.
+    marks = self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    self.assertEqual(1, self.hook.presses, "four messages, ONE press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_four_messages_userbookmark_first_is_the_two_finger_tap(self):
+    # the TAP's order (this fork's): bookmark half first is a bookmark, bookmark FIRST is the mark. Same four messages.
+    marks = self._press_of_four_messages(("userBookmark", "bookmarkButton", "userBookmark", "bookmarkButton"))
+    self.assertEqual(1, self.hook.presses, "still ONE press")
+    self.assertEqual(1, len(marks), "exactly one k=m record")
+    self.assertEqual("bad", marks[0]["verdict"])
+    self.assertEqual(dm.MARK_SOURCE_TOUCH2, marks[0]["source"])
+
+  def test_the_real_bad_gesture_is_two_bad_records_and_a_bad_confirmation(self):
+    # the owner's intended "negative": two presses ~1.0 s apart. Both must be BAD, and the confirmation the owner sees
+    # must be the BAD one (a GOOD confirmation here would tell him the opposite of what he meant).
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(99):
+      self._tick()
+    self._tick(services=("bookmarkButton",))                     # +1.00 s
+    self._tick(dt_s=0.000106, services=("userBookmark",))
+    self.assertEqual([], self._marks(), "nothing is typed while the burst is still open")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks), "every press of the burst is recorded")
+    self.assertEqual(["bad", "bad"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double", "bookmark_double"], [m["source"] for m in marks])
+    self.assertEqual(2, self.hook.presses, "two presses, not four messages")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last), "the confirmation is the BAD one")
+
+  def test_presses_49_79s_apart_are_two_good_records(self):
+    # the closest two DISTINCT presses on route 181: 49.79 s. Far outside MARK_GAP_S -> two separate good verdicts.
+    self.assertGreater(49.79, dm.MARK_GAP_S * 20, "the spacing below is not a burst by any reading of the constant")
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(4980):                                      # 49.8 s of card frames
+      self._tick()
+    self._tick(services=("bookmarkButton",))
+    self._tick(dt_s=0.00005, services=("userBookmark",))
+    for _ in range(210):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual(["good", "good"], [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_single", "bookmark_single"], [m["source"] for m in marks])
+
+  def test_burst_of_three_one_second_apart_is_three_bad_records(self):
+    # 3+ presses: the fastest honest rule is that the burst IS the message, so EVERY press of it is typed bad. If the
+    # implementation ever types anything else here, this test is the thing that says so.
+    for _ in range(3):
+      self._tick(services=("bookmarkButton",))
+      self._tick(dt_s=0.00005, services=("userBookmark",))
+      for _ in range(99):
+        self._tick()
+    self.assertEqual([], self._marks(), "one burst: nothing is typed until it closes")
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    marks = self._marks()
+    self.assertEqual(3, len(marks))
+    self.assertEqual(["bad"] * 3, [m["verdict"] for m in marks])
+    self.assertEqual(["bookmark_double"] * 3, [m["source"] for m in marks])
+    self.assertEqual(3, self.hook.presses)
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(last))
+
+  def test_disabled_log_dir_press_writes_nothing_and_raises_nothing(self):
+    os.environ["FCA11_LOG_DIR"] = "0"
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "logging disabled -> no record")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last), "the owner must still SEE that it landed")
+
+  def test_unwritable_log_dir_press_writes_nothing_and_raises_nothing(self):
+    # "no log dir" reached the way a bad path reaches it: the configured dir's parent is a FILE, so the writer cannot
+    # open at all. The press path must swallow it - a log must never take card down.
+    blocker = os.path.join(self.dir, "not-a-dir")
+    with open(blocker, "w") as f:
+      f.write("")
+    os.environ["FCA11_LOG_DIR"] = os.path.join(blocker, "fca11-log")
+    self._tick(services=("userBookmark",))
+    last = -1
+    for _ in range(210):
+      last = self._tick()
+    self.assertEqual([], self._marks(), "a writer that cannot open writes nothing")
+    self.assertEqual(1, self.hook.marks, "the verdict still reached the write path")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(last))
+    self.assertFalse(os.path.exists(os.path.join(blocker, "fca11-log")))
+
+  def test_the_ui_pair_is_one_press(self):
+    self._frame(press=True, second_service=True)     # userBookmark + bookmarkButton, same tick
+    for _ in range(210):
+      self._frame()
+    self.assertEqual(1, self.hook.presses)
+    self.assertEqual(["good"], [m["verdict"] for m in self._marks()])
+
+  def test_the_ui_pair_across_two_ticks_is_still_one_press(self):
+    self._frame(press=True)                          # bookmarkButton lands on the NEXT tick
+    self._frame(press=True)
+    for _ in range(210):
+      self._frame()
+    self.assertEqual(1, self.hook.presses, "a pair straddling a card tick must not read as a double press")
+    self.assertEqual(["good"], [m["verdict"] for m in self._marks()])
+
+  def test_snapshot_is_frozen_at_the_press_not_at_the_verdict(self):
+    f_press = self._frame(press=True, ask=-1.7)
+    for _ in range(210):
+      self._frame(ask=0.0)         # the planner has fully released 2 s later
+    m = self._marks()[0]
+    self.assertEqual(f_press, m["frame"], "the record must describe the PRESS frame")
+    self.assertAlmostEqual(-1.7, m["ask_mps2"], places=4)
+
+  def test_no_press_anywhere_no_mark_at_all(self):
+    for _ in range(400):
+      self._frame()
+    self.assertEqual([], self._marks(), "negative control: feature not triggered -> no k=m record")
+    self.assertEqual(0, self.hook.presses)
+    self.assertEqual(dm.MARK_CODE_NONE, self.law.mark_alert_code(self.t // int(0.01 * S)))
+
+  def test_confirmation_arms_for_2s_from_the_mark(self):
+    self._frame(press=True)
+    for _ in range(210):
+      self._frame()
+    until = self.law._mark_alert_until
+    closed = until - dm.MARK_ALERT_FRAMES
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(closed), "the confirmation is up on the frame the mark lands")
+    self.assertEqual(dm.MARK_CODE_GOOD, self.law.mark_alert_code(until - 1))
+    self.assertEqual(dm.MARK_CODE_NONE, self.law.mark_alert_code(until), "2 s, then silent")
+    self.assertEqual(200, dm.MARK_ALERT_FRAMES, "2 s at the 100 Hz controller rate")
+
+  def test_no_law_no_mark(self):
+    hook = DriverMarkHook()
+    self.sm.updated["userBookmark"] = True
+    hook.step(self.sm, SimpleNamespace(CC=SimpleNamespace()), self.cs, 5)
+    hook.step(self.sm, SimpleNamespace(), self.cs, int(3 * S))
+    self.assertEqual(0, hook.presses)
+    self.assertIsNone(law_of(SimpleNamespace()))
+
+
+def _cc(accel=0.0):
+  cc = structs.CarControl()
+  cc.enabled = True
+  cc.longActive = True
+  cc.actuators.accel = accel
+  return cc
+
+
+class TestWiring(unittest.TestCase):
+  def test_card_subscribes_both_services_and_steps_the_hook(self):
+    src = CARD.read_text()
+    self.assertIn("'userBookmark', 'bookmarkButton'", src)
+    self.assertIn("DriverMarkHook()", src)
+    self.assertRegex(src, r"self\.driver_mark_hook\.step\(self\.sm, self\.CI, CS, now_nanos\)")
+
+
+class TestCarSpecificRaises(unittest.TestCase):
+  def test_driver_mark_codes_raise_the_confirmation_alerts(self):
+    from openpilot.cereal import custom
+    from openpilot.selfdrive.selfdrived.events import Events
+    from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
+    EventNameSP = custom.OnroadEventSP.EventName
+
+    CP = structs.CarParams()
+    CP.brand = 'hyundai'
+    CP_SP = structs.CarParamsSP()
+    CP_SP.fca11Brake = True
+    CP_SP.enableGasInterceptor = True
+    cse = CarSpecificEventsSP(CP, CP_SP)
+    CS = structs.CarState()
+
+    def names(code):
+      CS_SP = structs.CarStateSP()
+      CS_SP.driverMark = code
+      return cse.update(CS, CS_SP, Events(), True)
+
+    def has(ev, name):
+      return bool(ev.has(name))
+
+    self.assertTrue(has(names(1), EventNameSP.driverMarkGood))
+    self.assertTrue(has(names(2), EventNameSP.driverMarkBad))
+    self.assertFalse(has(names(0), EventNameSP.driverMarkGood))
+    self.assertFalse(has(names(0), EventNameSP.driverMarkBad))
+
+  def test_the_confirmations_do_not_reuse_a_fca11_safety_ordinal(self):
+    from openpilot.cereal import custom
+    EventNameSP = custom.OnroadEventSP.EventName
+    used = {EventNameSP.fca11Unavailable, EventNameSP.fca11SuperviseStop, EventNameSP.fca11StopComplete,
+            EventNameSP.fca11BrakeNow, EventNameSP.fca11CameraBraking, EventNameSP.fca11Divergence}
+    self.assertNotIn(EventNameSP.driverMarkGood, used)
+    self.assertNotIn(EventNameSP.driverMarkBad, used)
+    self.assertNotEqual(EventNameSP.driverMarkGood, EventNameSP.driverMarkBad)
+
+
+if __name__ == "__main__":
+  unittest.main()
+
+
+class TestTwoFingerTapThroughTheHook(TestDriverMarkHook):
+  """The BAD gesture end to end: the UI publishes the pair in the REVERSED order (layout `_on_bad_mark`: userBookmark
+  first), and the hook must write a BAD k="m" record with source "touch2" and arm the BAD confirmation - no second press,
+  no 2 s wait."""
+
+  def _tap(self, dt_s=0.01):
+    """One two-finger tap as it reaches card: the reversed pair, ~0.1 ms apart."""
+    self._tick(dt_s, services=("userBookmark",))
+    self._tick(0.000106, services=("bookmarkButton",))
+
+  def test_a_reversed_pair_is_a_bad_record_within_a_quarter_second(self):
+    frame = self._tick(services=("userBookmark",))
+    self._tick(0.000106, services=("bookmarkButton",))
+    self.assertEqual([], self._marks(), "not before its own press window closes")
+    for _ in range(30):                      # 0.3 s: past the 0.25 s window, far short of MARK_GAP_S (2.0 s)
+      frame = self._tick()
+    marks = self._marks()
+    self.assertEqual(1, len(marks), "one gesture, one record")
+    self.assertEqual("bad", marks[0]["verdict"])
+    self.assertEqual(dm.MARK_SOURCE_TOUCH2, marks[0]["source"])
+    self.assertEqual(1, self.hook.presses, "one press, and not half of a pair")
+    self.assertEqual(dm.MARK_CODE_BAD, self.law.mark_alert_code(frame), "the confirmation the owner sees is the BAD one")
+    self.assertLess(dm.MARK_PAIR_DEDUP_S, dm.MARK_GAP_S,
+                    "the tap must be typed on its own window, not by the bookmark burst window")
+
+  def test_a_tap_needs_no_second_press(self):
+    self._tap()
+    for _ in range(240):                     # 2.4 s: well past MARK_GAP_S, so a burst would have been decided by now
+      self._tick()
+    self.assertEqual(1, len(self._marks()), "exactly one record, and nothing waiting on a second press")
+
+  def test_a_lone_half_through_the_hook_is_a_good_record(self):
+    # a dropped message must never invent a BAD verdict: one half alone stays a bookmark press
+    self._tick(services=("userBookmark",))
+    for _ in range(240):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(1, len(marks))
+    self.assertEqual("good", marks[0]["verdict"])
+    self.assertEqual("bookmark_single", marks[0]["source"])
+
+  def test_a_tap_does_not_make_a_neighbouring_swipe_bad(self):
+    self._tap()                                          # the tap
+    for _ in range(100):                                 # +1.0 s
+      self._tick()
+    self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})
+
+  def test_a_swipe_then_a_tap_is_still_good_then_bad(self):
+    self._press_of_four_messages(("bookmarkButton", "userBookmark", "bookmarkButton", "userBookmark"))
+    self._tap()                                          # the tap, ~2.1 s after the swipe
+    for _ in range(240):
+      self._tick()
+    marks = self._marks()
+    self.assertEqual(2, len(marks))
+    self.assertEqual({("bad", dm.MARK_SOURCE_TOUCH2), ("good", "bookmark_single")},
+                     {(m["verdict"], m["source"]) for m in marks})

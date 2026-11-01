@@ -328,4 +328,16 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventNameSP.fca11Divergence: {
     ET.PERMANENT: NormalPermanentAlert("FCA11 Safety Mismatch", "openpilot braking paused - camera state disagrees"),
   },
+
+  # fork (17c FEEDBACK): the TRANSIENT driver-mark confirmation. The owner marks a felt event with ONE bookmark press
+  # (good) or TWO rapid presses (bad); the car layer types the burst, writes the k="m" record and arms
+  # CarStateSP.driverMark for 2 s. This alert is the whole point: it proves the mark LANDED. The star-button experiment
+  # died because the owner pressed it and nothing happened anywhere. Separate ordinals from every FCA11 braking alert,
+  # and it cannot fire on a drive with no mark.
+  EventNameSP.driverMarkGood: {
+    ET.PERMANENT: NormalPermanentAlert("Marked GOOD", duration=2.0),
+  },
+  EventNameSP.driverMarkBad: {
+    ET.PERMANENT: NormalPermanentAlert("Marked BAD", duration=2.0),
+  },
 }

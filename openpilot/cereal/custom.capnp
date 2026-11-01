@@ -370,6 +370,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     fca11BrakeNow @33;  # fork (0040): persistent RED "BRAKE NOW" - ESC non-response or hold lost; clears only on driver brake
     fca11CameraBraking @34;  # fork (0053): TRANSIENT - the stock camera is braking, openpilot braking paused (resumes on its own)
     fca11Divergence @35;  # fork (0053): panda refused FCA11 while the car layer saw no camera braking (Python <-> panda disagreement)
+    driverMarkGood @36;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked GOOD" - one bookmark press (verdict landed)
+    driverMarkBad @37;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked BAD" - two bookmark presses within 2 s
   }
 }
 
@@ -382,6 +384,8 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
   fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
   fca11Shadow @8 :Bool;  # fork (0045): FCA11 SHADOW log-only mode (HyundaiFca11Shadow, default OFF); never sends; mirrors opendbc CarParamsSP
+  fca11DynamicRelease @10 :Bool;  # fork (18x): dynamic-release build - gentle 1 LSB onset, decrease limit, soft release ramp, k="b" trace (HyundaiFca11DynamicRelease, default OFF); mirrors opendbc CarParamsSP
+  pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
@@ -495,6 +499,8 @@ struct CarStateSP @0xb86e6369214c01c8 {
   nModeSteering @17 :UInt8;     # 0 Comfort / 1 Normal / 2 Sport
   fca11CameraBraking @18 :Bool;  # fork (0053): TRANSIENT - stock camera braking, openpilot braking paused (self-releasing)
   fca11Divergence @19 :Bool;     # fork (0053): panda refused FCA11 while the car layer saw no camera braking
+  driverMark @20 :UInt8;         # fork (17c FEEDBACK): TRANSIENT driver-mark confirmation, 0 none / 1 "marked GOOD" /
+                                 # 2 "marked BAD" (see fca11_long.on_driver_mark + driver_mark.py)
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
