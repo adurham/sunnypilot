@@ -141,7 +141,8 @@ class HyundaiSettings(BrandSettings):
     delivery_desc = tr("Uses the pedal's MEASURED response instead of the linear law for light braking asks " +
                        "(below about 0.5 m/s^2), so more of what the planner asks actually reaches the road, and the " +
                        "pedal stops dithering at the set speed. Positive asks and every hard stop are unchanged. " +
-                       "Requires the comma pedal. Takes effect at the next ignition.")
+                       "Measured in NORMAL drive mode: ECO and SPORT keep the stock pedal law (their accelerator " +
+                       "map is different). Requires the comma pedal. Takes effect at the next ignition.")
     if delivery_state.visible and not offroad:
       delivery_desc = offroad_hint + delivery_desc
     self.pedal_delivery_toggle.set_description(delivery_desc)

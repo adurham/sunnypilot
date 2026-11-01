@@ -411,6 +411,10 @@ struct CarControlSP @0xa5cd762cd951a455 {
   # pedal law: launch ceiling / pull gain / interceptor cap). 0 in capnp is aggressive, so the opendbc mirror defaults
   # to standard and the producer always writes it; consumers clamp anything unknown to standard.
   personality @5 :UInt8;
+  # fork (adurham): raw CLU13 drive mode (1 normal / 2 eco / 3 sport / 6 N-custom / 7 N; 0 = unknown), mirrored from
+  # CarStateSP.driveMode. The Hyundai pedal DELIVERY law is only valid in the mode it was measured in (NORMAL), so the
+  # car layer gates the measured inverse on this value instead of applying it blindly in ECO/SPORT.
+  driveMode @6 :UInt8;
 
   struct Param {
     key @0 :Text;
