@@ -777,12 +777,21 @@ class TestPedalFaultClearEndToEnd:
     CI, CC, CC_SP, ids = self._setup()
     out = self._drive(CI, CC, CC_SP, ids, [0] * 60)
     a = [_cmd_fields(d)[0] for d, _ in out if d is not None]
-    # first frame is one rate step, not a step to the cap (old behaviour: 0 -> cap in one frame)
-    # v_ego 25 m/s (from _drive): jerk limit 2.0 m/s^3 * 0.36 = 0.72/s, 0 -> 0.35 in 0.49 s
-    _, d1, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), gi.get_pedal_rate_up(25.) * DT_CTRL, 0)
-    assert a[0] == (d1[0] << 8) | d1[1]
-    assert all(y >= x for x, y in zip(a, a[1:], strict=False)) and abs(a[-1] - 1218) <= 2
-    assert sum(abs(x - 1218) > 2 for x in a) == 24  # 0.49 s ramp: 24 send slots below the cap
+    # 185 HAND-OVER: the engagement now starts at hold_cmd(25 m/s) instead of 0 (the seed; pre-185 the first slot was
+    # one rate step above rest, which is what closed the throttle at the hand-over), and the jerk limit carries it on to
+    # the cap - it is still a ramp, never a step to the cap in one frame (the old 12e/12f behaviour).
+    # v_ego 25 m/s (from _drive): jerk limit 2.0 m/s^3 * 0.36 = 0.72/s.
+    target = gi.get_pedal_command(1.0, 25.)
+    g = min(target, gi.get_hold_command(25.), gi.get_personality_ceiling(25.))
+    assert 0. < g < target                          # seeded at the hold: not 0, and not the cap either
+    expect = []
+    for k in range(60):
+      g = min(target, g + gi.get_pedal_rate_up(25.) * DT_CTRL)
+      if k % 2 == 0:
+        _, d, _ = create_gas_interceptor_command(CANPacker(gi.GAS_INTERCEPTOR_DBC), g, 0)
+        expect.append((d[0] << 8) | d[1])
+    assert a == expect
+    assert abs(a[-1] - 1218) <= 2
     # accel request drops to coast -> the very next frame is the zero frame
     CC2 = structs.CarControl()
     CC2.enabled = CC2.latActive = CC2.longActive = True
@@ -1728,12 +1737,14 @@ class TestBlipSmoothing17c:
     assert t_hold >= 0.9 * self.REENTRY_S, t_hold                                   # pre-fix: ~0.25 s
 
   def test_deliberate_ask_keeps_jerk_rate(self):
-    # a deliberate ask (>= 0.5 m/s^2: lead pulling away, merge) from a zero command keeps the UNCHANGED jerk-rate rise,
-    # byte-for-byte the pre-17c limiter: smoothing must not cost real pull authority.
+    # a deliberate ask (>= 0.5 m/s^2: lead pulling away, merge) from the hand-over keeps the UNCHANGED jerk-rate rise
+    # ABOVE the 185 seed, byte-for-byte the pre-17c limiter: smoothing must not cost real pull authority. (Pre-185 this
+    # started at 0; the engagement now starts at the seed - see gas_interceptor's 185 HAND-OVER note.)
     CI = self._ci()
     v = 25.
     slots = self._run(CI, [(1.0, v, self.SET_KPH)] * 60)
-    g, expect = 0., []
+    g = min(gi.get_pedal_command(1.0, v), gi.get_hold_command(v), gi.get_personality_ceiling(v))
+    expect = []
     for k in range(60):
       g = min(gi.get_pedal_command(1.0, v), g + gi.get_pedal_rate_up(v) * DT_CTRL)
       if k % 2 == 0:
@@ -1773,12 +1784,16 @@ class TestBlipSmoothing17c:
       assert not CI.CC.overspeed_released and CI.CC.gas > 0.
 
   def test_launch_and_low_speed_unchanged(self):
-    # the soft recovery is gated off below 25 mph and while launching: the standstill launch and a 6-10 m/s rolling
-    # recovery are byte-identical to the pre-17c limiter.
+    # the soft recovery is gated off below 25 mph and while launching: the standstill launch is byte-identical to the
+    # pre-17c limiter and a 6-10 m/s rolling recovery keeps its (unchanged, jerk-rate) rise. 185 HAND-OVER: above
+    # LAUNCH_RAMP_V_MAX the first active frame is seeded at the hold, so the rolling cases start there instead of at 0
+    # (a launch, below the ramp speed, is unchanged and still starts the launch ramp from 0).
     for v, accel in ((0., 1.2), (2., 0.3), (6., 0.0), (10., 0.2)):
       CI = self._ci()
       slots = self._run(CI, [(accel, v, 72.)] * 80)
-      g, launching, expect = 0., False, []
+      launching = accel > 0. and v <= gi.LAUNCH_RAMP_V_MAX
+      g, expect = (0. if launching else
+                   min(gi.get_pedal_command(accel, v), gi.get_hold_command(v), gi.get_personality_ceiling(v))), []
       for k in range(80):
         launching = accel > 0. and v <= gi.LAUNCH_RAMP_V_MAX
         g = min(gi.get_pedal_command(accel, v), g + gi.get_pedal_rate_up(v, launching) * DT_CTRL)
@@ -2233,3 +2248,115 @@ class TestPedalDelivery17c:
     # the documented band: above the deployed law's own crossing the new law holds exactly the floor
     assert gi.get_pedal_command(-0.45, 20.) == 0.
     assert abs(gi.get_delivery_pedal_command(-0.45, 20.) - gi.DELIVERY_PEDAL_FLOOR) < 1e-12
+
+
+# *** 185 HAND-OVER (route 185, measured): the first engaged frame is seeded at the hold, not 0 ***
+# Measured on the deployed build (the brief's table): the command starts at 0 on the first engaged frame and climbs at
+# the jerk rate, so the first frame commanded gas 0.0-1.9 % while the driver's foot held 6.6 / 9.4 / 12.2 % TPS. The
+# pedal outputs max(driver, command), so the engine throttle physically CLOSED to 0.0 % at t=9.4 / 31.2 / 76.5 s and
+# took 0.4-0.8 s to recover (aEgo +0.16 -> -0.29, +0.02 -> -0.18, +0.58 -> -0.36): the owner's "throttle blip style
+# surges towards the beginning of the drive". hold_cmd(v) is the physically correct feedforward and the car was already
+# at that pedal level under his foot, so the first active frame of an episode is now seeded at hold_cmd(v), min()'d with
+# that frame's own law target and the launch ceiling. Everything below drives the REAL path
+# (CarInterface.update -> CarInterface.apply -> create_gas_command -> the 0x700 wire).
+class TestHandover185:
+  def _ci(self):
+    CarInterface, CP, CP_SP = _get_ci({**BASE_FINGERPRINT, **REM}, True)
+    return CarInterface(CP, CP_SP)
+
+  def _run(self, CI, series, long_active=True, v_cruise=0.):
+    """[(accel, v_ego)] per 100 Hz frame -> (per-frame controller command, [(raw, enable)] per 50 Hz send slot).
+
+    v_cruise defaults to 0 (unset set speed) so the 16a over-speed release can never fire and the law is the only thing
+    being measured.
+    """
+    gas, slots = [], []
+    for i, (accel, v) in enumerate(series):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = CC.longActive = long_active
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = float(v_cruise)
+      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
+      gas.append(CI.CC.gas)
+      cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+      if cmd:
+        raw, _, en, _ = _cmd_fields(cmd[0])
+        slots.append((raw, en))
+    return gas, slots
+
+  @staticmethod
+  def _seed(law: float, v: float) -> float:
+    """min(law target, hold, launch ceiling) - the seed the first active frame is pinned to."""
+    return min(law, gi.get_hold_command(v), gi.get_personality_ceiling(v))
+
+  def test_handover_seeds_at_hold_9ms(self):
+    # route-185 band (20.9 km/h = 5.8 m/s, driven here at 9 m/s), ask +0.4: the law wants 0.14 pedal, the hold is
+    # 0.084, the ceiling 0.297. The first active frame must start AT the hold - pre-fix it was one rate step from 0
+    # (0.0028 pedal = 6 raw counts), which is what closed the throttle.
+    CI = self._ci()
+    v, ask = 9., 0.4
+    law = gi.get_pedal_command(ask, v)
+    hold, ceiling = gi.get_hold_command(v), gi.get_personality_ceiling(v)
+    assert hold < law < ceiling                       # non-vacuous: every term of the min() is distinct
+    seed = self._seed(law, v)
+    assert seed == hold
+    gas, slots = self._run(CI, [(ask, v)] * 3)
+    step = gi.get_pedal_rate_up(v) * DT_CTRL
+    # the seed itself, then one rate step of the unchanged rise limiter on top of it (the seed feeds the limiter, it
+    # does not bypass it - see STATE-handover.md "brief vs code")
+    assert seed <= gas[0] <= seed + step + 1e-12, (gas[0], seed, step)
+    assert gas[0] > 10 * step, (gas[0], step)         # NOT the 0-start: one rate step from 0 is 0.0028
+    assert gas[1] <= gas[0] + step + 1e-12
+    # on the wire: ENABLE=1 and the command is live in the first send slot (pre-fix: ~6 raw counts above rest)
+    raw0, en0 = slots[0]
+    assert en0 == 1 and raw0 >= 465 + 2151 * seed - 2, (raw0, 465 + 2151 * seed)
+
+  def test_handover_negative_ask_not_seeded(self):
+    # a LIFT is never delayed: with ask -1.0 the law's own target at 9 m/s is exactly 0 (below the hold), so the seed's
+    # min() makes it a no-op and the first frame is still the all-zero ENABLE=0 pass-through frame.
+    CI = self._ci()
+    v = 9.
+    assert gi.get_pedal_command(-1.0, v) == 0.
+    gas, slots = self._run(CI, [(-1.0, v)] * 2)
+    assert gas[0] == 0., gas[0]
+    assert slots[0] == (0, 0), slots[0]              # (raw, ENABLE) = the all-zero pass-through frame
+    assert all(s == (0, 0) for s in slots), slots
+
+  def test_handover_launch_unchanged(self):
+    # launches are unchanged: at v=0.5 m/s with ask +1.2 the launch latch is set, the seed is skipped and the first
+    # frame is today's launch-rate step from 0 (LAUNCH_RAMP_RATE_UP * DT_CTRL), not hold_cmd(0.5) + one jerk step.
+    CI = self._ci()
+    v, ask = 0.5, 1.2
+    gas, slots = self._run(CI, [(ask, v)] * 3)
+    target = gi.get_pedal_command(ask, v)
+    assert CI.CC.gas_launching
+    assert gas[0] == pytest.approx(min(target, gi.LAUNCH_RAMP_RATE_UP * DT_CTRL))
+    seeded = min(target, gi.get_hold_command(v), gi.get_personality_ceiling(v))   # what the seed WOULD have done
+    assert gas[0] < seeded + 1e-12, (gas[0], seeded)
+    assert slots[0][1] == 1 and slots[0][0] > 465
+
+  def test_handover_after_disengage(self):
+    # an episode boundary is a disengage, not just a fresh controller: active -> 0 frames -> active again re-seeds
+    # (route 185's hand-overs are re-engagements mid-drive, not only the first engage of the drive).
+    CI = self._ci()
+    v, ask = 12., 0.3
+    self._run(CI, [(ask, v)] * 20)                                   # engaged and settled
+    off_gas, off_slots = self._run(CI, [(ask, v)] * 3, long_active=False)
+    assert off_gas == [0., 0., 0.] and all(s == (0, 0) for s in off_slots)
+    gas, slots = self._run(CI, [(ask, v)] * 2)                       # re-engaged
+    seed = self._seed(gi.get_pedal_command(ask, v), v)
+    assert seed == gi.get_hold_command(v)
+    step = gi.get_pedal_rate_up(v) * DT_CTRL
+    assert seed <= gas[0] <= seed + step + 1e-12, (gas[0], seed, step)
+    assert gas[0] > 10 * step, (gas[0], step)                        # pre-fix: an anonymous rate step from 0
+    assert slots[0][1] == 1
+
+  def test_inactive_still_sends_zero(self):
+    # every inactive frame is unchanged: the all-zero ENABLE=0 frame (pedal pass-through + fault-clear), command 0.
+    CI = self._ci()
+    gas, slots = self._run(CI, [(0.4, 9.)] * 6, long_active=False)
+    assert gas == [0.] * 6
+    assert all(s == (0, 0) for s in slots), slots      # (raw, ENABLE): all-zero, pedal pass-through
+    assert len(slots) == 3

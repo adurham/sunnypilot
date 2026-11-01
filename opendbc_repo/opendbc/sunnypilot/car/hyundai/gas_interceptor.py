@@ -560,6 +560,9 @@ class GasInterceptorCarController:
     self.CP_SP = CP_SP
 
     self.gas = 0.
+    # 185 HAND-OVER: was longitudinal active on the previous controller frame? Used to recognise the FIRST active frame
+    # of an engagement episode (the hand-over), where the command is seeded at the hold instead of 0.
+    self._was_active = False
     # 0039: launch latch. Set while an engaged positive request is a (near)-rest pull-away (see the ramp branch
     # below), cleared as soon as the car is moving above LAUNCH_RAMP_V_MAX or the request is non-positive (a
     # lift/coast), so it only ever selects the fast launch rate from rest and never a rolling re-engagement.
@@ -585,6 +588,21 @@ class GasInterceptorCarController:
     # also clears any latched pedal fault (pedal firmware)
     # (no low-speed cut: a pause/resume engagement may start from a standstill; LOW_SPEED_MAX_GAS limits the launch)
     active = CC.longActive
+    # *** 185 HAND-OVER: gas must not dip at the driver -> openpilot hand-over ***
+    # Route 185 (deployed build, measured at the 100 Hz pedal frames): the rise limiter below starts every episode from
+    # 0 (the command is 0 while inactive), so the FIRST engaged frame commanded gas 0.0-1.9 % while the driver's foot
+    # had been holding 6.6 / 9.4 / 12.2 % TPS. The pedal outputs max(driver, command), so the engine throttle physically
+    # CLOSED to 0.0 % at each hand-over and took 0.4-0.8 s to come back:
+    #   t=9.4 s  20.9 km/h  driver TPS 6.6 %  -> first frame gas 1.9 %, TPS 0.0 %, back to 6.6 % in ~0.6 s
+    #   t=31.2 s 32.5 km/h  driver TPS 9.4 %  -> first frame gas 1.1 %, TPS 0.0 %, 11.3 % in ~0.8 s
+    #   t=76.5 s 37.2 km/h  driver TPS 12.2 % -> first frame gas 0.0 %, TPS 0.0 %, back to 6.6 % in ~0.4 s
+    # with aEgo swings +0.16/-0.29, +0.02/-0.18, +0.58/-0.36 m/s^2: the owner's "throttle blip style surges towards the
+    # beginning of the drive". hold_cmd(v) is the physically correct feedforward at that speed (0 standstill, 0.08 at
+    # 5-10 m/s, 0.09-0.12 at 12-20 m/s) and the car was ALREADY at that pedal level under his foot, so the dip is an
+    # artefact of the 0 start, not of the law. On the first active frame of an episode the command is therefore SEEDED
+    # at the hold (see the seed in the law branch below); the seed is min()'d against this frame's own law target and
+    # the launch ceiling, so it can never command more than the law already justifies and a lift is never delayed.
+    hand_over = active and not self._was_active
     # 17c delivery (opt-in): advance the pedal-path ask filter on EVERY active frame, ahead of the paths below that
     # can zero or bypass the law (over-speed release, FCA11 brake, cal hold, cam-brake, gas override). It is cleared
     # only by a disengage, so the hand-back from any of those zero states - and from a coast - is filtered as well
@@ -635,8 +653,13 @@ class GasInterceptorCarController:
     # which the driver never marked anything.
     CS.fca11_mark = self.fca11_brake.mark_alert_code(frame)
 
-    # jerk-limited upward from the last computed command (0 while inactive, so every engagement ramps from 0). A clear
-    # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
+    # jerk-limited upward from the last computed command. The command is 0 while inactive, so the FIRST active frame
+    # of an episode has nothing to ramp from - and ramping from 0 physically closed the engine throttle at every
+    # driver -> openpilot hand-over (route 185: TPS 6.6/9.4/12.2 % -> 0.0 % on the first commanded frame, 0.4-0.8 s to
+    # recover; see the hand-over note above). The first active frame is therefore SEEDED at hold_cmd(v) - min()'d
+    # against that frame's law target and the launch ceiling, so it never exceeds what the law already asked for and a
+    # lift is never delayed - and the rise limiter then carries on from there. A clear frame below does not reset it:
+    # the pedal resumes the command right after a ~20 ms fault blip.
     # While the FCA11 brake is active the pedal command is EXACTLY zero for this frame (hard zero, not the law's
     # zero: the law would still add the hold feedforward at speed).
     # 0029 CAL: while a scripted CAL hold is active the pedal is ALSO forced to 0, for the same reason (gas and
@@ -694,6 +717,18 @@ class GasInterceptorCarController:
             pedal_target = max(pedal_target, self.gas - weight * get_pedal_rate_down(CS.out.vEgo) * DT_CTRL)
         else:
           pedal_target = get_pedal_command(accel, CS.out.vEgo, personality)
+        # 185 HAND-OVER SEED: on the FIRST active frame of an episode, start the ramp at the hold instead of 0, so the
+        # pedal does not close the throttle the driver's foot was already holding open (the measured route-185 table
+        # above this frame's `hand_over`). The min() chain makes the seed strictly conservative: it is never above this
+        # frame's own law target (`pedal_target`: a negative ask's target is below the hold, so the seed is then a
+        # no-op - a lift is never delayed) and never above the launch ceiling, so it cannot add authority the plan did
+        # not ask for. Launches are skipped (gas_launching, set above for accel > 0 at vEgo <= LAUNCH_RAMP_V_MAX, where
+        # hold_cmd is ~0 anyway), and every zeroing path above (over-speed release, FCA11 brake, cal hold, cam brake)
+        # returns before this line, so those frames still command exactly 0. Inactive frames are untouched (0 /
+        # ENABLE=0 below).
+        if hand_over and not self.gas_launching:
+          self.gas = min(pedal_target, get_hold_command(CS.out.vEgo, personality),
+                         get_personality_ceiling(CS.out.vEgo, personality))
         self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
                                             self.gas_launching, reentry=accel < OVERSPEED_EXIT_ACCEL)
     elif self.fca11_brake.braking or self.fca11_brake._cal_active:
@@ -720,6 +755,9 @@ class GasInterceptorCarController:
                                                      self.interceptor_ids.command_msg))
 
     can_sends.extend(brake_sends)
+    # 185 HAND-OVER: remember whether this frame was active, so the NEXT frame can tell an engagement's first frame.
+    # Set on every call (including the inactive frames that reset the episode), after all command paths above.
+    self._was_active = active
     return can_sends
 
   def fca11_post_send(self) -> None:
