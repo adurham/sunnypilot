@@ -8,7 +8,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
   FCA11 Brake Shaping (Beta)    HyundaiFca11AffineGain  visible: pedal on AND braking on;  enabled: offroad
   FCA11 Shadow (Log-Only)       HyundaiFca11Shadow      visible: pedal on;                 enabled: offroad   (0045)
   Pedal Delivery Law            HyundaiPedalDeliveryLaw visible: pedal on;                 enabled: offroad
-  Dynamic Brake Release         HyundaiFca11DynamicRelease visible: pedal on AND braking on; enabled: offroad
+  Dynamic Brake Release         HyundaiFca11DynamicBrakes visible: pedal on AND braking on; enabled: offroad
   Stop-Approach Commitment      StopApproachCommit      visible: always (planner-side);   enabled: offroad
 
 Both keys are read at CarParams build time, so a change takes effect at the NEXT ignition; offroad-only enabling makes

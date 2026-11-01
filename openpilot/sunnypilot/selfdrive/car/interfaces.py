@@ -175,9 +175,9 @@ def initialize_params(params) -> list[dict[str, Any]]:
   # fork (18x): dynamic-release build of the FCA11 law. Same stale-libparams guard: a missing key leaves the build OFF
   # (the deployed law + the three unconditional 18x rules). Takes effect at the next ignition.
   try:
-    params_list.append({"HyundaiFca11DynamicRelease": params.get("HyundaiFca11DynamicRelease", return_default=True)})
+    params_list.append({"HyundaiFca11DynamicBrakes": params.get("HyundaiFca11DynamicBrakes", return_default=True)})
   except UnknownKeyName:
-    cloudlog.warning("HyundaiFca11DynamicRelease param unknown to libparams (not rebuilt?); the dynamic release stays OFF")
+    cloudlog.warning("HyundaiFca11DynamicBrakes param unknown to libparams (not rebuilt?); the dynamic release stays OFF")
   # fork (17c delivery): measured-inverse pedal law for negative asks + a pedal-path ask filter. Same stale-libparams
   # guard: a missing key leaves the law OFF (the deployed linear law). Takes effect at the next ignition.
   try:

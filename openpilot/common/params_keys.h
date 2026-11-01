@@ -256,7 +256,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // Read at CarParams build time => takes effect at the NEXT ignition. Inert unless HyundaiFca11Brake is also ON
     // (enforced in opendbc setup_interfaces). Default OFF; the three UNCONDITIONAL 18x rules (low-speed release hold,
     // crawl floor, 100 ms gas window) are NOT behind this key and run on every build.
-    {"HyundaiFca11DynamicRelease", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"HyundaiFca11DynamicBrakes", {PERSISTENT | BACKUP, BOOL, "0"}},
     // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
     // REGISTRATION ONLY in this tree: the key's reader (opendbc gas_interceptor) ships with the pedal-delivery lane
     // (commit f7282b49fd), which is not merged here; the entry exists so the compiled aarch64 libparams_c.so registers

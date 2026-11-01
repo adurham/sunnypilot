@@ -35,7 +35,7 @@ class HyundaiSettings(BrandSettings):
     # visible only where they can do anything, settable offroad only (CarParams/CarParamsSP are built at ignition).
     self.pedal_delivery_toggle = toggle_item_sp(tr("Pedal Delivery Law"), "", param="HyundaiPedalDeliveryLaw",
                                                 callback=self._on_fca11_toggle_changed)
-    self.fca11_dynamic_release_toggle = toggle_item_sp(tr("Dynamic Brake Release"), "", param="HyundaiFca11DynamicRelease",
+    self.fca11_dynamic_release_toggle = toggle_item_sp(tr("Dynamic Brakes"), "", param="HyundaiFca11DynamicBrakes",
                                                        callback=self._on_fca11_toggle_changed)
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
@@ -151,9 +151,10 @@ class HyundaiSettings(BrandSettings):
     # fork (18x): Dynamic Brake Release - the FCA11 brake becomes a ramp; needs FCA11 Braking, offroad only.
     dynamic_state = fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)
     self.fca11_dynamic_release_toggle.action_item.set_enabled(dynamic_state.enabled)
-    dynamic_desc = tr("Makes the FCA11 brake a ramp instead of a switch: a gentle ask starts at 1 LSB and climbs to " +
-                      "the target, decreases are rate-limited, and a standstill release ramps out over 0.5 s with gas " +
-                      "held at zero. Hard stops are NOT slowed. Requires FCA11 Braking. Takes effect at the next ignition.")
+    dynamic_desc = tr("Makes the FCA11 brake a ramp instead of a switch in BOTH directions: every brake episode " +
+                      "starts at 1 LSB and climbs to the target (about 0.7 s to full), and decreases are rate-limited, " +
+                      "with a standstill release ramped out over 0.5 s and gas held at zero through it. An emergency " +
+                      "ask and a step demand still go at full rate. Requires FCA11 Braking. Takes effect at the next ignition.")
     if dynamic_state.visible and not offroad:
       dynamic_desc = offroad_hint + dynamic_desc
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)

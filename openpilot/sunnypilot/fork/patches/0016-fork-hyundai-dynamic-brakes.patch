@@ -1,0 +1,379 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index aed26d0..23908e1 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -71,11 +71,11 @@ class CarParamsSP:
+   # (the deployed law: fca11Brake as today, fca11AffineGain forced False) and V3 is computed + logged alongside, NEVER
+   # sent. Coupled with custom.capnp CarParamsSP.fca11Shadow @8.
+   fca11Shadow: bool = auto_field()
+-  # 18x: DYNAMIC-RELEASE build (HyundaiFca11DynamicRelease, default OFF). Written ONLY by setup_interfaces from that param;
++  # 18x: DYNAMIC-RELEASE build (HyundaiFca11DynamicBrakes, default OFF). Written ONLY by setup_interfaces from that param;
+   # read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = gentle 1 LSB
+   # onset, a decrease limit, a soft release ramp and the k="b" level trace, all on the FEEL path only. OFF = the deployed
+-  # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicRelease @10.
+-  fca11DynamicRelease: bool = auto_field()
++  # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicBrakes @10.
++  fca11DynamicBrakes: bool = auto_field()
+   # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+   # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+   # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index b1c52eb..4c1650b 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -870,14 +870,20 @@ FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+ FCA11_GAS_WINDOW_HOLD_S = 0.10             # == the panda's BRAKE_THROTTLE_EXCL_US
+ FCA11_GAS_WINDOW_HOLD_FRAMES = 10          # controller frames at 100 Hz
+ 
+-# *** 18x: DYNAMIC RELEASE (param HyundaiFca11DynamicRelease -> CP_SP.fca11DynamicRelease, DEFAULT OFF) ***
++# *** 18x: DYNAMIC BRAKES (param HyundaiFca11DynamicBrakes -> CP_SP.fca11DynamicBrakes, DEFAULT OFF) ***
+ # ONE switch for the owner's "brakes need to be dynamic, gradual increase and decrease", minus the calibration drive
+-# (the owner's ruling: no scripted calibration drives, the car cannot be forced). ON does four things, all on the FEEL
++# (the owner's ruling: no scripted calibration drives, the car cannot be forced). ON does five things, all on the FEEL
+ # path (the deployed request path), all OFF = byte-for-byte today:
+-#   (a) GENTLE ONSET: when the law's OWN target for the ask is <= FCA11_MEAS_FLOOR_LSB (4 LSB, i.e. every ask from about
+-#       -0.30 to -0.85, which today is a one-frame step to 4), the episode STARTS at FCA11_DYN_GENTLE_FIRST_LSB and climbs
+-#       to the target at the existing comfort rise rate (0.19 LSB per sent frame at the low band ~ 0.32 s 1 -> 4). A HARD
+-#       ask (target > 4 LSB) keeps the deployed first frame AND the deployed rise, so a real stop is never slower.
++#   (a) GENTLE ONSET: every episode STARTS at FCA11_DYN_GENTLE_FIRST_LSB and climbs to the target at the rise limiter
++#       below (1 -> 4 in ~0.15 s at 4 LSB). A HARD EMERGENCY ask (<= FCA11_DYN_EMERGENCY_ACCEL) or a target that
++#       outruns the limiter by more than FCA11_DYN_RISE_MAX_GAP_LSB keeps the deployed first frame and the deployed rise.
++#   (a2) RISE LIMIT (18x v2, the owner's "increased braking force as well as decreased"): growth is jerk-limited at
++#       FCA11_DYN_RISE_JERK = 4.5 m/s^3 through the MEASURED map (dLSB = J * 0.02 / slope(LSB)), so the same knob
++#       produces a smooth ramp at every depth instead of a fixed LSB step; above 8 LSB that is ~0.9 LSB per sent frame,
++#       i.e. 0 -> 30 LSB in ~0.65 s. It never exceeds the panda's +RATE_STEP, and it is BYPASSED (panda max) for an
++#       emergency ask (<= -3.0 m/s^2) and for a step the planner is outrunning (target - prev > 12 LSB) - the two cases
++#       where a ramp would cost braking a real stop needs. The old DEEPEN_SLOPE bypass is NOT used on this path: at
++#       -2.0 m/s^3 an ordinary planner ramp would trip it and silently defeat the feature.
+ #   (b) DECREASE LIMIT: a level decrease is at most FCA11_DYN_DECREASE_LSB_PER_SENT (0.3) per SENT frame ~ 1.5 m/s^3,
+ #       instead of one-frame drops.
+ #   (c) SOFT RELEASE RAMP: on a release (the ask eased, or min-on ended - never a safety veto, see _update_law) the level
+@@ -889,8 +895,12 @@ FCA11_GAS_WINDOW_HOLD_FRAMES = 10          # controller frames at 100 Hz
+ #       ordinary drives: see _log_dyn_send and BRAKE-BUILD-REPORT.md §"what the next drive must show".
+ # WHAT RIDES IT: nothing in this module can be turned on by an env var; the flag is read ONCE from CP_SP (getattr, so an
+ # un-wired CP_SP - including every existing test double and the deployed build - is OFF).
+-FCA11_DYN_RELEASE_ENABLED = True             # code-level kill switch for the whole (a)-(d) build
+-FCA11_DYN_GENTLE_FIRST_LSB = 1               # (a) the first SENT level of a GENTLE episode (was 4)
++FCA11_DYN_BRAKES_ENABLED = True              # code-level kill switch for the whole (a)-(d) build
++FCA11_DYN_GENTLE_FIRST_LSB = 1               # (a) the first SENT level of a ramped episode (was 4)
++FCA11_DYN_RISE_JERK = 4.5                    # (a2) m/s^3: the growth limit through the measured map (planner ramps ~2-4)
++FCA11_DYN_RISE_MAX_GAP_LSB = 12              # (a2) a single-frame level gap above this means the planner stepped the ask
++FCA11_DYN_EMERGENCY_ACCEL = -3.0             # (a2) asks at/below this (near the 30 LSB cap) go at the panda max
++FCA11_DYN_ASK_STEP_ACCEL = 1.5               # (a2) an ask that jumps this much in ONE sent frame is a step demand
+ FCA11_DYN_DECREASE_LSB_PER_SENT = 0.3        # (b)/(c) ~1.5 m/s^3 at the measured low-band slope 0.26 m/s^2 per LSB
+ FCA11_DYN_STANDSTILL_HOLD_LSB = 8            # (c) a release from at/above this level is a standstill/stop-band hold
+ FCA11_DYN_STANDSTILL_RELEASE_S = 0.5         # (c) 30 -> 0 in exactly this long (30 / 25 sent frames = 1.2 LSB/frame)
+@@ -966,6 +976,16 @@ def feel_rate_lsb_per_sent(accel: float, lsb: float = float(FCA11_FEEL_SLOPE_KNE
+   return soft + frac * (step - soft)
+ 
+ 
++def dyn_rise_lsb_per_sent(lsb: float) -> float:
++  """18x (a2): the RISE allowed in ONE 50 Hz sent frame at command level ``lsb`` under the dynamic-brakes switch.
++
++  The same jerk limit converted through the MEASURED map (dLSB/dt = J / d(extra)/dLSB), so 4.5 m/s^3 is ~0.9 LSB/frame
++  above 8 LSB (0 -> 30 in ~0.65 s) and ~0.27 LSB/frame across the 4-8 cliff. Clamped to [0.05, +RATE_STEP]: it can never
++  exceed the panda ceiling, and the floor only stops a zero slope from freezing the ramp."""
++  slope = max(shape_local_slope_extra_per_lsb(lsb), 1e-6)
++  return max(0.05, min(float(HYUNDAI_FCA11_LONG_RATE_STEP), FCA11_DYN_RISE_JERK * FCA11_SHAPE_SENT_DT / slope))
++
++
+ def feel_anticipated_accel(accel: float, slope: float) -> float:
+   """0049: the ask predicted FCA11_FEEL_ANTICIPATE_S ahead, used ONLY while it is EASING (slope > 0) and never for a HARD
+   ask. Only ever returns an ask that is equal or LESS negative (a lower request) - never more braking."""
+@@ -1417,13 +1437,13 @@ class Fca11LongBrake:
+     # "enabled AND not the 0043 shaping law AND not Shadow", so this flag can never reach the shaped law, cal, the
+     # shadow core or a disabled instance. OFF -> the pre-0054 request map and release rule, byte-for-byte.
+     self.meas_inverse = bool(FCA11_FEEL_ENABLED) and bool(FCA11_MEAS_INVERSE) and self.feel
+-    # 18x: the DYNAMIC-RELEASE build (FCA11_DYN_*). Read ONCE, from CP_SP only, DEFAULT OFF. `getattr` (not an attribute
++    # 18x: the DYNAMIC-BRAKES build (FCA11_DYN_*). Read ONCE, from CP_SP only, DEFAULT OFF. `getattr` (not an attribute
+     # access) is deliberate: the field is wired in the superproject (param HyundaiFca11DynamicRelease -> capnp
+-    # CarParamsSP.fca11DynamicRelease -> structs.CarParamsSP), and this tree must stay OFF - byte-for-byte the deployed
++    # CarParamsSP.fca11DynamicBrakes -> structs.CarParamsSP), and this tree must stay OFF - byte-for-byte the deployed
+     # law - for every CP_SP that does not carry it, including every existing test double and the car as it is today.
+     # Scoped to the FEEL path like meas_inverse: it can never reach the shaped law, cal, or the Shadow core.
+-    self.dynamic_release = bool(FCA11_DYN_RELEASE_ENABLED) and self.feel and \
+-        bool(getattr(CP_SP, "fca11DynamicRelease", False))
++    self.dynamic_brakes = bool(FCA11_DYN_BRAKES_ENABLED) and self.feel and \
++        bool(getattr(CP_SP, "fca11DynamicBrakes", False))
+     self._rel_acc: float | None = None  # 18x: the release ramp's level accumulator (None = no ramp in progress)
+     self._rel_sent = 0                 # 18x: the last level the ramp put on the wire (1-2 LSB per sent frame, enforced)
+     self._rel_fast = False             # 18x: this ramp is a standstill release (the 0.5 s rate), latched at its start
+@@ -1490,7 +1510,7 @@ class Fca11LongBrake:
+     # (one JSONL stream of k=<kind> records, written by fca11_shadow_log.ShadowLogger - no new file format, no new
+     # module): when Shadow already opened the stream we share that writer (one writer per path, never two), otherwise we
+     # open the same stream with our own header. OFF -> no logger is created and no record is ever written.
+-    if self.dynamic_release and not self._core:
++    if self.dynamic_brakes and not self._core:
+       from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
+       self._dyn_log = self.shadow_log
+       if self._dyn_log is None:
+@@ -2087,12 +2107,15 @@ class Fca11LongBrake:
+     the same function _feel_level uses (same gentle gain, same speed-indexed floor input), so "gentle" here means exactly
+     "the level this episode is going to sit at anyway is <= 4 LSB". A target > 4 (a real stop) keeps the deployed first
+     frame, so no stop is ever slower than it is today."""
+-    if not self.dynamic_release:
++    if not self.dynamic_brakes:
+       return FCA11_FEEL_FIRST_LSB
+     v_mps = None if v_kph is None else v_kph / 3.6
+     gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
+     target = self._feel_target(accel, accel, personality, gain_speed, v_mps)
+-    return FCA11_DYN_GENTLE_FIRST_LSB if target <= FCA11_MEAS_FLOOR_LSB else FCA11_FEEL_FIRST_LSB
++    # 18x v2: EVERY episode ramps in, not only the gentle ones; only an emergency ask keeps the deployed first frame.
++    if accel <= FCA11_DYN_EMERGENCY_ACCEL:
++      return FCA11_FEEL_FIRST_LSB
++    return FCA11_DYN_GENTLE_FIRST_LSB
+ 
+   def _dyn_release_level(self, frame: int, prev_sent: int, standstill: bool = False) -> int:
+     """18x (c): the level (raw CR_VSM_DecCmd) for ONE frame of a soft release ramp; 0 = the ramp is over, close now.
+@@ -2287,6 +2310,7 @@ class Fca11LongBrake:
+     gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
+     # 0055: the speed-indexed floor's speed input. None (unit callers with no speed) = at speed = the moving floor 4.
+     v_mps = None if v_kph is None else v_kph / 3.6
++    prev_ask = self._feel_prev_ask
+     if self._feel_prev_ask is not None:
+       inst = (accel - self._feel_prev_ask) / (FCA11_SEND_EVERY * 0.01)
+       self._feel_slope += FCA11_FEEL_SLOPE_ALPHA * (inst - self._feel_slope)
+@@ -2304,7 +2328,20 @@ class Fca11LongBrake:
+     prev = self._feel_acc
+     if target > prev:
+       rate = feel_rate_lsb_per_sent(accel, prev)
+-      if self._feel_slope <= FCA11_FEEL_DEEPEN_SLOPE:
++      if self.dynamic_brakes:
++        # 18x (a2): the RISE is jerk-limited through the measured map (FCA11_DYN_RISE_JERK), except where a ramp would
++        # delay a real stop: an emergency ask and a step the planner is outrunning both keep the panda max. The old
++        # DEEPEN_SLOPE bypass is deliberately NOT used here - at -2.0 m/s^3 an ordinary planner ramp trips it, which
++        # would silently turn the feature off on exactly the asks it exists for.
++        ask_step = abs(accel - prev_ask) if prev_ask is not None else 0.0
++        if (accel <= FCA11_DYN_EMERGENCY_ACCEL or ask_step >= FCA11_DYN_ASK_STEP_ACCEL
++            or self._feel_standstill_hold):
++          # the standstill hold's 10-13 -> 30 LSB take-up is where the car moves 0-1.6 cm; slowing it makes the creep
++          # worse, so that band keeps the deployed rise (owner constraint, pinned by its own test).
++          rate = float(HYUNDAI_FCA11_LONG_RATE_STEP)
++        else:
++          rate = min(rate, dyn_rise_lsb_per_sent(prev))
++      elif self._feel_slope <= FCA11_FEEL_DEEPEN_SLOPE:
+         rate = float(HYUNDAI_FCA11_LONG_RATE_STEP)   # a fast-building demand is not throttled by the comfort ramp
+       new_acc = min(float(target), prev + rate)
+       # 0051 (a) RE-RISE DEADBAND: after the level came down from the episode peak, a GENTLE, not-fast-deepening ask must
+@@ -2322,18 +2359,18 @@ class Fca11LongBrake:
+       # 18x (b): with the dynamic release ON a decrease is limited to FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame
+       # (~1.5 m/s^3) instead of dropping in one frame. It can only ever LOWER the level more slowly - never raise it, never
+       # hold it above the honest target - and the floor below still applies. OFF = the deployed one-frame decrease.
+-      if self.dynamic_release:
++      if self.dynamic_brakes:
+         new_acc = max(float(target), prev - FCA11_DYN_DECREASE_LSB_PER_SENT)
+       else:
+         new_acc = float(target)        # decreases are immediate (the safe direction)
+     # 0055: the mid-episode floor is the SPEED-INDEXED one on the measured law (so a level the deadband held at 4 cannot
+     # lag under a floor that has since risen to 6-8); off the measured path it stays the 0049 constant 4. Never 0: 0 is
+     # the release, and a release is the caller's job (see the FCA11_MEAS_* block).
+-    # 18x (a): with the dynamic release ON, a GENTLE target (<= the 4 LSB floor the episode is going to sit at anyway)
+-    # lowers the floor to FCA11_DYN_GENTLE_FIRST_LSB, which is what lets the gentle onset start at 1 and climb instead of
+-    # being lifted straight back to 4 by this line. A target > 4 LSB keeps the deployed floor, i.e. the deployed level.
++    # 18x (a)/(a2): with the dynamic brakes ON the floor is lowered to the ramp's first level for EVERY target, so the
++    # ramp governs the onset at any depth instead of the level being lifted straight back to 4 on the next frame. The
++    # crawl floor below still applies as a max().
+     floor = float(fca11_floor_lsb(v_mps) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB)
+-    if self.dynamic_release and target <= FCA11_MEAS_FLOOR_LSB:
++    if self.dynamic_brakes:
+       floor = min(floor, float(FCA11_DYN_GENTLE_FIRST_LSB))
+     # 18x (b) (d): at crawl the level is never in the half-applied 1-5 LSB band: the measured clutch reads -20 Nm (creep
+     # torque closed) from 6 LSB, and 4 LSB - the deployed moving floor - reads +26 Nm with the car still rolling. This can
+@@ -2989,7 +3026,7 @@ class Fca11LongBrake:
+       # The final frame of the ramp is the ordinary passive close below (level 0 -> the panda hand-back), so the close
+       # frame, its frame number and the echo re-owe are the deployed ones.
+       ramp = 0
+-      if self.dynamic_release and was_braking and ok and not cal_on and not withhold and \
++      if self.dynamic_brakes and was_braking and ok and not cal_on and not withhold and \
+           not self._release_pending and self._attrib_hold == 0 and not self.brake_now:
+         ramp = self._dyn_release_level(frame, prev_sent,
+                                        standstill=bool(getattr(CS.out, "standstill", False)) or self._feel_standstill_hold)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
+index f8e16d1..ce75f37 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
+@@ -92,7 +92,7 @@ def _cp_sp(fca11=True, pedal=True, dyn=False):
+   cp_sp = structs.CarParamsSP()
+   cp_sp.fca11Brake = fca11
+   cp_sp.enableGasInterceptor = pedal
+-  cp_sp.fca11DynamicRelease = dyn
++  cp_sp.fca11DynamicBrakes = dyn
+   return cp_sp
+ 
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index a1320cd..b57e0f2 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -3730,7 +3730,7 @@ def _cp_sp(fca11=True, pedal=True, dyn=None):
+   cp_sp.fca11Brake = fca11
+   cp_sp.enableGasInterceptor = pedal
+   if dyn is not None:
+-    setattr(cp_sp, "fca11DynamicRelease", dyn)
++    setattr(cp_sp, "fca11DynamicBrakes", dyn)
+   return cp_sp
+ 
+ 
+@@ -3803,18 +3803,18 @@ class Test18xOffIsTheDeployedLaw(unittest.TestCase):
+ 
+   def test_param_absent_is_off(self):
+     b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
+-    self.assertFalse(b.dynamic_release)
++    self.assertFalse(b.dynamic_brakes)
+     self.assertIsNone(b._dyn_log, "OFF must not open the level-trace channel")
+ 
+   def test_param_false_is_off(self):
+-    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=False)).dynamic_release)
++    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=False)).dynamic_brakes)
+ 
+   def test_off_reproduces_the_deployed_command_stream_frame_for_frame(self):
+     """GOLDEN. Provenance: the same scenario run through the DEPLOYED fca11_long.py (fix17c-integrated @ 126af78a10, the
+     build on the car dcb94aea9a) produced exactly this (frame, level) sequence - 169 sent frames. It fails on ANY change
+     to the OFF path: an extra/missing frame, or a different level on any frame."""
+     b, out = self._run(dyn=None)
+-    self.assertFalse(b.dynamic_release)
++    self.assertFalse(b.dynamic_brakes)
+     want = list(out)
+     self.assertEqual(len(_DEPLOYED_STREAM.split()), len(want), "sent-frame COUNT changed")
+     self.assertEqual([d for _, d in want], [int(x) for x in _DEPLOYED_STREAM.split()], "a SENT LEVEL changed")
+@@ -4061,7 +4061,7 @@ class Test18xGasWindow(unittest.TestCase):
+     self.assertTrue(b.braking)
+ 
+ 
+-class Test18xDynamicRelease(unittest.TestCase):
++class Test18xDynamicBrakes(unittest.TestCase):
+   """The opt-in build: gentle onset from 1 LSB, a 0.3 LSB/sent-frame decrease limit, a release ramp, and the level trace.
+   Default OFF (proven above)."""
+ 
+@@ -4069,39 +4069,75 @@ class Test18xDynamicRelease(unittest.TestCase):
+     return fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn))
+ 
+   def test_flag_is_scoped_to_the_feel_path(self):
+-    self.assertTrue(self._brake(True).dynamic_release)
++    self.assertTrue(self._brake(True).dynamic_brakes)
+     # an affine/shaped instance has no feel path -> the flag can never reach it
+     cp_sp = structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=True)
+-    setattr(cp_sp, "fca11DynamicRelease", True)
++    setattr(cp_sp, "fca11DynamicBrakes", True)
+     b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+     self.assertFalse(b.feel)
+-    self.assertFalse(b.dynamic_release)
++    self.assertFalse(b.dynamic_brakes)
+     # a disabled instance neither
+-    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False, dyn=True)).dynamic_release)
+-
+-  def test_gentle_ask_first_sent_frame_is_1_lsb_and_hard_ask_is_unchanged(self):
+-    """THE OWNER'S TEST: ON + a gentle ask (the target is <= 4 LSB) starts at 1 LSB; ON + a hard ask keeps the deployed
+-    first frame (4 LSB), so a real stop is never slower than today."""
+-    def first_frames(dyn, ask):
++    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False, dyn=True)).dynamic_brakes)
++
++  def test_gentle_ask_first_sent_frame_is_1_lsb_and_hard_ask_is_ramped(self):
++    """THE OWNER'S TEST v2 ("dynamic brakes in general"): ON, EVERY ask ramps in - a gentle one sits at 4 LSB and a hard
++    one climbs to the same level the deployed law jumps to, never past it and never faster than the panda gate. Only an
++    EMERGENCY ask (<= -3.0 m/s^2) keeps the deployed first frame and the deployed rise, so a real stop is never slowed
++    where it matters most."""
++    def first_frames(dyn, ask, frames=120):
+       b = self._brake(dyn)
+       out = []
+-      for f in range(60):
++      for f in range(frames):
+         out += [(f, d) for d in _decs(b.update(_cc(ask), _CS(v_ego=15.0, cam=_cam()), f))]
+       return out
+ 
+-    gentle_on = first_frames(True, -0.65)
+-    gentle_off = first_frames(False, -0.65)
+-    self.assertEqual(4, gentle_off[0][1], "OFF (deployed): the first sent frame is 4")
+-    self.assertEqual(1, gentle_on[0][1], "ON: a gentle episode starts at 1 LSB")
+-    # and it CLIMBS to the same level the deployed law jumps to, at the existing rise rate (never past it)
+-    on_levels = [d for _, d in gentle_on]
+-    off_levels = [d for _, d in gentle_off]
+-    self.assertLessEqual(max(on_levels), max(off_levels), "ON must never command more than the deployed law")
+-    self.assertEqual(4, max(on_levels))
+-    self.assertIn(1, on_levels)
+-    self.assertTrue(all(b >= a for a, b in zip(on_levels, on_levels[1:])), "the gentle onset only climbs")
+-    # HARD ask: identical first frame AND identical stream (no slowing of a real stop)
+-    self.assertEqual(first_frames(False, -2.0), first_frames(True, -2.0))
++    gentle_on = [d for _, d in first_frames(True, -0.65)]
++    gentle_off = [d for _, d in first_frames(False, -0.65)]
++    self.assertEqual(4, gentle_off[0], "OFF (deployed): the first sent frame is 4")
++    self.assertEqual(1, gentle_on[0], "ON: every episode starts at 1 LSB")
++    self.assertLessEqual(max(gentle_on), max(gentle_off), "ON must never command more than the deployed law")
++    self.assertTrue(all(b >= a for a, b in zip(gentle_on, gentle_on[1:])), "the onset only climbs")
++
++    # HARD ask: ON now RAMPS it (the owner's "increased braking force as well as decreased").
++    hard_on = [d for _, d in first_frames(True, -2.0)]
++    hard_off = [d for _, d in first_frames(False, -2.0)]
++    self.assertEqual(4, hard_off[0])
++    self.assertEqual(1, hard_on[0], "ON: a hard ask ramps in from 1 LSB")
++    self.assertEqual(max(hard_off), max(hard_on), "it still reaches exactly the deployed level")
++    drops = [b - a for a, b in zip(hard_on, hard_on[1:]) if b < a]
++    self.assertEqual([], drops, "the rise never goes backwards")
++    steps = [b - a for a, b in zip(hard_on, hard_on[1:]) if b > a]
++    self.assertLessEqual(max(steps), fl.HYUNDAI_FCA11_LONG_RATE_STEP, "never faster than the panda gate")
++    self.assertGreaterEqual(len(steps), 8, f"the hard rise must be a ramp, not a jump ({len(steps)} steps)")
++    self.assertLessEqual(len(hard_on), len(hard_off) + 60, "the whole ramp costs under 1.2 s of sent frames")
++    self.assertGreaterEqual(max(hard_on), fl.FCA11_MEAS_FLOOR_LSB)
++
++    # EMERGENCY ask: byte-identical to the deployed stream (bypass survives).
++    self.assertEqual(first_frames(False, -3.5), first_frames(True, -3.5))
++
++  def test_step_ask_bypasses_the_rise_limit(self):
++    """A single-frame ask STEP mid-episode (the planner jumped, e.g. a cut-in) keeps the panda max; a planner-like ramp
++    does not. Without the bypass a ramp would delay exactly the case that needs braking now. At ONSET there is no step
++    to detect by construction (the law has no previous ask), which is why every episode ramps in from 1 LSB."""
++    def levels(ask_of, frames=160):
++      b = self._brake(True)
++      out = []
++      for f in range(frames):
++        out += [(f, d) for d in _decs(b.update(_cc(ask_of(f)), _CS(v_ego=20.0, cam=_cam()), f))]
++      return out
++
++    ramp = levels(lambda f: -0.05 * min(f, 40) - 0.2)
++    step = levels(lambda f: -0.8 if f < 40 else -2.5)
++
++    def up_steps(v):
++      return [b - a for a, b in zip(v, v[1:]) if b > a]
++
++    self.assertLessEqual(max(up_steps([d for _, d in ramp])), 2, "an ordinary planner ramp stays on the jerk limit")
++    self.assertGreaterEqual(max(up_steps([d for _, d in step])), 3, "the mid-episode step must keep the panda-max rise")
++    self.assertGreaterEqual(max(d for _, d in step), 16, "and it must reach the deep level quickly")
++    f16_ramp = next(f for f, d in ramp if d >= 16)
++    f16_step = next(f for f, d in step if d >= 16)
++    self.assertLess(f16_step, f16_ramp, f"the step must arrive sooner ({f16_step} vs {f16_ramp})")
+ 
+   def test_gentle_onset_never_commands_more_than_the_deployed_law_on_any_frame(self):
+     for ask in (-0.60, -0.65, -0.70, -0.75, -0.79):
+@@ -4201,7 +4237,8 @@ class Test18xDynamicRelease(unittest.TestCase):
+         s = b.update(_cc(ask), _CS(v_ego=v, cam=_cam(), standstill=st), f)
+         seq.append((f, _decs(s), b.episode_open))
+       first30 = next(f for f, d, eo in seq if d and d[0] == 30)
+-      window = [(f, d) for f, d, eo in seq if first30 - 40 <= f <= first30]
++      # the constraint covers the STANDSTILL HOLD BAND (f >= 60, where the latch is armed), not the crawl approach
++      window = [(f, d) for f, d, eo in seq if 60 <= f <= first30]
+       return first30, window
+ 
+     f_off, win_off = rise(False)
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index a92360f..06a74c6 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -181,14 +181,14 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11AffineGain")) and not shadow:   # 0045: Shadow wire = OLD-LAW
+     CP_SP.fca11AffineGain = True
+ 
+-  # 18x: the DYNAMIC-RELEASE build (HyundaiFca11DynamicRelease, PERSISTENT BOOL, default "0" = OFF): gentle 1 LSB onset,
++  # 18x: the DYNAMIC-RELEASE build (HyundaiFca11DynamicBrakes, PERSISTENT BOOL, default "0" = OFF): gentle 1 LSB onset,
+   # a per-sent-frame decrease limit, a soft release ramp and the k="b" level trace. Written HERE because the car layer
+-  # only READS getattr(CP_SP, "fca11DynamicRelease", False) - without this writer the key was a no-op in every build
++  # only READS getattr(CP_SP, "fca11DynamicBrakes", False) - without this writer the key was a no-op in every build
+   # (the 0043/0044 class the reachability guard exists for). Same truthy parser, same dependency: the dynamic release
+   # shapes FCA11 braking, so it is inert without HyundaiFca11Brake. OFF (the default, and every CP_SP built by an older
+   # libparams) = the deployed law plus only the three UNCONDITIONAL 18x rules. Next ignition to take effect.
+-  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicRelease")) and not shadow:
+-    CP_SP.fca11DynamicRelease = True
++  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicBrakes")) and not shadow:
++    CP_SP.fca11DynamicBrakes = True
+   # 17c DELIVERY (HyundaiPedalDeliveryLaw, PERSISTENT BOOL, default "0" = OFF): the measured-inverse law for NEGATIVE
+   # accel asks (the car's pedal has a dead band the linear law is 2.5-3x too weak on, so shallow braking asks ran away
+   # at +0.06..+0.13 m/s^2) plus a one-sided filter on the pedal path so the plan's 2-4 Hz ask dither cannot reach the
