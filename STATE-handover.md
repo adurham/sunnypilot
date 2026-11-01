@@ -125,3 +125,46 @@ The seed's first frame is hold_cmd(v) <= 0.16 pedal (A ~810 / B ~400 raw at 25-3
   (`assert 16 == 20` in the FCA11 decel ramp) and were NOT investigated or fixed by this lane.
 - The pristine upstream opendbc pin itself is not present in this worktree (opendbc_repo is a flattened directory in the
   superproject), so "applies cleanly to that pin" was verified at the post-0014 state CI reaches, not at the pin.
+
+## CP7 — commit + evidence (done)
+
+Committed on `fix/blip-handover` only: **427b5325f1** (base db6861e6af), 4 files / +573 −14:
+```
+ STATE-handover.md                                  | 127 ++++++++++
+ .../sunnypilot/car/hyundai/gas_interceptor.py      |  42 +++-
+ .../car/hyundai/tests/test_gas_interceptor.py      | 151 +++++++++++-
+ .../0015-fork-hyundai-gas-handover-seed.patch      | 267 +++++++++++++++++++++
+```
+
+### Where the brief contradicted the code
+1. **"the patch that owns it"** - `grep -l gas_interceptor.py` returns SEVEN patches (0002 creates the file,
+   0003/0006/0010/0012/0013 modify it). The series is sequential, not pin-relative: `git apply --check 0001` on a
+   post-0014 tree fails ("patch does not apply"), because 0003 already assumes 0002's file. So regenerating any one
+   patch in place would break the chain; per the owner's correction this lane ADDS `0015`, a diff of the two touched
+   files from the post-0014 state.
+2. **Test 1's expected value.** The brief's own code rule feeds the seed through `rate_limit_pedal_command`, i.e. the
+   first frame is `min(pedal_target, seed + rate_up*DT)`, NOT `min(law, hold, ceiling)`. At v=9 m/s / ask +0.4 the seed
+   is 0.084 but the first frame is 0.0868 (one 0.0028 step of the unchanged rise limiter). Implemented the rule as
+   written; the test pins `seed <= cmd <= seed + step` and `cmd > 10 * step` (pre-fix 0.0028).
+3. **"append to the test file" is not enough.** Three existing tests in that file pin the 0-start as the EXPECTED
+   behaviour and go red on the change: `test_engage_ramps_then_lift_is_immediate`,
+   `test_deliberate_ask_keeps_jerk_rate`, `test_launch_and_low_speed_unchanged`. Their open-loop models were updated to
+   start at the same seed (behaviour above the seed otherwise unchanged); no other existing test needed touching.
+4. **The two-line test-command rule with the worked example is not in the brief text.** Used the two-line form:
+   a `PYTHONPATH=.../opendbc_repo` line, then the `.../python3 -m pytest ...` line (the venv's editable opendbc
+   otherwise wins and the worktree copy would not be under test).
+5. **"applies cleanly to the pristine pin"** is unverifiable in this worktree: `opendbc_repo/` is a flattened directory
+   in the superproject, no pristine pin exists here. Verified at the post-0014 state that CI reaches immediately before
+   0015 (CI applies the series in `LC_ALL=C` filename order, `.github/workflows/sync-upstream.yaml`).
+6. **Design edge the brief did not cover:** `hand_over` is consumed on the first ACTIVE frame even if that frame is one
+   of the zeroed paths (FCA11 brake / cal hold / cam brake / over-speed release), which is what "reset to False on any
+   inactive frame" implies - so if an engagement's first frame is a brake frame, the following pedal ramp still starts
+   from 0. That is the conservative direction (it can only ever command LESS pedal) and is outside the brief's tests.
+
+### Unverified
+- No route-185 log replay / on-car validation of the new first frame (no log access in this lane; the measured table
+  was taken from the brief, not re-derived).
+- The 2 pre-existing failures in `test_gas_interceptor.py` (FCA11 `test_mirror_frame_bytes`,
+  `test_personality_reaches_gas_command`, both `assert 16 == 20`) predate this lane and were not investigated.
+- The 36 `test_ignore_frequency_check` safety failures are a stale prebuilt `libsafety` in this tree (identical on a
+  pristine HEAD copy); the safety suite was NOT rebuilt here.
