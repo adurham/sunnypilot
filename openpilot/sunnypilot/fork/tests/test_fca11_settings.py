@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from openpilot.sunnypilot.fork.fca11_settings import ToggleState, fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state
 
 REPO = Path(__file__).resolve().parents[4]
 PANEL = REPO / "openpilot" / "selfdrive" / "ui" / "sunnypilot" / "layouts" / "settings" / "vehicle" / "brands" / "hyundai.py"
@@ -44,6 +44,25 @@ class TestFca11SettingsRules(unittest.TestCase):
       self.assertEqual(ToggleState(visible=vis, enabled=vis and offroad), fca11_shadow_toggle_state(pedal, offroad),
                        (pedal, offroad))
     self.assertEqual(ToggleState(True, False), fca11_shadow_toggle_state(True, False))
+
+  def test_pedal_delivery_toggle_full_truth_table(self):
+    """17c: visible <=> pedal on (it lives in the pedal path); enabled <=> visible AND offroad."""
+    for pedal, offroad in itertools.product(ON_VALUES + OFF_VALUES, (True, False)):
+      vis = pedal in ON_VALUES
+      self.assertEqual(ToggleState(visible=vis, enabled=vis and offroad), pedal_delivery_toggle_state(pedal, offroad),
+                       (pedal, offroad))
+
+  def test_dynamic_release_toggle_full_truth_table(self):
+    """18x: visible <=> pedal on AND braking on (it is a property of the FCA11 law); enabled <=> visible AND offroad."""
+    for pedal, brake, offroad in itertools.product(ON_VALUES + OFF_VALUES, ON_VALUES + OFF_VALUES, (True, False)):
+      vis = pedal in ON_VALUES and brake in ON_VALUES
+      self.assertEqual(ToggleState(visible=vis, enabled=vis and offroad),
+                       fca11_dynamic_release_toggle_state(pedal, brake, offroad), (pedal, brake, offroad))
+
+  def test_stop_approach_toggle(self):
+    """17c lane C: always listed (planner-side, no pedal dependency); settable offroad only."""
+    self.assertEqual(ToggleState(True, True), stop_approach_toggle_state(True))
+    self.assertEqual(ToggleState(True, False), stop_approach_toggle_state(False))
 
 
 class TestPanelWiring(unittest.TestCase):
@@ -87,6 +106,27 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("The car brakes exactly as today", self.src)
     self.assertIn("(OLD-LAW)", self.src)
     self.assertNotIn("you brake for every stop", self.src)   # the first build's FCA11-DISABLED reading is gone
+
+  def test_new_lane_toggles_wiring(self):
+    """17c/18x: the three param-only lane switches are real UI toggles now, on the right keys and the right rules."""
+    for title, param, attr, rule in (
+      ("Pedal Delivery Law", "HyundaiPedalDeliveryLaw", "pedal_delivery_toggle", "pedal_delivery_toggle_state(pedal_raw, offroad)"),
+      ("Dynamic Brake Release", "HyundaiFca11DynamicRelease", "fca11_dynamic_release_toggle",
+       "fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)"),
+      ("Stop-Approach Commitment", "StopApproachCommit", "stop_approach_toggle", "stop_approach_toggle_state(offroad)"),
+    ):
+      self.assertRegex(self.src, r'toggle_item_sp\(tr\("' + re.escape(title) + r'"\),\s*"",\s*param="' + param + r'"')
+      m = re.search(r"self\.items = \[(.*?)\]", self.src, re.S)
+      self.assertIn(f"self.{attr}", m.group(1))
+      self.assertIn(rule, self.src)
+      self.assertIn(f"self.{attr}.set_visible(", self.src)
+      self.assertIn(f"self.{attr}.action_item.set_enabled(", self.src)
+
+  def test_new_lane_descriptions_are_honest(self):
+    self.assertIn("Requires the comma pedal", self.src)          # pedal delivery
+    self.assertIn("Requires FCA11 Braking", self.src)            # dynamic release
+    self.assertIn("never raises it", self.src)                   # stop-approach commitment
+    self.assertNotIn("you must enable it with a param", self.src)
 
 
 if __name__ == "__main__":

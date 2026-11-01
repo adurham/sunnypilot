@@ -9,7 +9,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp, toggle_item_sp
 from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state
 from opendbc.car.hyundai.values import CAR, UNSUPPORTED_LONGITUDINAL_CAR
 
 
@@ -31,11 +31,20 @@ class HyundaiSettings(BrandSettings):
     # fork (0045): FCA11 SHADOW - wire = OLD-LAW (today's law), V3 logged. Visible with the pedal on, settable offroad only.
     self.fca11_shadow_toggle = toggle_item_sp(tr("FCA11 Shadow (Log-Only)"), "", param="HyundaiFca11Shadow",
                                               callback=self._on_fca11_toggle_changed)
+    # fork (17c/18x): the three lane switches that used to be param/SSH only. Same rules as the toggles above:
+    # visible only where they can do anything, settable offroad only (CarParams/CarParamsSP are built at ignition).
+    self.pedal_delivery_toggle = toggle_item_sp(tr("Pedal Delivery Law"), "", param="HyundaiPedalDeliveryLaw",
+                                                callback=self._on_fca11_toggle_changed)
+    self.fca11_dynamic_release_toggle = toggle_item_sp(tr("Dynamic Brake Release"), "", param="HyundaiFca11DynamicRelease",
+                                                       callback=self._on_fca11_toggle_changed)
+    self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
+                                               callback=self._on_fca11_toggle_changed)
     self.drive_mode_personality_toggle = toggle_item_sp(
       tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
-                  self.fca11_shadow_toggle, self.drive_mode_personality_toggle]
+                  self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.fca11_dynamic_release_toggle,
+                  self.stop_approach_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
   def _on_tuning_selected(index):
@@ -125,3 +134,40 @@ class HyundaiSettings(BrandSettings):
     self.fca11_shadow_toggle.set_description(shadow_desc)
     self.fca11_shadow_toggle.show_description(True)
     self.fca11_shadow_toggle.set_visible(shadow_state.visible)
+
+    # fork (17c): Pedal Delivery Law - measured inverse for the light braking asks; pedal on, offroad only.
+    delivery_state = pedal_delivery_toggle_state(pedal_raw, offroad)
+    self.pedal_delivery_toggle.action_item.set_enabled(delivery_state.enabled)
+    delivery_desc = tr("Uses the pedal's MEASURED response instead of the linear law for light braking asks " +
+                       "(below about 0.5 m/s^2), so more of what the planner asks actually reaches the road, and the " +
+                       "pedal stops dithering at the set speed. Positive asks and every hard stop are unchanged. " +
+                       "Requires the comma pedal. Takes effect at the next ignition.")
+    if delivery_state.visible and not offroad:
+      delivery_desc = offroad_hint + delivery_desc
+    self.pedal_delivery_toggle.set_description(delivery_desc)
+    self.pedal_delivery_toggle.show_description(True)
+    self.pedal_delivery_toggle.set_visible(delivery_state.visible)
+
+    # fork (18x): Dynamic Brake Release - the FCA11 brake becomes a ramp; needs FCA11 Braking, offroad only.
+    dynamic_state = fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)
+    self.fca11_dynamic_release_toggle.action_item.set_enabled(dynamic_state.enabled)
+    dynamic_desc = tr("Makes the FCA11 brake a ramp instead of a switch: a gentle ask starts at 1 LSB and climbs to " +
+                      "the target, decreases are rate-limited, and a standstill release ramps out over 0.5 s with gas " +
+                      "held at zero. Hard stops are NOT slowed. Requires FCA11 Braking. Takes effect at the next ignition.")
+    if dynamic_state.visible and not offroad:
+      dynamic_desc = offroad_hint + dynamic_desc
+    self.fca11_dynamic_release_toggle.set_description(dynamic_desc)
+    self.fca11_dynamic_release_toggle.show_description(True)
+    self.fca11_dynamic_release_toggle.set_visible(dynamic_state.visible)
+
+    # fork (17c lane C): Stop-Approach Commitment - planner-side, always listed, offroad only.
+    stop_state = stop_approach_toggle_state(offroad)
+    self.stop_approach_toggle.action_item.set_enabled(stop_state.enabled)
+    stop_desc = tr("On an empty-lane stop, commits early to the stop point the model's own plan already chose, " +
+                   "instead of creeping past it. It only ever deepens the ask - never raises it - and does nothing " +
+                   "while a lead is present. Takes effect at the next ignition.")
+    if not offroad:
+      stop_desc = offroad_hint + stop_desc
+    self.stop_approach_toggle.set_description(stop_desc)
+    self.stop_approach_toggle.show_description(True)
+    self.stop_approach_toggle.set_visible(stop_state.visible)
