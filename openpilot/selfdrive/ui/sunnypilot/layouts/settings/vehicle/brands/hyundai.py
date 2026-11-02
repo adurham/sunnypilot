@@ -43,12 +43,15 @@ class HyundaiSettings(BrandSettings):
     # (aggressive included), shrinking with speed on the open road instead of the stock 1.25/1.45/1.75 s ladder.
     self.elastic_follow_toggle = toggle_item_sp(tr("Elastic Follow Distance"), "", param="AdaptiveFollowDistance",
                                                  callback=self._on_fca11_toggle_changed)
+    # fork: NEVER ACCELERATE TOWARD A LEAD (NoCloseOnLead) - approach a car you can already see by holding/coasting.
+    self.no_close_toggle = toggle_item_sp(tr("No Accelerate-To-Lead"), "", param="NoCloseOnLead",
+                                          callback=self._on_fca11_toggle_changed)
     self.drive_mode_personality_toggle = toggle_item_sp(
       tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
                   self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.fca11_dynamic_release_toggle,
-                  self.stop_approach_toggle, self.elastic_follow_toggle, self.drive_mode_personality_toggle]
+                  self.stop_approach_toggle, self.elastic_follow_toggle, self.no_close_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
   def _on_tuning_selected(index):
@@ -177,6 +180,17 @@ class HyundaiSettings(BrandSettings):
     self.elastic_follow_toggle.set_description(elastic_desc)
     self.elastic_follow_toggle.show_description(True)
     self.elastic_follow_toggle.set_visible(True)
+
+    # fork: No Accelerate-To-Lead - planner-side, always listed, offroad only.
+    self.no_close_toggle.action_item.set_enabled(offroad)
+    no_close_desc = tr("Approaches a car already in view by holding speed or coasting, never by speeding up to " +
+                       "reach the follow gap. Only removes acceleration - it never brakes harder - and it releases " +
+                       "once the gap is matched. Takes effect at the next ignition.")
+    if not offroad:
+      no_close_desc = offroad_hint + no_close_desc
+    self.no_close_toggle.set_description(no_close_desc)
+    self.no_close_toggle.show_description(True)
+    self.no_close_toggle.set_visible(True)
 
     # fork (17c lane C): Stop-Approach Commitment - planner-side, always listed, offroad only.
     stop_state = stop_approach_toggle_state(offroad)

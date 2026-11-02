@@ -19,6 +19,7 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
+from openpilot.sunnypilot.fork.no_close import NoCloseCap
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -113,6 +114,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.dt = dt
     self.accel_boost = AccelBoost()
     self.stop_commit = StopCommit()  # fork (17c): no-lead stop-approach commitment, param-gated (default OFF)
+    # fork: never accelerate toward a lead (fork/no_close.py, param NoCloseOnLead). Owner 2026-11-01: the car must
+    # not speed up to reach the follow gap on a car it can already see.
+    self.no_close = NoCloseCap()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -285,6 +289,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
+    # fork: last-stage cap - no positive ask while closing on a lead. After the min() so no candidate can raise it back.
+    _lead = sm['radarState'].leadOne
+    output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead))
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
