@@ -35,15 +35,21 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import COMFO
 
 PARAM = "AdaptiveFollowDistance"
 
-# one base gap for every personality (owner: aggressive == normal). 1.45 s is stock ``standard``.
-BASE_T_FOLLOW = get_T_FOLLOW(log.LongitudinalPersonality.standard)
+# 2026-11-01 (owner, verbatim): "I just want whatever the aggressive profile to be the new normal profile and the
+# aggressive profile to be like 1s +/- 0.4s or something". So NORMAL now runs at stock AGGRESSIVE's 1.25 s, and
+# AGGRESSIVE gets its own 1.00 s base - the elastic highway factor then takes it to 0.60 s (1.0 - 0.4), which is the
+# bottom of the range he asked for. RELAXED (unused on this car) follows NORMAL rather than being wider than it.
+BASE_T_NORMAL = get_T_FOLLOW(log.LongitudinalPersonality.aggressive)   # 1.25 s
+BASE_T_AGGRESSIVE = 1.00
+BASE_T_FOLLOW = BASE_T_NORMAL   # kept for callers that want "the" base gap
 
 # road-type x speed factor on BASE_T_FOLLOW (vEgo m/s). Highway gap SHRINKS with speed: 1.45 s at <= 16 m/s,
 # 1.19 s at >= 32 m/s. The +6 m standstill offset in the MPC makes 1.19 s read as ~1.4 s at 65 mph, which is the
 # distance the owner asked for after the 2026-11-01 drive ("normal follow distance right now is too far on the
 # interstate").
 GAP_FACTOR_BP = [16., 32.]
-GAP_FACTOR_V = [1.0, 0.82]
+GAP_FACTOR_V = [1.0, 0.82]          # NORMAL: 1.25 -> 1.02 s (45 -> 37 m at 65 mph)
+GAP_FACTOR_V_AGGRESSIVE = [1.0, 0.60]  # AGGRESSIVE: 1.00 -> 0.60 s (36 -> 22 m at 65 mph)
 HIGHWAY_ROAD_TYPES = ("highway", "interstate")
 
 # Throttle-only flat-ground coast decel magnitude (m/s^2, vEgo m/s). Measured on routes 00000127/00000128 with the
@@ -70,11 +76,11 @@ def is_throttle_only(CP, CP_SP) -> bool:
   return bool(CP_SP.enableGasInterceptor) and CP.brand == "hyundai"
 
 
-def speed_gap_factor(road_type: str, v_ego: float) -> float:
-  """Multiplier on BASE_T_FOLLOW: 1.0 in town, shrinking to GAP_FACTOR_V[-1] on the open road as speed rises."""
+def speed_gap_factor(road_type: str, v_ego: float, table=None) -> float:
+  """Multiplier on the personality's base gap: 1.0 in town, shrinking to table[-1] on the open road as speed rises."""
   if road_type == "urban":
     return 1.0  # never shorten in town: a throttle-only car needs the room where stops are sudden
-  return float(np.interp(v_ego, GAP_FACTOR_BP, GAP_FACTOR_V))
+  return float(np.interp(v_ego, GAP_FACTOR_BP, GAP_FACTOR_V if table is None else table))
 
 
 def coast_decel(v_ego: float) -> float:
@@ -90,11 +96,22 @@ def closing_margin(v_ego: float, v_lead: float) -> float:
   return float(np.clip(extra_dist / v_ego, 0., MAX_CLOSING_MARGIN))
 
 
+def is_aggressive(personality) -> bool:
+  """True for the AGGRESSIVE personality. Works for both the plain int and the capnp enum the planner passes."""
+  return personality == log.LongitudinalPersonality.aggressive
+
+
+def base_t_follow(personality) -> float:
+  """Base gap for a personality: AGGRESSIVE 1.00 s, everything else NORMAL 1.25 s (stock aggressive's value)."""
+  return BASE_T_AGGRESSIVE if is_aggressive(personality) else BASE_T_NORMAL
+
+
 def get_adaptive_t_follow(personality, v_ego: float, road_type: str, lead_present: bool, v_lead: float,
                           throttle_only: bool) -> float:
-  """Target time gap before rate limiting. ``personality`` is accepted for call compatibility and IGNORED by design:
-  the steady-state gap is one elastic law, not a personality ladder."""
-  t_follow = BASE_T_FOLLOW * speed_gap_factor(road_type, v_ego)
+  """Target time gap before rate limiting. Two bases, one elastic speed law per base (see GAP_FACTOR_V*)."""
+  aggressive = is_aggressive(personality)
+  t_follow = base_t_follow(personality) * speed_gap_factor(road_type, v_ego,
+                                                           GAP_FACTOR_V_AGGRESSIVE if aggressive else GAP_FACTOR_V)
   if throttle_only and lead_present:
     t_follow += closing_margin(v_ego, v_lead)
   return t_follow

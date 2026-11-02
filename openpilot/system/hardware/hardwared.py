@@ -88,6 +88,50 @@ class Chestnut:
     self.thread.start()
 
 
+class SlowHardware:
+  """2026-11-01 fork: the three calls in the 2 Hz deviceState publish path that can BLOCK for seconds.
+
+  Measured on the 2026-11-01 drive: hardwared stalled 7.70 / 6.20 / 5.30 / 3.81 s while every other service kept its
+  rate. Each stall raised commIssueAvgFreq (a soft-disable) and one of them ended in a disengage. The publish path
+  itself is cheap - it just assembled the message - so the stall was one of these:
+    * get_available_percent(): os.statvfs("/data"). /data was 90 % full with 59 GB of routes and continuous writes;
+      statvfs on a loaded, nearly-full filesystem can take seconds.
+    * HARDWARE.get_screen_brightness(): sysfs/I2C.
+    * HARDWARE.get_gpu_usage_percent(): devfreq sysfs.
+  They now run on their own thread and the publisher only ever READS the last value it produced. A blocked read then
+  costs freshness of freeSpace/brightness/GPU at worst - never a missed 2 Hz deviceState frame, so selfdrived can
+  never see "process communication too slow" from this daemon again.
+  """
+
+  def __init__(self, period: float = 2.0):
+    self.period = period
+    self.free_space_percent = 100.0
+    self.screen_brightness_percent = 0
+    self.gpu_usage_percent = 0.0
+    self._end = threading.Event()
+    self._thread = threading.Thread(target=self._run, name="slow-hardware", daemon=True)
+    self._thread.start()
+
+  def _run(self) -> None:
+    while not self._end.is_set():
+      try:
+        self.free_space_percent = float(get_available_percent(default=100.0))
+      except Exception:
+        pass
+      try:
+        self.screen_brightness_percent = int(HARDWARE.get_screen_brightness())
+      except Exception:
+        pass
+      try:
+        self.gpu_usage_percent = float(HARDWARE.get_gpu_usage_percent())
+      except Exception:
+        pass
+      self._end.wait(self.period)
+
+  def stop(self) -> None:
+    self._end.set()
+
+
 ThermalBand = namedtuple("ThermalBand", ['min_temp', 'max_temp'])
 HardwareState = namedtuple("HardwareState", ['network_type', 'network_info', 'network_strength', 'network_stats',
                                              'network_metered', 'modem_temps', 'usb_state'])
@@ -249,6 +293,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   thermal_config = HARDWARE.get_thermal_config()
 
   fan_controller = FanController(int(1./DT_HW))
+  slow_hw = SlowHardware()
   chestnut = Chestnut()
   chestnut_status = ChestnutStatus()
   branch = get_short_branch()
@@ -296,9 +341,9 @@ def hardware_thread(end_event, hw_queue) -> None:
     memory_usage = system_stats.memory_usage_percent() if system_stats is not None else 0.
     cpu_usage = system_stats.cpu_usage_percent() if system_stats is not None else []
 
-    msg.deviceState.freeSpacePercent = get_available_percent(default=100.0)
+    msg.deviceState.freeSpacePercent = slow_hw.free_space_percent
     msg.deviceState.memoryUsagePercent = int(round(memory_usage))
-    msg.deviceState.gpuUsagePercent = int(round(HARDWARE.get_gpu_usage_percent()))
+    msg.deviceState.gpuUsagePercent = int(round(slow_hw.gpu_usage_percent))
     online_cpu_usage = [int(round(n)) for n in cpu_usage]
     offline_cpu_usage = [0., ] * (len(msg.deviceState.cpuTempC) - len(online_cpu_usage))
     msg.deviceState.cpuUsagePercent = online_cpu_usage + offline_cpu_usage
@@ -312,7 +357,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     msg.deviceState.modemTempC = last_hw_state.modem_temps
 
-    msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
+    msg.deviceState.screenBrightnessPercent = slow_hw.screen_brightness_percent
 
     set_usb_state(msg.deviceState, last_hw_state.usb_state)
     chestnut.update(started_ts is None, last_hw_state.usb_state)

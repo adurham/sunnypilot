@@ -42,14 +42,20 @@ class TestRoadSpeedFactor(OpenpilotTestCase):
       self.assertEqual(fs, sorted(fs, reverse=True))   # monotone non-increasing
 
   def test_highway_numbers_65mph(self):
-    # 29 m/s (65 mph): factor 0.85375 -> T 1.238 s, MPC gap T*v + 6 m = 41.9 m = 1.44 s effective
+    # NORMAL: base 1.25 s, factor 0.85375 at 29 m/s -> T 1.067 s, MPC gap T*v + 6 m = 36.9 m = 1.27 s effective
     self.assertEqual(af.GAP_FACTOR_V, [1.0, 0.82])
+    self.assertEqual(af.GAP_FACTOR_V_AGGRESSIVE, [1.0, 0.60])
     t = af.get_adaptive_t_follow(STANDARD, 29., "interstate", True, 29., True)
-    self.assertAlmostEqual(t, 0.85375 * get_T_FOLLOW(STANDARD))
-    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.44, places=2)
-    # never wider than stock on the open road
+    self.assertAlmostEqual(t, 0.85375 * af.BASE_T_NORMAL)
+    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.27, places=2)
+    # AGGRESSIVE: base 1.00 s -> T 0.854 s, 30.8 m = 1.06 s effective at 65 mph (the owner's "1 s +/- 0.4 s")
+    ta = af.get_adaptive_t_follow(0, 29., "interstate", True, 29., True)
+    self.assertAlmostEqual(ta, 0.675 * af.BASE_T_AGGRESSIVE)     # 1.0 -> 0.6 between 16 and 32 m/s
+    self.assertAlmostEqual((ta * 29. + 6.) / 29., 0.88, places=2)
+    # never wider than its own base on the open road
     for v in (16., 20., 25., 29., 35.):
       self.assertLessEqual(af.speed_gap_factor("highway", v), 1.0)
+      self.assertLessEqual(af.speed_gap_factor("highway", v, af.GAP_FACTOR_V_AGGRESSIVE), 1.0)
 
   def test_unknown_follows_speed_only(self):
     self.assertAlmostEqual(af.speed_gap_factor("unknown", 30.), af.GAP_FACTOR_V[-1] if False else af.speed_gap_factor("highway", 30.))
@@ -78,13 +84,24 @@ class TestClosingMargin(OpenpilotTestCase):
 
 
 class TestAdaptiveTFollow(OpenpilotTestCase):
-  def test_one_gap_for_every_personality(self):
-    # owner: "aggressive follow distance needs to be normal follow distance" -> personality no longer moves the gap
+  def test_normal_is_stock_aggressive_and_aggressive_is_1s(self):
+    # owner 2026-11-01: "whatever the aggressive profile to be the new normal profile and the aggressive profile to be
+    # like 1s +/- 0.4s" -> NORMAL base = stock aggressive 1.25 s; AGGRESSIVE base 1.00 s, elastic down to 0.60 s.
+    self.assertAlmostEqual(af.BASE_T_NORMAL, get_T_FOLLOW(log.LongitudinalPersonality.aggressive))
+    self.assertAlmostEqual(af.BASE_T_AGGRESSIVE, 1.00)
     for p in PERSONALITIES:
+      expected = af.BASE_T_AGGRESSIVE if p == 0 else af.BASE_T_NORMAL
       with self.subTest(personality=p):
-        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), af.BASE_T_FOLLOW)
-        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True), af.speed_gap_factor("highway", 31.) * af.BASE_T_FOLLOW)
-    self.assertEqual(af.BASE_T_FOLLOW, get_T_FOLLOW(STANDARD))
+        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), expected)
+        if p == 0:
+          self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True),
+                                 af.speed_gap_factor("highway", 31., af.GAP_FACTOR_V_AGGRESSIVE) * expected)
+        else:
+          self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True),
+                                 af.speed_gap_factor("highway", 31.) * expected)
+    # the aggressive band the owner asked for: 1.0 s in town, never below 0.6 s
+    self.assertAlmostEqual(af.get_adaptive_t_follow(0, 5., "urban", False, 0., True), 1.00)
+    self.assertAlmostEqual(af.get_adaptive_t_follow(0, 40., "highway", False, 0., True), 0.60)
 
   def test_closing_margin_only_for_throttle_only_cars_with_a_lead(self):
     with_brakes = af.get_adaptive_t_follow(STANDARD, 30., "highway", True, 28., throttle_only=False)
@@ -215,6 +232,7 @@ class TestPlannerFollowsOverride(OpenpilotTestCase):
     # stock run itself. Expected change: -(1 - 0.8425) * T*v = -6.9 m at 30 m/s.
     _, stock = self._run(adaptive=False)
     _, adaptive_gap = self._run(adaptive=True)
-    expected = (1. - af.speed_gap_factor("unknown", 30.)) * af.BASE_T_FOLLOW * 30.
+    # stock settles at T_FOLLOW(standard) = 1.45 s, adaptive at BASE_T_NORMAL (1.25 s) x the speed factor
+    expected = (get_T_FOLLOW(STANDARD) - af.speed_gap_factor("unknown", 30.) * af.BASE_T_NORMAL) * 30.
     self.assertGreater(stock - adaptive_gap, 0.5 * expected)
     self.assertLess(stock - adaptive_gap, 1.5 * expected)

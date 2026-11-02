@@ -1,0 +1,70 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 6f08b94..cbf1490 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -315,7 +315,17 @@ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launchin
+     hold = get_hold_command(v_ego)
+     if gas_last < hold:
+       limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL)
+-  return min(gas, limit)
++  gas_out = min(gas, limit)
++  # 2026-11-01 BLIP FIX: a SMALL fall was applied in ONE frame. Measured on that drive (45.5 engaged min, the pedal
++  # reconstructed at 100 Hz from the logged law and checked against every 0x700 frame): 14 blips, every one of them a
++  # single peak of 0.02-0.03 pedal (~5-8 LSB) - the hold level going down 5-8 LSB and straight back up. One frame of
++  # that is an instant torque step; the rise limit then takes ~70 ms to walk it back, which is exactly what a blip
++  # feels like. A fall of up to PEDAL_FALL_BLIP_LSB is now walked down at the mirror rate instead of dropping at once.
++  # Anything bigger - a real lift, an FCA11/cal/cam-brake zero, a disengage, the over-speed release - is untouched:
++  # those are either > 8 LSB or an exact zero, and a zero target still falls in one frame (safety direction).
++  if gas_out > 0. and gas_last > 0. and (gas_last - gas_out) <= PEDAL_FALL_BLIP_LSB / 255.:
++    gas_out = max(gas_out, gas_last - get_pedal_rate_down(v_ego) * DT_CTRL)
++  return gas_out
+ 
+ 
+ def get_interceptor_gas(cp, sensor_msg: str = STANDARD_IDS.sensor_msg) -> float:
+@@ -435,6 +445,9 @@ def get_delivery_floor(v_ego: float) -> float:
+   return DELIVERY_PEDAL_FLOOR * _smoothstep((v_ego - DELIVERY_FLOOR_V) / (DELIVERY_FLOOR_RAMP_V - DELIVERY_FLOOR_V))
+ 
+ 
++PEDAL_FALL_BLIP_LSB = 8   # falls up to this are walked down at get_pedal_rate_down instead of one frame (2026-11-01)
++
++
+ def get_pedal_rate_down(v_ego: float) -> float:
+   """Fall rate inside the delivery law's shallow band, pedal fraction per second: PEDAL_JERK_DOWN through the law's
+   own speed schedule, i.e. the mirror of get_pedal_rate_up (0.12/s at a standstill, 0.30/s at 18 m/s, 0.43/s from
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index f9a637a..e64b415 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -2380,3 +2380,32 @@ class TestHandover185:
+     assert gas == [0.] * 6
+     assert all(s == (0, 0) for s in slots), slots      # (raw, ENABLE): all-zero, pedal pass-through
+     assert len(slots) == 3
++
++
++class TestSmallFallSmoothed:
++  """2026-11-01: the measured remaining blips were single-frame falls of 5-8 LSB that the rise limit then had to walk
++  back (14 in 45.5 engaged minutes). A SMALL fall is walked down at the mirror rate; big lifts and exact zeros stay
++  immediate so the safety direction is unchanged."""
++
++  def test_small_fall_is_walked_down_not_instant(self):
++    v = 30.
++    step = gi.get_pedal_rate_down(v) * gi.DT_CTRL
++    out = gi.rate_limit_pedal_command(0.05, 0.07, v)      # 0.02 = ~5 LSB
++    assert out == pytest.approx(0.07 - step, abs=1e-9)
++
++  def test_fall_at_the_lsb_boundary_is_still_smoothed(self):
++    v = 25.
++    step = gi.get_pedal_rate_down(v) * gi.DT_CTRL
++    out = gi.rate_limit_pedal_command(0.10, 0.10 + gi.PEDAL_FALL_BLIP_LSB / 255., v)
++    assert out == pytest.approx(0.10 + gi.PEDAL_FALL_BLIP_LSB / 255. - step, abs=1e-9)
++
++  def test_large_lift_is_immediate(self):
++    out = gi.rate_limit_pedal_command(0.02, 0.20, 30.)    # 0.18 = ~46 LSB, a real lift
++    assert out == pytest.approx(0.02, abs=1e-9)
++
++  def test_zero_still_falls_in_one_frame(self):
++    assert gi.rate_limit_pedal_command(0., 0.05, 30.) == 0.
++
++  def test_rise_limit_is_untouched(self):
++    out = gi.rate_limit_pedal_command(0.30, 0.10, 30.)
++    assert out == pytest.approx(0.10 + gi.get_pedal_rate_up(30.) * gi.DT_CTRL, abs=1e-9)
