@@ -89,6 +89,18 @@ A_FLOOR = -2.5           # m/s^2, this rule never asks harder than this (the e2e
 V_FLAT_DECEL = 0.35      # m/s^2, the plan must have stopped braking at the plateau by this much (a truncated real stop
                          # keeps braking hard at the horizon end and is left to commit_accel)
 
+# LATCH (2026-11-01, owner: "brakes for lights and stop signs with no leading car still overshoots"): the model's
+# terminal creep plateau SLIDES FORWARD as the car approaches it, so a rule that re-prices the plan's point every frame
+# keeps aiming at a point that recedes - the car creeps past the intended stop. Measured on the 5 routes of that drive
+# (196 qlogs): no-lead stops spend a median 3.4 s (p90 7.4 s, max 17.2 s) below 3 m/s before coming to rest, 45 % of it
+# between 0.15 and 1.0 m/s, and there is NO panic braking in the last second (median |a| 0.77, p10 0.98 m/s^2) - a slow
+# creep past the point, not a late hard stop. So the FIRST time the plan commits to a terminal plateau inside
+# LATCH_MAX_D, its distance is frozen into an odometer position and the rule prices THAT point from then on.
+LATCH_MAX_D = 60.0       # m, only latch a plateau this close (a far "plateau" is a curve, not a stop)
+LATCH_MIN_D = 2.0        # m, ...and this far
+LATCH_RELEASE_V = 2.0    # m/s, a latched stop is released if the car ends up crawling this fast with the point behind it
+LATCH_STOPPED_V = 0.2    # m/s, at rest the latch is done
+
 
 
 def commit_accel(x, v, t) -> float:
@@ -116,7 +128,7 @@ def stop_weight(v) -> float:
   return float(np.interp(ratio, [R_FULL, R_NONE], [1., 0.]) * np.interp(v_min, [V_STOP_FULL, V_STOP_NONE], [1., 0.]))
 
 
-def stop_line_accel(x, v, t=None):
+def stop_line_distance(x, v, t=None):
   """Decel that ends the car AT the plan's own creep plateau, or None when the plan is not parking on one.
 
   The plateau is the first plan point at <= V_CREEP. It counts as a stop point (rather than a curve, a slow zone, or a
@@ -126,7 +138,7 @@ def stop_line_accel(x, v, t=None):
     * the plan has stopped braking there: the tail's own decel is shallower than V_FLAT_DECEL. A uniform stop plan that
       the horizon truncates (e.g. 17 m/s braking to a stop 100 m out still reads 2.55 m/s at 10 s) keeps braking at
       the tail and is left to commit_accel(), which prices it exactly.
-  Returns max(-v0^2 / (2 * max(d - STOP_MARGIN, 1.0)), A_FLOOR) (<= 0), or None.
+  Returns the plan's own plateau distance ``d`` (metres ahead), or None when the plan is not parking on one.
   """
   x = np.asarray(x, dtype=float)
   v = np.clip(np.asarray(v, dtype=float), 0., None)
@@ -151,7 +163,15 @@ def stop_line_accel(x, v, t=None):
     return None
   if (float(tail[-1]) - float(tail[0])) / tail_dt < -V_FLAT_DECEL:
     return None
-  return float(max(-(v0 * v0) / (2. * max(d - STOP_MARGIN, 1.0)), A_FLOOR))
+  return d
+
+
+def stop_line_accel(x, v, t=None):
+  """Decel that ends the car at the plan's plateau point *as measured right now* (the unlatched rule)."""
+  d = stop_line_distance(x, v, t)
+  if d is None:
+    return None
+  return float(max(-(float(np.clip(np.asarray(v, dtype=float), 0., None)[0]) ** 2) / (2. * max(d - STOP_MARGIN, 1.0)), A_FLOOR))
 
 
 
@@ -168,6 +188,9 @@ class StopCommit:
     self.commit = 0.
     self.weight = 0.
     self.lead_clear = 0
+    self._s = 0.0            # odometer (m) accumulated while long is active - the frame the latch is frozen in
+    self.latch_s = None      # absolute odometer position of the latched stop point
+    self._latched_done = False   # this stop episode already spent its one latch (do not re-latch at a moving point)
     self._read_param()
 
   def _read_param(self) -> None:
@@ -186,6 +209,8 @@ class StopCommit:
   def reset(self) -> None:
     self.armed = False
     self.delta = 0.
+    self.latch_s = None
+    self._latched_done = False
 
   def update(self, e2e: float, long_active: bool, gas_pressed: bool, v_ego: float, lead_present: bool,
              plan_x, plan_v, plan_t=None) -> float:
@@ -202,13 +227,31 @@ class StopCommit:
       return e2e
 
     t = ModelConstants.T_IDXS if plan_t is None or len(plan_t) != len(plan_x) else plan_t
+    self._s += max(v_ego, 0.) * self.dt
     self.commit = commit_accel(plan_x, plan_v, t)
     self.weight = stop_weight(plan_v)
-    stop_line = stop_line_accel(plan_x, plan_v)
-    if stop_line is not None:
+    plateau_d = stop_line_distance(plan_x, plan_v)
+    if plateau_d is not None and self.latch_s is None and not self._latched_done and LATCH_MIN_D < plateau_d <= LATCH_MAX_D:
+      # first sighting of a terminal plateau this close: freeze the point (odometer frame) instead of re-pricing a
+      # target that the model slides forward as the car approaches
+      self.latch_s = self._s + plateau_d
+    if self.latch_s is not None:
+      remaining = self.latch_s - self._s - STOP_MARGIN
+      if v_ego > LATCH_RELEASE_V and remaining <= 0.:
+        self.latch_s = None               # the point is behind us and we are still rolling: it was not a stop
+        self._latched_done = True         # ...and the sliding plateau must not re-latch it on the next frame
+      elif plateau_d is None and self.weight < 0.05:
+        self.latch_s = None               # the plan stopped planning a stop at all (curve / new lead)
+        self._latched_done = False        # a later stop in the same engagement may latch again
+    if plateau_d is not None or self.latch_s is not None:
       # the plan is parking on a creep plateau: the point is the model's stop location, so price a full stop there and
       # let the commitment do its job (the weight curve asks "did the plan slow down", which is not the question here)
-      self.commit = min(self.commit, stop_line)
+      if self.latch_s is not None:
+        remaining = max(self.latch_s - self._s - STOP_MARGIN, 1.0)
+        line = float(max(-(v_ego * v_ego) / (2. * remaining), A_FLOOR))
+      else:
+        line = stop_line_accel(plan_x, plan_v)
+      self.commit = min(self.commit, line)
       self.weight = 1.0
     gap = self.commit - e2e
     if not self.armed:

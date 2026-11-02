@@ -310,3 +310,72 @@ class TestStopLine(OpenpilotTestCase):
     c = sc.StopCommit(params=FakeParams(enabled=False))
     x, v = creep_plan(8.0, 4.0)
     self.assertEqual(run(c, 60, -0.2, 8.0, plan=(x, v)), [-0.2] * 60)
+
+class TestStopLineLatch(OpenpilotTestCase):
+  """2026-11-01: the model's terminal creep plateau slides forward, so the stop point is LATCHED at first sighting.
+
+  Measured on the five routes of that drive (196 qlogs): no-lead stops spend a median 3.4 s (p90 7.4 s, max 17.2 s)
+  below 3 m/s before rest, 45 % of it between 0.15 and 1.0 m/s, with no panic braking in the last second - a slow
+  creep past the intended point, which is what re-pricing a receding target produces.
+  """
+
+  def _c(self):
+    return sc.StopCommit(params=FakeParams())
+
+  def test_point_is_frozen_at_first_sighting(self):
+    c = self._c()
+    x, v = creep_plan(10.0, 4.0)
+    d0 = sc.stop_line_distance(x, v)
+    c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNotNone(c.latch_s)
+    self.assertAlmostEqual(c.latch_s, d0 + 10.0 * c.dt, delta=0.05)   # the odometer advances one frame first
+    latched = c.latch_s
+    for k in range(10):                       # the plan slides the plateau forward (ramp 4 s -> 5 s -> ...)
+      x, v = creep_plan(10.0, 4.0 + 0.5 * (k + 1))
+      c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertAlmostEqual(c.latch_s, latched, places=6)   # ...and the target did NOT follow it
+
+  def test_far_plateau_is_not_latched(self):
+    c = self._c()
+    x, v = creep_plan(25.0, 8.0)              # plateau well beyond LATCH_MAX_D
+    c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNone(c.latch_s)
+
+  def test_crawling_plateau_is_not_latched(self):
+    c = self._c()
+    x, v = creep_plan(3.0, 4.0)               # below V0_MIN: already finishing the stop
+    c.update(-0.2, True, False, 3.0, False, x, v, T)
+    self.assertIsNone(c.latch_s)
+
+  def test_latch_releases_when_the_point_is_passed_while_still_rolling(self):
+    c = self._c()
+    x, v = creep_plan(10.0, 3.0)
+    c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNotNone(c.latch_s)
+    for _ in range(200):                      # drive past the point at 10 m/s
+      c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNone(c.latch_s)
+
+  def test_latch_releases_when_the_plan_abandons_the_stop(self):
+    c = self._c()
+    x, v = creep_plan(10.0, 3.0)
+    c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNotNone(c.latch_s)
+    x2, v2 = cruise_plan(10.0, 0.5)
+    for _ in range(5):
+      c.update(-0.2, True, False, 10.0, False, x2, v2, T)
+    self.assertIsNone(c.latch_s)
+
+  def test_disabled_never_latches(self):
+    c = sc.StopCommit(params=FakeParams(enabled=False))
+    x, v = creep_plan(10.0, 3.0)
+    for _ in range(20):
+      c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertIsNone(c.latch_s)
+
+  def test_deepens_toward_the_latched_point(self):
+    c = self._c()
+    x, v = creep_plan(10.0, 3.0)
+    for _ in range(120):
+      c.update(-0.2, True, False, 10.0, False, x, v, T)
+    self.assertLess(c.delta, -0.5)            # a real commitment, not the shallow cruise ask
