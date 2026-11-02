@@ -22,7 +22,7 @@ What it does
   that cannot brake is the wrong direction in town.
 * closing margin (throttle-only cars only): extra distance needed to cancel the closing speed by coasting instead
   of braking at ``COMFORT_BRAKE``: ``vrel^2/2 * (1/a_coast(v) - 1/COMFORT_BRAKE)``, as time at v_ego, capped at
-  ``MAX_CLOSING_MARGIN``. It only acts while the lead is slower. A same-speed lead that brakes hard gets no extra
+  ``MAX_CLOSING_MARGIN`` = 0.25 s and only while closing faster than ``CLOSING_MARGIN_MIN_VREL`` = 0.5 m/s. It only acts while the lead is slower. A same-speed lead that brakes hard gets no extra
   margin from this; that case still relies on FCW + the driver.
 
 The time gap is a runtime MPC parameter (p[4]), so the OCP and the generated solver are unchanged.
@@ -52,7 +52,13 @@ HIGHWAY_ROAD_TYPES = ("highway", "interstate")
 # orientationNED[1] reads +0.028 rad vs GPS grade on this car).
 COAST_DECEL_BP = [10., 18., 24., 30., 36.]
 COAST_DECEL_V = [0.27, 0.30, 0.35, 0.42, 0.42]
-MAX_CLOSING_MARGIN = 0.6  # s
+# 2026-11-01 (measured on that drive, routes 187-18b, 14,220 engaged-with-lead frames): the car held 1.66-1.72 s
+# implied T at 25-36 m/s while the law commanded 1.19 s. The difference is this margin: it is active whenever the lead
+# is slower - i.e. almost always on the interstate - and the 0.6 s cap is what the owner kept feeling as "too far".
+# The margin's job is only to cancel a REAL closing speed by coasting; at v_rel < 0.5 m/s it is noise. Cap 0.25 s and
+# gate at 0.5 m/s: the highway steady gap lands at the law's own 1.19-1.30 s instead of 1.7-1.8 s.
+MAX_CLOSING_MARGIN = 0.25  # s
+CLOSING_MARGIN_MIN_VREL = 0.5  # m/s
 
 # rate limits on the output (s of gap per s): add margin fast, give it back slowly
 T_FOLLOW_RATE_UP = 1.0
@@ -78,7 +84,7 @@ def coast_decel(v_ego: float) -> float:
 def closing_margin(v_ego: float, v_lead: float) -> float:
   """Extra time gap (s) for a throttle-only car to cancel the closing speed by coasting."""
   v_rel = v_ego - v_lead
-  if v_rel <= 0. or v_ego <= 1.:
+  if v_rel < CLOSING_MARGIN_MIN_VREL or v_ego <= 1.:
     return 0.
   extra_dist = v_rel ** 2 / 2. * (1. / coast_decel(v_ego) - 1. / COMFORT_BRAKE)
   return float(np.clip(extra_dist / v_ego, 0., MAX_CLOSING_MARGIN))
