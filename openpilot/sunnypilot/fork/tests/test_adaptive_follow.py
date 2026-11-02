@@ -27,32 +27,33 @@ class FakeParams:
 
 class TestRoadSpeedFactor(OpenpilotTestCase):
   def test_urban_never_changes_the_gap(self):
-    # a brakeless car must not follow closer in town: urban is exactly the personality gap at every speed
+    # a brakeless car must not follow closer in town: urban is exactly the base gap at every speed
     for v in (0., 10., 15., 20., 25., 30., 40.):
-      self.assertEqual(af.road_speed_factor("urban", v), 1.0)
+      self.assertEqual(af.speed_gap_factor("urban", v), 1.0)
 
-  def test_highway_ramps_up_with_speed(self):
+  def test_highway_shrinks_with_speed(self):
+    # owner's ruling 2026-11-01: the interstate gap is too wide, so it must SHRINK as speed rises
     for rt in af.HIGHWAY_ROAD_TYPES:
-      self.assertEqual(af.road_speed_factor(rt, 15.), 1.0)
-      self.assertAlmostEqual(af.road_speed_factor(rt, 29.), 1.1)
-      self.assertAlmostEqual(af.road_speed_factor(rt, 35.), 1.1)
+      self.assertEqual(af.speed_gap_factor(rt, 15.), 1.0)
+      self.assertAlmostEqual(af.speed_gap_factor(rt, 32.), af.GAP_FACTOR_V[-1])
+      self.assertAlmostEqual(af.speed_gap_factor(rt, 40.), af.GAP_FACTOR_V[-1])
       vs = [15. + i for i in range(20)]
-      fs = [af.road_speed_factor(rt, v) for v in vs]
-      self.assertEqual(fs, sorted(fs))
+      fs = [af.speed_gap_factor(rt, v) for v in vs]
+      self.assertEqual(fs, sorted(fs, reverse=True))   # monotone non-increasing
 
-  def test_highway_factor_drive_12f(self):
-    # drive 12f: 1.2 gave 1.97-2.02 s to a car at 29 m/s ("a bit far"); 1.1 -> T 1.60 s, d = T*v + 6 m = 52.3 m = 1.80 s
-    self.assertEqual(af.HIGHWAY_FACTOR_V, [1.0, 1.1])
+  def test_highway_numbers_65mph(self):
+    # 29 m/s (65 mph): factor 0.85375 -> T 1.238 s, MPC gap T*v + 6 m = 41.9 m = 1.44 s effective
+    self.assertEqual(af.GAP_FACTOR_V, [1.0, 0.82])
     t = af.get_adaptive_t_follow(STANDARD, 29., "interstate", True, 29., True)
-    self.assertAlmostEqual(t, 1.1 * get_T_FOLLOW(STANDARD))
-    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.80, places=2)
-    # never below stock on the highway (no-brake car keeps margin over stock 1.45 s)
-    for v in (15., 20., 25., 29., 35.):
-      self.assertGreaterEqual(af.road_speed_factor("highway", v), 1.0)
+    self.assertAlmostEqual(t, 0.85375 * get_T_FOLLOW(STANDARD))
+    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.44, places=2)
+    # never wider than stock on the open road
+    for v in (16., 20., 25., 29., 35.):
+      self.assertLessEqual(af.speed_gap_factor("highway", v), 1.0)
 
-  def test_unknown_is_between(self):
-    self.assertAlmostEqual(af.road_speed_factor("unknown", 30.), 1.1)
-    self.assertEqual(af.road_speed_factor("unknown", 15.), 1.0)
+  def test_unknown_follows_speed_only(self):
+    self.assertAlmostEqual(af.speed_gap_factor("unknown", 30.), af.GAP_FACTOR_V[-1] if False else af.speed_gap_factor("highway", 30.))
+    self.assertEqual(af.speed_gap_factor("unknown", 15.), 1.0)
 
 
 class TestClosingMargin(OpenpilotTestCase):
@@ -77,11 +78,13 @@ class TestClosingMargin(OpenpilotTestCase):
 
 
 class TestAdaptiveTFollow(OpenpilotTestCase):
-  def test_personality_is_the_base(self):
+  def test_one_gap_for_every_personality(self):
+    # owner: "aggressive follow distance needs to be normal follow distance" -> personality no longer moves the gap
     for p in PERSONALITIES:
       with self.subTest(personality=p):
-        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), get_T_FOLLOW(p))
-        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True), 1.1 * get_T_FOLLOW(p))
+        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), af.BASE_T_FOLLOW)
+        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True), af.speed_gap_factor("highway", 31.) * af.BASE_T_FOLLOW)
+    self.assertEqual(af.BASE_T_FOLLOW, get_T_FOLLOW(STANDARD))
 
   def test_closing_margin_only_for_throttle_only_cars_with_a_lead(self):
     with_brakes = af.get_adaptive_t_follow(STANDARD, 30., "highway", True, 28., throttle_only=False)
@@ -107,21 +110,21 @@ class TestAdaptiveFollowController(OpenpilotTestCase):
     self.assertIsNone(a.update(STANDARD, 31., "highway", False, 0.))
     p.enabled = True
     out = [a.update(STANDARD, 31., "highway", False, 0.) for _ in range(int(1. / a.dt) + 1)]
-    self.assertAlmostEqual(out[-1], 1.1 * get_T_FOLLOW(STANDARD))
+    self.assertAlmostEqual(out[-1], af.speed_gap_factor("highway", 31.) * af.BASE_T_FOLLOW)
 
   def test_rate_limits(self):
     a = af.AdaptiveFollow(True, params=FakeParams())
     t0 = a.update(STANDARD, 15., "urban", False, 0.)
-    self.assertAlmostEqual(t0, get_T_FOLLOW(STANDARD))
-    # jump to highway speed: rises at most T_FOLLOW_RATE_UP per second
-    t1 = a.update(STANDARD, 31., "highway", True, 28.)
-    self.assertAlmostEqual(t1 - t0, af.T_FOLLOW_RATE_UP * a.dt, places=6)
+    self.assertAlmostEqual(t0, af.BASE_T_FOLLOW)
+    # jump to highway speed with no lead: the gap now SHRINKS, at most T_FOLLOW_RATE_DOWN per second
+    t1 = a.update(STANDARD, 31., "highway", False, 0.)
+    self.assertAlmostEqual(t0 - t1, af.T_FOLLOW_RATE_DOWN * a.dt, places=6)
     for _ in range(100):
-      t_hi = a.update(STANDARD, 31., "highway", True, 28.)
-    self.assertAlmostEqual(t_hi, af.get_adaptive_t_follow(STANDARD, 31., "highway", True, 28., True), places=6)
-    # back to urban: margin is given back slowly
+      t_hi = a.update(STANDARD, 31., "highway", False, 0.)
+    self.assertAlmostEqual(t_hi, af.get_adaptive_t_follow(STANDARD, 31., "highway", False, 0., True), places=6)
+    # back to urban: the gap is given back slowly
     t2 = a.update(STANDARD, 15., "urban", False, 0.)
-    self.assertAlmostEqual(t_hi - t2, af.T_FOLLOW_RATE_DOWN * a.dt, places=6)
+    self.assertAlmostEqual(t2 - t_hi, af.T_FOLLOW_RATE_UP * a.dt, places=6)
 
   def test_throttle_only_detection(self):
     class P:
@@ -189,7 +192,7 @@ class TestPlannerFollowsOverride(OpenpilotTestCase):
     # so the planner would reset to carState every step (why upstream's test_following_distance fails 15/18 here).
     plant.planner.CP.openpilotLongitudinalControl = True
     # the Plant builds a Honda planner (has brakes) -> no closing margin; its liveMapDataSP is empty -> roadType
-    # unknown -> factor 1.1 at >= 29 m/s
+    # unknown -> speed-only factor (0.82 at >= 32 m/s)
     plant.planner.adaptive_follow = af.AdaptiveFollow(False, params=FakeParams(enabled=adaptive))
     while plant.current_time < t_end:
       out = plant.step(v_lead=v_lead, prob_lead=1.0, v_cruise=40.)
@@ -201,14 +204,17 @@ class TestPlannerFollowsOverride(OpenpilotTestCase):
 
   def test_enabled_passes_adaptive_t_follow_to_mpc(self):
     plant, _ = self._run(adaptive=True, t_end=2.)
-    self.assertAlmostEqual(float(plant.planner.mpc.params[0, 4]), 1.1 * get_T_FOLLOW(STANDARD), places=5)
+    got = float(plant.planner.mpc.params[0, 4])
+    self.assertLess(got, get_T_FOLLOW(STANDARD))                       # not the stock gap any more
+    self.assertGreaterEqual(got, af.GAP_FACTOR_V[-1] * af.BASE_T_FOLLOW - 1e-6)   # and never below the open-road floor
+    self.assertLessEqual(got, af.BASE_T_FOLLOW)
 
-  def test_enabled_lengthens_steady_state_gap(self):
+  def test_enabled_shortens_steady_state_gap(self):
     # Relative check only: in this Plant both stock and adaptive settle ~9 m beyond T*v + 6 at 30 m/s on this host
     # (upstream's absolute test_following_distance.py fails 15/18 on an unmodified tree here), so the oracle is the
-    # stock run itself. Expected change: +10 % of T*v = 4.35 m.
+    # stock run itself. Expected change: -(1 - 0.8425) * T*v = -6.9 m at 30 m/s.
     _, stock = self._run(adaptive=False)
     _, adaptive_gap = self._run(adaptive=True)
-    expected = 0.1 * get_T_FOLLOW(STANDARD) * 30.
-    self.assertGreater(adaptive_gap - stock, 0.5 * expected)
-    self.assertLess(adaptive_gap - stock, 1.5 * expected)
+    expected = (1. - af.speed_gap_factor("unknown", 30.)) * af.BASE_T_FOLLOW * 30.
+    self.assertGreater(stock - adaptive_gap, 0.5 * expected)
+    self.assertLess(stock - adaptive_gap, 1.5 * expected)

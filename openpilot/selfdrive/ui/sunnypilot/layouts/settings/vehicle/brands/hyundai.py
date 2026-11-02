@@ -39,12 +39,16 @@ class HyundaiSettings(BrandSettings):
                                                        callback=self._on_fca11_toggle_changed)
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
+    # fork: ELASTIC FOLLOW DISTANCE (AdaptiveFollowDistance) - the owner's follow law: one gap for every personality
+    # (aggressive included), shrinking with speed on the open road instead of the stock 1.25/1.45/1.75 s ladder.
+    self.elastic_follow_toggle = toggle_item_sp(tr("Elastic Follow Distance"), "", param="AdaptiveFollowDistance",
+                                                 callback=self._on_fca11_toggle_changed)
     self.drive_mode_personality_toggle = toggle_item_sp(
       tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
                   self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.fca11_dynamic_release_toggle,
-                  self.stop_approach_toggle, self.drive_mode_personality_toggle]
+                  self.stop_approach_toggle, self.elastic_follow_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
   def _on_tuning_selected(index):
@@ -161,6 +165,18 @@ class HyundaiSettings(BrandSettings):
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)
     self.fca11_dynamic_release_toggle.show_description(True)
     self.fca11_dynamic_release_toggle.set_visible(dynamic_state.visible)
+
+    # fork: Elastic Follow Distance - planner-side, always listed, offroad only (it is a runtime MPC parameter).
+    self.elastic_follow_toggle.action_item.set_enabled(offroad)
+    elastic_desc = tr("One follow gap for every personality, so Aggressive follows at the same distance as Normal. " +
+                      "The gap is continuous, not a 1/2/3 s preset: 1.45 s in town, shrinking to 1.19 s by 72 mph. " +
+                      "Aggressive still changes launch and pull behaviour, not the steady-state gap. Takes effect " +
+                      "at the next ignition.")
+    if not offroad:
+      elastic_desc = offroad_hint + elastic_desc
+    self.elastic_follow_toggle.set_description(elastic_desc)
+    self.elastic_follow_toggle.show_description(True)
+    self.elastic_follow_toggle.set_visible(True)
 
     # fork (17c lane C): Stop-Approach Commitment - planner-side, always listed, offroad only.
     stop_state = stop_approach_toggle_state(offroad)
