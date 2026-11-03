@@ -1,5 +1,5 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 6f08b94..cbf1490 100644
+index 6f08b94..b22cb68 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -315,7 +315,17 @@ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launchin
@@ -31,6 +31,16 @@ index 6f08b94..cbf1490 100644
  def get_pedal_rate_down(v_ego: float) -> float:
    """Fall rate inside the delivery law's shallow band, pedal fraction per second: PEDAL_JERK_DOWN through the law's
    own speed schedule, i.e. the mirror of get_pedal_rate_up (0.12/s at a standstill, 0.30/s at 18 m/s, 0.43/s from
+@@ -709,7 +722,8 @@ class GasInterceptorCarController:
+         # law below 20 m/s, exactly the deployed law below 16 m/s), and its ask is the FILTERED one (deeper asks still
+         # land on the same frame; the filter only slows the return toward 0 and the hand-back from a coast/brake
+         # episode). Both are faded by the same weight as the law, so below 16 m/s the pedal path is the deployed one
+-        # INCLUDING its ask and its fall behaviour. Positive asks - including exactly 0 - keep the RAW plan value, so
++        # INCLUDING its ask and its fall behaviour (except the small-fall walking below, which is applied after this branch).
++        # Positive asks - including exactly 0 - keep the RAW plan value, so
+         # that branch stays bit-identical to the deployed law too.
+         if delivery_on:
+           weight = get_delivery_blend_weight(CS.out.vEgo)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 index f9a637a..e64b415 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py

@@ -114,18 +114,19 @@ class SlowHardware:
 
   def _run(self) -> None:
     while not self._end.is_set():
+      # review N5: a permanently failing read must be visible in the log, not a silent default forever.
       try:
         self.free_space_percent = float(get_available_percent(default=100.0))
       except Exception:
-        pass
+        cloudlog.exception("slow-hardware: free space read failed")
       try:
         self.screen_brightness_percent = int(HARDWARE.get_screen_brightness())
       except Exception:
-        pass
+        cloudlog.exception("slow-hardware: screen brightness read failed")
       try:
         self.gpu_usage_percent = float(HARDWARE.get_gpu_usage_percent())
       except Exception:
-        pass
+        cloudlog.exception("slow-hardware: gpu usage read failed")
       self._end.wait(self.period)
 
   def stop(self) -> None:

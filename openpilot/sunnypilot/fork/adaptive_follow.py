@@ -13,13 +13,15 @@ What it does
 ------------
 ``t_follow = BASE_T_FOLLOW * speed_gap_factor(road_type, v_ego) + closing_margin(...)``, rate-limited.
 
-* ONE base gap for every personality (1.45 s, the stock standard value). Owner's ruling after the 2026-11-01
-  drive: "aggressive follow distance needs to be normal follow distance". The personality still sets launch /
-  pull behaviour elsewhere; it no longer moves the steady-state gap.
+* TWO bases, one per personality (owner, 2026-11-01, final ruling): NORMAL = **1.25 s** (stock AGGRESSIVE's value -
+  "whatever the aggressive profile to be the new normal profile"), AGGRESSIVE = **1.00 s** ("like 1s +/- 0.4s").
+  RELAXED is unused on this car and deliberately follows NORMAL, so it can never be the widest gap.
 * Elastic, not stepped: the gap is a continuous function of speed, never a 1 / 2 / 3 s preset. On highway /
-  interstate it SHORTENS as speed rises, 1.0 -> 0.82 between 16 and 32 m/s (1.45 -> 1.19 s, i.e. 55 -> 40 m at
-  65 mph). Unknown road type follows the same speed curve. Urban keeps the full base gap: shortening it on a car
-  that cannot brake is the wrong direction in town.
+  interstate it SHORTENS as speed rises: NORMAL 1.00 -> 0.82 between 16 and 32 m/s (**1.25 -> 1.02 s**, 45 -> 37 m
+  at 65 mph), AGGRESSIVE 1.00 -> 0.60 (**1.00 -> 0.60 s**, 36 -> 22 m). Unknown road type follows the same curves.
+  Urban keeps the full base gap: shortening it on a car that cannot brake is the wrong direction in town.
+  The MPC treats this as a TARGET, not a servo - the measured gap drifts roughly +/-0.4 s (p10-p90) around it on a
+  camera-only lead, by design.
 * closing margin (throttle-only cars only): extra distance needed to cancel the closing speed by coasting instead
   of braking at ``COMFORT_BRAKE``: ``vrel^2/2 * (1/a_coast(v) - 1/COMFORT_BRAKE)``, as time at v_ego, capped at
   ``MAX_CLOSING_MARGIN`` = 0.25 s and only while closing faster than ``CLOSING_MARGIN_MIN_VREL`` = 0.5 m/s. It only acts while the lead is slower. A same-speed lead that brakes hard gets no extra
