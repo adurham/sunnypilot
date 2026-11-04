@@ -1,0 +1,32 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -900,6 +900,7 @@
+ # (Fable review: a bridge or a parked car at 36 m reads as a 3.5 m/s^2 demand, and with the raised gate that would be a
+ # 0.35 g phantom brake at highway speed. The urgent authority stays reserved for the planner's own ask.)
+ FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
++
+ 
+ 
+ FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
+@@ -2143,7 +2144,10 @@
+       # 2026-11-03 (Fable review): this passed the raised gate unconditionally, so EVERY level on this path - a gentle ask,
+       # a lead-loss hold, a standstill level - could spend 46 LSB. The gate is now keyed on the ask itself, which is the only
+       # thing the owner's ruling covers: an ask at/below FCA11_URGENT_ASK_MSS2, i.e. a genuine hard stop.
+-      _ceil = getattr(self, '_urgent_ceiling_lsb', 0) if float(a_tgt) <= FCA11_URGENT_ASK_MSS2 else 0
++      # 2026-11-03 (Fable): keyed on the PLANNER's ask, never on this law's own closing demand or shortfall boost - a
++      # law-internal demand must never reach the 31-46 LSB region.
++      _gate_ask = float(getattr(self, '_planner_ask', a_tgt))
++      _ceil = getattr(self, '_urgent_ceiling_lsb', 0) if _gate_ask <= FCA11_URGENT_ASK_MSS2 else 0
+       return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+     if not self.feel_fix:
+       return feel_target_lsb(a_tgt, personality)
+@@ -2900,7 +2904,8 @@
+       self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+ 
+-    accel = self._closing_demand(CS, float(CC.actuators.accel))
++    self._planner_ask = float(CC.actuators.accel)   # the raw planner ask: the ONLY thing that may open the 46 LSB gate
++    accel = self._closing_demand(CS, self._planner_ask)
+     ok, _why = self.fca11_ok(CS, frame)
+     self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
+ 
