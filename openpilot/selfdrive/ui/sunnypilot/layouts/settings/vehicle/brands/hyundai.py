@@ -9,7 +9,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp, toggle_item_sp
 from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, fca11_stop_hold_toggle_state
 from opendbc.car.hyundai.values import CAR, UNSUPPORTED_LONGITUDINAL_CAR
 
 
@@ -39,6 +39,9 @@ class HyundaiSettings(BrandSettings):
                                                        callback=self._on_fca11_toggle_changed)
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
+    # 0034: EXPERIMENTAL — asks the ESC for its own stop hold at a standstill so the transmission releases the clutch.
+    self.fca11_stop_hold_toggle = toggle_item_sp(tr("Hold Clutch Release (experimental)"), "", param="HyundaiFca11StopHoldClutch",
+                                                 callback=self._on_fca11_toggle_changed)
     # fork: ELASTIC FOLLOW DISTANCE (AdaptiveFollowDistance) - the owner's follow law: one gap for every personality
     # (aggressive included), shrinking with speed on the open road instead of the stock 1.25/1.45/1.75 s ladder.
     self.elastic_follow_toggle = toggle_item_sp(tr("Elastic Follow Distance"), "", param="AdaptiveFollowDistance",
@@ -51,6 +54,7 @@ class HyundaiSettings(BrandSettings):
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
                   self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.fca11_dynamic_release_toggle,
+                  self.fca11_stop_hold_toggle,
                   self.stop_approach_toggle, self.elastic_follow_toggle, self.no_close_toggle, self.drive_mode_personality_toggle]
 
   @staticmethod
@@ -168,6 +172,20 @@ class HyundaiSettings(BrandSettings):
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)
     self.fca11_dynamic_release_toggle.show_description(True)
     self.fca11_dynamic_release_toggle.set_visible(dynamic_state.visible)
+
+    # 0034: Hold Clutch Release (experimental) - the FCA11 frame also asks for the ESC's own stop hold at a standstill.
+    hold_state = fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad)
+    self.fca11_stop_hold_toggle.action_item.set_enabled(hold_state.enabled)
+    hold_desc = tr("EXPERIMENTAL. While holding the car stopped, the FCA11 frame also asks the ESC for its own stop " +
+                   "hold, which is the condition under which the transmission releases the clutch (the car sits at " +
+                   "about 26 Nm of creep torque otherwise). Only sent at walking pace, at a real hold level, with FCA11 " +
+                   "Braking on. Unproven: whether the car holds on an incline this way, and how it lets go. Requires " +
+                   "FCA11 Braking. Takes effect at the next ignition.")
+    if hold_state.visible and not offroad:
+      hold_desc = offroad_hint + hold_desc
+    self.fca11_stop_hold_toggle.set_description(hold_desc)
+    self.fca11_stop_hold_toggle.show_description(True)
+    self.fca11_stop_hold_toggle.set_visible(hold_state.visible)
 
     # fork: Elastic Follow Distance - planner-side, always listed, offroad only (it is a runtime MPC parameter).
     self.elastic_follow_toggle.action_item.set_enabled(offroad)

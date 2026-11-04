@@ -60,6 +60,12 @@ def fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad: bool) -> T
   return ToggleState(visible=visible, enabled=visible and bool(offroad))
 
 
+def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleState:
+  """0034: Hold Clutch Release — a property of the FCA11 brake law (needs FCA11 Braking on), settable offroad only."""
+  visible = _on(pedal_raw) and _on(brake_raw)
+  return ToggleState(visible=visible, enabled=visible and bool(offroad))
+
+
 def stop_approach_toggle_state(offroad: bool) -> ToggleState:
   """17c lane C: Stop-Approach Commitment is planner-side (no pedal dependency), always listed, settable offroad only."""
   return ToggleState(visible=True, enabled=bool(offroad))
