@@ -6,6 +6,8 @@ the follow distance, it never needs to do that."
 """
 import math
 
+import numpy as np
+
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.fork import no_close as nc
 
@@ -59,21 +61,80 @@ class TestNoCloseCap(OpenpilotTestCase):
     c = nc.NoCloseCap(params=FakeParams(unknown=True))
     self.assertEqual(c.update(0.9, 25., True, 20.), 0.9)
 
-  def test_enters_at_enter_threshold(self):
-    c = nc.NoCloseCap(params=FakeParams())
-    self.assertEqual(c.update(0.9, 25., True, 25. - nc.ENTER + 0.01), 0.9)   # below ENTER: not closing
-    self.assertEqual(c.update(0.9, 25., True, 25. - nc.ENTER - 0.01), 0.)    # past ENTER: capped
+  def test_full_cap_at_or_past_enter(self):
+    for v_rel in (nc.ENTER, nc.ENTER + 0.01, 1.5, 5.):
+      with self.subTest(v_rel=v_rel):
+        c = nc.NoCloseCap(params=FakeParams())
+        self.assertEqual(c.update(0.9, 25., True, 25. - v_rel), 0.)
 
-  def test_hysteresis_holds_until_exit(self):
+  def test_no_cap_at_or_below_exit(self):
+    for v_rel in (nc.EXIT, nc.EXIT - 0.01, 0., -2.):
+      with self.subTest(v_rel=v_rel):
+        c = nc.NoCloseCap(params=FakeParams())
+        for _ in range(5):
+          self.assertEqual(c.update(0.9, 25., True, 25. - v_rel), 0.9)
+        self.assertFalse(c.closing)
+
+  def test_linear_inside_the_band(self):
+    mid = (nc.ENTER + nc.EXIT) / 2.
     c = nc.NoCloseCap(params=FakeParams())
-    self.assertEqual(c.update(0.9, 25., True, 21.), 0.)                 # closing
-    self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT - 0.01), 0.)  # still closing (above EXIT)
-    # 2026-11-03: a release now needs EXIT held for RELEASE_DWELL_S, so ONE frame below it stays capped
-    self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT + 0.01), 0.0)
+    self.assertAlmostEqual(c.update(0.8, 25., True, 25. - mid), 0.4, places=6)
     self.assertTrue(c.closing)
-    for _ in range(int(nc.RELEASE_DWELL_S / c.dt)):
-      out = c.update(0.9, 25., True, 25. - nc.EXIT + 0.01)
-    self.assertEqual(out, 0.9)  # ...and RELEASE_DWELL_S below EXIT releases
+
+  def test_release_needs_the_dwell(self):
+    """Full cap, then the gap matches: ONE frame below EXIT stays capped; RELEASE_DWELL_S of it releases fully."""
+    c = nc.NoCloseCap(params=FakeParams())
+    self.assertEqual(c.update(0.9, 25., True, 21.), 0.)
+    n = int(round(nc.RELEASE_DWELL_S / c.dt))
+    outs = [c.update(0.9, 25., True, 25. - nc.EXIT + 0.01) for _ in range(n)]
+    self.assertEqual(outs[0], 0.)    # ONE matched frame does not release
+    self.assertEqual(outs[-2], 0.)   # the capped frame is still in the window...
+    self.assertEqual(outs[-1], 0.9)  # ...and ages out after exactly RELEASE_DWELL_S below EXIT (as the old dwell)
+    self.assertFalse(c.closing)
+
+  def test_tighten_is_immediate(self):
+    """Pulling throttle while closing must never be delayed: the first frame at/past ENTER is fully capped, even
+    straight after a long uncapped stretch, and every rise of the closing speed lowers the output on that frame."""
+    c = nc.NoCloseCap(params=FakeParams())
+    for _ in range(50):
+      self.assertEqual(c.update(0.9, 25., True, 25.), 0.9)
+    self.assertEqual(c.update(0.9, 25., True, 25. - nc.ENTER), 0.)
+    c = nc.NoCloseCap(params=FakeParams())
+    prev = c.update(0.9, 25., True, 25. - nc.EXIT)
+    for v_rel in np.linspace(nc.EXIT + 0.02, nc.ENTER, 10):
+      out = c.update(0.9, 25., True, 25. - v_rel)
+      self.assertAlmostEqual(out, 0.9 * nc.no_close_factor(v_rel), places=9)  # no lag: exactly the raw factor
+      self.assertLess(out, prev)
+      prev = out
+
+  def test_negative_or_zero_ask_untouched(self):
+    """Coast/brake passes through bit-for-bit in every state: closing, inside the band, held by the dwell."""
+    c = nc.NoCloseCap(params=FakeParams())
+    for v_rel in (3., 0.5, 0.4, 0.1, 0.1, 0.1, -1.):
+      for a in (0., -0.01, -0.7, -3.5):
+        self.assertEqual(c.update(a, 25., True, 25. - v_rel), a)
+
+  def test_continuity_for_smooth_closing_speed(self):
+    """The route-191 cliff: a smoothly rising closing speed may not drop the ask by more than accel*dv/(ENTER-EXIT)
+    per frame (no binary step anywhere), and a smoothly falling one may only bring throttle back after the dwell."""
+    c = nc.NoCloseCap(dt=0.05, params=FakeParams())
+    a = 0.4
+    dv = 0.02   # m/s per 50 ms frame = 0.4 m/s^2 of relative decel - a brisk but ordinary closure
+    bound = a * dv / (nc.ENTER - nc.EXIT) + 1e-9
+    v_rels = list(np.arange(-0.5, 1.2, dv)) + list(np.arange(1.2, -0.5, -dv))
+    out = [c.update(a, 20., True, 20. - v) for v in v_rels]
+    falls = [p - q for p, q in zip(out, out[1:])]
+    self.assertLessEqual(max(falls), bound)
+    self.assertEqual(min(out), 0.)          # still reaches the full cap
+    self.assertEqual(out[-1], a)            # and fully releases
+    rises = [q - p for p, q in zip(out, out[1:])]
+    self.assertLessEqual(max(rises), bound)  # release is continuous too (the dwell shifts it, it doesn't step it)
+
+  def test_unusable_lead_speed_frame_does_not_release(self):
+    c = nc.NoCloseCap(params=FakeParams())
+    self.assertEqual(c.update(0.9, 25., True, 21.), 0.)
+    self.assertEqual(c.update(0.9, 25., True, -5.), 0.9)   # unusable frame: inert for that frame (as before)...
+    self.assertEqual(c.update(0.9, 25., True, 25.), 0.)    # ...but it did not flush the dwell window
 
   def test_lead_disappearing_releases(self):
     c = nc.NoCloseCap(params=FakeParams())
