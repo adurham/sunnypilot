@@ -9,9 +9,9 @@
  
  # *** FCA11_BRAKE_GAIN — ONE provenance block (the single source of truth for this constant) ***
  #
-@@ -885,6 +885,21 @@
- FCA11_STOP_HOLD_V_KPH = 2.0               # km/h: the hold request is armed at/below this speed (the stop band)
- FCA11_STOP_HOLD_MIN_LSB = FCA11_CRAWL_MIN_LSB   # LSB: ... and only when the law is actually holding (>= the clutch-open level)
+@@ -878,6 +878,21 @@
+ # any host 0x38D with either set. A lane that set them (patch 0024) never actuated and has been REMOVED; panda safety is
+ # deliberately not relaxed. build_fca11_frame copies both fields from the camera (always 0 here), so they are never ours.
  
 +# *** 2026-11-03 (route 191, owner: "braking feels binary; if the initial force isn't enough nothing more happens") ***
 +# THE MEASUREMENT that explains it: over 1,568 engaged plan frames on route 191 the planner's own aTarget went below
@@ -31,7 +31,7 @@
  FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
  FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
  
-@@ -2674,7 +2689,31 @@
+@@ -2657,7 +2672,31 @@
        if self.shadow_log is not None:
          self.shadow_log.epilogue(ep)
        self._sh_ep = None
@@ -60,10 +60,10 @@
 +    a_req = max(a_req, -FCA11_AEB_MAX_MSS2)
 +    return min(float(accel), a_req)
 +
-   def _stop_hold_request(self, v_kph: float, dec_cmd: int) -> bool | None:
-     """The FCA_StopReq / HBA request for this frame, or None to mirror the camera.
- 
-@@ -2852,7 +2891,7 @@
+   def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
+     sends: list[CanData] = []
+@@ -2821,7 +2860,7 @@
        self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
        return sends
  
@@ -74,10 +74,10 @@
  
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-@@ -4476,3 +4476,47 @@
-     law = self._law(True)
-     self.assertIsNone(law._stop_hold_request(2.5, 20), "above the stop band")
-     self.assertIsNone(law._stop_hold_request(0.0, 4), "not holding hard enough to be a stop")
+@@ -4554,3 +4554,47 @@
+           lane[byte] |= mask
+           lane[7] = hyundai_checksum(bytes(lane[:7]))
+           self.assertEqual([False], self._verdicts(tc, [(f, bytes(lane))], lambda x: x), name)
 +
 +class TestClosingDemand(unittest.TestCase):
 +  """2026-11-03 (route 191): over 1,568 engaged plan frames the planner's aTarget sat below -2.0 m/s^2 on EIGHT frames and
