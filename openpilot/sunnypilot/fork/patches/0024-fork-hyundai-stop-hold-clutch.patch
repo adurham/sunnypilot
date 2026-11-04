@@ -1,0 +1,133 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -869,6 +869,22 @@
+ # 7 LSB reads -20.0 Nm, the same as every level above it, i.e. the clutch is unambiguously open and the creep torque is
+ # gone. 6 is the boundary, not yet open; one more LSB costs ~+0.1 m/s^2 of commanded brake at crawl.
+ FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguously OPEN clutch (-20 Nm, creep torque gone)
++
++# *** 2026-11-03 (route 190): THE STOP HOLD — the one lever that reaches the CLUTCH ***
++# THE MEASUREMENT: at a standstill the driver's own pedal puts Clutch_Driving_Tq (0x162) at 0.0 Nm over 3,796 frames -
++# no torque through the clutch, i.e. functionally released - while our FCA11 hold leaves it at +26 Nm over 3,994 frames
++# (creep torque live, the "50 lb-ft at the light" the owner reported). A 7 LSB request does NOT fix it at v == 0: the
++# brake pressure the ESC builds from CR_VSM_DecCmd is injected DOWNSTREAM of the master-cylinder sensor, so the car's own
++# pressure reading stays 0.00 bar and the transmission never learns the car is being held. The clutch therefore follows
++# the PEDAL-side signal, not the caliper.
++# THE LEVER: FCA11 carries two fields we have never set - FCA_StopReq (21|1) and CF_VSM_HBACmd (1|2) - and the camera's
++# own frames are inert at a standstill (both read 0 in every logged frame), so mirroring them does nothing. While the law
++# is HOLDING the car at a stop, ask the ESC for its own stop hold with hydraulic assist: the ESC then owns the stop, which
++# is the brake event a transmission reacts to. Gated on the dynamic-brakes instance, so the deployed law never changes a
++# byte, and never CLEARS the camera's bits (None = mirror).
++FCA11_STOP_HOLD_V_KPH = 2.0               # km/h: the hold request is armed at/below this speed (the stop band)
++FCA11_STOP_HOLD_MIN_LSB = FCA11_CRAWL_MIN_LSB   # LSB: ... and only when the law is actually holding (>= the clutch-open level)
++
+ FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
+ FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+ 
+@@ -1231,6 +1247,11 @@
+   warn: int
+   cmd_act: bool
+   dec_cmd_act: bool
++  # 2026-11-03: the STOP-HOLD request. None = mirror the camera (the shipped behaviour, byte-for-byte);
++  # True = ask the ESC for its own stop hold (FCA_StopReq) with hydraulic assist (CF_VSM_HBACmd = 1) so the
++  # transmission sees a real brake event and releases the clutch. Measured on route 190: the driver's pedal at a
++  # standstill puts Clutch_Driving_Tq at 0.0 Nm (no torque), our 20 LSB FCA11 hold leaves it at +26 Nm (creep live).
++  stop_hold: bool = None
+ 
+ 
+ def _get_bits(dat: bytes, start: int, length: int) -> int:
+@@ -1311,6 +1332,12 @@
+   setb(31, 1, 1 if m.dec_cmd_act else 0)
+   setb(35, 4, int(cam_alive) & 0xF)
+ 
++  # 2026-11-03: the stop hold. The camera's own FCA11 is inert at a standstill (StopReq/HBA read 0 in every logged
++  # frame), so there is nothing to mirror: only when the law asks for the hold do these two fields stop being copies.
++  if m.stop_hold:
++    setb(21, 1, 1)     # FCA_StopReq
++    setb(1, 2, 1)      # CF_VSM_HBACmd = 1
++
+   out = bytes(b[:7])
+   return out + bytes([hyundai_checksum(out)])
+ 
+@@ -2648,6 +2675,20 @@
+         self.shadow_log.epilogue(ep)
+       self._sh_ep = None
+ 
++  def _stop_hold_request(self, v_kph: float, dec_cmd: int) -> bool | None:
++    """The FCA_StopReq / HBA request for this frame, or None to mirror the camera.
++
++    Only the dynamic-brakes (V3 core) instance may ask, and only while it is holding the car at a stop; every other frame
++    mirrors the camera byte-for-byte, so the deployed-law stream is untouched.
++    """
++    if not getattr(self, "dynamic_brakes", False):
++      return None
++    try:
++      holding = float(v_kph) <= FCA11_STOP_HOLD_V_KPH and int(dec_cmd) >= FCA11_STOP_HOLD_MIN_LSB
++    except (TypeError, ValueError):
++      return None
++    return True if holding else None
++
+   def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
+     sends: list[CanData] = []
+@@ -3030,7 +3071,8 @@
+       t_cam, dat = cam
+       if frame % FCA11_SEND_EVERY == 0:
+         cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
+-        m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++        m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False,
++                             stop_hold=self._stop_hold_request(v_kph_now, dec_cmd))
+         out = build_fca11_frame(dat, (cam_alive + 1) & 0xF, m)
+         sends.append(CanData(FCA11_ADDR, out, 0))
+         # R7-A: the panda allows +RATE_STEP over the last ACCEPTED frame, and we only SEND on the 50 Hz
+@@ -3083,7 +3125,8 @@
+         self._feel_acc = float(ramp)
+         if frame % FCA11_SEND_EVERY == 0:
+           cam_alive = (dat[4] >> 3) & 0xF
+-          m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
++          m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False,
++                               stop_hold=self._stop_hold_request(v_kph_now, ramp))
+           sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
+           self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
+           self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -4440,3 +4440,39 @@
+     self.assertEqual(30, fl.personality_max_dec(fl.PERSONALITY_AGGRESSIVE))
+     self.assertEqual(30, fl.fca11_standstill_hold_lsb())
+     self.assertLessEqual(max(fl.PERSONALITY_MAX_DEC.values()), fl.FCA11_MEAS_CEIL_LSB)
++
++class TestStopHold(unittest.TestCase):
++  """2026-11-03 (route 190): at a standstill the driver's pedal leaves Clutch_Driving_Tq at 0.0 Nm while our FCA11 hold
++  leaves it at +26 Nm, so the clutch follows the PEDAL-side signal, not the caliper. While the dynamic-brakes instance is
++  holding the car at a stop, the mirror asks for the ESC's own stop hold (FCA_StopReq + CF_VSM_HBACmd); every other frame
++  mirrors the camera byte-for-byte, and the deployed law never sets either field."""
++
++  CAM = bytes.fromhex("0000030000000000")
++
++  def _law(self, dynamic=True):
++    b = object.__new__(fl.Fca11LongBrake)
++    b.dynamic_brakes = dynamic
++    return b
++
++  def test_frame_sets_stopreq_and_hba_only_when_asked(self):
++    f = fl.build_fca11_frame(self.CAM, 3, fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3,
++                                                             cmd_act=True, dec_cmd_act=False, stop_hold=True))
++    self.assertEqual(1, (f[2] >> 5) & 0x1, "FCA_StopReq is bit 21")
++    self.assertEqual(1, (f[0] >> 1) & 0x3, "CF_VSM_HBACmd is bits 1-2")
++
++  def test_mirroring_the_camera_is_unchanged(self):
++    a = fl.build_fca11_frame(self.CAM, 3, fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3,
++                                                             cmd_act=True, dec_cmd_act=False))
++    b = fl.build_fca11_frame(self.CAM, 3, fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3,
++                                                             cmd_act=True, dec_cmd_act=False, stop_hold=False))
++    self.assertEqual(a, b, "None/False must both mirror the camera byte-for-byte")
++
++  def test_only_the_dynamic_instance_asks(self):
++    self.assertIsNone(self._law(False)._stop_hold_request(0.0, 30), "deployed law never sets the fields")
++    self.assertTrue(self._law(True)._stop_hold_request(0.0, 20), "holding at a stop -> ask")
++    self.assertTrue(self._law(True)._stop_hold_request(1.5, 7), "armed up to the stop band at the clutch-open level")
++
++  def test_it_never_asks_while_moving_or_light(self):
++    law = self._law(True)
++    self.assertIsNone(law._stop_hold_request(2.5, 20), "above the stop band")
++    self.assertIsNone(law._stop_hold_request(0.0, 4), "not holding hard enough to be a stop")
