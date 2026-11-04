@@ -1,0 +1,80 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -896,7 +896,9 @@
+ # only when the car is genuinely closing (c >= 1.0 m/s), only with a lead inside 40 m, and it is capped by the wire gate.
+ FCA11_AEB_MIN_CLOSING_MPS = 1.0      # m/s: below this the car is following, not closing - never add braking
+ FCA11_AEB_GAP_M = 4.0                # m: the standstill gap it defends (lead distance minus this is the room it has)
+-FCA11_AEB_MAX_MSS2 = 4.9             # m/s^2: ~46 LSB, the raised wire gate - the only ceiling on this demand
++FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the demand may never enter the 31-46 region
++# (Fable review: a bridge or a parked car at 36 m reads as a 3.5 m/s^2 demand, and with the raised gate that would be a
++# 0.35 g phantom brake at highway speed. The urgent authority stays reserved for the planner's own ask.)
+ FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
+ 
+ 
+@@ -1380,7 +1382,11 @@
+     _refuse_shadow_env()
+     self._core = bool(core)
+     # 2026-11-03 (owner: guard 0.5 g): only the V3 shaping instance may spend the raised gate on a hard-stop ask.
+-    self._urgent_ceiling_lsb = int(HYUNDAI_FCA11_LONG_MAX_DEC) if bool(core) else 0
++    # 2026-11-03 (Opus, route 191): this was `... if bool(core) else 0`, and the ACTUATING instance is built with
++    # core=False - so the car never had the raised gate at all: every hard-stop ask was clipped to the deployed 30 LSB
++    # and the 0.5 g guard could not be spent. The tiers, the aggressive cap and the standstill hold are pinned to 30
++    # separately, so giving the actuating instance the gate changes no normal level.
++    self._urgent_ceiling_lsb = int(HYUNDAI_FCA11_LONG_MAX_DEC)
+     self.shadow = (not self._core) and shadow_enabled(CP_SP)
+     self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
+     # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
+@@ -2134,7 +2140,10 @@
+     stop band as the car slows instead of stepping at band entry. None = at speed = the moving floor.
+     """
+     if self.meas_inverse:
+-      _ceil = getattr(self, '_urgent_ceiling_lsb', 0)
++      # 2026-11-03 (Fable review): this passed the raised gate unconditionally, so EVERY level on this path - a gentle ask,
++      # a lead-loss hold, a standstill level - could spend 46 LSB. The gate is now keyed on the ask itself, which is the only
++      # thing the owner's ruling covers: an ask at/below FCA11_URGENT_ASK_MSS2, i.e. a genuine hard stop.
++      _ceil = getattr(self, '_urgent_ceiling_lsb', 0) if float(a_tgt) <= FCA11_URGENT_ASK_MSS2 else 0
+       return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+     if not self.feel_fix:
+       return feel_target_lsb(a_tgt, personality)
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+@@ -355,9 +355,16 @@
+         if d <= 0:
+           continue
+         total += 1
+-        deployed_req = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(min(asks[f], fl.FCA11_BRAKE_ONSET_ACCEL)), p)
++        # 2026-11-03: the actuating instance now carries the raised 0.5 g gate (HYUNDAI_FCA11_LONG_MAX_DEC = 46) and may
++        # spend it on a genuine hard-stop ask, so the deployed request for that ask is the 46 LSB mapping, not 30's.
++        _ask = min(asks[f], fl.FCA11_BRAKE_ONSET_ACCEL)
++        _ceil = fl.HYUNDAI_FCA11_LONG_MAX_DEC if _ask <= fl.FCA11_URGENT_ASK_MSS2 else 0
++        deployed_req = fl.dec_cmd_from_accel_measured(_ask, ceil_lsb=_ceil) if _ceil else \
++            fl.clamp_dec_cmd(fl.dec_cmd_from_accel(_ask), p)
+         self.assertLessEqual(d, deployed_req, f"trial {trial} f={f}: above the deployed request for this ask")
+-        if d > old.get(f, 0):
++        # 2026-11-03: an ask at/below FCA11_URGENT_ASK_MSS2 spends the raised 0.5 g gate, which the pre-0049 law never
++        # had - those slots are a deliberate new authority, not a misalignment, so they are excluded from the count.
++        if d > old.get(f, 0) and _ask > fl.FCA11_URGENT_ASK_MSS2:
+           misaligned += 1
+     self.assertLess(misaligned, 0.01 * total, f"misaligned slots must be rare: {misaligned}/{total}")
+ 
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
+@@ -266,8 +266,16 @@
+       last = 0
+       for f, d in _run(b, asks, leads=leads, personality=p):
+         if d > 0:
+-          req = fl.clamp_dec_cmd(fl.dec_cmd_from_accel(min(asks[f], fl.FCA11_BRAKE_ONSET_ACCEL)), p)
+-          self.assertLessEqual(d, req, f"trial {trial} f={f}: above the PRE-0049 request")
++          # 2026-11-03: a genuine hard-stop ask may spend the raised 0.5 g gate on the actuating instance.
++          _ask = min(asks[f], fl.FCA11_BRAKE_ONSET_ACCEL)
++          _ceil = fl.HYUNDAI_FCA11_LONG_MAX_DEC if _ask <= fl.FCA11_URGENT_ASK_MSS2 else 0
++          req = fl.dec_cmd_from_accel_measured(_ask, ceil_lsb=_ceil) if _ceil else \
++              fl.clamp_dec_cmd(fl.dec_cmd_from_accel(_ask), p)
++          # 2026-11-03 (Fable review): the contract is not "byte-identical to the pre-0049 map" any more - it is
++          # "never above the DEPLOYED 30 LSB ceiling unless this frame's ask is a genuine hard stop (<= -2.4 m/s^2),
++          # in which case the raised 46 LSB gate is allowed". The old exact-request bound was a proxy for that.
++          _lim = fl.HYUNDAI_FCA11_LONG_MAX_DEC if _ask <= fl.FCA11_URGENT_ASK_MSS2 else fl.FCA11_MEAS_CEIL_LSB
++          self.assertLessEqual(d, _lim, f"trial {trial} f={f}: above the ceiling for this ask")
+           self.assertLessEqual(d, last + STEP)
+         last = d
+ 

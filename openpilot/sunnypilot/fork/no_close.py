@@ -27,8 +27,14 @@ from openpilot.common.realtime import DT_MDL
 
 PARAM = "NoCloseOnLead"
 
-ENTER = 0.3   # m/s, v_ego - v_lead above this = closing on the lead
-EXIT = 0.1    # m/s, ...and below this the cap releases (hysteresis: a matched lead must not toggle it)
+# 2026-11-03 (route 191, the owner's "throttle fluttering"): with 0.3/0.1 the cap toggled 6x per engaged minute - the
+# ask flipped 0.400 <-> 0.000 (a 0.4 step, ~33 LSB of pedal) and 39 of the zeros sat at a lead speed difference of
+# 0.1 m/s or less, i.e. right on the release threshold, where radar noise alone can cross it. Raised to 0.6/0.25 AND a
+# release now needs the gap to stay matched for RELEASE_DWELL_S, so a lead hovering at the threshold cannot square-wave
+# the pedal. The cap is still exactly min(accel, 0) - it never deepens a brake request.
+ENTER = 0.6   # m/s, v_ego - v_lead above this = closing on the lead
+EXIT = 0.25   # m/s, ...and below this the cap may release once it has stayed there for the dwell
+RELEASE_DWELL_S = 0.5   # s: a release needs EXIT held this long, not one noisy frame
 
 # a lead whose speed is not usable (radarState vLead can be 0 for an unconfirmed track) must NOT read as "closing".
 MIN_LEAD_SPEED_VALID = -1.0
@@ -55,6 +61,7 @@ class NoCloseCap:
     self._frame = 0
     self.enabled = False
     self.closing = False
+    self._release_frames = 0
     self._read_param()
 
   def _read_param(self) -> None:
@@ -80,8 +87,16 @@ class NoCloseCap:
       return accel
 
     v_rel = float(v_ego - v_lead)
-    if self.closing:
-      self.closing = v_rel > EXIT
+    if not (self.closing or v_rel > ENTER):
+      self.closing = False
+      return cap_no_close(accel, v_ego, lead_present, v_lead, False, enabled=True)
+    # engaged: stay engaged until the gap has been matched for RELEASE_DWELL_S (not one noisy frame)
+    if v_rel > EXIT:
+      self._release_frames = 0
+      self.closing = True
     else:
-      self.closing = v_rel > ENTER
+      self._release_frames += 1
+      if self._release_frames >= max(1, int(round(RELEASE_DWELL_S / self.dt))):
+        self.closing = False
+        self._release_frames = 0
     return cap_no_close(accel, v_ego, lead_present, v_lead, self.closing, enabled=True)

@@ -68,7 +68,12 @@ class TestNoCloseCap(OpenpilotTestCase):
     c = nc.NoCloseCap(params=FakeParams())
     self.assertEqual(c.update(0.9, 25., True, 21.), 0.)                 # closing
     self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT - 0.01), 0.)  # still closing (above EXIT)
-    self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT + 0.01), 0.9)  # released
+    # 2026-11-03: a release now needs EXIT held for RELEASE_DWELL_S, so ONE frame below it stays capped
+    self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT + 0.01), 0.0)
+    self.assertTrue(c.closing)
+    for _ in range(int(nc.RELEASE_DWELL_S / c.dt)):
+      out = c.update(0.9, 25., True, 25. - nc.EXIT + 0.01)
+    self.assertEqual(out, 0.9)  # ...and RELEASE_DWELL_S below EXIT releases
 
   def test_lead_disappearing_releases(self):
     c = nc.NoCloseCap(params=FakeParams())
@@ -101,3 +106,15 @@ class TestWiring(OpenpilotTestCase):
     i_min = src.index("min(candidates")
     i_cap = src.index("self.no_close.update")
     self.assertGreater(i_cap, i_min)
+
+
+def test_lead_hovering_at_the_threshold_cannot_square_wave():
+  """Route 191: 6 blips per engaged minute, the ask flipping 0.400 <-> 0.000 - a lead sitting at the release threshold."""
+  c = nc.NoCloseCap(dt=0.05, params=FakeParams(enabled=True))
+  c.enabled = True
+  out = []
+  for i in range(200):
+    v_rel = 0.62 if i % 4 == 0 else 0.22          # radar noise straddling the old 0.3/0.1 band
+    out.append(c.update(0.4, 20., True, 20. - v_rel))
+  flips = sum(1 for a, b in zip(out, out[1:]) if abs(a - b) > 0.1)
+  assert flips <= 2, f"pedal command flipped {flips} times in 10 s"
