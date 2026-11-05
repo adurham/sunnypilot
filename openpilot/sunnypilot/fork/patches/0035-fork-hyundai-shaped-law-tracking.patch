@@ -1,8 +1,8 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index a40ac9f..b060f81 100644
+index a40ac9f..522d10a 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -996,6 +996,80 @@ FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the
+@@ -996,6 +996,96 @@ FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the
  # 0.35 g phantom brake at highway speed. The urgent authority stays reserved for the planner's own ask.)
  FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
  
@@ -23,8 +23,10 @@ index a40ac9f..b060f81 100644
 +#              clamped [-TRIM_DOWN, +TRIM_UP], frozen against the ceiling/floor it is pushing into (anti-windup)
 +#   level    = clip(ff + trim, 4, ceiling), slewed at FCA11_TRACK_JERK through the local MEASURED plant slope, both up AND
 +#              down (down at 2x), never above +RATE_STEP over the last sent frame (panda contract)
-+#   ceiling  = the personality tier cap; FCA11_MEAS_CEIL_LSB (30, the deployed law ceiling - never the 31-46 wire region)
-+#              only while need exceeds what the tier cap measurably delivers + FCA11_TRACK_URGENT_MARGIN.
++#   ceiling  = the personality tier cap; FCA11_TRACK_CEIL_MAX_LSB (30, the deployed law ceiling - never the 31-46 wire
++#              region, which is behind a DEFAULT-OFF constant) only while the need exceeds what the tier cap measurably
++#              delivers + FCA11_TRACK_URGENT_MARGIN, LATCHED (it leaves again below FCA11_TRACK_CEIL_EXIT_FRAC of that)
++#              and only for the standard tier and up. It is a bound on the TARGET, never a post-slew cut.
 +# LIGHT ASKS at speed (>= FCA11_TRACK_LIGHT_V_MIN): the weakest level (4 LSB) delivers ~1.0 m/s^2, so an ask softer than
 +# FCA11_TRACK_LIGHT_OPEN does not OPEN an episode (left to the pedal's coast/throttle-lift), and an open one releases below
 +# FCA11_TRACK_LIGHT_RELEASE after min-on. Below that speed (every stop) the deployed open/release rules are untouched (the
@@ -45,6 +47,20 @@ index a40ac9f..b060f81 100644
 +FCA11_TRACK_FB_DELAY_SENT = 25           # sent frames (0.5 s) before the trim integrates (onset transient + ESC lag)
 +FCA11_TRACK_LAG_SENT = 15                # sent frames (0.3 s): the need is compared with the decel it produces this late
 +FCA11_TRACK_URGENT_MARGIN = 0.10         # m/s^2 beyond what the tier cap delivers before the 30 LSB ceiling opens
++FCA11_TRACK_CEIL_EXIT_FRAC = 0.85        # hysteresis on that switch: leave the raised ceiling only below 0.85x what the
++                                         # tier cap delivers (1.33 m/s^2 for the standard cap; the old rule was a 0.1 band,
++                                         # so a need hovering at the switch recut the level 27 -> 20 every second)
++FCA11_TRACK_CEIL_MAX_LSB = 30            # THE MOST THIS PATH MAY COMMAND (0.30 g): the deployed law ceiling. The 31-46 wire
++                                         # region was never measured on this plant, so it is not reachable here.
++FCA11_TRACK_URGENT46_ENABLED = False     # DEFAULT OFF: the owner's 0.5 g (41-46 LSB) lane on this path. A rebuild-time
++                                         # opt-in (a code constant, not a params key: no libparams rebuild, no new key).
++FCA11_TRACK_BAND_DESCENT_FRAMES = 5      # F4: sent frames the hold band takes to walk an inherited (up to 30 LSB) tracked
++                                         # level down to its own target instead of a one-frame 30 -> 20 lurch at the seam
++FCA11_TRACK_DOWN_STEP_LSB = 3.0          # F2: the most the DOWN slew may take in one sent frame. The panda has no rule for
++                                         # decreases; 2x the jerk rate through the measured slope is 0.4-1.4 LSB/frame except
++                                         # on the flat 13-20 segment, where FCA11_TRACK_MIN_SLOPE floors the slope at 0.02
++                                         # and it reached exactly 4 (a 0.05-0.14 m/s^2 physical step that still READS as a
++                                         # step in LSB). Capped so no sent frame moves by the panda's onset step on the way down.
 +FCA11_TRACK_LIGHT_V_MIN = 10.0           # m/s
 +FCA11_TRACK_LIGHT_OPEN = -0.80           # m/s^2: at speed a NEW episode needs this (4 LSB delivers ~1.0)
 +FCA11_TRACK_LIGHT_RELEASE = -0.50        # m/s^2: at speed an open episode releases above this (after min-on)
@@ -83,7 +99,7 @@ index a40ac9f..b060f81 100644
  
  
  FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
-@@ -1624,6 +1698,13 @@ class Fca11LongBrake:
+@@ -1624,6 +1714,14 @@ class Fca11LongBrake:
      # Scoped to the FEEL path like meas_inverse: it can never reach the shaped law, cal, or the Shadow core.
      self.dynamic_brakes = bool(FCA11_DYN_BRAKES_ENABLED) and self.feel and \
          bool(getattr(CP_SP, "fca11DynamicBrakes", False))
@@ -94,37 +110,64 @@ index a40ac9f..b060f81 100644
 +        bool(getattr(CP_SP, "fca11DynamicBrakes", False))
 +    self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
 +    self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
++    self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
      # 0034: the stop-hold clutch lane (FCA11_STOP_HOLD_*). Read ONCE, CP_SP only, DEFAULT OFF; never on a disabled
      # instance or the Shadow compute core (whose frames never reach the wire).
      self.stop_hold_clutch = self.enabled and (not self._core) and stop_hold_enabled(CP_SP)
-@@ -2182,6 +2263,56 @@ class Fca11LongBrake:
+@@ -2182,6 +2280,84 @@ class Fca11LongBrake:
      self._shape_sent_n = 0
      self._shape_in_hold_band = False
      self._shape_band_clear()
 +    self._track_reset()
 +
 +  def _track_reset(self) -> None:
-+    """0035: a fresh tracking episode - no trim, no need history."""
++    """0035: a fresh tracking episode - no trim, no need history, no latched ceiling."""
 +    self._track_trim = 0.0
 +    self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)
++    self._track_ceil_hi = False
 +
 +  def _track_ceiling(self, need: float, personality) -> int:
-+    """0035: the tier cap, or the deployed 30 LSB law ceiling while the need exceeds what the tier cap measurably delivers;
-+    the existing urgent lane (a PLANNER ask <= FCA11_URGENT_ASK_MSS2) keeps its raised gate. Never below the tier cap."""
++    """0035: the tier cap, or the 30 LSB law ceiling while the need exceeds what the tier cap measurably delivers.
++
++    Fable F2 corrections, all three in this function:
++    (a) LATCHED with hysteresis: enter above ``plant(tier cap) + FCA11_TRACK_URGENT_MARGIN`` (1.67 m/s^2 for the standard
++        cap) and leave only below ``FCA11_TRACK_CEIL_EXIT_FRAC`` of what the cap delivers (1.33). Un-latched, a need
++        hovering at the switch re-clamped the level 27 -> 20 in one 20 ms frame, repeating every second.
++    (b) this path can never command more than ``FCA11_TRACK_CEIL_MAX_LSB`` (30, 0.30 g): the 31-46 LSB urgent lane is
++        behind ``FCA11_TRACK_URGENT46_ENABLED`` (DEFAULT OFF) - it was never measured on this plant.
++    (c) the raised ceiling belongs to the STANDARD tier and up: a RELAXED tier (cap 12) keeps its own cap, so the tier
++        cap bounds the level in every personality (it leaked to 26 LSB before this).
++    """
 +    cap = personality_max_dec(personality)
-+    ceil = cap
-+    if need > fca11_track_plant_decel(cap) + FCA11_TRACK_URGENT_MARGIN:
-+      ceil = max(cap, FCA11_MEAS_CEIL_LSB)
-+    if float(getattr(self, "_planner_ask", 0.0)) <= FCA11_URGENT_ASK_MSS2:
++    hi = min(int(FCA11_MEAS_CEIL_LSB), int(FCA11_TRACK_CEIL_MAX_LSB))
++    if cap >= personality_max_dec(PERSONALITY_STANDARD) and hi > cap:
++      enter = fca11_track_plant_decel(cap) + FCA11_TRACK_URGENT_MARGIN
++      leave = FCA11_TRACK_CEIL_EXIT_FRAC * fca11_track_plant_decel(cap)
++      if need > enter:
++        self._track_ceil_hi = True
++      elif need < leave:
++        self._track_ceil_hi = False
++    else:
++      self._track_ceil_hi = False
++    ceil = hi if self._track_ceil_hi else cap
++    if FCA11_TRACK_URGENT46_ENABLED and float(getattr(self, "_planner_ask", 0.0)) <= FCA11_URGENT_ASK_MSS2:
 +      ceil = max(ceil, int(getattr(self, "_urgent_ceiling_lsb", 0)) or ceil)
-+    return int(ceil)
++    top = int(HYUNDAI_FCA11_LONG_MAX_DEC) if FCA11_TRACK_URGENT46_ENABLED else int(FCA11_TRACK_CEIL_MAX_LSB)
++    return int(min(ceil, top))
 +
 +  def _track_level(self, need: float, CS, frame: int, personality, hard: bool) -> int:
 +    """0035: the TRACKING level for one frame of a moving shaped episode (see the FCA11_TRACK_* block).
 +
 +    State advances only on the 50 Hz send slot, like _shape_level. ``need`` (m/s^2, >= 0) is the planner ask merged with
 +    the closing-lead demand. Level = measured inverse + integral trim on (need 0.3 s ago - delivered), slewed at a jerk
-+    limit through the measured slope in BOTH directions, clamped [4, ceiling], <= +RATE_STEP over the last sent frame."""
++    limit through the measured slope in BOTH directions, clamped [4, ceiling], <= +RATE_STEP over the last sent frame.
++
++    Fable F2: the ceiling bounds the TARGET above, never the slewed OUTPUT below. Clamping the output meant a ceiling
++    that stepped down CUT the level in one frame (27 -> 20 = a 0.69 m/s^2 release step, 41 -> 30 = 1.4) - exactly the
++    "slewed both ways" claim it was hiding. Now the level walks down at the (2x) down-slew, ~0.4-1.1 LSB per sent frame
++    on the measured table, so no such step exists. The panda contract on the last line is still the hard bound on what
++    may leave the law, and it only ever LOWERS a sent frame.
++    """
 +    if frame % FCA11_SEND_EVERY != 0:
 +      return int(round(self._shape_acc))
 +    ceil = self._track_ceiling(need, personality)
@@ -146,15 +189,17 @@ index a40ac9f..b060f81 100644
 +    elif target >= prev:
 +      new_acc = min(target, prev + (step if hard else min(step, rate)))
 +    else:
-+      new_acc = max(target, prev - min(step, 2.0 * rate))
-+    new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), min(float(ceil), new_acc))
++      new_acc = max(target, prev - min(step, 2.0 * rate, float(FCA11_TRACK_DOWN_STEP_LSB)))
++    # F2: NO `min(ceil, ...)` here - see the docstring. The floor is the only post-slew clamp; a ceiling drop rides the
++    # down slew above.
++    new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
 +    self._shape_acc = new_acc
 +    self._shape_sent_n += 1
 +    return min(int(round(new_acc)), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
  
    def _shape_band_clear(self) -> None:
      """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
-@@ -2253,6 +2384,10 @@ class Fca11LongBrake:
+@@ -2253,6 +2429,10 @@ class Fca11LongBrake:
      # level-law target (integer LSB): the shaped inverse of the demand; in the stop/hold band (WI3) the tier cap only
      # once the car is confirmed stopped / a hard ask / the timeout ramp, else the creep floor. The band state is stepped
      # on EVERY frame (above the send-slot return) so the 1.5 s timeout is counted in real time.
@@ -165,7 +210,27 @@ index a40ac9f..b060f81 100644
      target = shape_dec_cmd_from_extra(want, cap)
      if in_hold_band:
        target = self._shape_band_target(cap, target, v_kph, standstill, hard, frame)
-@@ -2915,7 +3050,8 @@ class Fca11LongBrake:
+@@ -2286,7 +2466,18 @@ class Fca11LongBrake:
+       slew = float(HYUNDAI_FCA11_LONG_RATE_STEP) if fast else shape_slew_lsb_per_sent(prev)
+       new_acc = min(float(target), prev + slew)
+     else:
+-      new_acc = float(target)                           # decrease is immediate (safe direction; release ramp deferred)
++      # decrease is immediate (safe direction; release ramp deferred).
++      # 0035 F4: EXCEPT the hold-band seam on the tracking instance - the band may inherit a level ABOVE its own target
++      # from the tracked moving episode (up to 30 -> the tier cap 20), which was a one-frame 10 LSB lurch at the end of
++      # exactly the firm stops this layer serves. Walk it down over >= FCA11_TRACK_BAND_DESCENT_FRAMES sent frames.
++      # Only the tracking instance (the pre-0035 law keeps its immediate decrease) and only for a step the panda's own
++      # +RATE_STEP would not already bound.
++      gap = prev - float(target)
++      if getattr(self, "shape_track", False) and in_hold_band and gap > float(HYUNDAI_FCA11_LONG_RATE_STEP):
++        new_acc = max(float(target), prev - min(float(HYUNDAI_FCA11_LONG_RATE_STEP),
++                                                max(1.0, gap / FCA11_TRACK_BAND_DESCENT_FRAMES)))
++      else:
++        new_acc = float(target)
+     new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
+     self._shape_acc = new_acc
+     self._shape_sent_n += 1
+@@ -2915,7 +3106,8 @@ class Fca11LongBrake:
      the planner's ask, never softens it, only ever runs on the dynamic-brakes instance, and is capped by the wire gate.
      A missing lead, a lead beyond range, or any non-closing state leaves the ask exactly as the planner sent it.
      """
@@ -175,7 +240,7 @@ index a40ac9f..b060f81 100644
        return accel
      try:
        d = float(getattr(CS, "fca11_lead_drel_m", None))
-@@ -3150,12 +3286,20 @@ class Fca11LongBrake:
+@@ -3150,12 +3342,20 @@ class Fca11LongBrake:
      crawl = bool(float(CS.out.vEgo) < FCA11_CRAWL_V_MAX)
      if self.feel and not in_band:
        open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
@@ -196,12 +261,27 @@ index a40ac9f..b060f81 100644
      self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
      _slow = bool(float(CS.out.vEgo) < FCA11_FEEL_DWELL_SLOW_MPS)
      self._feel_dwell_slow = self._feel_dwell_slow + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL and _slow) else 0
+@@ -3172,7 +3372,13 @@ class Fca11LongBrake:
+     # but STILL AND ONLY while `ok` holds. When the sequencer drops cal_on, the episode releases through
+     # the PRODUCTION path (a veto stops braking on this frame; a soft cal end lets the same release
+     # logic run).
+-    onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or accel <= FCA11_ONSET_BYPASS_ACCEL))
++    # 0035 (Fable F1): the hard-ask bypass keys on the PLANNER's OWN ask, never on `accel`. `accel` carries this law's
++    # internal closing-lead demand, which is memoryless (-c^2/2(d-gap) for one frame of ANY in-range closing lead), so a
++    # single 20 Hz model frame of a false vision object opened an episode with no debounce at all (30 m / 25 m/s -> 12
++    # LSB for 0.58 s; three frames -> 30 LSB). The demand may still raise the level INSIDE an open episode, and it may
++    # still OPEN one - but only after the same 0.2 s of consecutive ask frames every mild planner ask must serve.
++    _bypass = bool(float(getattr(self, "_planner_ask", 0.0)) <= FCA11_ONSET_BYPASS_ACCEL)
++    onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or _bypass))
+     if self.feel and self._feel_dwell >= FCA11_FEEL_DWELL_FRAMES:
+       onset = True   # 0049 dwell escape (feel path only; `ok` is part of the dwell count): a SUSTAINED small ask opens
+     if self.feel and self._feel_dwell_slow >= FCA11_FEEL_DWELL_SLOW_FRAMES:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
 new file mode 100644
-index 0000000..f21e334
+index 0000000..6a0fa2d
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,303 @@
 +"""0035: the SHAPED law keeps TRACKING the need inside an episode (FCA11_TRACK_* block in fca11_long.py).
 +
 +Owner complaint #1 (2026-11-04): "braking does whatever the first request was and never adjusts". The car runs with
@@ -387,6 +467,120 @@ index 0000000..f21e334
 +    t = d.f
 +    d.run(100, -0.4, 19.0)
 +    self.assertEqual([], d.levels(t + 20))
++
++
++class TestPhantomLeadCannotOpen(unittest.TestCase):
++  """Fable F1: the law-internal closing demand may RAISE an open episode, but it may not OPEN one on its own.
++
++  Before: the demand fed `hard = accel <= -1.2`, which bypassed the 0.2 s onset debounce, so one 20 Hz model frame of a
++  false vision object (30 m, closing 25 m/s) opened a 12 LSB / 0.58 s episode. The bypass is now keyed on the PLANNER's
++  own ask; the demand still counts as the ask, so it opens once it has persisted the same debounce every mild ask serves.
++  """
++
++  def _phantom(self, model_frames):
++    return _Drive().run(50, -0.1, 25.0, a_ego=0.0) \
++                   .run(5 * model_frames, -0.1, 25.0, a_ego=0.0, lead=(30.0, -25.0)) \
++                   .run(150, -0.1, 25.0, a_ego=0.0)
++
++  def test_one_two_three_model_frame_phantoms_send_nothing(self):
++    for mf in (1, 2, 3):
++      self.assertEqual([], self._phantom(mf).levels(), f"{mf} model frame phantom")
++
++  def test_one_controller_frame_phantom_sends_nothing(self):
++    d = _Drive().run(50, 0.0, 15.0, a_ego=0.0).run(1, 0.0, 15.0, a_ego=0.0, lead=(20.0, -8.0)).run(100, 0.0, 15.0, a_ego=0.0)
++    self.assertEqual([], d.levels())
++
++  def test_a_closing_lead_persisting_past_the_debounce_still_opens(self):
++    """0.3 s of a real closing lead - the demand is not silenced, it just has to outlive the onset debounce."""
++    d = _Drive().run(50, -0.1, 25.0, a_ego=0.0).run(30, -0.1, 25.0, a_ego=0.0, lead=(30.0, -25.0))
++    self.assertTrue(d.levels())
++
++  def test_the_demand_still_raises_the_level_inside_an_open_episode(self):
++    """Opened by the PLANNER (-1.3): the same closing lead must still deepen the episode (only the OPEN is gated)."""
++    plain = _Drive().run(60, -1.3, 15.0, a_ego=-1.0).levels()[-1]
++    lead = _Drive().run(60, -1.3, 15.0, a_ego=-1.0, lead=(20.0, -8.0)).levels()[-1]
++    self.assertGreater(lead, plain, (plain, lead))
++
++  def test_a_hard_planner_ask_still_opens_without_the_debounce(self):
++    """The bypass is keyed on the planner ask: a genuine -1.3 at speed still opens immediately (not after 0.2 s)."""
++    self.assertTrue(_Drive().run(10, -1.3, 15.0, a_ego=-1.0).levels())
++
++
++class TestCeilingIsATargetClamp(unittest.TestCase):
++  """Fable F2: the ceiling bounds the TARGET before the jerk slew, with hysteresis, and rides the down slew on a drop."""
++
++  def test_hover_across_the_ceiling_switch_does_not_sawtooth(self):
++    """Ask alternating -1.72 / -1.62 every 1 s at 1.6 delivered: levels 27-28 -> 20 in one frame, once a second."""
++    d = _Drive().run(200, -1.9, 15.0, a_ego=-1.6)
++    for k in range(6):
++      d.run(100, -1.72 if k % 2 == 0 else -1.62, 15.0, a_ego=-1.6)
++    seq = [(f, x) for f, x in d.sent if f >= 200]
++    self.assertEqual([], [(f, a, b) for (_, a), (f, b) in zip(seq, seq[1:]) if a - b >= 4])
++    # the raised ceiling is LATCHED: with the need held above the 1.33 m/s^2 exit the level never returns to the cap
++    self.assertGreater(min(x for _, x in seq), 20)
++
++  def test_crossing_the_urgent_gate_does_not_step(self):
++    """Ask -2.5 -> -2.3: the level used to go 41 -> 30 in one 20 ms frame (a 1.4 m/s^2 release step)."""
++    d = _Drive().run(300, -2.5, 15.0, a_ego=-1.6)
++    t = d.f
++    d.run(30, -2.3, 15.0, a_ego=-1.6)
++    seq = [x for f, x in d.sent if f >= t - 4]
++    self.assertLess(max(a - b for a, b in zip(seq, seq[1:])), 4, seq)
++
++  def test_no_single_frame_step_over_the_panda_step_in_a_harness_sweep(self):
++    """A sweep of asks x speeds x personalities: no level delta above the panda's own +RATE_STEP anywhere."""
++    worst = 0
++    for personality in (fl.PERSONALITY_RELAXED, STD, fl.PERSONALITY_AGGRESSIVE):
++      for v in (6.0, 15.0, 25.0):
++        d = _Drive(personality=personality)
++        d.run(60, -1.4, v, a_ego=-1.0).run(80, -2.6, v, a_ego=-1.2).run(80, -1.5, v, a_ego=-2.0)
++        d.run(80, -2.9, v, a_ego=-1.1).run(80, -0.9, v, a_ego=-1.4)
++        prev = 0
++        for _, x in d.sent:
++          if prev and x:                      # a release frame (0) is an episode end, not a level step
++            worst = max(worst, abs(x - prev))
++          prev = x
++    self.assertLessEqual(worst, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++
++  def test_max_level_on_this_path_is_30(self):
++    """"For this build cap the law at 30 LSB (0.30 g) on this path" - the 41-46 lane is behind a DEFAULT-OFF constant."""
++    for ask in (-2.2, -2.5, -3.0, -3.4):
++      lv = _Drive().run(400, ask, 15.0, a_ego=-1.0).levels()
++      self.assertLessEqual(max(lv), 30, ask)
++
++  def test_the_41_46_lane_is_off_by_default(self):
++    self.assertFalse(fl.FCA11_TRACK_URGENT46_ENABLED)
++    self.assertEqual(30, fl.FCA11_TRACK_CEIL_MAX_LSB)
++
++
++class TestTierCapBound(unittest.TestCase):
++  """Fable F2 (the leak): the tier cap bounds the level in EVERY personality - relaxed reached 26 LSB before this."""
++
++  def test_relaxed_tier_cap_is_never_exceeded(self):
++    for ask, aego in ((-1.6, -1.3), (-2.2, -1.6), (-3.0, -1.0)):
++      lv = _Drive(personality=fl.PERSONALITY_RELAXED).run(400, ask, 15.0, a_ego=aego).levels()
++      self.assertLessEqual(max(lv), 12, (ask, aego))
++
++  def test_each_personality_is_bounded_by_its_cap_or_the_documented_30(self):
++    """relaxed 12; standard 20 raised to the documented 30 lane; aggressive 30 (its own cap)."""
++    for personality, allowed in ((fl.PERSONALITY_RELAXED, 12), (STD, 30), (fl.PERSONALITY_AGGRESSIVE, 30)):
++      lv = _Drive(personality=personality).run(400, -2.5, 15.0, a_ego=-1.3).levels()
++      self.assertLessEqual(max(lv), allowed, personality)
++      self.assertGreaterEqual(max(lv), min(allowed, 12), personality)   # and it does brake, not silently nothing
++
++
++class TestHoldBandSeam(unittest.TestCase):
++  """Fable F4: the band may inherit a tracked level above its own target; the hand-over must not lurch."""
++
++  def test_band_entry_walks_down_instead_of_stepping(self):
++    d = _Drive().run(300, -2.0, 6.0, a_ego=-1.5)
++    entry = d.levels()[-1]
++    self.assertGreaterEqual(entry, 27, entry)          # the tracked moving level really is above the band target
++    t = d.f
++    d.run(40, -2.0, 0.8, a_ego=-1.5)                  # 0.8 m/s = 2.9 km/h -> into the <= 3 km/h hold band
++    seq = [x for f, x in d.sent if f >= t - 4]
++    self.assertLess(max(a - b for a, b in zip(seq, seq[1:])), 4, seq)
++    self.assertLessEqual(seq[-1], 20, seq)            # and it does reach the band's own target
 +
 +
 +if __name__ == "__main__":
