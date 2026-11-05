@@ -316,9 +316,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    # fork: last-stage cap - no positive ask while closing on a lead. After the min() so no candidate can raise it back.
+    # fork: last-stage cap - no positive ask while the gap to the lead is not growing (fork/no_close.py). After the min()
+    # so no candidate can raise it back; dRel/vRel feed its closing-speed filter (fork/lead_closing.py).
     _lead = sm['radarState'].leadOne
-    output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead))
+    output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead),
+                                           float(_lead.dRel), float(_lead.vRel))
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     # fork (lane C): a model shouldStop flicker must not release a held standstill (route 194 #8). Hold-only: never adds a
     # go, never raises the ask; a moving car and a reset planner pass through unchanged.
