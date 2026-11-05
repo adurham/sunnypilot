@@ -68,7 +68,8 @@ class TestNoCloseCap(OpenpilotTestCase):
         self.assertEqual(c.update(0.9, 25., True, 25. - v_rel), 0.)
 
   def test_no_cap_at_or_below_exit(self):
-    for v_rel in (nc.EXIT, nc.EXIT - 0.01, 0., -2.):
+    # 2026-11-04: at speed EXIT is -0.5 (a lead pulling away); a MATCHED lead (0.) is now fully capped
+    for v_rel in (nc.EXIT, nc.EXIT - 0.01, -2.):
       with self.subTest(v_rel=v_rel):
         c = nc.NoCloseCap(params=FakeParams())
         for _ in range(5):
@@ -97,7 +98,7 @@ class TestNoCloseCap(OpenpilotTestCase):
     straight after a long uncapped stretch, and every rise of the closing speed lowers the output on that frame."""
     c = nc.NoCloseCap(params=FakeParams())
     for _ in range(50):
-      self.assertEqual(c.update(0.9, 25., True, 25.), 0.9)
+      self.assertEqual(c.update(0.9, 25., True, 25. - nc.EXIT), 0.9)   # lead pulling away: uncapped
     self.assertEqual(c.update(0.9, 25., True, 25. - nc.ENTER), 0.)
     c = nc.NoCloseCap(params=FakeParams())
     prev = c.update(0.9, 25., True, 25. - nc.EXIT)
@@ -121,7 +122,7 @@ class TestNoCloseCap(OpenpilotTestCase):
     a = 0.4
     dv = 0.02   # m/s per 50 ms frame = 0.4 m/s^2 of relative decel - a brisk but ordinary closure
     bound = a * dv / (nc.ENTER - nc.EXIT) + 1e-9
-    v_rels = list(np.arange(-0.5, 1.2, dv)) + list(np.arange(1.2, -0.5, -dv))
+    v_rels = list(np.arange(-1.0, 1.2, dv)) + list(np.arange(1.2, -1.0, -dv))
     out = [c.update(a, 20., True, 20. - v) for v in v_rels]
     falls = [p - q for p, q in zip(out, out[1:])]
     self.assertLessEqual(max(falls), bound)
