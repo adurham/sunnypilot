@@ -25,8 +25,10 @@ DELAY_SHUTDOWN_TIME_S = 300 # Wait at least DELAY_SHUTDOWN_TIME_S seconds after 
 VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S = 60
 
 class PowerMonitoring:
-  def __init__(self):
-    self.params = Params()
+  def __init__(self, params=None):
+    # hardwared passes its ParamsWorker so the CarBatteryCapacity write and the shutdown reads stay off the 2 Hz
+    # deviceState thread (they are /data file ops; see params_worker.py)
+    self.params = params if params is not None else Params()
     self.last_measurement_time = None           # Used for integration delta
     self.last_save_time = 0                     # Used for saving current value in a param
     self.power_used_uWh = 0                     # Integrated power usage in uWh since going into offroad
