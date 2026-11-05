@@ -20,6 +20,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
 from openpilot.sunnypilot.fork.no_close import NoCloseCap
+from openpilot.sunnypilot.fork.standstill_launch import StandstillLaunchDebounce
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -85,6 +86,24 @@ E2E_GATE_ENTER_VREL_MEDIAN_FRAMES = 6  # 0.3 s at 20 Hz, same window as the aLea
 # hard-accel tail falls back to the pre-gate baseline) while keeping the anti-lag behaviour the gate was built for
 # (the lagging case measured +0.04 model vs +0.81 MPC -> the car now accelerates at 0.4 instead of sticking at 0.04).
 E2E_GATE_MAX_RAISE = 0.4      # m/s^2, ceiling on the accel the gate itself may add
+# stop-plan veto (lane C, routes 193 #3 / 194 #6): the gate exists to stop the model braking EARLY for a far lead; it must
+# never overrule the model braking for a STOP of its own (a red light / stop sign with the lead driving away through it).
+# On 193 t=229 and 194 t=681 the lead was pulling away (vRel +1.4..+6.6) at 28-30 m, the model asked -1.04 / -1.41 with its
+# own plan falling to 0.82 / 1.23 m/s, and the gate published +0.40: the car accelerated into the stop until the driver
+# braked. Archive census (2,381 segments, 21 with a gate raise of a braking wish): model plan v_min <= 2.0 m/s in 4
+# segments, the driver braked within 0.69-1.36 s in all 4; v_min >= 5.25 m/s in the other 17 (the follow cases the gate
+# was built for). So: no entry and same-frame exit while min(modelV2.velocity.x) <= this (model_plans_stop, fed to the gate
+# through its existing should_stop_e2e input).
+E2E_GATE_STOP_PLAN_V = 2.0    # m/s
+
+
+def model_plans_stop(plan_v) -> bool:
+  """lane C stop-plan veto: True while the model's own velocity plan falls to <= E2E_GATE_STOP_PLAN_V somewhere in its
+  horizon. An empty or non-finite plan is NOT a stop (the gate keeps its old behaviour)."""
+  v = [float(x) for x in plan_v]
+  if not v or not all(math.isfinite(x) for x in v):
+    return False
+  return min(v) <= E2E_GATE_STOP_PLAN_V
 
 
 def turn_accel_limit(v_ego, angle_steers, CP):
@@ -117,6 +136,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork: never accelerate toward a lead (fork/no_close.py, param NoCloseOnLead). Owner 2026-11-01: the car must
     # not speed up to reach the follow gap on a car it can already see.
     self.no_close = NoCloseCap()
+    # fork (lane C, route 194 #8): a held standstill releases only on a sustained go (fork/standstill_launch.py)
+    self.standstill_launch = StandstillLaunchDebounce()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -152,6 +173,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     of the veto band; a non-finite vRel or a frame inside the band holds it (ambiguous -> fail toward OFF). Both
     buffers and the latch are cleared while no lead is present. Every term is an AND on the existing tests, so the
     veto can only keep the gate OFF: it never raises the ask itself.
+
+    should_stop_e2e is "the model is stopping": its action.shouldStop OR its own plan stopping (model_plans_stop, the lane-C
+    stop-plan veto). Either one keeps the gate off and drops it on the same frame.
 
     d_des matches the MPC's steady follow distance: get_safe_obstacle_distance(v_ego, t_follow) minus the lead's
     stopped-equivalence term is STOP_DISTANCE + t_follow * v_ego at equal speeds, with the same t_follow the MPC got."""
@@ -260,7 +284,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork (cycle 1): far-lead e2e gate. Applied to the RAW e2e value, before the turn limit (raising e2e after the
     # turn limit would delete curve braking). Raise-only: never lowers e2e, never touches the MPC/cruise candidates.
     output_a_target_e2e = self.update_e2e_gate(sm['radarState'].leadOne, v_ego, output_a_target_e2e,
-                                               output_a_target_mpc, sm['modelV2'].action.shouldStop,
+                                               output_a_target_mpc,
+                                               # lane C: "the model is stopping" = its flag OR its own plan stopping
+                                               bool(sm['modelV2'].action.shouldStop) or
+                                               model_plans_stop(sm['modelV2'].velocity.x),
                                                t_follow if t_follow is not None else
                                                get_T_FOLLOW(sm['selfdriveState'].personality))
     # G4: the e2e candidate owns the launch and was never turn-limited (get_cruise_accel's
@@ -293,6 +320,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     _lead = sm['radarState'].leadOne
     output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead))
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    # fork (lane C): a model shouldStop flicker must not release a held standstill (route 194 #8). Hold-only: never adds a
+    # go, never raises the ask; a moving car and a reset planner pass through unchanged.
+    self.output_should_stop, output_a_target = self.standstill_launch.update(self.output_should_stop, output_a_target,
+                                                                             sm['carState'].standstill, not reset_state)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
