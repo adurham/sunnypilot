@@ -139,6 +139,26 @@ class TestParamReachability(unittest.TestCase):
   def test_writer_allowlist_is_minimal(self):
     self.assertEqual({}, CPR.WRITER_ALLOWLIST)
 
+  def test_feed_lint_catches_a_key_the_feed_never_provides(self):
+    """0039, exactly the route-195 stop-hold defect: opendbc's setup_interfaces READS the key, initialize_params() never
+    feeds it, so the branch that sets the CarParamsSP field is unreachable on the car and the writer lint still passes."""
+    read = 'def setup(CP_SP, params_dict):\n  if params_dict.get("HyundaiFca11X"):\n    CP_SP.a = True\n'
+    feed_without = 'def initialize_params(params):\n  keys = []\n  return [{k: params.get(k) for k in keys}]\n'
+    feed_with = ('def initialize_params(params):\n  keys = []\n'
+                 '  params_list = [{k: params.get(k) for k in keys}]\n'
+                 '  params_list.append({"HyundaiFca11X": params.get("HyundaiFca11X", return_default=True)})\n'
+                 '  return params_list\n')
+    reg = {"HyundaiFca11X"}
+    self.assertEqual(({"HyundaiFca11X"}, ["HyundaiFca11X"]), CPR._feed_gaps(read, feed_without, reg))
+    self.assertEqual(({"HyundaiFca11X"}, []), CPR._feed_gaps(read, feed_with, reg))
+
+  def test_repo_tree_feed_lint_runs_and_passes(self):
+    """The lint must RUN on the real tree (not skip): a missing superproject initialize_params would print 'skip' and
+    this assertion fails, so the guard cannot go quiet by accident."""
+    rc, out = _run(REPO, _opendbc_root())
+    self.assertIn("ok   feed-lint", out)
+    self.assertNotIn("skip feed-lint", out)
+
   def test_cli_exit_codes(self):
     with tempfile.TemporaryDirectory() as d:
       self.assertEqual(2, CPR.main(["--tree", d]))

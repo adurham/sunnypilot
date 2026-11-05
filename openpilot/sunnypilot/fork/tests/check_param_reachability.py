@@ -353,8 +353,60 @@ def run(tree: str, opendbc: str | None = None, verbose: bool = False) -> int:
   guarded = sorted({e[0] for e in envs if e not in bad and e[0] not in ENV_ALLOWLIST})
   tag = "ok  " if not bad else "FAIL"
   print(f"{tag} env-ban: {len(envs)} FCA11_* env read(s), {len(bad)} banned; allowlisted: {allowed} + guards {guarded}")
+
+  # (d) FEED LINT (0039). The writer lint above asks whether a CarParamsSP field is ASSIGNED somewhere; it cannot see that
+  # the branch assigning it is gated on a param key that card.py never puts in the list feeding setup_interfaces. That is
+  # exactly how the stop-hold clutch lane shipped dead: opendbc read HyundaiFca11StopHoldClutch, initialize_params() never
+  # fed it, params_dict.get() was None, the field stayed False and the pair was sent on 0 of 399 hold frames on route 195
+  # while every logged input was satisfied. So: every param key opendbc's setup_interfaces READS out of params_dict must be
+  # one of the keys the runtime FEEDS into it.
+  rc = _feed_lint(rc, tree, opendbc, registry)
   print(f"scanned {len(files)} production file(s); registry {len(registry)} keys; CarParamsSP {len(sp_fields)} fields")
   return rc
+
+
+PARAM_READ_RE = re.compile(r'params_dict\.get\(\s*"([A-Za-z0-9_]+)"')
+PARAM_FEED_RE = re.compile(r'params_list\.append\(\{\s*"([A-Za-z0-9_]+)"')
+PARAM_KEYLIST_RE = re.compile(r'^\s*"([A-Za-z0-9_]+)",\s*$', re.MULTILINE)
+
+
+def _feed_lint(rc: int, tree: str, opendbc: str, registry: set[str]) -> int:
+  """(d) FEED LINT: `initialize_params()` (the ONLY feed for opendbc setup_interfaces) must put every key that
+  setup_interfaces reads out of params_dict into the list. A key that is read but not fed makes its branch unreachable on
+  the car, silently (default-Off), for the whole ignition - the 0034-0039 stop-hold defect and the 0044 shaping defect."""
+  feed_path = os.path.join(tree, "openpilot", "sunnypilot", "selfdrive", "car", "interfaces.py")
+  read_path = os.path.join(opendbc, "opendbc", "sunnypilot", "car", "interfaces.py")
+  if not os.path.isfile(read_path):
+    print(f"ERROR feed-lint: missing {read_path}")
+    return 2
+  if not os.path.isfile(feed_path):
+    # A minimal fixture tree (the guard's own unit tests) has no superproject initialize_params. Say so - never silently
+    # pass, and never fail a tree that this check does not apply to. The repo-tree test asserts this lint RUNS.
+    print(f"skip feed-lint: no initialize_params at {feed_path}")
+    return rc
+
+  with open(read_path, encoding="utf-8") as fh:
+    read_src = fh.read()
+  with open(feed_path, encoding="utf-8") as fh:
+    feed_src = fh.read()
+
+  read, missing = _feed_gaps(read_src, feed_src, registry)
+  for k in missing:
+    lines = [i + 1 for i, ln in enumerate(read_src.splitlines()) if f'params_dict.get("{k}")' in ln]
+    print(f"FAIL feed-lint: opendbc setup_interfaces READS params key {k!r} from params_dict at "
+          f"opendbc/sunnypilot/car/interfaces.py:{lines}, but initialize_params() never feeds it -- its branch is "
+          f"unreachable on the car (default OFF for the whole ignition)")
+  tag = "ok  " if not missing else "FAIL"
+  print(f"{tag} feed-lint: {len(read)} param key(s) read out of params_dict; not fed by initialize_params(): {missing}")
+  return 1 if missing else rc
+
+
+def _feed_gaps(read_src: str, feed_src: str, registry: set[str]) -> tuple[set[str], list[str]]:
+  """The pure half of the feed lint: (keys read out of params_dict, those not fed into it). Fed = a
+  `params_list.append({"KEY": ...})` literal or a `"KEY",` entry of the base `keys.extend([...])` list."""
+  read = {k for k in PARAM_READ_RE.findall(read_src) if k in registry}
+  fed = set(PARAM_FEED_RE.findall(feed_src)) | {k for k in PARAM_KEYLIST_RE.findall(feed_src) if k in registry}
+  return read, sorted(read - fed)
 
 
 def main(argv=None):

@@ -313,5 +313,137 @@ class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
       os.environ.pop("FCA11_LOG_DIR", None)
 
 
+def _run_stop_hold_path(stop_hold):
+  """Real Params -> initialize_params() -> get_params/get_params_sp -> setup_interfaces(), FCA11 braking ON and the gas
+  interceptor pedal ON, with HyundaiFca11StopHoldClutch = stop_hold (True / False / None = absent)."""
+  params = Params()
+  for k in ("HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11StopHoldClutch"):
+    params.remove(k)
+  params.put_bool("HyundaiGasInterceptor", True, block=True)
+  params.put_bool("HyundaiFca11Brake", True, block=True)
+  if stop_hold is not None:
+    params.put_bool("HyundaiFca11StopHoldClutch", stop_hold, block=True)
+  plist = sp_interfaces.initialize_params(params)
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = {**BASE_FINGERPRINT, **STD}
+  CarInterface = interfaces[CAR_UNDER_TEST]
+  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  setup_interfaces(CarInterface, CP, CP_SP, plist)
+  return CP, CP_SP, plist
+
+
+def _pair_bits(CP, CP_SP, frames=1200):
+  """Drive the REAL law from that CP/CP_SP through a full stop and a 6 s hold at the ROUTE 195 logged condition, and
+  return [(frame, level, hba, stopreq)] for every 0x38D it sends.
+
+  The scenario's hold publishes exactly what carstate.py published on drive 195 (vEgo 0.015..0.066 m/s, standstill True,
+  fastest wheel 0.00..0.31 km/h, TCS13 FCA_ACK = 1, TCS13 StandStill = 1) - the frames the pair was missing from."""
+  os.environ["FCA11_LOG_DIR"] = "0"
+  try:
+    b = fl.Fca11LongBrake(CP, CP_SP)
+    CS = SimpleNamespace(out=structs.CarState(), interceptor_state=0, interceptor_fault_seen=False,
+                         fca11_cam_frame=(0, bytes(8)), fca11_now_nanos=0, fca11_wheel_min_kph=0.0,
+                         fca11_wheel_max_kph=0.0, fca11_esc_ack=True, fca11_esc_standstill=True)
+    CS.out.gearShifter = structs.CarState.GearShifter.drive
+    CC = structs.CarControl()
+    CC.enabled = CC.longActive = True
+    out = []
+    for f in range(frames):
+      if f < 50:
+        ask, v, ss = -0.2, 20.0 / 3.6, False
+      elif f < 350:
+        v = max(0.0, 20.0 / 3.6 * (1.0 - (f - 50) / 300.0))
+        ask, ss = -2.0, v == 0.0
+      elif f < 950:
+        ask, v, ss = -2.0, 0.03, True
+      else:
+        ask, v, ss = 0.5, min(3.0, (f - 950) * 0.02), False
+      CS.out.vEgo = v
+      CS.out.standstill = ss
+      CS.out.aEgo = -1.5 if ask < 0 else 0.3
+      CS.fca11_wheel_max_kph = 0.1 if ss else v * 3.6
+      CS.fca11_wheel_min_kph = 0.03 if ss else v * 3.6
+      CS.fca11_cam_frame = (f * 10_000_000, bytes(8))
+      CS.fca11_now_nanos = f * 10_000_000
+      CC.actuators.accel = ask
+      for s in b.update(CC, CS, f):
+        if s.address == fl.FCA11_ADDR:
+          d = bytes(s.dat)
+          out.append((f, fl._get_bits(d, 8, 8), fl._get_bits(d, 1, 2), fl._get_bits(d, 21, 1)))
+    return out
+  finally:
+    os.environ.pop("FCA11_LOG_DIR", None)
+
+
+class TestFca11StopHoldParamPlumbingE2E(OpenpilotTestCase):
+  """0034's stop-hold clutch lane end to end through the REAL compiled registry and the REAL card.py path.
+
+  THE DEFECT THIS PINS (route 195, 2026-11-05): `HyundaiFca11StopHoldClutch` was registered in params_keys.h and the UI
+  wrote it, opendbc's setup_interfaces read it, and Fca11LongBrake._stop_hold_ok checked every input - but
+  initialize_params() never put the key in the list that feeds setup_interfaces, so CP_SP.fca11StopHoldClutch stayed
+  False, `_stop_hold_ok` returned False on its FIRST clause (before it looked at a single input) and the pair was sent
+  on 0 of 399 level-30 frames while vEgo, standstill, fastest wheel, TCS13 FCA_ACK and StandStill were all satisfied.
+  The pre-0039 plumbing tests injected {'HyundaiFca11StopHoldClutch': ...} straight into setup_interfaces, so they
+  exercised the writer and never the feed - the same shape as the 0044 HyundaiFca11AffineGain bug."""
+
+  def test_key_is_registered_and_defaults_off(self):
+    params = Params()
+    params.check_key("HyundaiFca11StopHoldClutch")
+    params.remove("HyundaiFca11StopHoldClutch")
+    self.assertFalse(params.get("HyundaiFca11StopHoldClutch", return_default=True), "default must be OFF")
+
+  def test_initialize_params_reads_the_key(self):
+    for setting in (True, False, None):
+      _, _, plist = _run_stop_hold_path(setting)
+      vals = [d["HyundaiFca11StopHoldClutch"] for d in plist if "HyundaiFca11StopHoldClutch" in d]
+      self.assertEqual(1, len(vals), f"initialize_params must feed the key exactly once (setting={setting})")
+      if setting is None:
+        self.assertFalse(vals[0])
+      else:
+        self.assertEqual(setting, bool(vals[0]))
+
+  def test_cp_sp_field_follows_the_param(self):
+    CP, CP_SP, _ = _run_stop_hold_path(True)
+    self.assertTrue(CP_SP.fca11Brake, "precondition: FCA11 braking is armed")
+    self.assertTrue(CP_SP.fca11StopHoldClutch, "toggle ON must reach CP_SP through initialize_params")
+    for setting in (False, None):
+      _, CP_SP, _ = _run_stop_hold_path(setting)
+      self.assertFalse(CP_SP.fca11StopHoldClutch, f"setting={setting} must leave the lane OFF")
+
+  def test_pair_on_the_wire_at_a_standstill_hold(self):
+    """The behaviour the owner asked for: the actuating frame at a standstill hold carries CF_VSM_HBACmd = 1 and
+    FCA_StopReq = 1 (at a level >= 7 LSB), and with the toggle OFF the pair never appears."""
+    CP, CP_SP, _ = _run_stop_hold_path(True)
+    sent = _pair_bits(CP, CP_SP)
+    holds = [(f, lvl) for f, lvl, hba, sr in sent if (hba, sr) == (1, 1)]
+    self.assertTrue(holds, "the pair must ride the standstill hold frames")
+    self.assertTrue(all(lvl >= fl.FCA11_STOP_HOLD_MIN_LSB for _f, lvl in holds), "the pair never rides below the hold level")
+    self.assertFalse([lvl for _f, lvl, hba, sr in sent if lvl < fl.FCA11_STOP_HOLD_MIN_LSB and (hba, sr) == (1, 1)])
+
+    CPo, CP_SPo, _ = _run_stop_hold_path(False)
+    self.assertFalse([x for x in _pair_bits(CPo, CP_SPo) if x[2:] == (1, 1)], "OFF: byte-for-byte today's frames")
+
+  def test_route_195_reproduction_without_the_feed(self):
+    """Reproduce the field failure from the fixed tree: hand setup_interfaces the list an UNFIXED initialize_params
+    produced (identical except the key is absent). CP_SP stays False, the law sends 0 of the same frames with the pair
+    even though every input the gate reads is satisfied - the exact 0-of-399 signature of drive 195."""
+    _, _, plist = _run_stop_hold_path(True)
+    unfixed = [d for d in plist if "HyundaiFca11StopHoldClutch" not in d]
+    fingerprint = {i: {} for i in range(8)}
+    fingerprint[0] = {**BASE_FINGERPRINT, **STD}
+    CarInterface = interfaces[CAR_UNDER_TEST]
+    CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+    CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+    setup_interfaces(CarInterface, CP, CP_SP, unfixed)
+    self.assertTrue(CP_SP.fca11Brake)
+    self.assertFalse(CP_SP.fca11StopHoldClutch, "an absent key leaves the lane OFF (the 0034-0039 field state)")
+    b = fl.Fca11LongBrake(CP, CP_SP)
+    self.assertFalse(b.stop_hold_clutch)
+    sent = _pair_bits(CP, CP_SP)
+    self.assertTrue(sent, "precondition: the law is braking and holding")
+    self.assertFalse([x for x in sent if x[2:] == (1, 1)], "0 pair frames - the route-195 signature")
+
+
 if __name__ == "__main__":
     unittest.main()
