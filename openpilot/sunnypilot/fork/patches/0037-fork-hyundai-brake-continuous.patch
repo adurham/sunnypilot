@@ -1,5 +1,40 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_log.py b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+index f5bb9f0..16eff70 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+@@ -220,7 +220,7 @@ class EpisodeLogger:
+       self._panda_refused += n
+ 
+   # ------------------------------------------------------------------ record + write
+-  def episode_record(self, frame: int, reason: str, stop_kph: float) -> dict | None:
++  def episode_record(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0) -> dict | None:
+     if not self._open or self._frames == 0:
+       return None
+     return {
+@@ -232,6 +232,10 @@ class EpisodeLogger:
+       "dec_cmd_min": self._dec_min,
+       "dec_cmd_max": self._dec_max,
+       "dec_cmd_last": self._dec_last,
++      # 0037/M3: SENT frames at 1-3 LSB in THIS episode - the low end the law's plant inverse EXTENDS below the
++      # measured 4 LSB cliff. Its delivered decel is unmeasured; the same episode's `plateaus` carry the measured
++      # aEgo for every sustained level (including 1-3 LSB), which is what makes the first drive able to falsify it.
++      "cont_low_lsb_frames": int(cont_low_lsb_frames),
+       "v_kph_start": _r(self._v_start),
+       "v_kph_min": _r(self._v_min),
+       "v_kph_end": _r(self._v_end),
+@@ -256,8 +260,8 @@ class EpisodeLogger:
+     except Exception:  # noqa: BLE001 - a malformed sample must not cost the whole episode line
+       return []
+ 
+-  def flush(self, frame: int, reason: str, stop_kph: float) -> None:
+-    rec = self.episode_record(frame, reason, stop_kph)
++  def flush(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0) -> None:
++    rec = self.episode_record(frame, reason, stop_kph, cont_low_lsb_frames)
+     self.reset()
+     if rec is not None:
+       self._append(rec)
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index d21562e..ce3aa09 100644
+index d21562e..87428b0 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -53,6 +53,7 @@ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
@@ -136,10 +171,42 @@ index d21562e..ce3aa09 100644
      # 0036: once the pair has been on the wire during a standstill and then drops while the car is STILL stopped (the ESC
      # stopped acknowledging, the level fell under the hold), it stays off until the car moves again - no on/off flapping
      # at the light. Reset only by leaving standstill.
-@@ -1846,6 +1952,19 @@ class Fca11LongBrake:
+@@ -1828,8 +1934,9 @@ class Fca11LongBrake:
+ 
+   @property
+   def braking(self) -> bool:
+-    """True while the pedal must stay at EXACTLY 0 (gas_interceptor.py reads this), which is _actuating OR the panda's
+-    own 100 ms gas window after the last actuating frame (FCA11_GAS_WINDOW_HOLD_*).
++    """True while the pedal must stay at EXACTLY 0 (gas_interceptor.py reads `gas_hold` for that, which is this flag
++    gated on the level reaching the measured first bite), which is _actuating OR the panda's own 100 ms gas window after
++    the last actuating frame (FCA11_GAS_WINDOW_HOLD_*).
+ 
+     The split matters: `_actuating` is "an actuating 0x38D went out this frame" - the flag every piece of the law uses
+     (episode state, holding, the feel ramp, the echo attribution, the div/probation guard, the logs). `braking` adds the
+@@ -1846,6 +1953,39 @@ class Fca11LongBrake:
      episode too, as it always was). Use this - not `braking` - for "is the brake episode open/closed"."""
      return bool(self._actuating)
  
++  @property
++  def brake_level(self) -> int:
++    """The level of the 0x38D that is on the wire for the state `braking` describes: the last level actually SENT
++    (0 once the episode has closed - the release path zeroes the reference with the passive close frame). Read by the
++    gas side (M1) and by the tests; never by the brake law itself."""
++    return int(self._dec_last_sent) if self.braking else 0
++
++  @property
++  def gas_hold(self) -> bool:
++    """0037/M1: True -> the throttle must be commanded to EXACTLY 0 this frame because the brake is really biting.
++
++    `braking` alone is NOT enough. The continuous law opens an episode at 1 LSB (the phantom bound), and a >= 0.25 s
++    vision phantom reaches 1-3 LSB; keying the pedal's forced zero on `braking` then produced a 5.2 % -> 0 -> 5.2 %
++    pedal dip in ~0.7 s per ghost - owner complaint #4 (throttle blips) reintroduced, and pre-0037 that phantom did
++    nothing on either wire (probe: lane-E/gas_probe_*.txt). The first level on this plant that MEASURABLY bites is
++    FCA11_FEEL_FIRST_LSB = 4 LSB (1.00 m/s^2 net, the ESC's measured cliff), so the gas side follows the brake only
++    from there. Below it the 1-3 LSB levels are still SENT - they just do not zero the throttle.
++    """
++    return bool(self.braking and int(self._dec_last_sent) >= FCA11_FEEL_FIRST_LSB)
++
 +  def cont_coast(self, accel: float, v_ego_mps: float) -> bool:
 +    """0037: True -> the gas must be at its TRUE ZERO (0x700 ENABLE=0 pass-through) this frame.
 +
@@ -156,7 +223,16 @@ index d21562e..ce3aa09 100644
    # ---- window ----
  
    def _gas_holdoff_ok(self, frame: int) -> bool:
-@@ -2297,8 +2416,12 @@ class Fca11LongBrake:
+@@ -2036,7 +2176,7 @@ class Fca11LongBrake:
+                            bool(CS.out.gasPressed), bool(CS.out.brakePressed), FCA11_SEND_EVERY)
+     elif self.log._open:
+       reason = self._last_why if self._last_why not in ("", "disabled") else "release"
+-      self.log.flush(frame, reason, FCA11_STOP_KPH)
++      self.log.flush(frame, reason, FCA11_STOP_KPH, self.cont_low_lsb_frames)
+ 
+   def _camera_owns_refusal(self) -> bool:
+     """0053/route 16a: True when a REFUSED actuating echo this tick is the camera hand-back's doing, not a wall.
+@@ -2297,8 +2437,12 @@ class Fca11LongBrake:
    def _shape_reset(self) -> None:
      """0043: arm a fresh shaped episode - the float LSB accumulator starts at the floor, the onset-hold
      sent-frame counter and the hold-band latch are cleared. Called on every (re)open, on disable, on the
@@ -171,7 +247,7 @@ index d21562e..ce3aa09 100644
      self._shape_sent_n = 0
      self._shape_in_hold_band = False
      self._shape_band_clear()
-@@ -2381,6 +2504,71 @@ class Fca11LongBrake:
+@@ -2381,6 +2525,80 @@ class Fca11LongBrake:
      self._shape_sent_n += 1
      return min(int(round(new_acc)), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
  
@@ -197,12 +273,12 @@ index d21562e..ce3aa09 100644
 +    standstill = bool(getattr(CS.out, "standstill", False))
 +    need = max(0.0, -float(accel_ask))
 +    bn = fca11_cont_brake_need(need, v)
-+    if bn <= 0.0:
-+      # no brake demand at all: the trim has nothing to correct, and an offset carried onto a zero target is exactly a
-+      # phantom hold (a wound-up trim kept a level on the wire for 1 s after a 250 ms vision phantom in the first cut of
-+      # this law). The LEVEL still walks down at the down-slew - only the target is released.
-+      self._track_trim = 0.0
-+      self._track_hist.clear()
++    # M4 (review): the trim is NOT zeroed on `bn <= 0`. Around the coast handover the plan dithers at 2-4 Hz across
++    # need == coast(v), so zeroing on every zero-demand frame disarmed the only closed loop on this actuator and
++    # restarted it from its 0.5 s delay exactly at the 1-3 LSB levels whose gain is least known. It cannot wind up
++    # (its update is gated on bn > 0), it is not APPLIED while bn <= 0 (the target below is 0, so the level walks down),
++    # and it IS dropped when the episode genuinely closes - `_track_reset()` at the top of the next frame, which is
++    # what actually killed the phantom hold this guard was first added for.
 +    self._track_hist.append(bn)
 +    prev = float(self._shape_acc)
 +    # feedback trim: the same numbers as 0035 (KI 8, +12/-6, 0.5 s delay, 0.3 s lag), but compared in the brake's OWN
@@ -216,7 +292,12 @@ index d21562e..ce3aa09 100644
 +      if not ((err > 0.0 and prev >= ceil_now - 0.5) or (err < 0.0 and prev <= 0.5)):
 +        self._track_trim += FCA11_TRACK_KI * err * FCA11_SHAPE_SENT_DT
 +        self._track_trim = max(-FCA11_TRACK_TRIM_DOWN, min(FCA11_TRACK_TRIM_UP, self._track_trim))
-+    target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + self._track_trim
++    if bn > 0.0:
++      target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + self._track_trim
++    else:
++      # M4: no demand -> target 0 whatever the held trim says, so the level walks down (no phantom hold) while the
++      # trim itself survives the handover for the next real ask.
++      target = 0.0
 +    # the stop/hold band is a BLEND now: the creep floor (or the standstill hold) fades in over 3->5 km/h instead of
 +    # swapping the law at 3 km/h. Only while the demand is a stop demand (bn > 0) - the planner asking to move must
 +    # release, exactly like the panda's gas/brake exclusion does.
@@ -235,6 +316,10 @@ index d21562e..ce3aa09 100644
 +    self._shape_acc = new_acc
 +    dec = min(int(round(new_acc)), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
 +    if dec > 0:
++      if not self._actuating:
++        # M3: the harvest counter is PER EPISODE - it restarts when a new episode opens (a cumulative lifetime count
++        # cannot be quoted next to one episode's plateaus in episodes.jsonl).
++        self.cont_low_lsb_frames = 0
 +      self._shape_sent_n += 1     # SENT frames that carried a level (the trim's 0.5 s delay is real braking time)
 +    if 0 < dec <= 3:
 +      self.cont_low_lsb_frames += 1   # 1-3 LSB: sent, delivered decel UNMEASURED on this plant (harvest from the wire log)
@@ -243,7 +328,16 @@ index d21562e..ce3aa09 100644
    def _shape_band_clear(self) -> None:
      """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
      self._shape_band_entry_lsb: int | None = None   # the level held at band entry (None = not in the band yet)
-@@ -3421,6 +3609,14 @@ class Fca11LongBrake:
+@@ -3176,7 +3394,7 @@ class Fca11LongBrake:
+       # 0041: and the gating timers, so a disable is a clean start.
+       self._noresp_cmd_since = None
+       self._brake_now_clear_since = None
+-      self.log.flush(frame, "disabled", FCA11_STOP_KPH)
++      self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames)
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+       self._on_frames = 0
+@@ -3421,6 +3639,14 @@ class Fca11LongBrake:
      holding = bool(self._actuating and ok and
                     (accel <= release_accel or self._on_frames < FCA11_MIN_ON_FRAMES))
      want_brake = bool(onset or holding or cal_on)
@@ -258,7 +352,7 @@ index d21562e..ce3aa09 100644
      # 0035: the G7 budget-edge stop and the 3 s cooldown hold-off that used to sit here are DELETED with the
      # panda's budget/cooldown. The only things that end a brake are the planner/cal release above and the `ok`
      # gates (driver, gear, floor, camera, pedal, staleness). The one remaining hold-off is the close-frame
-@@ -3487,9 +3683,13 @@ class Fca11LongBrake:
+@@ -3487,9 +3713,13 @@ class Fca11LongBrake:
          dec_cmd = self._feel_level(accel, frame, personality, v_kph_now,
                                     standstill=bool(getattr(CS.out, "standstill", False)))
        elif self.affine_gain and not cal_on:
@@ -276,7 +370,7 @@ index d21562e..ce3aa09 100644
          # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
          # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index b22cb68..b5cb1c1 100644
+index b22cb68..1973134 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -27,7 +27,7 @@ from opendbc.car import Bus, DT_CTRL, structs
@@ -288,7 +382,68 @@ index b22cb68..b5cb1c1 100644
  from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_NORMAL
  from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
  
-@@ -690,7 +690,12 @@ class GasInterceptorCarController:
+@@ -526,6 +526,19 @@ PEDAL_FAULT_TIMEOUT_FRAMES = 50        # fault continuously visible while comman
+ PEDAL_MAX_CLEARS = 8                   # more than this many clears ...
+ PEDAL_CLEAR_WINDOW_FRAMES = 200        # ... within 2 s
+ 
++# *** 0037/M5: the coast cliff is a QUANTIZED level, not a timer (review M5) ***
++# The continuous negative branch hands the pedal over to the engine brake at need = coast(v). That boundary sits where
++# the car spends speed-dependent time, and the plan dithers at 2-4 Hz, so the raw predicate toggled
++# "ENABLE=0 pass-through" <-> "live 1-2 count pedal" at the dither rate - the 17c "ENABLE 0/1/0/1 at 100 ms" class,
++# relocated from -0.52 to the coast cliff. The hysteresis is sized to the pedal's own quantization, not to a delay:
++# create_gas_interceptor_command encodes GAS_COMMAND = gas_amount * 255 (one count = 1/255 of pedal) and enables above
++# 0.001, so a target below one count is not representable as a live command - and any live command (even 2 raw counts)
++# collapses the measured coast (-1.33 m/s^2) to about -0.05 (route 16a). Entry is therefore "the pedal would be below
++# one count", and the release needs TWO counts, one LSB of hysteresis.
++PEDAL_WIRE_LSB = 1.0 / 255.0           # one GAS_COMMAND count (gas_amount * 255 in create_gas_interceptor_command)
++COAST_ZERO_ENTER_PEDAL = 1.0 * PEDAL_WIRE_LSB   # at/below this the wire cannot carry a live command -> exact zero
++COAST_ZERO_EXIT_PEDAL = 2.0 * PEDAL_WIRE_LSB    # one LSB of hysteresis above the entry, so dither cannot cross it
++
+ 
+ class PedalFaultMonitor:
+   """Clear-frame policy + escalation. Owned by CarStateExt (which also reads `escalated` into accFaulted) and stepped
+@@ -584,6 +597,9 @@ class GasInterceptorCarController:
+     # 17c: over-speed release latch (hysteresis). Set by over_speed_release(), held by over_speed_release_held(),
+     # cleared whenever longitudinal is not active.
+     self.overspeed_released = False
++    # 0037/M5: the coast-handover latch (see PEDAL_WIRE_LSB above): once the continuous law's pedal target falls below
++    # one wire count the pedal goes to EXACTLY 0, and it stays there until the target reaches two counts.
++    self.coast_zero_latched = False
+     # 17c delivery (opt-in, HyundaiPedalDeliveryLaw): the pedal-path ask filter state. Unused (and never advanced)
+     # unless CP_SP.pedalDeliveryLaw is set, so the OFF path stays byte-for-byte the deployed one.
+     self.delivery_law = bool(getattr(CP_SP, 'pedalDeliveryLaw', False))
+@@ -592,6 +608,30 @@ class GasInterceptorCarController:
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+ 
++  def _coast_zero(self, accel: float, v_ego: float) -> bool:
++    """0037/M5: True -> the pedal must be at EXACTLY 0 (ENABLE=0 pass-through) because the ask is at/past the coast.
++
++    Same `coast(v)` curve the brake law hands over at (engine braking first), with the crossing made QUANTIZED instead
++    of raw: the continuous branch's own target `hold(v)·max(0, 1 − need/coast(v))` is computed here, the latch sets when
++    that target would be below one GAS_COMMAND count (not representable as a live command) and releases only at two
++    counts - one pedal LSB of hysteresis, sized to the wire, no time delay. Inert on every non-continuous instance, on
++    asks >= 0, and when the coast is ~0 (v ~ 0, where the hold band owns the frame).
++    """
++    if not (getattr(self.fca11_brake, "cont_law", False) and self.fca11_brake.enabled) or float(accel) >= 0.0:
++      self.coast_zero_latched = False
++      return False
++    coast = fca11_cont_coast(v_ego)
++    if coast <= 1e-3:
++      self.coast_zero_latched = False
++      return False
++    pedal = get_hold_command(v_ego) * max(0.0, 1.0 - (-float(accel)) / coast)
++    if self.coast_zero_latched:
++      if pedal >= COAST_ZERO_EXIT_PEDAL:
++        self.coast_zero_latched = False
++    elif pedal <= COAST_ZERO_ENTER_PEDAL:
++      self.coast_zero_latched = True
++    return self.coast_zero_latched
++
+   def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0,
+                          personality: int = PERSONALITY_STANDARD, drive_mode: int = 0) -> list[CanData]:
+     can_sends: list[CanData] = []
+@@ -690,10 +730,18 @@ class GasInterceptorCarController:
      # actuation. Inert when cal mode is off (`_cal_active` is False).
      # 0053: while the CAMERA is braking (cam_brake), openpilot never throttles against it: the pedal command is forced to
      # exactly 0 (the panda refuses any non-zero GAS_COMMAND then too). The zero stream keeps flowing (fault-clear path).
@@ -297,12 +452,19 @@ index b22cb68..b5cb1c1 100644
 +    # measured coast at this speed already delivers: the pedal then goes to EXACTLY 0 (ENABLE=0, pass-through) instead of
 +    # holding the car's speed on hold_cmd(v). It is the same coast(v) curve the brake law hands over at, so gas and brake
 +    # meet at one point (DESIGN.md lane-E §3). False on every non-continuous instance and every ask >= 0.
-+    coast_zero = bool(active) and self.fca11_brake.cont_coast(CC.actuators.accel, CS.out.vEgo)
++    # M1: the brake's own forced zero is `gas_hold`, not `braking` - a 1-3 LSB episode (a vision phantom) must not cut
++    # the throttle; only a level that has reached the measured first bite (4 LSB) does. See Fca11LongBrake.gas_hold.
++    # M5: the coast cliff is a QUANTIZED level, not a timer - see _coast_zero().
++    coast_zero = bool(active) and self._coast_zero(CC.actuators.accel, CS.out.vEgo)
 +    if self.fca11_brake.cam_brake or coast_zero:
        self.gas = 0.
        self.gas_launching = False
-     elif active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
-@@ -706,6 +711,16 @@ class GasInterceptorCarController:
+-    elif active and not self.fca11_brake.braking and not self.fca11_brake._cal_active:
++    elif active and not self.fca11_brake.gas_hold and not self.fca11_brake._cal_active:
+       accel = CC.actuators.accel
+       # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
+       # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
+@@ -706,6 +754,16 @@ class GasInterceptorCarController:
        if self.overspeed_released:
          self.gas = 0.
          self.gas_launching = False
@@ -319,12 +481,21 @@ index b22cb68..b5cb1c1 100644
        else:
          # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
          # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
+@@ -752,7 +810,7 @@ class GasInterceptorCarController:
+                          get_personality_ceiling(CS.out.vEgo, personality))
+         self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
+                                             self.gas_launching, reentry=accel < OVERSPEED_EXIT_ACCEL)
+-    elif self.fca11_brake.braking or self.fca11_brake._cal_active:
++    elif self.fca11_brake.gas_hold or self.fca11_brake._cal_active:
+       self.gas = 0.
+       self.gas_launching = False
+     else:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py
 new file mode 100644
-index 0000000..3088164
+index 0000000..88ce4c6
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,656 @@
 +"""0037: the ONE continuous brake law (FCA11_CONT_ENABLED) - conformance + engine braking first.
 +
 +Owner (2026-11-05): "As long as it's linear I don't care. The entire point is that we need to treat braking with the same
@@ -399,6 +570,25 @@ index 0000000..3088164
 +def _gas_word(dat: bytes) -> int:
 +  sig = _gas_signals()["GAS_COMMAND"]
 +  return (dat[sig.start_bit // 8] >> (sig.start_bit % 8)) & ((1 << sig.size) - 1)
++
++
++def _elantra_ci():
++  """The car's own object: Elantra 2022 non-SCC with the gas interceptor + FCA11 brake (AffineGain, DynamicBrakes)."""
++  from opendbc.car.car_helpers import interfaces
++  from opendbc.car.hyundai.values import CAR
++  from opendbc.sunnypilot.car.interfaces import setup_interfaces
++  from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import BASE_FINGERPRINT, STD as PEDAL
++  car = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **PEDAL}
++  CarInterface = interfaces[car]
++  CP = CarInterface.get_params(car, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, car, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  setup_interfaces(CarInterface, CP, CP_SP, [
++    {"HyundaiGasInterceptor": True}, {"HyundaiFca11Brake": True},
++    {"HyundaiFca11AffineGain": True}, {"HyundaiFca11DynamicBrakes": True},
++  ])
++  return CarInterface(CP, CP_SP)
 +
 +
 +class _Drive:
@@ -618,21 +808,7 @@ index 0000000..3088164
 +  """(b) through the REAL gas path: 0x700/0x200 carries an all-zero ENABLE=0 frame at the hand-over ask."""
 +
 +  def _ci(self):
-+    from opendbc.car.car_helpers import interfaces
-+    from opendbc.car.hyundai.values import CAR
-+    from opendbc.sunnypilot.car.interfaces import setup_interfaces
-+    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import BASE_FINGERPRINT, STD as PEDAL
-+    car = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
-+    fingerprint = {i: {} for i in range(8)}
-+    fingerprint[0] = {**BASE_FINGERPRINT, **PEDAL}
-+    CarInterface = interfaces[car]
-+    CP = CarInterface.get_params(car, fingerprint, [], alpha_long=False, is_release=False, docs=False)
-+    CP_SP = CarInterface.get_params_sp(CP, car, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
-+    setup_interfaces(CarInterface, CP, CP_SP, [
-+      {"HyundaiGasInterceptor": True}, {"HyundaiFca11Brake": True},
-+      {"HyundaiFca11AffineGain": True}, {"HyundaiFca11DynamicBrakes": True},
-+    ])
-+    return CarInterface(CP, CP_SP)
++    return _elantra_ci()
 +
 +  def test_coast_ask_sends_the_all_zero_pedal_frame(self):
 +    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import _Fca11CS, _fca11_cam_frame
@@ -832,8 +1008,151 @@ index 0000000..3088164
 +    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), cp).cont_law)
 +
 +
++# ---------------------------------------------------------------------------------------------------------------------
++# CORRECTIONS ROUND 2 (deploy-gate review, 2026-11-05): M1 phantom vs THROTTLE, M4 trim through the handover, M5 the
++# ENABLE dither at the coast cliff. Each one fails on the 0037 tree this file was written against (lane-E/gas_probe_*).
++# ---------------------------------------------------------------------------------------------------------------------
++class TestPhantomOnTheGasWire(unittest.TestCase):
++  """M1: a vision phantom that only reaches 1-3 LSB must NOT touch the throttle.
++
++  The continuous law opens an episode at 1 LSB, so `braking` is True for every phantom >= 0.25 s; keying the pedal's
++  forced zero on it produced a 5.2 % -> 0 -> 5.2 % dip in ~0.7 s per ghost (owner complaint #4) where pre-0037 the same
++  phantom did nothing on either wire. The gas side now follows the brake only from FCA11_FEEL_FIRST_LSB = 4 LSB (the
++  measured first bite, 1.00 m/s^2), so the 1-3 LSB levels are still SENT but leave the pedal alone.
++  """
++
++  V = 20.0
++  ASK = -0.20                       # planner ask: shallower than coast(20) = 0.349 -> the pedal holds a partial value
++  GHOST = (30.0, -25.0)             # the closing-lead phantom the probes use
++
++  def _frames(self, ghost_frames=0, pad=0):
++    """(gas[], enable[], brake_level[], first ghost frame) over 60 warm-up + ghost_frames ghost + 60+pad clear frames."""
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import _Fca11CS, _fca11_cam_frame
++    CI = _elantra_ci()
++    cs = _Fca11CS(v_ego=self.V, cam=(0, _fca11_cam_frame(alive=5)))
++    gas, en, lvl = [], [], []
++
++    def step(lead):
++      d, vr = lead if lead is not None else (None, None)
++      setattr(cs, "fca11_lead_drel_m", d)
++      setattr(cs, "fca11_lead_vrel_mps", vr)
++      setattr(cs, "fca11_lead_one", object() if lead is not None else None)
++      sends = CI.CC.create_gas_command(_cc(self.ASK), cs, len(gas), 0)
++      pedal = [d for a, d, _s in sends if a in (0x200, 0x700)]
++      gas.append(float(CI.CC.gas))
++      en.append(_enable_bit(pedal[0]) if pedal else None)
++      lvl.append(int(CI.CC.fca11_brake.brake_level))
++
++    for _ in range(60):
++      step(None)
++    t = len(gas)
++    for _ in range(ghost_frames):
++      step(self.GHOST)
++    for _ in range(60 + pad):
++      step(None)
++    return gas, en, lvl, t
++
++  def test_a_short_phantom_does_not_move_the_pedal(self):
++    for model_frames in (1, 2, 3, 5):
++      n = 5 * model_frames                                    # one 20 Hz model frame = 5 controller frames
++      ref_gas, ref_en, _, _ = self._frames(0, pad=n)
++      gas, en, lvl, t = self._frames(n)
++      self.assertEqual(len(gas), len(ref_gas))
++      self.assertLessEqual(max(lvl), 3, (model_frames, max(lvl)))
++      self.assertEqual(gas, ref_gas, f"a {model_frames}-frame phantom moved the throttle")
++      self.assertEqual(en, ref_en)
++      self.assertEqual(sum(1 for x in en if x == 0), 0, "no ENABLE=0 frame may be caused by a 1-3 LSB phantom")
++
++  def test_a_real_episode_at_the_bite_still_cuts_the_throttle(self):
++    gas, en, lvl, t = self._frames(50)                        # 0.5 s of the same closing lead: past the 4 LSB bite
++    self.assertGreaterEqual(max(lvl), 4, lvl[t:t + 50])
++    i = next(k for k in range(t, len(lvl)) if lvl[k] >= 4 and en[k] is not None)
++    self.assertEqual(gas[i], 0.0)
++    self.assertEqual(en[i], 0, "at/above the first bite the pedal must be the all-zero ENABLE=0 frame")
++
++  def test_the_coast_handover_is_still_at_need_equals_coast(self):
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import _Fca11CS, _fca11_cam_frame
++    CI = _elantra_ci()
++    cs = _Fca11CS(v_ego=self.V, cam=(0, _fca11_cam_frame(alive=5)))
++    coast = fl.fca11_cont_coast(self.V)
++    for f in range(0, 40, 2):
++      CI.CC.create_gas_command(_cc(0.0), cs, f, 0)
++    self.assertGreater(CI.CC.gas, 0.0)
++    sends = CI.CC.create_gas_command(_cc(-coast), cs, 40, 0)
++    pedal = [d for a, d, _s in sends if a in (0x200, 0x700)]
++    self.assertEqual(CI.CC.gas, 0.0)
++    self.assertEqual(_enable_bit(pedal[0]), 0, "need == coast(v) must still be the 0x700 ENABLE=0 hand-over")
++    self.assertEqual(_gas_word(pedal[0]), 0)
++    # M5 makes the crossing quantized, but only inside the pedal's own LSB: 1 % shallower is still an exact zero ...
++    self.assertEqual(fl.fca11_cont_coast(self.V), coast)
++    CI.CC.create_gas_command(_cc(-0.99 * coast), cs, 42, 0)
++    self.assertEqual(CI.CC.gas, 0.0)
++    # ... and a ask a quarter of the coast shallower is a live, partial pedal (engine braking modulated)
++    CI.CC.create_gas_command(_cc(-0.25 * coast), cs, 44, 0)
++    self.assertGreater(CI.CC.gas, 0.0)
++
++  def test_the_coast_cliff_does_not_dither_the_enable_bit(self):
++    """M5: a +-2 % of coast dither at 10 Hz across the hand-over must not toggle ENABLE, and no live frame may be a
++    single pedal count. The hysteresis is one pedal LSB (1/255), not a time delay."""
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import _Fca11CS, _fca11_cam_frame
++    CI = _elantra_ci()
++    cs = _Fca11CS(v_ego=self.V, cam=(0, _fca11_cam_frame(alive=5)))
++    coast = fl.fca11_cont_coast(self.V)
++    for f in range(0, 40, 2):
++      CI.CC.create_gas_command(_cc(0.0), cs, f, 0)
++    flips = 0
++    prev = None
++    for i in range(60):
++      ask = -(coast * (1.02 if (i // 5) % 2 == 0 else 0.98))
++      sends = CI.CC.create_gas_command(_cc(ask), cs, 40 + 2 * i, 0)
++      pedal = [d for a, d, _s in sends if a in (0x200, 0x700)]
++      en = _enable_bit(pedal[0])
++      if prev is not None and en != prev:
++        flips += 1
++      prev = en
++      if en:
++        self.assertGreaterEqual(_gas_word(pedal[0]), 2, "a live command below 2 counts is not representable")
++    self.assertLessEqual(flips, 1, f"ENABLE toggled {flips} times on a 1.2 s dither across the coast cliff")
++
++
++class TestTrimThroughTheHandover(unittest.TestCase):
++  """M4: the feedback trim is held through the coast handover instead of being disarmed on every zero-demand frame,
++  and it is still dropped when the episode really closes (the phantom hold the original guard was added for)."""
++
++  def _open(self):
++    d = _Drive().run(200, -1.5, v=15.0, a_ego=-1.2)
++    self.assertGreater(d.b._track_trim, 0.0, "the loop must have accumulated a correction to hold")
++    self.assertTrue(d.b.episode_open)
++    return d
++
++  def test_the_trim_survives_a_zero_demand_frame(self):
++    d = self._open()
++    trim = d.b._track_trim
++    d.run(1, -0.01, v=15.0, a_ego=-1.2)        # need < coast(15) -> brake_need == 0
++    self.assertEqual(d.b._track_trim, trim, "a zero-demand frame disarmed the loop")
++    d.run(1, -1.5, v=15.0, a_ego=-1.2)         # the same demand returns: no 0.5 s re-arm penalty
++    self.assertEqual(d.b._track_trim, trim)
++
++  def test_the_trim_is_dropped_when_the_episode_closes(self):
++    d = self._open()
++    d.run(80, -0.01, v=15.0, a_ego=-1.2)       # release: the level walks to 0 and the episode closes
++    self.assertFalse(d.b.episode_open)
++    self.assertEqual(d.b._track_trim, 0.0, "a closed episode must not carry a trim into the next one")
++
++  def test_a_phantom_leaves_nothing_on_the_wire_after_it(self):
++    d = self._open()
++    d.run(80, -0.01, v=15.0, a_ego=-1.2)
++    t = d.f
++    d.run(5, -0.1, v=15.0, a_ego=0.0, lead=(30.0, -25.0))
++    d.run(120, -0.1, v=15.0, a_ego=0.0)
++    tail = [x for f, x in d.sent if f >= t + 60]
++    self.assertEqual(tail, [0.0] * len(tail), "a held trim must not hold a level after the phantom")
++    self.assertEqual(d.b._track_trim, 0.0)
++
++
 +if __name__ == "__main__":
 +  unittest.main()
+\ No newline at end of file
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
 index 412b432..d2d482b 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
