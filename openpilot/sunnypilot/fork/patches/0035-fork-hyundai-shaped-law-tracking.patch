@@ -1,5 +1,5 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index a40ac9f..522d10a 100644
+index a40ac9f..083ed71 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -996,6 +996,96 @@ FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the
@@ -199,18 +199,29 @@ index a40ac9f..522d10a 100644
  
    def _shape_band_clear(self) -> None:
      """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
-@@ -2253,6 +2429,10 @@ class Fca11LongBrake:
+@@ -2253,8 +2429,21 @@ class Fca11LongBrake:
      # level-law target (integer LSB): the shaped inverse of the demand; in the stop/hold band (WI3) the tier cap only
      # once the car is confirmed stopped / a hard ask / the timeout ramp, else the creep floor. The band state is stepped
      # on EVERY frame (above the send-slot return) so the 1.5 s timeout is counted in real time.
 +    if getattr(self, "shape_track", False) and not in_hold_band:
 +      # 0035: moving, outside the band -> the TRACKING layer owns the level (see FCA11_TRACK_*).
 +      self._shape_band_clear()
-+      return self._track_level(want, CS, frame, personality, hard)
++      # 0035 (Fable R1): `accel_ask` here is the MERGED need (planner ask + this law's own closing-lead demand). The
++      # +RATE_STEP fast lane / onset-hold bypass belongs to the PLANNER's hard ask only (the F1 open-bypass rule): keyed
++      # on the merged need, a one-frame phantom inside a planner-opened episode ramped 4 -> 30 LSB in ~0.16 s. The demand
++      # still raises the level through `want`, at the comfort jerk slew. (The hold band keeps `hard` as before.)
++      hard_planner = bool(float(getattr(self, "_planner_ask", accel_ask)) <= FCA11_ONSET_BYPASS_ACCEL)
++      return self._track_level(want, CS, frame, personality, hard_planner)
      target = shape_dec_cmd_from_extra(want, cap)
      if in_hold_band:
++      # 0035 (Fable R2): the band ends the moving episode's raised-ceiling latch. Band entry does not call _track_reset
++      # (the episode stays open), so without this a creep-out (> 5 km/h, no release) resumed on the 30 LSB lane for any
++      # need inside the 1.33..1.67 hysteresis. Cleared on every band frame -> a creep-out starts from the tier cap.
++      self._track_ceil_hi = False
        target = self._shape_band_target(cap, target, v_kph, standstill, hard, frame)
-@@ -2286,7 +2466,18 @@ class Fca11LongBrake:
+     else:
+       self._shape_band_clear()
+@@ -2286,7 +2475,18 @@ class Fca11LongBrake:
        slew = float(HYUNDAI_FCA11_LONG_RATE_STEP) if fast else shape_slew_lsb_per_sent(prev)
        new_acc = min(float(target), prev + slew)
      else:
@@ -230,7 +241,7 @@ index a40ac9f..522d10a 100644
      new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
      self._shape_acc = new_acc
      self._shape_sent_n += 1
-@@ -2915,7 +3106,8 @@ class Fca11LongBrake:
+@@ -2915,7 +3115,8 @@ class Fca11LongBrake:
      the planner's ask, never softens it, only ever runs on the dynamic-brakes instance, and is capped by the wire gate.
      A missing lead, a lead beyond range, or any non-closing state leaves the ask exactly as the planner sent it.
      """
@@ -240,7 +251,7 @@ index a40ac9f..522d10a 100644
        return accel
      try:
        d = float(getattr(CS, "fca11_lead_drel_m", None))
-@@ -3150,12 +3342,20 @@ class Fca11LongBrake:
+@@ -3150,12 +3351,20 @@ class Fca11LongBrake:
      crawl = bool(float(CS.out.vEgo) < FCA11_CRAWL_V_MAX)
      if self.feel and not in_band:
        open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
@@ -261,7 +272,7 @@ index a40ac9f..522d10a 100644
      self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
      _slow = bool(float(CS.out.vEgo) < FCA11_FEEL_DWELL_SLOW_MPS)
      self._feel_dwell_slow = self._feel_dwell_slow + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL and _slow) else 0
-@@ -3172,7 +3372,13 @@ class Fca11LongBrake:
+@@ -3172,7 +3381,13 @@ class Fca11LongBrake:
      # but STILL AND ONLY while `ok` holds. When the sequencer drops cal_on, the episode releases through
      # the PRODUCTION path (a veto stops braking on this frame; a soft cal end lets the same release
      # logic run).
@@ -278,10 +289,10 @@ index a40ac9f..522d10a 100644
      if self.feel and self._feel_dwell_slow >= FCA11_FEEL_DWELL_SLOW_FRAMES:
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
 new file mode 100644
-index 0000000..6a0fa2d
+index 0000000..412b432
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_track.py
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,340 @@
 +"""0035: the SHAPED law keeps TRACKING the need inside an episode (FCA11_TRACK_* block in fca11_long.py).
 +
 +Owner complaint #1 (2026-11-04): "braking does whatever the first request was and never adjusts". The car runs with
@@ -581,6 +592,43 @@ index 0000000..6a0fa2d
 +    seq = [x for f, x in d.sent if f >= t - 4]
 +    self.assertLess(max(a - b for a, b in zip(seq, seq[1:])), 4, seq)
 +    self.assertLessEqual(seq[-1], 20, seq)            # and it does reach the band's own target
++
++  def test_a_band_pass_clears_the_latched_ceiling(self):
++    """Fable R2: a latched 30 LSB ceiling must not survive the hold band. Latched at 6 m/s (need 2.0), into the band at
++    0.8 m/s, then a creep-out at 5.8 km/h with need 1.5 (inside the 1.33..1.67 hysteresis): the episode starts again
++    from the tier cap 20, not from the carried-over 30 lane (it climbed 19, 20, 21 ... 24 before)."""
++    d = _Drive().run(300, -2.0, 6.0, a_ego=-1.5).run(60, -2.0, 0.8, a_ego=-1.5)
++    t = d.f
++    d.run(100, -1.5, 1.6, a_ego=-1.0)                 # 1.6 m/s = 5.8 km/h -> out of the band, tracking resumes
++    seq = [x for f, x in d.sent if f >= t]
++    self.assertTrue(seq and min(seq) > 0, seq)        # still braking (no release) - the episode never closed
++    self.assertLessEqual(max(seq), 20, seq)
++
++
++class TestPhantomInsideAnOpenEpisode(unittest.TestCase):
++  """Fable R1: the +RATE_STEP fast ramp belongs to the PLANNER's hard ask. The law's own closing demand may still raise an
++  open episode, but at the comfort jerk slew - a one-frame phantom mid-follow ramped 4 -> 30 LSB in ~0.16 s before."""
++
++  def _run(self):
++    d = _Drive().run(50, -0.9, 25.0, a_ego=-0.8)       # planner-opened soft episode, past the 0.2 s onset hold
++    t = d.f
++    d.run(15, -0.9, 25.0, a_ego=-0.8, lead=(30.0, -25.0)).run(60, -0.9, 25.0, a_ego=-0.8)   # 3 model frames phantom
++    return d, t
++
++  def test_a_phantom_does_not_fast_ramp_an_open_episode(self):
++    d, t = self._run()
++    seq = [x for f, x in d.sent if f >= t - 2]
++    self.assertTrue(seq and min(seq) > 0, seq)        # the episode stays open
++    rises = [b - a for a, b in zip(seq, seq[1:])]
++    self.assertLess(max(rises), 4, seq)                # no +RATE_STEP fast-lane frame
++    self.assertLess(max(seq), 20, seq)                 # and nowhere near the 30 LSB lane
++
++  def test_the_demand_still_raises_a_soft_open_episode_at_the_slew(self):
++    d, t = self._run()
++    plain = _Drive().run(125, -0.9, 25.0, a_ego=-0.8)
++    lv = [x for f, x in d.sent if t <= f < t + 15]
++    pl = [x for f, x in plain.sent if t <= f < t + 15]
++    self.assertGreater(max(lv), max(pl), (lv, pl))
 +
 +
 +if __name__ == "__main__":
