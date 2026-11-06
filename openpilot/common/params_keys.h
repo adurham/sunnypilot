@@ -260,9 +260,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"HyundaiFca11DynamicBrakes", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"HyundaiFca11StopHoldClutch", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork 0034: FCA11 frame carries the ESC stop-hold pair at a standstill (experimental)
     // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
-    // REGISTRATION ONLY in this tree: the key's reader (opendbc gas_interceptor) ships with the pedal-delivery lane
-    // (commit f7282b49fd), which is not merged here; the entry exists so the compiled aarch64 libparams_c.so registers
-    // both keys and the merge does not need a second deploy-blocking rebuild. Setting it here is INERT. Default OFF.
+    // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
+    // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
+    // "REGISTRATION ONLY ... Setting it here is INERT" note here was stale - it described the pre-merge state.)
+    // Default OFF.
     // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
     // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
     // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
