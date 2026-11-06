@@ -30,7 +30,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      gas_out = max(gas_out, gas_last - get_pedal_rate_down(v_ego) * DT_CTRL)
    return gas_out
  
-@@ -484,8 +489,51 @@
+@@ -484,8 +489,63 @@
    if accel <= accel_prev:
      return float(accel)
    return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / DELIVERY_ASK_TAU_S)))
@@ -55,6 +55,11 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
 +# Y's step-response figure, not this measure; the earlier -22/-11/-17/0/+77 list was the 0.6 s arm and is superseded).
 +GAS_RISE_LAG_TAU_S = 0.45    # s; first-order time constant of a rise (0.45 = the 0.6 blip counts, less error and lag)
 +GAS_RISE_LAG_RESET_V = 0.2   # m/s; at/below this the state re-seeds to the current ask (== FCA11_STOP_HOLD_V_MAX_MPS)
++# DELAY, NOT MODELLED (Fable follow-up 4): CP.longitudinalActuatorDelay stays 0.5 s (hyundai/interface.py) - this lag
++# is applied AFTER the planner, in the pedal law, so the planner's model and the modeld long delay are untouched. On a
++# RISING ask the pedal is therefore up to ~tau (0.45 s: 63 % of a step in 0.45 s, 95 % in 1.35 s) later than that model
++# assumes; on a FALL it is not later at all. That asymmetry is deliberate and the delay is NOT to be retuned to hide
++# it (the planner would then brake/accelerate early everywhere, not only on rises).
  
  
 +def filter_gas_rise(accel: float, accel_prev: float, dt: float = DT_CTRL,
@@ -64,6 +69,13 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
 +  RISE (ask > previous output): approached with time constant `tau`. The output stays strictly between the previous
 +  output and the ask, so on every rise frame output <= max(ask, previous output) and output < ask.
 +  FALL (ask <= previous output): returned unchanged, so on every fall frame output == ask and a lift is never delayed.
++  PARTIAL FALL (the ask FALLS but stays ABOVE the previous output - e.g. raw 0.8 -> 0.6 while this state is 0.4): the
++  ask is compared with the previous OUTPUT, never with the previous ask, so this frame is a RISE and the answer is
++  (c): the output KEEPS RISING at `tau` toward the new ask. It does not jump to the raw ask (a) and does not hold (b).
++  It cannot overshoot - the output stays strictly below the new ask and converges to it - so the cost is a DELAY on a
++  reduction (the pedal keeps rising for up to ~tau after the plan has eased), never an added demand: output <= ask on
++  every frame. Pinned by test_partial_fall_below_the_previous_ask_keeps_rising_at_tau; drive-level counts in
++  lane-Z4/STATE.md.
 +  RESET: re-seed to the current ask. The CALLER decides when (longitudinal inactive, the first active frame of an
 +  episode, driver gas/brake takeover, standstill) so no stale value is ever carried into a new episode AND the first
 +  active frame is not a rise from the 0 that LongControl sends while inactive.
@@ -82,7 +94,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
  def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
    """The measured-inverse law alone (blend weight 1). Accelerator only: <= 0 means the plateau floor or a coast,
    never brake."""
-@@ -604,6 +652,11 @@
+@@ -604,6 +664,11 @@
      # unless CP_SP.pedalDeliveryLaw is set, so the OFF path stays byte-for-byte the deployed one.
      self.delivery_law = bool(getattr(CP_SP, 'pedalDeliveryLaw', False))
      self.delivery_ask = 0.
@@ -94,7 +106,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      self.interceptor_ids = get_interceptor_ids(CP_SP)
      self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
      self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
-@@ -670,6 +723,30 @@
+@@ -670,6 +735,30 @@
      if delivery_on:
        self.delivery_ask = filter_delivery_ask(CC.actuators.accel, self.delivery_ask) if active else 0.
  
@@ -125,7 +137,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
      # command is hard-zeroed this frame (gas and brake are never commanded together) and the pedal stream keeps
      # flowing (zero frames), which also keeps the pedal fault-clear path alive.
-@@ -745,36 +822,46 @@
+@@ -745,36 +834,46 @@
        self.gas = 0.
        self.gas_launching = False
      elif active and not self.fca11_brake.gas_hold and not self.fca11_brake._cal_active:
@@ -179,7 +191,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
            self.gas_launching = False
          # 17c: soft recovery up to the hold for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL); a deliberate ask keeps
          # the unchanged jerk-rate response (lead pulling away, merge). rate_limit_pedal_command gates it off below
-@@ -790,12 +877,15 @@
+@@ -790,12 +889,15 @@
            weight = get_delivery_blend_weight(CS.out.vEgo)
            ask = accel + weight * (self.delivery_ask - accel) if accel < 0. else accel
            pedal_target = get_delivery_pedal_command(ask, CS.out.vEgo, personality)
@@ -196,7 +208,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
              pedal_target = max(pedal_target, self.gas - weight * get_pedal_rate_down(CS.out.vEgo) * DT_CTRL)
          else:
            pedal_target = get_pedal_command(accel, CS.out.vEgo, personality)
-@@ -812,7 +902,8 @@
+@@ -812,7 +914,8 @@
            self.gas = min(pedal_target, get_hold_command(CS.out.vEgo, personality),
                           get_personality_ceiling(CS.out.vEgo, personality))
          self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
@@ -206,7 +218,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      elif self.fca11_brake.gas_hold or self.fca11_brake._cal_active:
        self.gas = 0.
        self.gas_launching = False
-@@ -826,6 +917,8 @@
+@@ -826,6 +929,8 @@
        # cam-brake, deep-ask coast): those frames advance the filter above, and re-arming it there was the second hole
        # review C4 found (the coast -> live hand-back is exactly the transition that snaps the throttle).
        self.delivery_ask = 0.
@@ -251,7 +263,7 @@ diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/inter
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-@@ -2409,3 +2409,367 @@
+@@ -2409,3 +2409,470 @@
    def test_rise_limit_is_untouched(self):
      out = gi.rate_limit_pedal_command(0.30, 0.10, 30.)
      assert out == pytest.approx(0.10 + gi.get_pedal_rate_up(30.) * gi.DT_CTRL, abs=1e-9)
@@ -599,7 +611,110 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +    assert jerk > 3. * soft                              # the two paths are separable
 +    assert out[20 + steps][1] == pytest.approx((steps + 1) * jerk, abs=1e-4)
 +
++  # ---- Fable follow-ups: the two named corners and the locality of the lagged ask ----------------------------------
++  def test_partial_fall_below_the_previous_ask_keeps_rising_at_tau(self):
++    """Fable follow-up 1: the raw ask FALLS but stays ABOVE the lagged state (raw 0.8 -> 0.6 while the lagged ask is
++    0.4). The filter compares the ask with its own previous OUTPUT, never with the previous ask, so that frame is a
++    RISE and the answer is (c) - the ask KEEPS RISING at tau toward 0.6. It does not jump to the raw ask (a) and does
++    not hold at the old state (b). Pinned through the real controller, then the pure function with the brief's exact
++    numbers. The cost is a delay on a reduction only: the output never goes above the ask (counted in lane-Z4/STATE.md
++    over 197 and 198)."""
++    tau = getattr(gi, "GAS_RISE_LAG_TAU_S", 0.45)          # no AttributeError on a tree without the feature
++    alpha = 1. - np.exp(-DT_CTRL / tau)
++    CI = self._ci(True)
++    # state through the controller: 0.8 (lag settles) -> one 0.4 frame (a FALL passes through: state IS 0.4)
++    # -> one 0.8 frame (state 0.4088: the "0.4" of the brief) -> then the partial fall to 0.6.
++    self._run(CI, [(0.8, 20.0, True, False, False, 255.)] * 200)
++    lead = self._run(CI, [(0.4, 20.0, True, False, False, 255.)] +
++                         [(0.8, 20.0, True, False, False, 255.)])
++    prev = lead[-1][0]
++    assert prev == pytest.approx(0.4 + 0.4 * alpha, abs=2e-6)      # the lagged state, just under the brief's 0.4
++    tail = self._run(CI, [(0.6, 20.0, True, False, False, 255.)] * 200)
++    assert tail[0][0] != pytest.approx(0.6, abs=1e-6)              # NOT (a): no jump to the raw ask
++    assert tail[0][0] != pytest.approx(prev, abs=1e-9)             # NOT (b): no hold
++    assert tail[0][0] == pytest.approx(prev + (0.6 - prev) * alpha, abs=2e-6)   # (c): one tau step toward 0.6
++    asks = [prev] + [t[0] for t in tail]
++    assert all(b > a for a, b in zip(asks[:-1], asks[1:]))         # keeps rising, monotonically ...
++    assert max(asks) <= 0.6 + 2e-6                                 # ... never above the new ask (no overshoot) ...
++    assert tail[-1][0] > 0.99 * 0.6                                # ... and it does converge to it
++    # the pedal follows the ask, so it keeps rising after the raw ask has fallen: this IS the cost of case (c)
++    assert sum(1 for a, b in zip(tail[:-1], tail[1:]) if b[1] > a[1] + 1e-12) > 20
++    filt = getattr(gi, "filter_gas_rise", None)
++    assert filt is not None, "the rise filter must exist"          # value failure, not AttributeError, on 0040
++    assert filt(0.6, 0.4) == pytest.approx(0.4 + 0.2 * alpha, abs=2e-6)   # (c) from exactly the brief's numbers
++
++  def test_negative_input_corner_clamps_the_pedal_and_never_exceeds_off(self):
++    """Fable follow-up 2: raw -0.5 -> +0.5 at 20 m/s while the lagged ask is still NEGATIVE for a few hundred ms
++    (measured: 31 frames = 0.31 s). Through the real controller, in the configs the car runs: in the deployed and
++    cont_law arms the pedal law's negative branch commands EXACTLY zero pedal for that lagged ask, and on no frame is
++    ON above OFF. With the delivery law the negative branch IS the plateau floor by design (that law commands the
++    floor for any negative ask - OFF does the same when its own ask is negative), so ON sits on the floor, 2.55 LSB,
++    and is still never above OFF. That is the one place where "clamps to zero" is the switch's config, not the law."""
++    series = [(-0.5, 20.0, True, False, False, 255.)] * 100 + [(0.5, 20.0, True, False, False, 255.)] * 120
++    v = 20.0
++    # the deployed law's OWN zero crossing for a decel ask (pedal = scale*ask + hold, clipped at 0): at/below this the
++    # law commands exactly nothing, so that is the stretch where "the +0.5 raw ask has not leaked" is checkable.
++    zero_ask = -gi.get_hold_command(v) / gi.get_pedal_scale(v)
++    for name, kw in (("deployed", {}), ("cont_law", {"cont": True}), ("delivery", {"delivery": True})):
++      on = self._run(_get_ci_rise_combo(True, **kw), series)
++      off = self._run(_get_ci_rise_combo(False, **kw), series)
++      neg = sum(1 for o in on[100:] if o[0] < 0.)
++      assert neg > 20, (name, neg)                       # the corner is real: a few hundred ms of negative lagged ask
++      d = [o[1] - f[1] for o, f in zip(on, off)]
++      assert max(d) <= 0., (name, max(d))                # NEVER above the OFF pedal, on any frame
++      assert min(d) < -1e-3, name                        # ... and the lag is really in play (not vacuous)
++      if name == "delivery":
++        # this law's negative branch is the plateau floor by DESIGN (OFF commands the same floor for the same negative
++        # ask), so ON sits on the floor instead of 0 - and still under OFF, checked above.
++        assert 0. < max(o[1] for o in on[100:100 + neg]) < max(f[1] for f in off[100:100 + neg])
++      else:
++        deep = [o for o in on[100:100 + neg] if o[0] <= zero_ask]
++        assert len(deep) > 2, (name, len(deep))            # real deep-decel frames AFTER the raw ask went positive
++        assert all(o[1] == 0. for o in deep), (name, [o[1] for o in deep])   # ... and the pedal is EXACTLY 0 there
++      assert on[-1][1] > 0.                              # the pedal does come back once the ask is really positive
++
++  def test_lagged_ask_never_reaches_the_actuators_output_or_the_logged_accel(self):
++    """Fable follow-up 3: the lagged ask is LOCAL to the pedal law. The plan ask (`CC.actuators.accel`) is only read -
++    it is not rewritten - and the Actuators the car publishes/logs carries the RAW ask's own path (here the SCC
++    jerk-limited `actual_accel`, fed from CC.actuators.accel), never the lagged value. Checked field by field against
++    the OFF arm on a lagging series, so a drive can compare raw-ask variance ON vs OFF and see exactly zero
++    difference. (There is no log field for the lagged ask, and adding one is a cereal schema change - see
++    lane-Z4/STATE.md.)"""
++    series = [(0.0, 20.0, True, False, False, 255.)] * 20 + \
++             [(0.6, 20.0, True, False, False, 255.)] * 40 + \
++             [(-0.1, 20.0, True, False, False, 255.)] * 20 + \
++             [(0.9, 20.0, True, False, False, 255.)] * 40
++    on_ci, off_ci = self._ci(True), self._ci(False)
++    sp = self._sp(1)
++    lagging = 0
++    for i, (accel, v, active, brake, gas, vc) in enumerate(series):
++      rows = []
++      for CI in (on_ci, off_ci):
++        CC = structs.CarControl()
++        CC.enabled = CC.latActive = True
++        CC.longActive = bool(active)
++        CC.actuators.accel = float(accel)
++        CI.update([])
++        CI.CS.out.vEgo = float(v)
++        CI.CS.out.vCruise = float(vc)
++        CI.CS.out.brakePressed = bool(brake)
++        CI.CS.out.gasPressed = bool(gas)
++        acts, _ = CI.apply(CC.as_reader(), sp, i * int(DT_CTRL * 1e9))
++        assert float(CC.actuators.accel) == pytest.approx(accel, abs=1e-6)   # the plan ask is not rewritten (Float32)
++        lagged = getattr(CI.CC, "gas_ask", accel)                            # None on 0040 -> the raw ask
++        rows.append((acts, lagged))
++      on_acts, on_lagged = rows[0]
++      off_acts = rows[1][0]
++      for fld in ("accel", "gas", "brake", "torque", "torqueOutputCan", "speed"):
++        a, b = float(getattr(on_acts, fld)), float(getattr(off_acts, fld))
++        assert a == b, (fld, i, a, b)                                     # ON == OFF in every logged field
++      if on_lagged < accel - 1e-3:                                        # a frame the lag really is holding back
++        lagging += 1
++        assert float(on_acts.accel) != pytest.approx(float(on_lagged), abs=1e-6)   # the lagged ask is NOT logged
++    assert lagging > 20                                                  # not vacuous: the series does lag
++
 +  # ---- the switch, and OFF = the deployed path ----------------------------------------------------------------------
++
 +  def test_off_is_the_deployed_path_and_bypassing_the_lag_reproduces_it(self):
 +    series = ([(1.2, 1.0)] * 40 + [(0.0, 18.0)] * 60 +
 +              [(0.3 if k % 7 else 0.06, 25.0) for k in range(400)] +
