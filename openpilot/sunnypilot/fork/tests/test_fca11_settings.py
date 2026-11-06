@@ -2,6 +2,7 @@
 
 The raylib panel cannot run headless; this pins the decision it delegates to, plus a static check that the panel
 actually wires the shaping toggle to HyundaiFca11AffineGain through these functions."""
+import ast
 import itertools
 import re
 import unittest
@@ -165,9 +166,35 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)", self.src)
     self.assertIn("V3 NEVER acts on the car", self.src)
     self.assertIn("Data collection only", self.src)
-    self.assertIn("The car brakes exactly as today", self.src)
     self.assertIn("(OLD-LAW)", self.src)
+    self.assertIn("ON switches braking back to the OLD law", self.src)
     self.assertNotIn("you brake for every stop", self.src)   # the first build's FCA11-DISABLED reading is gone
+
+  def _description(self, var):
+    """The whole tr(...) string of a panel description (`shaping_desc`, `dynamic_desc`, `shadow_desc`)."""
+    blocks = re.findall(var + r" = tr\((.*?)\)\n", self.src, re.S)
+    self.assertTrue(blocks, f"no {var} description in the panel")
+
+    def join(node):
+      if isinstance(node, ast.Constant):
+        return node.value
+      if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return join(node.left) + join(node.right)
+      raise AssertionError(f"unexpected description node: {type(node).__name__}")
+
+    return join(ast.parse("(" + blocks[0] + ")", mode="eval").body)
+
+  def test_brake_law_descriptions_stay_in_step_with_the_two_states(self):
+    """SETTINGS TIDY (§2.3): the new continuous (linear) law is ON only with Brake Shaping AND Dynamic Brakes ON and
+    Shadow OFF, so flipping ANY of the three gives the OLD law - each of the three rows must say so, and the
+    next-ignition sentence must survive."""
+    for var in ("shaping_desc", "dynamic_desc", "shadow_desc"):
+      block = self._description(var)
+      self.assertIn("continuous (linear)", block, var)
+      self.assertIn("OLD law", block, var)
+      self.assertIn("ANY of the three", block, var)
+      self.assertIn("at the next ignition", block, var)
+    self.assertIn("ON switches braking back to the OLD law", self._description("shadow_desc"))
 
   def test_new_lane_toggles_wiring(self):
     """17c/18x: the three param-only lane switches are real UI toggles now, on the right keys and the right rules."""

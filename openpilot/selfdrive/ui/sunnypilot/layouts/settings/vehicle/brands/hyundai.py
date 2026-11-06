@@ -136,10 +136,11 @@ class HyundaiSettings(BrandSettings):
     # fork (0044): FCA11 Brake Shaping (Beta) - visible only with the pedal AND FCA11 Braking on, settable offroad only.
     shaping_state = fca11_shaping_toggle_state(pedal_raw, brake_raw, offroad)
     self.fca11_shaping_toggle.action_item.set_enabled(shaping_state.enabled)
-    shaping_desc = tr("Experimental: eases the FCA11 brake onset to match your own pedal feel (a gentle start, then " +
-                      "a smooth build) and asks for the braking level the car actually delivers. Hard stops are NOT " +
-                      "slowed: a firm brake request still ramps at full rate. Requires FCA11 Braking. Takes effect " +
-                      "at the next ignition.")
+    shaping_desc = tr("Experimental: with this ON the brake uses the NEW continuous (linear) law - a gentle onset, " +
+                      "then a smooth build, asking for the level the car actually delivers. Hard stops are NOT " +
+                      "slowed: a firm brake request still ramps at full rate. The new law needs this switch AND " +
+                      "Dynamic Brakes ON with FCA11 Shadow OFF; flipping ANY of the three puts braking back on the " +
+                      "OLD law. Requires FCA11 Braking. Takes effect at the next ignition.")
     if shaping_state.visible and not offroad:
       shaping_desc = offroad_hint + shaping_desc
     self.fca11_shaping_toggle.set_description(shaping_desc)
@@ -149,10 +150,11 @@ class HyundaiSettings(BrandSettings):
     # fork (0045): FCA11 Shadow (Log-Only) - visible with the pedal on, settable offroad only; next ignition.
     shadow_state = fca11_shadow_toggle_state(pedal_raw, offroad)
     self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)
-    shadow_desc = tr("Data collection only. The car brakes exactly as today: FCA11 Braking keeps using the current " +
-                     "law (OLD-LAW) if it is on, and nothing changes if it is off. Alongside, the new shaped law (V3) " +
-                     "is computed on every frame and written to a log on the device; V3 NEVER acts on the car. While " +
-                     "ON, Brake Shaping is ignored. Takes effect at the next ignition.")
+    shadow_desc = tr("Data collection only. ON switches braking back to the OLD law: the new continuous (linear) " +
+                     "law needs Brake Shaping AND Dynamic Brakes ON with this OFF, so with this ON the car brakes " +
+                     "exactly like the pre-shaping build (OLD-LAW) while the new law (V3) is still computed on every " +
+                     "frame and written to a log on the device. V3 NEVER acts on the car. Flipping ANY of the three " +
+                     "switches the brake law. Requires the comma pedal. Takes effect at the next ignition.")
     if shadow_state.visible and not offroad:
       shadow_desc = offroad_hint + shadow_desc
     self.fca11_shadow_toggle.set_description(shadow_desc)
@@ -190,10 +192,11 @@ class HyundaiSettings(BrandSettings):
     # fork (18x): Dynamic Brake Release - the FCA11 brake becomes a ramp; needs FCA11 Braking, offroad only.
     dynamic_state = fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)
     self.fca11_dynamic_release_toggle.action_item.set_enabled(dynamic_state.enabled)
-    dynamic_desc = tr("Makes the FCA11 brake a ramp instead of a switch in BOTH directions: every brake episode " +
-                      "starts at 1 LSB and climbs to the target (about 0.7 s to full), and decreases are rate-limited, " +
-                      "with a standstill release ramped out over 0.5 s and gas held at zero through it. An emergency " +
-                      "ask and a step demand still go at full rate. Requires FCA11 Braking. Takes effect at the next ignition.")
+    dynamic_desc = tr("Not a separate feel option: the brake has two states. The NEW continuous (linear) law - a " +
+                      "gentle 1 LSB onset, a ramp in BOTH directions, rate-limited falls and a soft standstill " +
+                      "release - runs only with this ON and Brake Shaping ON and FCA11 Shadow OFF; switching ANY of " +
+                      "the three puts braking back on the OLD law. An emergency ask and a step demand still go at " +
+                      "full rate. Requires FCA11 Braking. Takes effect at the next ignition.")
     if dynamic_state.visible and not offroad:
       dynamic_desc = offroad_hint + dynamic_desc
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)
