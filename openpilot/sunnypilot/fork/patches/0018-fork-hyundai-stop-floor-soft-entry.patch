@@ -1,0 +1,64 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 4c1650b..2b0d056 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -557,25 +557,36 @@ FCA11_MEAS_FLOOR_EXTRA = FCA11_MEAS_BITE + FCA11_MEAS_K * FCA11_MEAS_FLOOR_LSB /
+ # onset clamp; at <= 1.0 m/s, i.e. at every band speed, it IS 8, so the band stays byte-identical to 0054 there).
+ # The stop HOLD itself is untouched: a deployed request ABOVE the floor still commands what it commanded. ``None`` means
+ # "at speed" (>= 2.0 m/s) -> 4, so a caller with no speed gets the moving floor, which is what every pre-0055 pin means.
++# 2026-11-01 (owner: "brakes for holds hits too early, car isn't stopped so causes a big jerk"): the ramp used to reach the
++# 8 LSB stop floor at 1.0 m/s, i.e. BEFORE the 3 km/h band (0.83 m/s) - so the last 3 km/h of every stop entered the band
++# already commanding 7-8 LSB (~1.1-1.25 m/s^2) on a car that was still rolling, which is the bite. The ramp now finishes at
++# 0.4 m/s: at band entry it is 6 LSB, 5 at 1.0 m/s, and 4 (the moving floor) from 1.2 m/s up. The TRUE hold is untouched
++# (30 LSB, panda-max rise, latched at standstill) - this only softens the last metre of the approach.
+ FCA11_FLOOR_RAMP_TOP_MPS = 2.0   # at/above: FCA11_MEAS_FLOOR_LSB (4), the moving floor
+ FCA11_FLOOR_RAMP_BOT_MPS = 1.0   # at/below: FCA11_NORESPONSE_MIN_LSB (8), the stop-band hold floor
+ 
+ 
+-def fca11_floor_lsb(v_ego_mps=None) -> int:
++FCA11_FLOOR_RAMP_TOP_SOFT_MPS = 1.2   # 2026-11-01: the SOFT ramp (dynamic brakes ON only) - see fca11_floor_lsb(soft=True)
++FCA11_FLOOR_RAMP_BOT_SOFT_MPS = 0.4
++
++
++def fca11_floor_lsb(v_ego_mps=None, soft: bool = False) -> int:
+   """0055: the SPEED-INDEXED floor (LSB) of the measured law at ego speed ``v_ego_mps`` (m/s).
+ 
+-  v >= 2.0 -> 4 LSB; v <= 1.0 -> 8 LSB; in between, linear 4 -> 8 and rounded to the nearest LSB; None -> 4 (at speed).
++  v >= 1.2 -> 4 LSB; v <= 0.4 -> 8 LSB; in between, linear 4 -> 8 and rounded to the nearest LSB; None -> 4 (at speed).
+   A pure function of v: no state, no time term, same v always gives the same LSB. See the 0055 block above for the
+   ruling it implements, the measured table it interpolates and the jerk/roll-out arithmetic.
+   """
++  top, bot = ((FCA11_FLOOR_RAMP_TOP_SOFT_MPS, FCA11_FLOOR_RAMP_BOT_SOFT_MPS) if soft
++              else (FCA11_FLOOR_RAMP_TOP_MPS, FCA11_FLOOR_RAMP_BOT_MPS))
+   if v_ego_mps is None:
+     return FCA11_MEAS_FLOOR_LSB
+-  if v_ego_mps >= FCA11_FLOOR_RAMP_TOP_MPS:
++  if v_ego_mps >= top:
+     return FCA11_MEAS_FLOOR_LSB
+-  if v_ego_mps <= FCA11_FLOOR_RAMP_BOT_MPS:
++  if v_ego_mps <= bot:
+     return FCA11_NORESPONSE_MIN_LSB
+   moving, stop = float(FCA11_MEAS_FLOOR_LSB), float(FCA11_NORESPONSE_MIN_LSB)
+-  frac = (v_ego_mps - FCA11_FLOOR_RAMP_BOT_MPS) / (FCA11_FLOOR_RAMP_TOP_MPS - FCA11_FLOOR_RAMP_BOT_MPS)
++  frac = (v_ego_mps - bot) / (top - bot)
+   return int(round(stop + (moving - stop) * frac))
+ 
+ 
+@@ -2298,7 +2309,7 @@ class Fca11LongBrake:
+         self._feel_standstill_hold = True
+       dec = self._feel_band_clamp(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
+       if self.meas_inverse:
+-        band_floor = fca11_floor_lsb(None if v_kph is None else v_kph / 3.6)
++        band_floor = fca11_floor_lsb(None if v_kph is None else v_kph / 3.6, soft=self.dynamic_brakes)
+         dec = max(dec, min(band_floor, personality_max_dec(personality)))
+       dec = self._feel_band_clamp(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
+       if frame % FCA11_SEND_EVERY == 0:
+@@ -2369,7 +2380,7 @@ class Fca11LongBrake:
+     # 18x (a)/(a2): with the dynamic brakes ON the floor is lowered to the ramp's first level for EVERY target, so the
+     # ramp governs the onset at any depth instead of the level being lifted straight back to 4 on the next frame. The
+     # crawl floor below still applies as a max().
+-    floor = float(fca11_floor_lsb(v_mps) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB)
++    floor = float(fca11_floor_lsb(v_mps, soft=self.dynamic_brakes) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB)
+     if self.dynamic_brakes:
+       floor = min(floor, float(FCA11_DYN_GENTLE_FIRST_LSB))
+     # 18x (b) (d): at crawl the level is never in the half-applied 1-5 LSB band: the measured clutch reads -20 Nm (creep

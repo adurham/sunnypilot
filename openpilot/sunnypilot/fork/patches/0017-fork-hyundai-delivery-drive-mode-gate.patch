@@ -1,0 +1,149 @@
+diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
+index 54741ec..c315c8f 100644
+--- a/opendbc/car/hyundai/carcontroller.py
++++ b/opendbc/car/hyundai/carcontroller.py
+@@ -152,7 +152,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+                                             stopping, hud_control, actuators, CS, CC))
+ 
+       # comma pedal (no-op unless CP_SP.enableGasInterceptor)
+-      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame, now_nanos, CC_SP.personality))
++      can_sends.extend(GasInterceptorCarController.create_gas_command(self, CC, CS, self.frame, now_nanos, CC_SP.personality,
++                                                                     int(getattr(CC_SP, 'driveMode', 0) or 0)))
+       # engagement state the pause/resume button is judged against on the next CarState update (carstate_ext.py)
+       CS.pedal_long_engaged = CC.enabled
+ 
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 23908e1..4cd5152 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -165,6 +165,10 @@ class CarControlSP:
+   # fork (adurham): raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed) so the Hyundai pedal law can
+   # scale its ceilings/gains by the driver's feel dial. Defaults to STANDARD so no-arg construction is never aggressive.
+   personality: int = field(default=1)
++  # fork (adurham): raw CLU13 drive mode mirrored from CarStateSP.driveMode (1 normal / 2 eco / 3 sport / 6 N-custom /
++  # 7 N; 0 = unknown). The Hyundai pedal DELIVERY law is only valid in the mode it was measured in (NORMAL): the pedal
++  # map, and so the delivered decel for a given lift, changes with the mode. Defaults to 0 = unknown = deployed law.
++  driveMode: int = field(default=0)
+ 
+   @auto_dataclass
+   class Param:
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 32d4a97..6f08b94 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -28,6 +28,7 @@ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car import create_gas_interceptor_command
+ from opendbc.sunnypilot.car.hyundai.fca11_long import Fca11LongBrake
++from opendbc.sunnypilot.car.hyundai.drive_mode import DRIVE_MODE_NORMAL
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+ 
+ GAS_INTERCEPTOR_DBC = "hyundai_gas_interceptor_generated"
+@@ -579,7 +580,7 @@ class GasInterceptorCarController:
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+ 
+   def create_gas_command(self, CC: structs.CarControl, CS, frame: int, now_nanos: int = 0,
+-                         personality: int = PERSONALITY_STANDARD) -> list[CanData]:
++                         personality: int = PERSONALITY_STANDARD, drive_mode: int = 0) -> list[CanData]:
+     can_sends: list[CanData] = []
+     if not self.CP_SP.enableGasInterceptor:
+       return can_sends
+@@ -607,7 +608,13 @@ class GasInterceptorCarController:
+     # can zero or bypass the law (over-speed release, FCA11 brake, cal hold, cam-brake, gas override). It is cleared
+     # only by a disengage, so the hand-back from any of those zero states - and from a coast - is filtered as well
+     # (review C4.2; it used to be re-armed by every exact-zero command, i.e. exactly never where it mattered).
+-    if self.delivery_law:
++    # fork (adurham): the delivery law is a MEASURED inverse of the pedal plant, and that plant is the accelerator MAP,
++    # which Hyundai changes with the drive mode (ECO dulls it, SPORT sharpens it). The table was fit on route 17c, which
++    # ran in NORMAL (CarStateSP.driveMode == 1 for 96% of the engaged frames; the remaining aggressive-personality frames
++    # were all disengaged, so the whole fit is NORMAL). Applying it in another mode would command the wrong lift, so the
++    # measured law runs ONLY in NORMAL; ECO / SPORT / N and an undecoded mode (0) keep the deployed linear law.
++    delivery_on = self.delivery_law and int(drive_mode or 0) == DRIVE_MODE_NORMAL
++    if delivery_on:
+       self.delivery_ask = filter_delivery_ask(CC.actuators.accel, self.delivery_ask) if active else 0.
+ 
+     # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
+@@ -704,7 +711,7 @@ class GasInterceptorCarController:
+         # episode). Both are faded by the same weight as the law, so below 16 m/s the pedal path is the deployed one
+         # INCLUDING its ask and its fall behaviour. Positive asks - including exactly 0 - keep the RAW plan value, so
+         # that branch stays bit-identical to the deployed law too.
+-        if self.delivery_law:
++        if delivery_on:
+           weight = get_delivery_blend_weight(CS.out.vEgo)
+           ask = accel + weight * (self.delivery_ask - accel) if accel < 0. else accel
+           pedal_target = get_delivery_pedal_command(ask, CS.out.vEgo, personality)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index 53339a6..f9a637a 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -1829,7 +1829,14 @@ class TestPedalDelivery17c:
+     assert CP_SP.pedalDeliveryLaw is delivery
+     return CarInterface(CP, CP_SP)
+ 
+-  def _run(self, CI, series):
++  @staticmethod
++  def _sp(mode=1):
++    """CarControlSP with the drive mode the delivery law gates on (1 = NORMAL, the mode the table was measured in)."""
++    sp = structs.CarControlSP()
++    sp.driveMode = int(mode)
++    return sp
++
++  def _run(self, CI, series, mode=1):
+     """[(accel, v_ego, v_cruise_kph)] per 100 Hz frame -> [(raw, enable)] per 50 Hz send slot."""
+     out = []
+     for i, (accel, v, vc) in enumerate(series):
+@@ -1839,14 +1846,14 @@ class TestPedalDelivery17c:
+       CI.update([])
+       CI.CS.out.vEgo = float(v)
+       CI.CS.out.vCruise = float(vc)
+-      _, sends = CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
++      _, sends = CI.apply(CC.as_reader(), self._sp(mode), i * int(DT_CTRL * 1e9))
+       cmd = [d for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+       if cmd:
+         raw, _, en, _ = _cmd_fields(cmd[0])
+         out.append((raw, en))
+     return out
+ 
+-  def _run_gas(self, CI, series):
++  def _run_gas(self, CI, series, mode=1):
+     """[(accel, v_ego, v_cruise_kph)] per 100 Hz frame -> the controller's per-frame pedal command (before packing)."""
+     out = []
+     for i, (accel, v, vc) in enumerate(series):
+@@ -1856,7 +1863,7 @@ class TestPedalDelivery17c:
+       CI.update([])
+       CI.CS.out.vEgo = float(v)
+       CI.CS.out.vCruise = float(vc)
+-      CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
++      CI.apply(CC.as_reader(), self._sp(mode), i * int(DT_CTRL * 1e9))
+       out.append(CI.CC.gas)
+     return out
+ 
+@@ -1902,6 +1909,19 @@ class TestPedalDelivery17c:
+     # the filter is never advanced and the controller never enters the new branch
+     assert CI.CC.delivery_law is False and CI.CC.delivery_ask == 0.
+ 
++  def test_measured_law_is_gated_to_normal_mode(self):
++    """The inverse is a property of the ACCELERATOR MAP, which Hyundai changes with the drive mode (ECO dulls it, SPORT
++    sharpens it). The table was fit on route 17c, which ran in NORMAL, so ECO / SPORT / N / N-custom and an undecoded
++    mode (0) must keep the deployed linear law - the identical stream as the param being OFF."""
++    vs = self.SET_KPH * CV.KPH_TO_MS
++    series = ([(-0.05 if k % 3 else -0.30, vs, self.SET_KPH) for k in range(300)] +
++              [(-0.9, vs, self.SET_KPH)] * 40 + [(0.2, vs, self.SET_KPH)] * 60)
++    deployed = self._run_gas(self._ci(delivery=False), series)
++    for mode in (0, 2, 3, 6, 7):
++      assert self._run_gas(self._ci(delivery=True), series, mode=mode) == deployed, f"mode {mode} must keep the deployed law"
++    # and NORMAL really is the new law (otherwise the gate would be silently doing nothing)
++    assert self._run_gas(self._ci(delivery=True), series, mode=1) != deployed
++
+   # ---- the law ------------------------------------------------------------------------------------------------------
+   def test_drop_table_is_monotone_and_anchored(self):
+     assert list(gi.DELIVERY_ACCEL_BP) == sorted(gi.DELIVERY_ACCEL_BP)
+@@ -2194,7 +2214,7 @@ class TestPedalDelivery17c:
+       CC.actuators.accel = float(accel)
+       CI.update([])
+       CI.CS.out.vEgo, CI.CS.out.vCruise = v, vc
+-      CI.apply(CC.as_reader(), structs.CarControlSP(), i * int(DT_CTRL * 1e9))
++      CI.apply(CC.as_reader(), self._sp(), i * int(DT_CTRL * 1e9))
+       states.append(CI.CC.delivery_ask)
+       gas.append(CI.CC.gas)
+     assert max(states) < -0.15, max(states)                  # never re-seeded by the +0.02 frames (was 0.02)

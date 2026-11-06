@@ -1,0 +1,158 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -707,6 +707,16 @@
+ FCA11_SHADOW_ENV_REMOVED = "FCA11_SHADOW"
+ FCA11_V3_BUDGET_S = 0.003          # a V3 post-send step slower than this is an overrun (the 100 Hz frame is 10 ms)
+ FCA11_V3_OVERRUN_TRIP = 5          # CONSECUTIVE overruns before V3 is disabled for the ignition (each one is logged)
++# 0054: the shadow log's IDLE / availability trace. Route 16a: the per-frame trace only exists inside the shadow WINDOW
++# (V3/OLD-LAW braking, camera request, or a longActive release ask), so the whole 170 s "FCA11 Braking Unavailable"
++# window - raised 14:36:13, cleared 14:39:04 - fell between two file records and every flag a reader could see came
++# from the frames on either side of it. While the feature is ARMED but longitudinal is NOT active (and ALWAYS while
++# fca11_unavailable holds), the writer therefore emits one frame record every FCA11_SHADOW_IDLE_FRAMES controller frames
++# (50 = 0.5 s = 2 Hz) plus ONE immediately on every change of the diagnostic state tuple (see _shadow_diag_state), so an
++# availability loss is diagnosable from fca11-shadow.jsonl alone. Same record builder, same field names; the idle record
++# adds only `idle` + `diag` (see fca11_shadow_log.frame_idle). Pure logging: nothing here is read by a send decision or
++# an alert.
++FCA11_SHADOW_IDLE_FRAMES = 50     # 0.5 s at the 100 Hz controller rate (2 Hz idle record)
+ 
+ 
+ def shadow_enabled(CP_SP) -> bool:
+@@ -1131,6 +1141,10 @@
+     self._sh_episode_id = 0
+     self._sh_ep: dict | None = None
+     self._sh_prev_echo: list = []      # 0045 (V3 core only): synthetic ACCEPTED echoes of the previous frame's frames
++    # 0054: the IDLE availability trace (armed but longActive off, or fca11_unavailable): last frame an idle record went
++    # out, and the diagnostic state tuple it carried. Written by _shadow_record only; read by nothing else.
++    self._sh_idle_last_frame: int | None = None
++    self._sh_diag_prev: dict | None = None
+ 
+   # ---- window ----
+ 
+@@ -1775,6 +1789,53 @@
+                                    v3_send_wouldbe=bool(v3_sends), wouldbe_sends=tuple(v3_sends or ()),
+                                    oldlaw_cmd_lsb=ol_lsb, oldlaw_send=bool(ol), oldlaw_instant_lsb=int(inst))
+     self._shadow_record(accel, enabled, long_active, CS, frame, personality, accel_law)
++
++  def _shadow_diag_state(self, CS) -> dict:
++    """0054: the diagnostic tuple the IDLE availability trace watches (and embeds in every idle record as ``diag``).
++
++    These are the OLD-LAW instance's own availability inputs - the ones that actually raise/clear the driver-facing
++    "FCA11 Braking Unavailable" - NOT the V3 core's mirrors the frame record's ``hc_unavailable`` / ``hard_cut`` /
++    ``pedal_cut`` fields carry (V3 synthesises ACCEPTED echoes, so its refusal wall can never latch: route 16a's
++    ``fca11_unavailable`` was True for 170 s while those three fields read false). ``cam_quiet`` is BUCKETED
++    (2 = the camera is braking, 1 = its quiet tail is still running, 0 = quiet) so the once-per-camera-frame decay can
++    never trigger an edge on its own - the budget stays 2 Hz.
++    """
++    quiet = int(self._cam_quiet)
++    try:
++      gear = int(getattr(CS.out.gearShifter, "raw", CS.out.gearShifter))
++    except (TypeError, ValueError):
++      gear = -1
++    return dict(
++      fca11_unavailable=bool(self.fca11_unavailable), pedal_cut=bool(self._pedal_cut),
++      refused_cut=bool(self._refused_cut), cam_brake=bool(self.cam_brake),
++      cam_quiet=(0 if quiet >= FCA11_CAM_RESUME_FRAMES else (1 if quiet > 0 else 2)),
++      interceptor_state=int(getattr(CS, "interceptor_state", 0) or 0),
++      interceptor_fault_seen=bool(getattr(CS, "interceptor_fault_seen", False)),
++      brake_pressed=bool(CS.out.brakePressed), gas_pressed=bool(CS.out.gasPressed),
++      gear=gear,
++    )
++
++  def _shadow_idle_due(self, CS, frame: int, long_active: bool) -> bool:
++    """0054: is an IDLE (availability-trace) frame record due on THIS controller frame?
++
++    True while the feature is ARMED and either longitudinal is NOT active or the surfaced loss (fca11_unavailable)
++    stands; then one record every FCA11_SHADOW_IDLE_FRAMES (2 Hz) and, whatever the cadence, ONE on every change of the
++    _shadow_diag_state tuple. Called on EVERY frame, before the 50 Hz slot gate, so a change is logged on the tick it
++    happens. Cheap on the hot path: an armed + longActive + available frame returns after one boolean expression, and
++    nothing here is read by a send decision or an alert (a log must never change control).
++    """
++    if self.shadow_log is None or not self.shadow_log.enabled or self.shadow_log.truncated:
++      return False                    # nothing can be written: skip the tuple build entirely
++    if not (self.enabled and (not long_active or self.fca11_unavailable)):
++      return False
++    diag = self._shadow_diag_state(CS)
++    changed = self._sh_diag_prev is not None and diag != self._sh_diag_prev
++    self._sh_diag_prev = diag
++    last = self._sh_idle_last_frame
++    due = bool(changed or last is None or frame < last or (frame - last) >= FCA11_SHADOW_IDLE_FRAMES)
++    if due:
++      self._sh_idle_last_frame = int(frame)
++    return due
+ 
+   def _shadow_record(self, accel, enabled, long_active, CS, frame: int, personality, accel_law: float) -> None:
+     v3 = self._shadow_v3
+@@ -1794,7 +1855,12 @@
+                          n_sent=0, v3_min=None, v3_max=0, v3_last=0, oldlaw_instant_max=0, oldlaw_cmd_max=0,
+                          cap_hit_frames=0, held_band_frames=0, v_start_mps=v, v_min_mps=v, ask_min_mps2=accel_law,
+                          camera_request_seen=False, tier_cap=cap)
+-    if frame % FCA11_SEND_EVERY != 0 and not (self._sh_ep is not None and not v3_braking):
++    # 0054: the IDLE availability-trace decision is taken on EVERY frame (not only the 50 Hz slot) so a state change
++    # is recorded on the tick it happens; it is inert unless the feature is armed and either longitudinal is inactive
++    # or fca11_unavailable holds, and it never reaches past the shadow log.
++    idle_due = self._shadow_idle_due(CS, frame, long_active)
++    if frame % FCA11_SEND_EVERY != 0 and not (self._sh_ep is not None and not v3_braking) \
++       and not idle_due:
+       return   # frame records ride the 50 Hz send slot; an episode close is never missed
+     cam = getattr(CS, "fca11_cam_frame", None)
+     dat = cam[1] if cam is not None and len(cam[1]) == 8 else None
+@@ -1851,7 +1917,11 @@
+     )
+     if self.shadow_log is not None:
+       window = bool(v3_braking or self.braking or cam_req or (long_active and accel_law <= FCA11_BRAKE_RELEASE_ACCEL))
+-      self.shadow_log.frame(rec, window)
++      if window or not idle_due:
++        self.shadow_log.frame(rec, window)        # the windowed 50 Hz trace, byte-for-byte as before
++      else:
++        # 0054: the IDLE record - the SAME record, written outside the window, plus `idle` and the diagnostic tuple.
++        self.shadow_log.frame_idle(dict(rec, idle=True, diag=self._sh_diag_prev))
+     if ep is not None and not v3_braking:
+       ep.update(frame_end=int(frame), t_wall_end=time.time(), duration_s=round((frame - ep["frame_start"]) * 0.01, 2),
+                 v_end_mps=v, end_reason=(why or "release"), v3_min=(ep["v3_min"] or 0))
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+@@ -44,6 +44,14 @@
+                  vRel = vLead - vEgo (< 0 = CLOSING); no lead => lead_present False and every other lead_* null (never 0);
+                  low-quality leads are NOT filtered: lead_model_prob / lead_radar are logged raw for an offline gate.
+     tier_cap, personality, episode_id (V3 would-be episode; null outside one)
++            0054: while the feature is ARMED but longitudinal is NOT active (and always while fca11_unavailable holds) a
++            2 Hz IDLE record is emitted outside this window (see ``ShadowLogger.frame_idle``) so an availability loss is
++            visible in the log. An idle record is the same ``k="f"`` frame record (same builder, same field names) plus
++            ``idle`` = true and ``diag`` = the OLD-LAW availability tuple {fca11_unavailable, pedal_cut, refused_cut,
++            cam_brake, cam_quiet (0 quiet | 1 tail | 2 camera braking), interceptor_state, interceptor_fault_seen,
++            brake_pressed, gas_pressed, gear}: one every 0.5 s, plus one on every change of that tuple. The windowed
++            records are unchanged - byte for byte and at 50 Hz - and an idle record never carries a field the windowed
++            one lacks.
+   k="ep"     one EPILOGUE per V3 would-be episode (V3 braking true -> false): episode_id, frame/t bounds, duration_s,
+              n_frames, n_sent, v3 min/max/last, oldlaw_instant max, oldlaw_cmd max, cap-hit and hold-band frame counts,
+              v start/min/end, ask min, camera_request_seen, end_reason, tier_cap.
+@@ -214,6 +222,27 @@
+       if len(self._pre) > FCA11_SHADOW_CONTEXT_RECORDS:
+         self._pre.pop(0)
+ 
++  def frame_idle(self, rec: dict) -> None:
++    """0054: one IDLE frame record, written OUTSIDE the shadow window - the availability trace.
++
++    ``fca11_long._shadow_record`` calls this at 2 Hz (plus one on every change of its diagnostic state tuple) while the
++    feature is ARMED but longitudinal is NOT active, and always while ``fca11_unavailable`` holds. Route 16a: the
++    windowed trace above stops the moment nothing is braking, so a 170 s "FCA11 Braking Unavailable" window (raised
++    14:36:13, cleared 14:39:04) fell entirely between two records and could not be read from the log at all. The record
++    is the SAME frame record (same builder, same field names, same schema) plus two keys the caller adds: ``idle``
++    (True) and ``diag`` (the OLD-LAW availability tuple - the flags that actually raise the alert, which the frame
++    record's V3 mirrors can never show).
++
++    The 1 s pre-context ring is DROPPED here: everything in it is OLDER than this record, so flushing it later (on a
++    window opening) would both break the log's time order and blow the 2 Hz byte budget. Flushed immediately - at 2 Hz
++    that is one small append, and a drive that ends abruptly still keeps its last 0.5 s.
++    """
++    if not self.enabled or self.truncated:
++      return
++    self._pre = []
++    self.write(dict(rec, k="f"))
++    self.flush()
++
+   def epilogue(self, rec: dict) -> None:
+     self.write(dict(rec, k="ep"))
+     self.flush()

@@ -1,0 +1,17 @@
+# offload artifacts that are regenerable / environment-specific — keep them out of git.
+__pycache__/
+*.pyc
+
+# Mac-side built decoder (rebuild: xcrun swiftc -O openpilot/offload/mac/vtdec.swift -o openpilot/offload/mac/vtdec)
+mac/vtdec
+
+# bench/log outputs
+mac/logs/
+replay/reports/
+replay/fixtures/
+
+# platform-specific compiled model artifacts (regenerate per INTERFACES §4; see models/sha256sums.txt)
+models/*.pkl
+models/*.pkl.chunk*
+models/*.pkl.unchunked
+models/*.onnx

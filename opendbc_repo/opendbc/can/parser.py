@@ -137,6 +137,13 @@ class CANParser:
     self.can_invalid_cnt: int = CAN_INVALID_CNT
     self.last_nonempty_nanos: int = 0
     self._last_update_nanos: int = 0
+    # fork: opt-in raw-frame capture (hyundai FCA11 long braking mirrors the camera's 0x38D byte-for-byte, so the
+    # car layer needs the raw bytes, not just the decoded signals). Empty = no cost in the hot loop.
+    self.capture_addrs: set[int] = set()
+    self.captured: dict[int, tuple[int, bytes]] = {}
+    # fork (0053): EVERY captured frame of the last update() call, in arrival order. The FCA11 camera hand-back counts
+    # camera FRAMES exactly like the panda does, so it must not see only the newest one per tick.
+    self.captured_all: dict[int, list[tuple[int, bytes]]] = {}
 
   def _add_message(self, name_or_addr: str | int, freq: int | None = None) -> None:
     if isinstance(name_or_addr, numbers.Number):
@@ -205,6 +212,8 @@ class CANParser:
     for addr in self.addresses:
       for k in self.vl_all[addr]:
         self.vl_all[addr][k].clear()
+    if self.capture_addrs:
+      self.captured_all = {}
 
     updated_addrs: set[int] = set()
     for entry in strings:
@@ -215,6 +224,10 @@ class CANParser:
         if src != self.bus:
           continue
         bus_empty = False
+        if self.capture_addrs and address in self.capture_addrs:
+          # fork: keep the newest raw frame for the mirrored-address consumers (FCA11 long braking)
+          self.captured[address] = (t, bytes(dat))
+          self.captured_all.setdefault(address, []).append(self.captured[address])
         state = self.message_states.get(address)
         if state is None or len(dat) > 64:
           continue
