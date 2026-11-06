@@ -282,13 +282,17 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # after FCA11_HOLD_NAG_LOUD_S the nag becomes loud and re-chimes every FCA11_HOLD_NAG_REPEAT_S. NOTHING HERE CAPS THE
   # HOLD: the brake command keeps flowing and the hold stays on the wire until the driver brakes / shifts / disengages.
   # Raised from CarStateSP.holdNag (opendbc half: Fca11LongBrake.hold_nag, a pure observer of the SENT level).
-  #   soft - LOW, silent, small: a notice, never in the way of steering.
+  #   soft - LOW, silent, MID: a notice, never in the way of steering. `mid`, not `small` (review D4): the second line
+  #          is the part that explains WHY the banner appeared, and the renderer never draws a `small` alert's text_2 -
+  #          the upstream invariant is explicit (selfdrived/tests/test_alerts.py: `small` => text_2 empty, `mid` =>
+  #          text_2 non-empty), the same rule NormalPermanentAlert applies. Dropping the line instead would have been
+  #          the other honest fix; keeping it is worth one extra line at a stop the driver is being asked to take over.
   #   loud - HIGH (below BRAKE NOW's HIGHEST so a real brake fault still wins), audible, 3 s at the head of each
   #          repeat period, then back to the soft banner for the rest of it.
   EventNameSP.fca11HoldNagSoft: {
     ET.WARNING: Alert("Stopped - press brake to keep holding",
                       "FCA11 has held this stop for over 2 minutes",
-                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+                      AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
   },
 
   EventNameSP.fca11HoldNagLoud: {

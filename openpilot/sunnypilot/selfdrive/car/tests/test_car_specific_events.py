@@ -211,4 +211,8 @@ class TestFca11HoldNagEvents:
     assert loud.audible_alert != soft.audible_alert
     assert soft.audible_alert == 0
     assert "press brake" in soft.alert_text_1.lower()
+    # D4: the soft banner's second line is DRAWN only if the size says so - upstream's rule is `small` => text_2 empty,
+    # `mid` => text_2 non-empty (selfdrived/tests/test_alerts.py). A small soft alert would silently drop the line.
+    assert soft.alert_size == log.SelfdriveState.AlertSize.mid
+    assert soft.alert_text_2
     assert loud.priority < EVENTS_SP[EventNameSP.fca11BrakeNow][ET.PERMANENT].priority   # a real fault outranks a nag

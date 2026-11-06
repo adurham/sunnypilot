@@ -173,7 +173,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,326 @@
 +"""
 +0041: the standstill HOLD COUNTDOWN + escalating driver nag (fca11_long.py).
 +
@@ -186,6 +186,7 @@ new file mode 100644
 +stop-hold lane's tests do, and reads the state the superproject publishes (CarStateSP.holdNag) plus the level that
 +actually went out on the wire.
 +"""
++import hashlib
 +import unittest
 +
 +from opendbc.car import structs
@@ -197,6 +198,9 @@ new file mode 100644
 +                     int(getattr(fl, "FCA11_HOLD_NAG_LOUD", 2)))
 +# SENT frames per second is the counting unit: 100 Hz controller / FCA11_SEND_EVERY == 2.
 +SENT_PER_S = float(getattr(fl, "FCA11_HOLD_NAG_SENT_HZ", 50.0))
++# the arming level, read defensively so the GOLDEN test fails on its claims (the nag never runs) and not on an
++# AttributeError when it is run against the pre-0041 tree - same rule as NONE/SOFT/LOUD above.
++ARM_LSB = int(getattr(fl, "FCA11_HOLD_NAG_MIN_LSB", 20))
 +
 +
 +def _cp_sp(fca11=True):
@@ -206,11 +210,14 @@ new file mode 100644
 +  return cp_sp
 +
 +
-+def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None):
++def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None,
++          engaged=True, long_active=True):
 +  """Run n controller frames of a steady standstill hold. Returns [(frame, wire level, hold_nag)] for SENT frames.
 +
 +  `ask` is the planner ask; at a standstill a gentle ask (-0.30) holds ~8 LSB (the band floor) and a firm one (-2.0)
 +  holds 30 LSB, which is the regime the countdown is about. The camera is fresh on every frame.
++  `engaged`/`long_active` feed CarControl as-is: a disengaged frame is how a test delivers the driver's resume edge
++  (the only thing that clears a `_driver_cut` latch, exactly as the panda re-arms on it).
 +  """
 +  if record is None:
 +    record = []
@@ -218,7 +225,7 @@ new file mode 100644
 +    cs = _CS(v_ego=v, cam=(0, CAM), standstill=standstill, a_ego=-1.5 if ask < 0 else 0.3,
 +              brake=brake_pressed, gear=gear or structs.CarState.GearShifter.drive)
 +    cs.fca11_wheel_max_kph = v * 3.6
-+    sends = brake.update(_cc(ask), cs, f)
++    sends = brake.update(_cc(ask, engaged=engaged, long_active=long_active), cs, f)
 +    if record is not None:
 +      # getattr: on the pre-0041 tree the state does not exist, and the behavioural tests must then fail on the VALUE
 +      # (it never nags) rather than on an AttributeError - the same standard lane V was reviewed against.
@@ -328,15 +335,35 @@ new file mode 100644
 +
 +  def test_d_the_driver_brake_takes_over_and_resets_the_countdown(self):
 +    """The nag exists to hand the hold to the driver's foot: brakePressed drops it on the same frame and starts a new
-+    countdown, so a later hold must run its own full 120 s."""
++    countdown, so a later hold must run its own full 120 s of SENT frames.
++
++    D1: the brake press also latches `_driver_cut`, which NOTHING clears but a `CC.enabled` False -> True edge on a
++    clean frame (the panda's own re-arm rule, fca11_long.py update()). Without that edge the second hold sends
++    nothing at all and the old `{NONE}` assertion here was vacuous by construction. So the test now delivers the
++    resume edge the driver really makes, asserts the latch is gone AND that the re-hold is a genuine hold on the
++    wire, and pins soft to the 6000th armed (>= FCA11_HOLD_NAG_MIN_LSB) SENT frame of the new episode.
++    """
 +    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
 +    rec = _hold(brake, int(121 * 100))
 +    self.assertEqual(SOFT, rec[-1][2])
 +    rec_b = _hold(brake, 10, brake_pressed=True, start=12100)
 +    self.assertEqual({NONE}, {nag for _f, _s, nag in rec_b})
 +    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
-+    rec2 = _hold(brake, int(119.5 * 100), start=12110)
-+    self.assertEqual({NONE}, {nag for _f, _s, nag in rec2})
++    # the driver re-engages: one disengaged frame, then engaged again - the only path that re-arms the driver cut
++    _hold(brake, 2, start=12110, engaged=False, long_active=False)
++    self.assertTrue(bool(getattr(brake, "_driver_cut", False)), "the brake must still be latching the cut here")
++    _hold(brake, 2, start=12112)
++    self.assertFalse(bool(getattr(brake, "_driver_cut", True)), "the re-engage edge must re-arm the driver cut")
++    # the re-hold is a real STANDSTILL HOLD, not the vacuous zero-frame stream the old test asserted on
++    rec2 = _hold(brake, int(130 * 100), start=12114)
++    levels2 = [lv for _f, lv in _levels(rec2)]
++    self.assertGreaterEqual(len(levels2), 6000, "the re-engaged hold must actually be on the wire")
++    self.assertGreaterEqual(max(levels2), fl.FCA11_HOLD_NAG_MIN_LSB)
++    f_soft2 = _first_nag(rec2, SOFT)
++    self.assertIsNotNone(f_soft2)
++    armed2 = [(f, lv) for f, lv in _levels(rec2) if lv >= fl.FCA11_HOLD_NAG_MIN_LSB]
++    self.assertEqual(6000, sum(1 for f, _lv in armed2 if f <= f_soft2),
++                     "the new episode must count its own 6000 armed sent frames")
 +
 +  def test_e_expiry_never_releases_the_hold(self):
 +    """THE hard rule: at 120 s, at 180 s and 60 s after that the level on the wire is still the full hold. A released
@@ -357,9 +384,13 @@ new file mode 100644
 +    self.assertEqual(30, by_t[sent])
 +
 +  def test_f_the_nag_changes_no_wire_byte(self):
-+    """Golden stream: the same 240 s hold run twice through the REAL class, once with the escalation neutralised
++    """Golden stream, LOCAL: the same 240 s hold run twice through the REAL class, once with the escalation neutralised
 +    (hold_nag_level pinned to 0). Every 0x38D byte and every frame number must be identical, and the level must not
-+    move across the 120 s / 180 s boundaries in the normal run."""
++    move across the 120 s / 180 s boundaries in the normal run.
++
++    This is a within-tree check and cannot catch a side effect _hold_nag_step would have in BOTH runs - the
++    CROSS-TREE pin (and the writes-anything check) is TestGoldenStreamOnThe0040Base.test_h below.
++    """
 +    real = fl.hold_nag_level
 +    try:
 +      normal = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
@@ -377,6 +408,94 @@ new file mode 100644
 +    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
 +    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
 +    self.assertEqual([], _wire(rec))
++
++
++# *** D2: the GOLDEN taken from the 0040 BASE, not from this tree. ***
++# The two 240 s streams above run in THIS tree, so a side effect _hold_nag_step had on the law would appear in both
++# runs and cancel out. These pins cannot: they were taken by running the SAME script through the 0040 BASE class
++# (/tmp/W-fresh = aa9bff6f + the 38 patches before 0041), where the countdown does not exist at all. So the whole
++# stream - frame number + every 0x38D byte, 35 753 sent frames - is byte-for-byte what the deployed tree puts on the
++# wire. Re-measured identically on e2dab20e7f and on this commit.
++# WHICH writes it catches (measured, not argued): the hold CEILING (FCA11_STANDSTILL_HOLD_LSB written down to 20), the
++# actuation GATE (self._actuating = False) and the panda's rate REFERENCE (self._dec_last_sent = 0) each change the
++# sha256 or the sent count and fail this test. What it does NOT catch, because nothing can: in a TRUE standstill hold
++# the commanded level is pinned to the hold ceiling by the law's own `max(target, hold)` blend, so a write to a shaping
++# accumulator (`_shape_acc`, `_feel_acc`, `_cont_q_*`, `_rel_acc`) is inert by construction - it is overwritten before
++# it can reach the wire. That is also why the base and the new stream are identical on this scenario at all.
++GOLDEN_0040_SHA256 = "133319d868752ebf419a9a1e181590b74ca44e8828c74f1cf4643dce490db0de"
++GOLDEN_0040_SENT_FRAMES = 35753
++GOLDEN_SOFT_FRAME = 12502          # absolute controller frame of the first soft state: 12 002 sent frames into the 130 s hold
++GOLDEN_LOUD_ONSETS = (31546, 51806, 70908)   # 180.06 s into each of the three holds that follow a reset
++GOLDEN_NAG_AT_PHASE_END = (0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)   # brake, gas, N and disengage each drop the nag to 0
++# approach 5 s; hold 130 s; brake tap; re-engage; hold 200 s; gas; N; re-engage; hold 190 s; disengage; hold 190 s;
++# launch. 722 s, 72 200 controller frames at 100 Hz.
++GOLDEN_SCRIPT = (
++  (5, {"v": 3.0, "ss": False, "ask": -1.5}),
++  (130, {}),
++  (0.3, {"brake": True}),
++  (0.1, {"eng": False, "long": False}),
++  (200, {}),
++  (0.5, {"gas": True}),
++  (2, {"gear": structs.CarState.GearShifter.neutral}),
++  (0.1, {"eng": False, "long": False}),
++  (190, {}),
++  (1, {"long": False, "eng": False}),
++  (190, {}),
++  (3, {"v": 2.0, "ss": False, "ask": 0.5}),
++)
++
++
++class TestGoldenStreamOnThe0040Base(unittest.TestCase):
++  """D2: the CROSS-TREE golden. A >= 240 s standstill hold with every reset event, driven through the REAL class, and
++  the 0x38D stream it produces hashed against the one the 0040 base produces."""
++
++  def test_h_a_722_s_scripted_hold_reproduces_the_0040_base_bytes(self):
++    """The exact scenario Opus replayed across trees, through the real class: approach; 130 s hold (soft); driver
++    brake; re-engage; 200 s hold - loud at 180 s and its 3 s re-chime; gas; N; re-engage; 190 s; disengage; 190 s;
++    launch. Frame number + bytes of all 35 753 sent 0x38D frames must hash to the sha256 the 0040 BASE produces, and
++    the nag must actually run (soft, three loud onsets) or the byte identity would be about a stream this feature
++    never sees.
++    """
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    # the optional per-frame logs are not part of the wire and are left off in the pinned run
++    brake._dyn_log = None
++    brake._mark_log = None
++    h = hashlib.sha256()
++    sent = armed = 0
++    frame = 0
++    nag = []
++    for dur, kw in GOLDEN_SCRIPT:
++      for _ in range(int(dur * 100)):
++        v = kw.get("v", 0.0)
++        cs = _CS(v_ego=v, cam=(0, CAM), standstill=kw.get("ss", True),
++                 a_ego=-1.5 if kw.get("ask", -2.0) < 0 else 0.3,
++                 brake=kw.get("brake", False), gear=kw.get("gear", structs.CarState.GearShifter.drive))
++        cs.out.gasPressed = kw.get("gas", False)
++        cs.fca11_wheel_max_kph = v * 3.6
++        cc = _cc(kw.get("ask", -2.0))
++        cc.longActive = kw.get("long", True)
++        cc.enabled = kw.get("eng", True)
++        for s in brake.update(cc, cs, frame):
++          if s.address == fl.FCA11_ADDR:
++            h.update(frame.to_bytes(4, "little") + bytes(s.dat))
++            sent += 1
++            armed += fl._get_bits(s.dat, 8, 8) >= ARM_LSB
++        nag.append(int(getattr(brake, "hold_nag", NONE)))
++        frame += 1
++    self.assertEqual(GOLDEN_0040_SENT_FRAMES, sent)
++    self.assertEqual(GOLDEN_0040_SHA256, h.hexdigest(),
++                     "the 0041 nag must not change ONE byte of the 0040 stream")
++    # the stream IS a real hold (Opus: >= 20 LSB on 99 % of sent frames), so the identity above means something
++    self.assertGreaterEqual(armed, int(0.99 * sent))
++    # and the countdown really ran across that stream: soft, then a loud onset in each of the three later holds
++    self.assertEqual(GOLDEN_SOFT_FRAME, nag.index(SOFT) if SOFT in nag else None)
++    self.assertEqual(list(GOLDEN_LOUD_ONSETS),
++                     [i for i in range(1, len(nag)) if nag[i] == LOUD and nag[i - 1] != LOUD])
++    ends, stop = [], 0
++    for dur, _kw in GOLDEN_SCRIPT:
++      stop += int(dur * 100)
++      ends.append(nag[stop - 1])
++    self.assertEqual(list(GOLDEN_NAG_AT_PHASE_END), ends)
 +
 +
 +if __name__ == "__main__":
