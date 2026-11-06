@@ -1,7 +1,7 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-@@ -304,12 +304,15 @@
+@@ -304,12 +304,17 @@
  
  
  def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launching: bool = False,
@@ -13,13 +13,15 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
    because hold(v_now) > gas_last by ~1e-5 re-entered the branch every frame). At/above the hold the normal rate takes
 -  over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter."""
 +  over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter.
-+  small_falls=False (0042-Z, while the rise lag is transparent): the small-fall walk below is skipped. The walk's
-+  floor is gas_last, so with a LAGGED gas_last it could hold the pedal above what the unlagged law commands; skipping
-+  it is what makes "lagged pedal <= unlagged pedal on every frame" true (Opus defect 1)."""
++  small_falls=False (0042-Z, whenever the rise lag is ON): the small-fall walk below is skipped on EVERY frame, not only
++  on the transparent ones. The walk's floor is gas_last, so with a LAGGED gas_last it can hold the pedal above what the
++  unlagged law commands; skipping it is what makes "lagged pedal <= unlagged pedal on every frame" true (Opus defect 1).
++  Gating it on `_gas_lagging` alone left 4 frames +4.8 LSB (Opus re-review N2): with the delivery law the PEDAL target
++  can fall on a frame whose plan ask is still rising, i.e. a lagging frame, and the walk then held the lift back."""
    limit = gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL
    if reentry and not launching and v_ego >= PEDAL_REENTRY_V_MIN:
      hold = get_hold_command(v_ego)
-@@ -323,7 +326,7 @@
+@@ -323,7 +328,7 @@
    # feels like. A fall of up to PEDAL_FALL_BLIP_LSB is now walked down at the mirror rate instead of dropping at once.
    # Anything bigger - a real lift, an FCA11/cal/cam-brake zero, a disengage, the over-speed release - is untouched:
    # those are either > 8 LSB or an exact zero, and a zero target still falls in one frame (safety direction).
@@ -28,28 +30,33 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      gas_out = max(gas_out, gas_last - get_pedal_rate_down(v_ego) * DT_CTRL)
    return gas_out
  
-@@ -486,6 +489,45 @@
+@@ -484,8 +489,51 @@
+   if accel <= accel_prev:
+     return float(accel)
    return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / DELIVERY_ASK_TAU_S)))
- 
- 
++
++
 +# *** 0042-Z: RISE-ONLY FIRST-ORDER LAG ON THE ACCEL ASK (param HyundaiGasRiseLag, default OFF) ***
 +# Lane Y (BRIEF-Y / YREPORT.md, routes 198 Normal + drive 197) measured the small gas moves: they are REAL 1.3-2 s
 +# planner requests of 0.1-1.0 m/s^2 that the pedal reproduces with 0.04 s lag and 0.57 % mean error, so no pedal-side
 +# slew, deadband or quantised-demand threshold can remove them (a 1.48 m/s^3 jerk limit keeps 94 % of the swing). The
 +# only lever that cuts them is the ASK. A first-order lag on the ask takes the top off a RISE in exchange for lag ON
 +# THAT RISE ONLY: a FALL passes through unchanged, so lifting off is never delayed.
-+# The guarantee holds in the PEDAL domain too (Opus review of 0042, defect 1): while the lag is on, the small-fall blip
-+# walk below is SKIPPED on every frame the filter is transparent (ask <= previous ask). Its floor is the previous
-+# PEDAL command, and a lagged previous command is what made the walk hold the pedal up to 8 LSB ABOVE the unlagged
-+# law for up to 13 frames after a fall (probe: v=15, ask 0 -> +0.2 for 0.2 s -> -0.1, ON 0.104 vs OFF 0.075). With the
-+# walk skipped the lagged pedal is <= the unlagged pedal on every frame: the lag can only hold a rise back.
++# The guarantee holds in the PEDAL domain too (Opus reviews of 0042, defects 1 and N2): while the lag is on, the
++# small-fall blip walk below is SKIPPED on EVERY frame (not only where the filter happens to be transparent - a lagging
++# frame can still carry a FALLING pedal target under the delivery law). Its floor is the previous PEDAL command, and a
++# lagged previous command is what made the walk hold the pedal up to 8 LSB ABOVE the unlagged law for up to 13 frames
++# after a fall (probe: v=15, ask 0 -> +0.2 for 0.2 s -> -0.1, ON 0.104 vs OFF 0.075). With the walk off the lagged pedal
++# is <= the unlagged pedal on every frame: the lag can only hold a rise back.
 +# Continuous in the ask: no threshold, no bucket, no deadband, and no threshold on the DEMAND either.
-+# Lane Z's own 5 worst blips (q3_traces.txt) swing -22 / -11 / -17 / 0 / +77 % - one of the five grows, so tau is NOT a
-+# flat percentage cut (the "35 % cut" this code used to quote was lane Y's step-response figure, not this measure).
++# Lane Z's own 5 worst blips (q3_traces.txt = lane Y's Q2 windows, re-run at the SHIPPED tau 0.45 in traces_Z.py:
++# 0.339 -> 0.360 / 0.130 -> 0.122 / 0.268 -> 0.200 / 0.030 -> 0.042 / 0.576 -> 0.541 m/s^2) swing +6 / -6 / -25 / +38 /
++# -6 % - one of the five grows, so tau is NOT a flat percentage cut (the "35 % cut" this code used to quote was lane
++# Y's step-response figure, not this measure; the earlier -22/-11/-17/0/+77 list was the 0.6 s arm and is superseded).
 +GAS_RISE_LAG_TAU_S = 0.45    # s; first-order time constant of a rise (0.45 = the 0.6 blip counts, less error and lag)
 +GAS_RISE_LAG_RESET_V = 0.2   # m/s; at/below this the state re-seeds to the current ask (== FCA11_STOP_HOLD_V_MAX_MPS)
-+
-+
+ 
+ 
 +def filter_gas_rise(accel: float, accel_prev: float, dt: float = DT_CTRL,
 +                    tau: float = GAS_RISE_LAG_TAU_S, reset: bool = False) -> float:
 +  """0042-Z: rise-only first-order lag on the accel ask, in the ASK domain (m/s^2). Time-based (dt, seconds).
@@ -61,8 +68,9 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
 +  episode, driver gas/brake takeover, standstill) so no stale value is ever carried into a new episode AND the first
 +  active frame is not a rise from the 0 that LongControl sends while inactive.
 +  PEDAL domain: this function alone only bounds the ASK. The pedal guarantee (lagged pedal <= unlagged pedal on every
-+  frame) needs the controller's small-fall walk to be off while this filter is transparent - see
-+  rate_limit_pedal_command(small_falls=...).
++  frame) needs the controller's small-fall walk to be OFF on every frame while this filter is on - see
++  rate_limit_pedal_command(small_falls=...). It is gated on the SWITCH, not on this frame's lag activity: a lagging
++  frame can still carry a FALLING pedal target (the delivery law's shallower ask), and the walk would hold that lift.
 +  """
 +  if reset:
 +    return float(accel)
@@ -74,7 +82,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
  def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
    """The measured-inverse law alone (blend weight 1). Accelerator only: <= 0 means the plateau floor or a coast,
    never brake."""
-@@ -604,6 +646,11 @@
+@@ -604,6 +652,11 @@
      # unless CP_SP.pedalDeliveryLaw is set, so the OFF path stays byte-for-byte the deployed one.
      self.delivery_law = bool(getattr(CP_SP, 'pedalDeliveryLaw', False))
      self.delivery_ask = 0.
@@ -86,7 +94,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      self.interceptor_ids = get_interceptor_ids(CP_SP)
      self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
      self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
-@@ -670,6 +717,29 @@
+@@ -670,6 +723,30 @@
      if delivery_on:
        self.delivery_ask = filter_delivery_ask(CC.actuators.accel, self.delivery_ask) if active else 0.
  
@@ -99,8 +107,9 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
 +    # frame was a rise FROM 0 (Opus defect 3: 20 m/s, raw 0.5 -> gas_ask 0.0083). Re-seeding on the first active frame
 +    # makes rolling re-engagement start at that frame's own ask. The state therefore never carries a stale value into
 +    # a new episode (the 0040 trim lesson: reset on every episode close and veto).
-+    # `self._gas_lagging` = this frame's ask is actually held back by the filter (a rise), and the pedal limiter below
-+    # must keep its small-fall walk OFF on the frames where it is not (Opus defect 1 - see that call).
++    # `self._gas_lagging` = this frame's ask is actually held back by the filter (a rise). It is DIAGNOSTIC: the pedal
++    # limiter's small-fall walk is gated on the SWITCH, not on this flag (Opus re-review N2 - a lagging frame can still
++    # carry a falling pedal target, and the walk would then hold the lift back).
 +    # OFF = `ask` is the raw planner ask and not one frame of the path below changes.
 +    ask_raw = float(CC.actuators.accel)
 +    if self.gas_rise_lag:
@@ -116,7 +125,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
      # command is hard-zeroed this frame (gas and brake are never commanded together) and the pedal stream keeps
      # flowing (zero frames), which also keeps the pedal fault-clear path alive.
-@@ -745,15 +815,20 @@
+@@ -745,36 +822,46 @@
        self.gas = 0.
        self.gas_launching = False
      elif active and not self.fca11_brake.gas_hold and not self.fca11_brake._cal_active:
@@ -140,13 +149,23 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
        if self.overspeed_released:
          self.gas = 0.
          self.gas_launching = False
-@@ -766,15 +841,16 @@
+-      elif self.fca11_brake.cont_law and accel < 0.:
++      elif self.fca11_brake.cont_law and accel_raw < 0.:
+         # 0037: the continuous negative branch. One straight line in the ASK domain from hold_cmd(v) at ask 0 to EXACTLY
+         # 0 at ask = -coast(v), then 0 for every deeper ask: engine braking modulated, then the true coast, then the brake
+         # law (which leaves 0 on the same curve). It replaces the deployed/delivery pair on this path - and with it the
+         # delivery law's plateau floor and its hard 0 at |ask| >= 0.52 (DELIVERY_COAST_ACCEL), the only step in the gas
+         # law (DESIGN.md §1). The rise/fall limiter is the SAME one (a fall inside 8 LSB is walked at PEDAL_JERK_DOWN).
++        # 0042-Z: the BRANCH TEST is the RAW ask. With the lagged ask, a sign crossing (raw >= 0, lagged still < 0) took
++        # this branch on ON and the positive/hold branch on OFF, and this branch has no soft re-entry, so ON came back
++        # onto the gas FASTER than OFF - +21.7 LSB above OFF for ~100 frames at 22 m/s (Opus re-review N1a). The LAW
++        # below still consumes the lagged ask; only the selector is raw.
          coast = fca11_cont_coast(CS.out.vEgo)
          pedal_target = get_hold_command(CS.out.vEgo) * max(0., 1. - (-accel) / coast) if coast > 1e-3 else 0.
          self.gas_launching = False
 -        self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo)
 +        self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
-+                                            small_falls=self._gas_lagging or not self.gas_rise_lag)
++                                            small_falls=not self.gas_rise_lag)
        else:
          # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
          # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
@@ -160,17 +179,34 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
            self.gas_launching = False
          # 17c: soft recovery up to the hold for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL); a deliberate ask keeps
          # the unchanged jerk-rate response (lead pulling away, merge). rate_limit_pedal_command gates it off below
-@@ -812,7 +888,8 @@
+@@ -790,12 +877,15 @@
+           weight = get_delivery_blend_weight(CS.out.vEgo)
+           ask = accel + weight * (self.delivery_ask - accel) if accel < 0. else accel
+           pedal_target = get_delivery_pedal_command(ask, CS.out.vEgo, personality)
+-          if accel < 0. and weight > 0. and pedal_target > 0.:
++          if accel_raw < 0. and weight > 0. and pedal_target > 0.:
+             # review C5: the inverse is 3.5-4.7x steeper than the linear law near ask -0.09, so plan dither would
+             # arrive as downward pedal steps. A fall inside the shallow band (live target, |ask| < the coast
+             # threshold) is therefore bounded to get_pedal_rate_down(v), the mirror of the rise limit. An exact-zero
+             # target (coast at |ask| >= 0.52) and every release / FCA11 / cal / cam-brake / disengage zero, which
+             # never reach this line, still fall immediately.
++            # 0042-Z: the BAND test is the RAW ask (Opus re-review N1b). On a lagging frame whose raw ask has already
++            # crossed back to >= 0 the OFF pedal lifts at once, so this bound must not apply; with the lagged ask in
++            # the test ON walked the shallow-band fall instead (+54.6 LSB above OFF for ~0.5 s - a delayed lift).
+             pedal_target = max(pedal_target, self.gas - weight * get_pedal_rate_down(CS.out.vEgo) * DT_CTRL)
+         else:
+           pedal_target = get_pedal_command(accel, CS.out.vEgo, personality)
+@@ -812,7 +902,8 @@
            self.gas = min(pedal_target, get_hold_command(CS.out.vEgo, personality),
                           get_personality_ceiling(CS.out.vEgo, personality))
          self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
 -                                            self.gas_launching, reentry=accel < OVERSPEED_EXIT_ACCEL)
 +                                            self.gas_launching, reentry=accel_raw < OVERSPEED_EXIT_ACCEL,
-+                                            small_falls=self._gas_lagging or not self.gas_rise_lag)
++                                            small_falls=not self.gas_rise_lag)
      elif self.fca11_brake.gas_hold or self.fca11_brake._cal_active:
        self.gas = 0.
        self.gas_launching = False
-@@ -826,6 +903,8 @@
+@@ -826,6 +917,8 @@
        # cam-brake, deep-ask coast): those frames advance the filter above, and re-arming it there was the second hole
        # review C4 found (the coast -> live hand-back is exactly the transition that snaps the throttle).
        self.delivery_ask = 0.
@@ -215,10 +251,37 @@ diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/inter
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-@@ -2409,3 +2409,269 @@
+@@ -2409,3 +2409,367 @@
    def test_rise_limit_is_untouched(self):
      out = gi.rate_limit_pedal_command(0.30, 0.10, 30.)
      assert out == pytest.approx(0.10 + gi.get_pedal_rate_up(30.) * gi.DT_CTRL, abs=1e-9)
++
++
++def _get_ci_rise_combo(rise: bool, delivery: bool = False, cont: bool = False):
++  """CarInterface with the pedal armed, the 0042 lag on/off, and optionally the delivery law / the continuous brake
++  law's negative branch (`cont_law`), which are the two configs the re-review (N1) showed the lag could go above OFF."""
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **REM}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  params_list: list = [{"HyundaiGasInterceptor": True}]
++  if delivery:
++    params_list.append({"HyundaiPedalDeliveryLaw": True})
++  if rise:
++    params_list.append({"HyundaiGasRiseLag": True})
++  setup_interfaces(CarInterface, CP, CP_SP, params_list)
++  assert CP_SP.enableGasInterceptor
++  # NO assert on CP_SP.gasRiseLag here: on the 0040 tree the field does not exist, and the pin must then fail on the
++  # BEHAVIOUR it protects (the two arms come out equal / the walk walks), not on a precondition.
++  if delivery:
++    assert CP_SP.pedalDeliveryLaw is True
++  CI = CarInterface(CP, CP_SP)
++  if cont:
++    # the 0037 continuous negative branch: the brake law sets this from its own shape track, which the harness's
++    # zeroed FCA11 state cannot reach, so it is forced here exactly as the car runs it on 193/194.
++    CI.CC.fca11_brake.cont_law = True
++  return CI
 +
 +
 +def _get_ci_rise(rise: bool, pedal=REM):
@@ -296,7 +359,9 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +  # ---- the switch ---------------------------------------------------------------------------------------------------
 +  def test_param_defaults_off_and_reads_the_key(self):
 +    _, _, off = _get_ci_rise(False)
-+    assert off.gasRiseLag is False
++    # `getattr`: on the 0040 tree the field does not exist at all, and the pin must fail BY VALUE there, not by
++    # AttributeError (Opus re-review: 4 of the fail-before failures were AttributeErrors).
++    assert getattr(off, "gasRiseLag", None) is False
 +    assert off.enableGasInterceptor is True
 +    for val, want in ((True, True), ("1", True), (b"1", True), (False, False), ("0", False), ("true", False), (2, False)):
 +      fingerprint = {i: {} for i in range(8)}
@@ -354,8 +419,8 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +      CI = self._ci(True)
 +      warm = [(0.0, self.V, True, False, False, self.SET_KPH)] * 2 + \
 +             [(0.6, self.V, True, False, False, self.SET_KPH)] * 10
-+      self._run(CI, warm)
-+      assert CI.CC.gas_ask < 0.6                                     # lagging before the reset
++      warm_out = self._run(CI, warm)
++      assert warm_out[-1][0] < 0.6                                   # lagging before the reset (a value, not an attr)
 +      ask = self._run(CI, [frame])[0][0]
 +      assert ask == pytest.approx(frame[0], abs=2e-6), (name, ask)   # re-seeded to the current ask
 +
@@ -398,6 +463,73 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +    assert worst <= 0., worst            # NEVER above the unlagged pedal, on any frame
 +    assert below > 100                   # ... and the lag really is in play (the check is not vacuous)
 +
++  def test_pedal_never_exceeds_with_the_cont_law_on(self):
++    """Opus re-review N1a: `cont_law and accel < 0.` read the LAGGED ask, so on a sign crossing (raw >= 0, lagged still
++    < 0) ON took the continuous negative branch and OFF the positive one; that branch carries no soft re-entry, so ON
++    came back onto the gas FASTER than OFF (+21.7 LSB for ~100 frames at 22 m/s). The selector must read the RAW ask.
++    Mutation pin: `accel_raw` -> `accel` on that line fails here by value."""
++    series = [(0.3, 22.0, True, False, False, 255.)] * 40 + \
++             [(-0.3, 22.0, True, False, False, 255.)] * 150 + \
++             [(0.3, 22.0, True, False, False, 255.)] * 100
++    on = self._run(_get_ci_rise_combo(True, cont=True), series)
++    off = self._run(_get_ci_rise_combo(False, cont=True), series)
++    d = [o[1] - f[1] for o, f in zip(on, off)]
++    assert max(d) <= 0., max(d)          # NEVER above the OFF pedal on the config the car runs (cont_law)
++    assert min(d) < -1e-3                # ... and the lag is in play (not vacuous)
++    # the crossing frame is a real crossing: the lagged ask is still negative while the raw ask is +0.3
++    assert on[190][0] < 0.
++
++  def test_pedal_never_exceeds_with_the_delivery_law_on(self):
++    """Opus re-review N1b: the delivery law's shallow-band fall bound (`if accel < 0. and weight > 0. ...`) read the
++    LAGGED ask, so on a lagging frame whose raw ask had crossed back to +0.02 ON walked the lift from 0.343 while OFF
++    dropped at once (0.346 -> 0.129): +54.6 LSB for ~0.5 s, a delayed lift. Mutation pin for that line."""
++    series = [(0.8, 20.0, True, False, False, 255.)] * 300 + \
++             [(-0.003, 20.0, True, False, False, 255.)] * 10 + \
++             [(0.02, 20.0, True, False, False, 255.)] * 60
++    on = self._run(_get_ci_rise_combo(True, delivery=True), series)
++    off = self._run(_get_ci_rise_combo(False, delivery=True), series)
++    d = [o[1] - f[1] for o, f in zip(on, off)]
++    assert max(d) <= 0., max(d)
++    assert min(d) < -1e-3
++    assert on[310][0] < 0.               # the lagged ask is still negative on the crossing frame
++
++  def test_cont_branch_small_fall_is_not_walked_with_the_lag_on(self):
++    """Mutation pin for the cont-branch `small_falls=` argument (it was unpinned: mutating only that site passed).
++    With the feature ON the walk is off on EVERY frame, not only on the transparent ones (N2), so a fall inside the 8 LSB
++    blip band lands on the law target in one frame instead of being walked down from the LAGGED pedal."""
++    v = 22.0
++    coast, hold = gi.fca11_cont_coast(v), gi.get_hold_command(v)
++    a1 = -0.02
++    a2 = -(abs(a1) + (4.0 / 255.) * coast / hold)      # a 4 LSB fall from the first ask's own target
++    CI = _get_ci_rise_combo(True, cont=True)
++    self._run(CI, [(a1, v, True, False, False, 255.)] * 40)
++    prev = CI.CC.gas
++    pedal = self._run(CI, [(a2, v, True, False, False, 255.)])[0][1]
++    target = hold * max(0., 1. - abs(a2) / coast)
++    assert 0. < prev - target <= gi.PEDAL_FALL_BLIP_LSB / 255.     # inside the walk band: the pin is not vacuous
++    assert pedal == pytest.approx(target, abs=1e-9)                # ... and it is NOT walked (mutant: walked)
++
++  def test_launch_latch_clear_reads_the_raw_ask(self):
++    """The launch-latch CLEAR (`elif accel_raw <= 0.`). Under a RISE-ONLY filter this read is provably equivalent to
++    the lagged one - the filter can never output a positive ask on a frame whose raw ask is <= 0 (invariant below), so
++    no reachable state, and no mutation to `accel`, can be distinguished here. The pin is therefore the invariant plus
++    the reachable clear; if the filter ever gains an overshoot or a hold, this fails and the raw read becomes load
++    bearing. (Stated in lane-Z3/STATE.md: the brief's "mutate the CLEAR and a test fails" is not satisfiable.)"""
++    CI = self._ci(True)
++    self._run(CI, [(0.6, 2.0, True, False, False, 108.)] * 20)
++    assert CI.CC.gas_launching is True
++    out = self._run(CI, [(0.0, 2.0, True, False, False, 108.)])
++    assert out[0][0] == pytest.approx(0.0, abs=1e-9)     # the fall reaches the ask on the same frame ...
++    assert CI.CC.gas_launching is False                  # ... and clears the latch
++    filt = getattr(gi, "filter_gas_rise", None)
++    assert filt is not None                              # value failure on a tree without the filter
++    rng = np.random.default_rng(7)
++    state, bad = 0.0, 0
++    for raw in np.clip(np.cumsum(rng.normal(0., 0.2, 20000)), -2., 2.):
++      state = filt(float(raw), state)
++      bad += int(raw <= 0. and state > 0.)
++    assert bad == 0                                      # the raw and lagged reads agree in sign
++
 +  def test_never_exceeds_max_ask_prev_on_a_rise_and_equals_the_ask_on_a_fall(self):
 +    """Through the real controller (Opus defect 6): the pure function was pinned, the path the car runs was not."""
 +    rng = np.random.default_rng(42)
@@ -423,9 +555,11 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +      prev_state = got
 +    assert rises > 100 and falls > 100
 +    # the pure function keeps its own exact bound too
++    filt = getattr(gi, "filter_gas_rise", None)
++    assert filt is not None, "the rise filter must exist"     # a VALUE failure on a tree without it, not AttributeError
 +    prev = 0.0
 +    for a in (0.3, 0.9, 0.2, -1.0, 0.4):
-+      o = gi.filter_gas_rise(a, prev)
++      o = filt(a, prev)
 +      assert (o == a) if a <= prev else (prev <= o <= a)
 +      prev = o
 +
@@ -472,16 +606,16 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/open
 +              [(-0.05 if k % 4 else -0.20, 25.0) for k in range(100)] + [(0.9, 25.0)] * 60)
 +    rows = [(a, v, True, False, False, 108.) for a, v in series]
 +    off = self._wire(self._ci(False), [a for a, _ in series])
-+    # the OFF controller's ask state IS the raw ask on every frame, and the lag never marks a frame
++    # the OFF controller's ask state IS the raw ask on every frame
 +    CI_off = self._ci(False)
 +    asks = self._run(CI_off, rows)
 +    assert all(o[0] == pytest.approx(a, abs=2e-6) for o, (a, _v) in zip(asks, series))
-+    assert CI_off.CC._gas_lagging is False
 +    assert len(off) == len([1 for i, _ in enumerate(series) if i % 2 == 0])
++    # the real filter DOES change the wire on that same series (the test is not vacuous). FIRST, so that on a tree
++    # without the feature this fails by VALUE (ON wire == OFF wire) instead of at the state attribute below.
++    assert self._wire(self._ci(True), [a for a, _ in series]) != off
++    assert getattr(CI_off.CC, "_gas_lagging", None) is False      # the lag never marks an OFF frame
 +    # bypassing the flag on an ON controller IS the deployed path, byte for byte: nothing of 0042 runs outside its block
 +    CI_bypass = self._ci(True)
 +    CI_bypass.CC.gas_rise_lag = False
 +    assert self._wire(CI_bypass, [a for a, _ in series]) == off
-+    # and the real filter DOES change the wire on that same series (the test is not vacuous)
-+    assert self._wire(self._ci(True), [a for a, _ in series]) != off
-+
