@@ -321,6 +321,13 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("self.fca11_stop_hold_toggle.set_visible(hold_state.visible)", self.src)
     self.assertIn("FORK.md row 137", self.src)   # why the row is out of the way is written next to the row
     self.assertIn("(row 141)", self.src)         # ... and the TCU evidence it may not cite otherwise
+    # R5 nits 2-3 (Opus): the row must not claim the TCU opens its clutch on THIS request (row 137 / lane-U: the DCT
+    # opens on the brake pedal switch), and it must not guess where a stored ON came from - it can only say what the
+    # panel can see.
+    self.assertNotIn("releases the clutch", self.src)
+    hold_desc = self._description("hold_desc")
+    self.assertNotIn("backup restore", hold_desc)
+    self.assertIn("(the stored value is ON)", hold_desc)
 
 
 # --- D4: the brake-law text, checked against the REAL controller for every (Shaping, Dynamic, Shadow) combination ---
@@ -428,6 +435,14 @@ for b in (True, False):
 ui_state.params.d["HyundaiFca11StopHoldClutch"] = False
 ui_state.params.d.update({"HyundaiFca11Brake": True, "HyundaiFca11AffineGain": True,
                           "HyundaiFca11DynamicBrakes": True, "HyundaiFca11Shadow": False})
+# N6: the row at value ON while ONROAD - it must be LISTED (its rule is visibility, not offroad) and NOT settable.
+ui_state.params.d["HyundaiFca11StopHoldClutch"] = True
+ui_state.off = False
+panel.update_settings()
+hold_on_onroad = {"visible": bool(panel.fca11_stop_hold_toggle.visible),
+                  "enabled": panel.fca11_stop_hold_toggle.action_item.enabled}
+ui_state.off = True
+ui_state.params.d["HyundaiFca11StopHoldClutch"] = False
 ui_state.off = False
 panel.update_settings()
 onroad = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled, "desc": it.desc}
@@ -444,8 +459,8 @@ for it in panel.items:
     it.callback(2)
   else:
     it.callback(True)
-print(json.dumps({"combos": out, "hold_on": hold_on, "onroad": onroad, "update_writes": update_writes,
-                  "callback_writes": list(WRITES)}))
+print(json.dumps({"combos": out, "hold_on": hold_on, "hold_on_onroad": hold_on_onroad, "onroad": onroad,
+                  "update_writes": update_writes, "callback_writes": list(WRITES)}))
 '''
 
 
@@ -522,6 +537,108 @@ def _real_law(brake, shaping, dynamic, shadow):
     return LAW_RAMP if brake_obj.dynamic_brakes else LAW_OLD
   raise AssertionError(f"no law flag is set for Braking={brake} Shaping={shaping} Dynamic={dynamic} Shadow={shadow}: "
                        f"cont_law={brake_obj.cont_law} affine_gain={brake_obj.affine_gain} feel={brake_obj.feel}")
+
+
+def _camera_frame(alive=3):
+  """A 0x38D camera frame in the LOGGED layout, so the law's own camera checks see a live, non-braking camera
+  (status/DriverSetStatus/alive set, byte4 bit7 always 1, real CRC)."""
+  try:
+    from opendbc.car.hyundai.hyundaican import hyundai_checksum
+  except Exception as e:
+    raise unittest.SkipTest(f"the fork's hyundai can helpers are not in this tree: {e}")
+  b = bytearray(8)
+
+  def setb(start, length, val):
+    for i in range(length):
+      b[(start + i) // 8] |= ((int(val) >> i) & 1) << ((start + i) % 8)
+
+  setb(18, 2, 2)        # FCA_Status
+  setb(22, 3, 1)        # FCA_DrvSetStatus
+  setb(35, 4, alive)
+  setb(39, 9, 255)      # FCA_RelativeVelocity
+  setb(48, 8, 254)      # FCA_TimetoCollision
+  b[4] |= 0x80
+  b[7] = hyundai_checksum(bytes(b[:7]))
+  return bytes(b)
+
+
+def _sent_levels(shaping, dynamic, shadow, accel, v_ego=15.0, pre=100, frames=250):
+  """[(level, dat)] for every 0x38D frame the REAL controller sends after `accel` becomes the ask.
+
+  `pre` frames of a 0.0 ask first (a settled cruise), then the ask held for `frames` frames at 50 Hz, so the levels are
+  the ones that would reach the car on the wire. The controller is the tree's own, built through `setup_interfaces`, so
+  a change in the car layer shows up here as a changed level list, not as a stale comment."""
+  try:
+    from opendbc.car import structs
+    from opendbc.car.hyundai.interface import CarInterface
+    from opendbc.car.hyundai.values import CAR
+    from opendbc.sunnypilot.car.interfaces import setup_interfaces
+    from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+  except Exception as e:
+    raise unittest.SkipTest(f"the fork's fca11_long is not in this tree: {e}")
+
+  class _CS:
+    """The same minimal CarState double the car layer's own controller tests use (it reads nothing else)."""
+
+    def __init__(self):
+      self.out = structs.CarState()
+      self.out.vEgo = v_ego
+      self.out.gearShifter = structs.CarState.GearShifter.drive
+      self.out.brakePressed = False
+      self.out.gasPressed = False
+      self.out.aEgo = 0.0
+      self.out.standstill = False
+      self.interceptor_state = 0
+      self.interceptor_fault_seen = False
+      self.fca11_cam_frame = (0, _camera_frame())
+      self.fca11_now_nanos = 0
+      self.fca11_lead_closing = False
+      self.fca11_wheel_min_kph = v_ego * 3.6
+      self.fca11_echoes = []
+
+  saved = {k: os.environ.get(k) for k in ("FCA11_LOG_DIR", "FCA11_CAL_DIR")}
+  os.environ["FCA11_LOG_DIR"] = "0"    # never touch /data/fca11-log from a test host
+  os.environ["FCA11_CAL_DIR"] = "0"
+  try:
+    cp = structs.CarParams()
+    cp.brand = "hyundai"
+    cp.carFingerprint = CAR.HYUNDAI_ELANTRA_2021
+    cp_sp = structs.CarParamsSP()
+    cp_sp.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
+    setup_interfaces(CarInterface, cp, cp_sp, [
+      {"HyundaiGasInterceptor": "1"}, {"HyundaiFca11Brake": True},
+      {"HyundaiFca11AffineGain": bool(shaping)}, {"HyundaiFca11DynamicBrakes": bool(dynamic)},
+      {"HyundaiFca11Shadow": bool(shadow)}, {"HyundaiLongitudinalTuning": 0},
+    ])
+    brake_obj = fl.Fca11LongBrake(cp, cp_sp)
+    brake_obj._dyn_log = None      # no shadow record from a test host
+    brake_obj._mark_log = None
+    out = []
+    for f in range(pre + frames):
+      cc = structs.CarControl()
+      cc.enabled = True
+      cc.longActive = True
+      cc.actuators.accel = 0.0 if f < pre else accel
+      for s in brake_obj.update(cc, _CS(), f):
+        if s.address == fl.FCA11_ADDR and f >= pre:
+          out.append((fl._get_bits(s.dat, 8, 8), s.dat))
+  finally:
+    for k, v in saved.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+  return out
+
+
+def _eighteen_clause(desc):
+  """The 18x sentence of a brake row, exactly as that row renders it."""
+  sent = next((s for s in _sentences(desc)
+               if s.startswith("Shaping OFF with Dynamic Brakes ON and Shadow OFF gives")), None)
+  if sent is None:
+    raise AssertionError(f"no 18x sentence in this description: {desc[:240]!r}")
+  return sent
 
 
 def _sentences(desc):
@@ -679,6 +796,65 @@ class TestBrakeLawMatrix(unittest.TestCase):
       self.assertEqual(LAW_CONT, law, row)
       self.assertEqual((1, 1, 1, 0), conds, f"{row}: {sent}")
 
+  def test_the_18x_clause_states_what_the_real_controller_does(self):
+    """R5 (Opus re-review #3): "a gentle ask starts at 1 LSB and a hard ask is ramped in (-2.8 m/s^2: 20 LSB at
+    780 ms), but an emergency ask (-3.0 m/s^2 or harder) still steps like the OLD law" must be what the controller
+    DOES at the asks it names - measured here, through the real car layer, not copied from a comment.
+
+    The lane measured -2.8 only; the wire is a ramp down to -2.99 and a STEP from -3.0 (that is
+    `accel <= FCA11_DYN_EMERGENCY_ACCEL` in `_dyn_first_lsb`, plus the panda's RATE_STEP on the rise), so "even a
+    hard ask is ramped in rather than stepped" was false and N5 (a clause saying a hard ask jumps) is the mutant this
+    test exists for: the ramp asks fail it, the byte-identity with the OLD law fails the opposite claim."""
+    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+    self.assertEqual(-3.0, fl.FCA11_DYN_EMERGENCY_ACCEL, "the sentence quotes -3.0 m/s^2: the boundary moved")
+    self.assertEqual(4, fl.HYUNDAI_FCA11_LONG_RATE_STEP, "the sentence quotes 4 LSB per sent frame")
+    # 0x38D leaves the controller on SENT frames only; the module's own period is what turns frames into ms.
+    dt_ms = int(round(fl.FCA11_SHAPE_SENT_DT * 1000))
+    self.assertEqual(20, dt_ms)   # 50 Hz on the wire; the quoted 140 ms / 780 ms are SENT-frame times
+
+    ramp = {ask: _sent_levels(0, 1, 0, ask) for ask in (-2.0, -2.8, -2.99)}   # S0D1H0, the 18x law
+    emerg = {ask: (_sent_levels(0, 1, 0, ask), _sent_levels(0, 0, 0, ask)) for ask in (-3.0, -3.5)}
+    for ask, frames in ramp.items():
+      self.assertEqual(1, frames[0][0], f"a sub-emergency ask ({ask}) must open at 1 LSB, not step")
+      self.assertLess(frames[0][0], frames[-1][0], f"a sub-emergency ask ({ask}) must ramp, not jump")
+    t20 = next((i * dt_ms for i, (lv, _) in enumerate(ramp[-2.8]) if lv >= 20), None)
+    self.assertIsNotNone(t20, "the -2.8 ask must reach 20 LSB on the ramp")
+    for ask, (frames, old) in emerg.items():
+      self.assertEqual([4, 8, 12, 16], [lv for lv, _ in frames[:4]], f"an emergency ask ({ask}) must keep the step")
+      self.assertEqual([d for _, d in old], [d for _, d in frames],
+                       f"an emergency ask ({ask}) must be BYTE-IDENTICAL to the OLD law")
+
+    for row in BRAKE_ROWS:
+      clause = _eighteen_clause(self.matrix["combos"]["1010"][row]["desc"])
+      self.assertIn("a gentle ask starts at 1 LSB", clause, row)
+      self.assertIn(f"-2.8 m/s^2: 20 LSB at {t20} ms", clause, f"{row}: the quoted ramp number must be the measured one")
+      self.assertIn(f"{fl.FCA11_DYN_EMERGENCY_ACCEL:.1f} m/s^2 or harder", clause, row)
+      self.assertIn("still steps like the OLD law", clause, row)
+      self.assertIn(f"{fl.HYUNDAI_FCA11_LONG_RATE_STEP} LSB per sent frame", clause, row)
+      self.assertNotIn("even a hard ask is ramped in rather than stepped", clause, f"{row}: the false clause is back")
+
+  def test_the_braking_off_sentence_never_appears_with_braking_on(self):
+    """N7 (Opus): the Shadow row's Braking-OFF branch must be unreachable while Braking is ON. The `if True:` form
+    told a Braking-ON owner "nothing is sent ... only logs", the exact opposite of what the car does."""
+    for shaping, dynamic, shadow in itertools.product((1, 0), (1, 0), (1, 0)):
+      combo = f"1{shaping}{dynamic}{shadow}"
+      for row in BRAKE_ROWS:
+        desc = self.matrix["combos"][combo][row]["desc"]
+        self.assertNotIn("With FCA11 Braking OFF", desc, f"{row} at {combo}")
+        self.assertNotIn("nothing is sent", desc, f"{row} at {combo}")
+        self.assertNotIn("assume FCA11 Braking ON", desc, f"{row} at {combo}")
+
+  def test_the_braking_off_table_says_which_car_it_describes(self):
+    """Nit 1 (Opus): with Braking OFF the Shadow row is still listed, so its four-state table must say it assumes
+    Braking ON - and the table must still be the law the controller picks in the state it names (Braking ON)."""
+    for shaping, dynamic, shadow in itertools.product((1, 0), (1, 0), (1, 0)):
+      combo = f"0{shaping}{dynamic}{shadow}"
+      desc = self.matrix["combos"][combo]["FCA11 Shadow (Log-Only)"]["desc"]
+      self.assertIn("The four combinations below assume FCA11 Braking ON", desc, combo)
+      table = _law_table(desc)
+      self.assertEqual(_real_law(1, shaping, dynamic, shadow), _table_law(table, shaping, dynamic, shadow),
+                       f"{combo}: the table must still be the law Braking ON selects\n{desc}")
+
   def test_hidden_rows_are_the_two_retired_rows_plus_braking_dependents(self):
     """A rule that flips a retired row back on after the fact (a late `set_visible(brake_state.visible)` or a late
     tuning re-show) lands here: the rows are read after update_settings, not inferred from the source. The Shaping and
@@ -699,6 +875,10 @@ class TestBrakeLawMatrix(unittest.TestCase):
       brake = bool(int(combo[0]))
       self.assertEqual(brake, row["visible"], f"hold value ON at {combo}: the row must be listed iff Braking is on")
       self.assertEqual(brake, row["enabled"], f"hold value ON at {combo}: settable offroad")
+    # N6 (Opus): the row at value ON while ONROAD - visible (its rule is visibility) and NOT settable. Enabling it on
+    # visibility alone (`set_enabled(hold_state.visible)`) would let the owner flip a CarParams key while driving.
+    self.assertTrue(self.matrix["hold_on_onroad"]["visible"], "the hold row must stay LISTED onroad while its value is ON")
+    self.assertFalse(self.matrix["hold_on_onroad"]["enabled"], "the hold row must NOT be settable onroad")
 
   def test_the_brake_rows_are_listed_and_settable_offroad_in_every_combination(self):
     for combo, rows in self.matrix["combos"].items():

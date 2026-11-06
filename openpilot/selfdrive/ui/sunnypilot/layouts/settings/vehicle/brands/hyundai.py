@@ -44,7 +44,8 @@ class HyundaiSettings(BrandSettings):
                                                        callback=self._on_fca11_toggle_changed)
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
-    # 0034: EXPERIMENTAL — asks the ESC for its own stop hold at a standstill so the transmission releases the clutch.
+    # 0034: EXPERIMENTAL — asks the ESC for its own stop hold at a standstill (the request does NOT open the clutch:
+    # the TCU reads the brake pedal switch, not 0x38D — row 137 and this row's TCU evidence, row 141).
     # LISTED ONLY WHILE ITS OWN VALUE IS ON (fca11_stop_hold_toggle_state): per FORK.md row 137 the hold has never been
     # validated, and the TCU reads the brake pedal switch, not 0x38D (row 141), so the row is out of the way at its
     # default 0 — but the key is BACKUP-flagged and was 1 on route 195, and a restore writes it back with no switch in
@@ -159,7 +160,9 @@ class HyundaiSettings(BrandSettings):
       "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
       "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
       "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus the "
-      "18x release ramp: a gentle ask starts at 1 LSB, and even a hard ask is ramped in rather than stepped. Shadow "
+      "18x release ramp: a gentle ask starts at 1 LSB and a hard ask is ramped in (-2.8 m/s^2: 20 LSB at 780 ms), but "
+      "an emergency ask (-3.0 m/s^2 or harder) still steps like the OLD law - 4 LSB per sent frame, full strength "
+      "within 140 ms. Shadow "
       "ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at "
       "the next ignition.")
     if shaping_state.visible and not offroad:
@@ -181,15 +184,21 @@ class HyundaiSettings(BrandSettings):
     if not brake_values.brake:
       shadow_law = tr("With FCA11 Braking OFF nothing is sent, so this switch only logs: the 0043 shaped law is "
                       "computed on every frame and never sent to the car.")
-    shadow_desc = tr(state_sent) + " " + shadow_law + " " + tr(
+    shadow_table = tr(
       "Shaping ON with Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
       "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop ramps in over "
       "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
       "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
       "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus the "
-      "18x release ramp: a gentle ask starts at 1 LSB, and even a hard ask is ramped in rather than stepped. Shadow "
+      "18x release ramp: a gentle ask starts at 1 LSB and a hard ask is ramped in (-2.8 m/s^2: 20 LSB at 780 ms), but "
+      "an emergency ask (-3.0 m/s^2 or harder) still steps like the OLD law - 4 LSB per sent frame, full strength "
+      "within 140 ms. Shadow "
       "ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires the comma pedal. Takes effect at "
       "the next ignition.")
+    # N1: with FCA11 Braking OFF this row is still listed (only Shaping/Dynamic depend on Braking), so the four-state
+    # table must say WHICH car it describes - otherwise the row states a law for a car that runs none.
+    assume_braking = (tr("The four combinations below assume FCA11 Braking ON. ") if not brake_values.brake else "")
+    shadow_desc = tr(state_sent) + " " + shadow_law + " " + assume_braking + shadow_table
     if shadow_state.visible and not offroad:
       shadow_desc = offroad_hint + shadow_desc
     self.fca11_shadow_toggle.set_description(shadow_desc)
@@ -228,17 +237,20 @@ class HyundaiSettings(BrandSettings):
     dynamic_state = fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)
     self.fca11_dynamic_release_toggle.action_item.set_enabled(dynamic_state.enabled)
     # D1/D2: same four states as the shaping row. The "emergency ask and a step demand still go at full rate" claim is
-    # DELETED - it was pinned on the continuous law, where 0037 removed the bypass; the fast jump it described is the
-    # 18x ramp's own hard-ask path, which is what this switch gives you with Shaping OFF.
+    # DELETED - it was pinned on the continuous law, where 0037 removed the bypass. With Shaping OFF the 18x ramp is
+    # what runs: a sub-emergency ask (even a -2.8 m/s^2 step) ramps in from 1 LSB, but an EMERGENCY ask
+    # (accel <= FCA11_DYN_EMERGENCY_ACCEL, -3.0 m/s^2) keeps the panda's RATE_STEP and is byte-identical to the OLD
+    # law there (measured: -3.0 -> 4,8,12,16,20,24,26; -3.5 -> 4,8,12,16,20,24,28,31).
     dynamic_desc = tr(state_sent) + " " + tr(
       "Shaping ON with Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
       "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop ramps in over "
       "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
       "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
       "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus "
-      "this switch's 18x release ramp: a gentle ask starts at 1 LSB, and even a hard ask is ramped in rather than "
-      "stepped. Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. "
-      "Takes effect at the next ignition.")
+      "this switch's 18x release ramp: a gentle ask starts at 1 LSB and a hard ask is ramped in (-2.8 m/s^2: 20 LSB "
+      "at 780 ms), but an emergency ask (-3.0 m/s^2 or harder) still steps like the OLD law - 4 LSB per sent frame, "
+      "full strength within 140 ms. Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. "
+      "Requires FCA11 Braking. Takes effect at the next ignition.")
     if dynamic_state.visible and not offroad:
       dynamic_desc = offroad_hint + dynamic_desc
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)
@@ -250,11 +262,10 @@ class HyundaiSettings(BrandSettings):
     hold_state = fca11_stop_hold_toggle_state(pedal_raw, brake_raw, hold_raw, offroad)
     self.fca11_stop_hold_toggle.action_item.set_enabled(hold_state.enabled)
     hold_desc = tr("EXPERIMENTAL. While holding the car stopped, the FCA11 frame also asks the ESC for its own stop " +
-                   "hold, which is the condition under which the transmission releases the clutch (the car sits at " +
-                   "about 26 Nm of creep torque otherwise). Only sent at walking pace, at a real hold level, with FCA11 " +
-                   "Braking on. Unproven: whether the car holds on an incline this way, and how it lets go. This row " +
-                   "is only listed while the switch is ON - the stored value came from a backup restore - so turning " +
-                   "it OFF here hides the row again. Requires FCA11 Braking. Takes effect at the next ignition.")
+                   "hold (the car sits at about 26 Nm of creep torque otherwise). Only sent at walking pace, at a real " +
+                   "hold level, with FCA11 Braking on. Unproven: whether the car holds on an incline this way, and how " +
+                   "it lets go. This row is only listed while the switch is ON (the stored value is ON), so turning it " +
+                   "OFF here hides the row again. Requires FCA11 Braking. Takes effect at the next ignition.")
     if hold_state.visible and not offroad:
       hold_desc = offroad_hint + hold_desc
     self.fca11_stop_hold_toggle.set_description(hold_desc)
