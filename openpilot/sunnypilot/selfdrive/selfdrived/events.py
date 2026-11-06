@@ -281,7 +281,8 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # 1:30 / release the brakes after 2 mins"). The car is held stopped by ESC pressure + a live clutch torque; the hold is
   # NOT a parking brake, so it is BOUNDED now: 2:00 FROM THE MOMENT THE CAR IS FULLY STOPPED BY OPENPILOT (the clock
   # starts at a dead stop - all four wheels at rest - not when the braking began and not while the car still creeps).
-  # At 2:00 openpilot disengages and the deployed driver-disengage release takes the brakes off. MEASURED under the
+  # At 2:00 LONGITUDINAL control disengages - not "openpilot": lateral (MADS) stays engaged by design, see tier 4 below -
+  # and the deployed driver-disengage release takes the brakes off. MEASURED under the
   # car's configuration (continuous law ON) through the COMPILED libsafety TX hook
   # (lane-X3/proof_release_compiled.py): the law sends NOTHING on 0x38D after the disengage (6 046/6 046 hold frames
   # accepted, 0 refused) and the panda stops blocking the camera's 0x38D at +90 ms, inside its 100 ms TX_STALE, so the
