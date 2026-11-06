@@ -71,10 +71,12 @@ def fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad: bool) -> T
 
 
 def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleState:
-  """0034 Hold Clutch Release — RETIRED as a row: the FCA11 frame never carried the ESC stop-hold pair on the car and
-  the TCU does not act on 0x38D (FORK.md rows 130/137), so the row is hidden everywhere. The key, its reader, the capnp
-  slot @11 and the stored value stay untouched. To bring the row back, restore the visibility expression below
-  (`visible = _on(pedal_raw) and _on(brake_raw)`) and update the tests that pin it hidden."""
+  """0034 Hold Clutch Release — RETIRED as a row, and the citation is precise: the ESC's own stop hold has NEVER been
+  validated on the car (FORK.md row 137: "Not validated (drive-gated)"), and the reason the pair was expected to
+  matter is not in 0x38D at all — the TCU opens the DCT clutch on the BRAKE PEDAL switch, not on any bit we send
+  (the lane-U report, UREPORT.md Q2-Q3; summarised in FORK.md row 140). So the row is hidden everywhere. The key, its
+  reader, the capnp slot @11 and the stored value stay untouched. To bring the row back, restore the visibility
+  expression below (`visible = _on(pedal_raw) and _on(brake_raw)`) and update the tests that pin it hidden."""
   return ToggleState(visible=False, enabled=False)
 
 

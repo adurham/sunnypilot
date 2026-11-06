@@ -117,8 +117,9 @@ class TestFca11SettingsRules(unittest.TestCase):
     self.assertEqual({"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}, hidden)
 
   def test_stop_hold_row_is_retired_hidden(self):
-    """SETTINGS TIDY: the 0034 row is hidden on every car - the pair was never carried on the wire and the TCU does not
-    act on 0x38D (FORK.md rows 130/137). The rule keeps the pedal/brake arguments so the row comes back by reverting it."""
+    """SETTINGS TIDY: the 0034 row is hidden on every car - the ESC hold has never been validated (FORK.md row 137)
+    and the TCU opens the clutch on the brake pedal switch, not on 0x38D (lane-U report, summarised in row 140). The
+    rule keeps the pedal/brake arguments so the row comes back by reverting it."""
     for pedal, brake, offroad in itertools.product(ON_VALUES + OFF_VALUES, ON_VALUES + OFF_VALUES, (True, False)):
       self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state(pedal, brake, offroad), (pedal, brake, offroad))
 
@@ -246,7 +247,8 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("self.fca11_stop_hold_toggle", m.group(1))
     self.assertIn("fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad)", self.src)
     self.assertIn("self.fca11_stop_hold_toggle.set_visible(hold_state.visible)", self.src)
-    self.assertIn("FORK.md rows 130/137", self.src)   # how to bring it back is written next to the row
+    self.assertIn("FORK.md row 137", self.src)   # how to bring it back is written next to the row
+    self.assertIn("(row 140)", self.src)         # ... and the TCU evidence it may not cite otherwise
 
 
 class TestEveryRowWiring(unittest.TestCase):
