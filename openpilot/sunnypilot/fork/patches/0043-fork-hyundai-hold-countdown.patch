@@ -203,58 +203,261 @@ diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
    # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
    # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
---- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+new file mode 100644
+--- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -134,14 +134,20 @@
- 
-   def test_tier_edges_by_value(self):
-     """Both sides of every edge, by value: the counter is compared as FRAMES, never as seconds."""
+@@ -0,0 +1,491 @@
++"""
++0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
++
++Owner's spec (2026-11-06): "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 seconds /
++release the brakes after 2 mins". This REPLACES 0041-N, whose rule was the opposite ("the hold is never released").
++
++Four tiers, counted in SENT 0x38D frames at 50 Hz (controller 100 Hz / FCA11_SEND_EVERY == 2):
++  1 soft     3000 frames =  60 s   silent banner
++  2 loud     4500 frames =  90 s   audible and CONTINUOUS (no repeat/pulse logic any more)
++  3 final    5500 frames = 110 s   warningImmediate
++  4 EXPIRED  6000 frames = 120 s   a STICKY latch: the superproject disengages openpilot, the law stops sending and
++                                   the ESC is released (the panda hands FCA11 back to the camera's idle frame). The
++                                   latch survives the counter reset that the disengage itself causes and clears
++                                   ONLY on the driver's brake press.
++The law is UNTOUCHED: this block is a pure observer of the sent level and never writes it. The tests below prove the
++wire is byte-identical to the tree without the countdown, including through a disengage at 5999/6000/6001 sent frames.
++
++Every stream test drives the REAL controller (Fca11LongBrake.update) with a CarState double, exactly as the stop-hold
++lane's tests do, and reads the state the superproject publishes (CarStateSP.holdNag) plus what actually went out.
++Every behavioural test asserts an ACTIVITY bound first: a leg that sends no frames would pass any assertion about
++what it sends.
++"""
++import hashlib
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _real_camera_frame
++
++CAM = _real_camera_frame(alive=3)
++# read defensively, so a run against a tree WITHOUT the countdown fails on its claims (the nag never runs), not on an
++# AttributeError - the same rule lane V was reviewed against.
++NONE = int(getattr(fl, "FCA11_HOLD_NAG_NONE", 0))
++SOFT = int(getattr(fl, "FCA11_HOLD_NAG_SOFT", 1))
++LOUD = int(getattr(fl, "FCA11_HOLD_NAG_LOUD", 2))
++FINAL = int(getattr(fl, "FCA11_HOLD_NAG_FINAL", 3))
++EXPIRED = int(getattr(fl, "FCA11_HOLD_NAG_EXPIRED", 4))
++ARM_LSB = int(getattr(fl, "FCA11_HOLD_NAG_MIN_LSB", 20))
++SOFT_F = int(getattr(fl, "FCA11_HOLD_NAG_SOFT_FRAMES", 3000))
++LOUD_F = int(getattr(fl, "FCA11_HOLD_NAG_LOUD_FRAMES", 4500))
++FINAL_F = int(getattr(fl, "FCA11_HOLD_NAG_FINAL_FRAMES", 5500))
++EXPIRE_F = int(getattr(fl, "FCA11_HOLD_NAG_EXPIRE_FRAMES", 6000))
++
++
++def _cp_sp(fca11=True):
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = fca11
++  cp_sp.enableGasInterceptor = True
++  return cp_sp
++
++
++def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None,
++          engaged=True, long_active=True):
++  """Run n controller frames of a steady standstill hold. Returns [(frame, sends, hold_nag)] for every frame.
++
++  `ask` is the planner ask; at a standstill a gentle ask (-0.30) holds ~8 LSB and a firm one (-2.0) holds 30 LSB, the
++  regime the countdown is about (30 LSB is the hold ceiling the wire allows). The camera is fresh on every frame.
++  `engaged`/`long_active` feed CarControl as-is: a disengaged frame is how a test delivers a driver disengage.
++  """
++  if record is None:
++    record = []
++  for f in range(start, start + n):
++    cs = _CS(v_ego=v, cam=(0, CAM), standstill=standstill, a_ego=-1.5 if ask < 0 else 0.3,
++             brake=brake_pressed, gear=gear or structs.CarState.GearShifter.drive)
++    cs.fca11_wheel_max_kph = v * 3.6
++    sends = brake.update(_cc(ask, engaged=engaged, long_active=long_active), cs, f)
++    record.append((f, sends, int(getattr(brake, "hold_nag", NONE))))
++  return record
++
++
++def _wire(record):
++  """[(frame, bytes)] of every 0x38D actually sent, in order."""
++  out = []
++  for f, sends, _nag in record:
++    out.extend((f, bytes(s.dat)) for s in sends if s.address == fl.FCA11_ADDR)
++  return out
++
++
++def _levels(record):
++  return [(f, fl._get_bits(dat, 8, 8)) for f, dat in _wire(record)]
++
++
++def _armed(record):
++  """Every SENT frame at or above the arming level - the frames the countdown counts."""
++  return [(f, lv) for f, lv in _levels(record) if lv >= ARM_LSB]
++
++
++def _hold_until_armed(brake, n_armed, start=0, **kw):
++  """Feed one controller frame at a time until exactly n_armed armed SENT frames have gone out.
++
++  The first sent frames of an episode are below the arming level (the onset ramp), so "119.98 s" is NOT "5999 armed
++  frames" - the boundary tests have to be built on the armed count itself.
++  """
++  rec = []
++  f = start
++  while len(_armed(rec)) < n_armed:
++    rec.extend(_hold(brake, 1, start=f, **kw))
++    f += 1
++    if f - start > 40 * n_armed:
++      raise AssertionError("the hold never reached the armed count")
++  return rec, f
++
++
++def _first_nag(record, want):
++  for f, _sends, nag in record:
++    if nag == want:
++      return f
++  return None
++
++
++def _nag_at(record, want):
++  """The count of SENT-armed frames at the moment the state first became ``want``."""
++  armed = _armed(record)
++  f_want = _first_nag(record, want)
++  if f_want is None:
++    return None
++  return sum(1 for f, _lv in armed if f <= f_want)
++
++
++class TestTierShape(unittest.TestCase):
++  """The pure four-tier escalation, in SENT frames."""
++
++  def test_named_constants(self):
++    self.assertEqual(3000, fl.FCA11_HOLD_NAG_SOFT_FRAMES)
++    self.assertEqual(4500, fl.FCA11_HOLD_NAG_LOUD_FRAMES)
++    self.assertEqual(5500, fl.FCA11_HOLD_NAG_FINAL_FRAMES)
++    self.assertEqual(6000, fl.FCA11_HOLD_NAG_EXPIRE_FRAMES)
++    self.assertEqual(20, fl.FCA11_HOLD_NAG_MIN_LSB)
++    self.assertEqual((0, 1, 2, 3, 4), (NONE, SOFT, LOUD, FINAL, EXPIRED))
++    # the 0041-N repeat/pulse machinery is GONE: an asserted alert loops in soundd, so there is nothing to re-chime
++    for gone in ("FCA11_HOLD_NAG_REPEAT_S", "FCA11_HOLD_NAG_LOUD_PULSE_S",
++                 "FCA11_HOLD_NAG_SOFT_S", "FCA11_HOLD_NAG_LOUD_S"):
++      self.assertFalse(hasattr(fl, gone), f"{gone} must be gone in v2")
++
++  def test_tier_edges_by_value(self):
++    """Both sides of every edge, by value: the counter is compared as FRAMES, never as seconds."""
 +    # LITERALS on purpose (60/90/110 s at 50 sent Hz): an expectation derived from the constant would move with a
 +    # mutation of that constant and prove nothing. These are the owner's times, not a restatement of the code.
-     self.assertEqual(NONE, fl.hold_nag_level(0))
--    self.assertEqual(NONE, fl.hold_nag_level(SOFT_F - 1))
--    self.assertEqual(SOFT, fl.hold_nag_level(SOFT_F))
--    self.assertEqual(SOFT, fl.hold_nag_level(LOUD_F - 1))
--    self.assertEqual(LOUD, fl.hold_nag_level(LOUD_F))
--    self.assertEqual(LOUD, fl.hold_nag_level(FINAL_F - 1))
--    self.assertEqual(FINAL, fl.hold_nag_level(FINAL_F))
++    self.assertEqual(NONE, fl.hold_nag_level(0))
 +    self.assertEqual(NONE, fl.hold_nag_level(3000 - 1))
 +    self.assertEqual(SOFT, fl.hold_nag_level(3000))
 +    self.assertEqual(SOFT, fl.hold_nag_level(4500 - 1))
 +    self.assertEqual(LOUD, fl.hold_nag_level(4500))
 +    self.assertEqual(LOUD, fl.hold_nag_level(5500 - 1))
 +    self.assertEqual(FINAL, fl.hold_nag_level(5500))
-     self.assertEqual(NONE, fl.hold_nag_level(-5), "never negative")
++    self.assertEqual(NONE, fl.hold_nag_level(-5), "never negative")
 +    # and the module constants ARE those numbers (a shift here is a behaviour change, caught by test_b as well)
 +    self.assertEqual((3000, 4500, 5500, 6000),
 +                     (fl.FCA11_HOLD_NAG_SOFT_FRAMES, fl.FCA11_HOLD_NAG_LOUD_FRAMES,
 +                      fl.FCA11_HOLD_NAG_FINAL_FRAMES, fl.FCA11_HOLD_NAG_EXPIRE_FRAMES))
- 
-   def test_expired_is_not_a_tier(self):
-     """hold_nag_level stops at 3: EXPIRED is a latch that has to survive the counter reset, so it cannot be a value of
-@@ -178,12 +184,13 @@
-     EXPIRED on the 6000th - and 4 from then on. It is the SENT count, not a wall clock (the frames are fed in a loop)."""
-     rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(125 * 100))
-     armed = _armed(rec)
--    self.assertGreaterEqual(len(armed), EXPIRE_F, "activity: the hold must reach 6000 armed sent frames")
++
++  def test_expired_is_not_a_tier(self):
++    """hold_nag_level stops at 3: EXPIRED is a latch that has to survive the counter reset, so it cannot be a value of
++    the pure function (a counter-derived 4 would drop back to 0 on the disengage frame - the bug this pins)."""
++    self.assertEqual(FINAL, fl.hold_nag_level(EXPIRE_F - 1))
++    self.assertEqual(FINAL, fl.hold_nag_level(EXPIRE_F))
++    self.assertEqual(FINAL, fl.hold_nag_level(10 * EXPIRE_F))
++
++
++class TestCountdownOnTheRealClass(unittest.TestCase):
++  """The counter is armed by the SENT level, tiered at 60/90/110/120 s, and latches at 120 s."""
++
++  def test_a_the_lsb_arming_gate_is_what_starts_the_clock(self):
++    """The SAME 61 s standstill hold never nags when the arming level is above what the law sends, and reaches soft
++    when it is at or below it: the clock is armed by the SENT level, not by "we are stopped"."""
++    real = fl.FCA11_HOLD_NAG_MIN_LSB
++    try:
++      fl.FCA11_HOLD_NAG_MIN_LSB = 31          # one LSB above the 30 LSB ceiling the wire allows
++      rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(61 * 100))
++      levels = [lv for _f, lv in _levels(rec)]
++      self.assertGreaterEqual(len(levels), 2900, "the law must still be holding (activity bound)")
++      self.assertEqual(30, max(levels))
++      self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++
++      fl.FCA11_HOLD_NAG_MIN_LSB = 30          # the level it actually sends
++      rec2 = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(61 * 100))
++      self.assertGreaterEqual(len(_armed(rec2)), SOFT_F, "activity: 61 s must produce >= 3000 armed sent frames")
++      self.assertEqual(SOFT, rec2[-1][2])
++    finally:
++      fl.FCA11_HOLD_NAG_MIN_LSB = real
++
++  def test_b_the_four_tiers_land_on_the_sent_clock(self):
++    """The real class, 125 s at 30 LSB: soft on the 3000th armed SENT frame, loud on the 4500th, final on the 5500th,
++    EXPIRED on the 6000th - and 4 from then on. It is the SENT count, not a wall clock (the frames are fed in a loop)."""
++    rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(125 * 100))
++    armed = _armed(rec)
 +    self.assertGreaterEqual(len(armed), 6000, "activity: the hold must reach 6000 armed sent frames")
-     self.assertEqual(30, max(lv for _f, lv in _levels(rec)))
--    self.assertEqual(SOFT_F, _nag_at(rec, SOFT), "soft must land on the 3000th armed sent frame")
--    self.assertEqual(LOUD_F, _nag_at(rec, LOUD), "loud must land on the 4500th")
--    self.assertEqual(FINAL_F, _nag_at(rec, FINAL), "final must land on the 5500th")
--    self.assertEqual(EXPIRE_F, _nag_at(rec, EXPIRED), "expiry must land on the 6000th")
++    self.assertEqual(30, max(lv for _f, lv in _levels(rec)))
 +    # LITERALS again: 3000 / 4500 / 5500 / 6000 armed SENT frames == 60 / 90 / 110 / 120 s at 50 Hz
 +    self.assertEqual(3000, _nag_at(rec, SOFT), "soft must land on the 3000th armed sent frame")
 +    self.assertEqual(4500, _nag_at(rec, LOUD), "loud must land on the 4500th")
 +    self.assertEqual(5500, _nag_at(rec, FINAL), "final must land on the 5500th")
 +    self.assertEqual(6000, _nag_at(rec, EXPIRED), "expiry must land on the 6000th")
-     self.assertEqual(EXPIRED, rec[-1][2], "and the latch must still be up at the end of the hold")
- 
-   def test_c_motion_before_the_tier_restarts_the_clock(self):
-@@ -242,6 +249,22 @@
-         brake.update(_cc(-2.0), cs, f)
-       self.assertFalse(bool(getattr(brake, "_hold_expired", True)), f"{kw} at 5999 must not latch")
-       self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++    self.assertEqual(EXPIRED, rec[-1][2], "and the latch must still be up at the end of the hold")
++
++  def test_c_motion_before_the_tier_restarts_the_clock(self):
++    """59 s of hold (no tier), then the car MOVES: the nag is 0 again and the clock restarts from zero, so a further
++    59 s of hold cannot reach soft. This is a reset, not a pause."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(59 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), 2900, "activity: 59 s must arm the clock")
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    for f in range(5900, 5940):
++      cs = _CS(v_ego=2.0, cam=(0, CAM), standstill=False, a_ego=-1.0)
++      cs.fca11_wheel_max_kph = 7.2
++      brake.update(_cc(-0.31), cs, f)
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    rec2 = _hold(brake, int(59 * 100), start=6000)
++    self.assertGreaterEqual(len(_armed(rec2)), 2900, "activity: the second leg must also be on the wire")
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec2}, "a motion reset must restart the count at 0")
++
++  def test_d_gas_at_5999_never_latches(self):
++    """One armed sent frame short of expiry, the driver presses the gas: the count resets, the latch must NOT set, and
++    the hold is back to 0. (A latch here would disengage the car on a hold that never expired.)"""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), EXPIRE_F, "activity: the hold must reach the threshold")
++    self.assertEqual(EXPIRED, rec[-1][2], "the control leg must actually expire")
++    brake2 = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec2, f_gas = _hold_until_armed(brake2, EXPIRE_F - 1)     # one armed sent frame short of expiry
++    self.assertEqual(EXPIRE_F - 1, len(_armed(rec2)), "activity: exactly one frame short")
++    self.assertEqual(FINAL, rec2[-1][2])
++    for f in range(f_gas, f_gas + 20):
++      cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++      cs.out.gasPressed = True
++      cs.fca11_wheel_max_kph = 0.0
++      brake2.update(_cc(-2.0), cs, f)
++    self.assertFalse(bool(getattr(brake2, "_hold_expired", True)), "a gas press at 5999 must not latch")
++    self.assertEqual(0, int(getattr(brake2, "_nag_frames", 0)))
++    self.assertEqual(NONE, int(getattr(brake2, "hold_nag", NONE)))
++
++  def test_e_gear_and_unavailable_at_5999_never_latch(self):
++    """Gear leaving D, and the panda marking the law unavailable, both reset the count one frame short of expiry and
++    must not latch it."""
++    for kw in ({"gear": structs.CarState.GearShifter.neutral}, {"pedal_cut": True}):
++      brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++      rec, f_reset = _hold_until_armed(brake, EXPIRE_F - 1)
++      self.assertEqual(EXPIRE_F - 1, len(_armed(rec)), "activity: exactly one frame short")
++      for f in range(f_reset, f_reset + 20):
++        cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5,
++                 gear=kw.get("gear", structs.CarState.GearShifter.drive))
++        cs.fca11_wheel_max_kph = 0.0
++        if kw.get("pedal_cut"):
++          # the panda's pedal-fault cut, as the law sees it. `fca11_unavailable` is RECOMPUTED every frame from these
++          # latches (fca11_long.py: `self.fca11_unavailable = bool(self.enabled and (self._pedal_cut or ...))`), so
++          # forcing the published flag would be overwritten - set the latch the law actually reads.
++          brake._pedal_cut = True
++        brake.update(_cc(-2.0), cs, f)
++      self.assertFalse(bool(getattr(brake, "_hold_expired", True)), f"{kw} at 5999 must not latch")
++      self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
 +
 +  def test_e2_the_drivers_brake_at_5999_never_latches(self):
 +    """The fourth reset the brief names: one armed sent frame short of expiry the driver presses the BRAKE. That is the
@@ -271,6 +474,227 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 +    self.assertFalse(bool(getattr(brake, "_hold_expired", True)), "a brake press at 5999 must not latch")
 +    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)), "and the count must be back at 0")
 +    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
- 
-   def test_f_the_latch_outlives_the_disengage_and_every_reset_but_the_brake(self):
-     """THE point of the latch. At expiry the superproject disengages: the law stops actuating, so the counter RESETS on
++
++  def test_f_the_latch_outlives_the_disengage_and_every_reset_but_the_brake(self):
++    """THE point of the latch. At expiry the superproject disengages: the law stops actuating, so the counter RESETS on
++    that very frame - and 4 has to survive it, or the alert would vanish exactly when the brakes come off. Then it must
++    survive gas, gear N, a re-engage and a second disengage, and clear ONLY on the brake press."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), EXPIRE_F, "activity: the leg must reach expiry")
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)))
++    # the disengage the superproject performs on holdNag == 4
++    dis = _hold(brake, 100, start=12100, engaged=False, long_active=False)
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)), "the disengage must reset the counter")
++    self.assertEqual([], _wire(dis), "a disengaged law puts nothing on 0x38D (the ESC is handed back)")
++    self.assertEqual({EXPIRED}, {nag for _f, _s, nag in dis}, "the latch must survive the counter reset")
++    # gas
++    _hold(brake, 10, start=12200)
++    for f in range(12210, 12230):
++      cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++      cs.out.gasPressed = True
++      cs.fca11_wheel_max_kph = 0.0
++      brake.update(_cc(-2.0), cs, f)
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "gas must not clear the latch")
++    # gear N
++    _hold(brake, 10, start=12230, gear=structs.CarState.GearShifter.neutral)
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "gear must not clear the latch")
++    # re-engage (the resume edge the driver makes) and hold again: still latched, and the count starts from zero
++    # underneath it. The edge is delivered as a disengaged->engaged pair: the gear-N leg latches `_driver_cut`, and
++    # NOTHING but a CC.enabled rising edge on a clean frame clears it (fca11_long.py update()).
++    _hold(brake, 2, start=12240, engaged=False, long_active=False)
++    re_hold = _hold(brake, int(5 * 100), start=12242)
++    self.assertGreaterEqual(len(_re_sent(re_hold)), 200, "activity: the re-engaged hold must be on the wire")
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "re-engaging must not clear the latch")
++    self.assertLess(int(getattr(brake, "_nag_frames", 0)), SOFT_F)
++    # the brake - the ONLY clear
++    b = _hold(brake, 2, start=12740, brake_pressed=True)
++    self.assertGreaterEqual(len(b), 2)
++    self.assertFalse(bool(getattr(brake, "_hold_expired", True)), "the brake press must clear the latch")
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++
++  def test_g_the_nag_changes_no_wire_byte(self):
++    """Golden stream, LOCAL: the same 240 s hold run twice through the REAL class, once with the escalation neutralised
++    (hold_nag_level pinned to 0 and the latch forced off). Every 0x38D byte and every frame number must be identical -
++    the observer cannot reach the law. The CROSS-TREE pin is test_j/test_k below."""
++    real = fl.hold_nag_level
++    try:
++      normal = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++      fl.hold_nag_level = lambda _frames: 0
++      neutral = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++    finally:
++      fl.hold_nag_level = real
++    self.assertEqual(_wire(normal), _wire(neutral))
++    self.assertGreaterEqual(len(_wire(normal)), 11900, "activity: the stream must be a real hold")
++    self.assertEqual({SOFT, LOUD, FINAL, EXPIRED}, {nag for _f, _s, nag in normal} - {NONE},
++                     "and the countdown really ran (all four states seen)")
++
++  def test_h_disabled_feature_publishes_nothing(self):
++    """OFF is the deployed path: with fca11Brake off the law never actuates and the published state stays 0."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False))
++    rec = _hold(brake, 400)
++    self.assertEqual(400, len(rec))
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    self.assertEqual([], _wire(rec))
++
++
++def _re_sent(record):
++  return _wire(record)
++
++
++# *** The GOLDEN, taken from the tree WITHOUT the countdown (the 0040 base + 0042). ***
++# The two streams above run in THIS tree, so a side effect _hold_nag_step had on the law would appear in both runs and
++# cancel out. These pins cannot: they were taken by running the SAME script through the base class (/tmp/CD-base =
++# aa9bff6f + patches 0001..0040 + 0042, no countdown at all). The whole stream - frame number + every 0x38D byte - is
++# byte-for-byte what that tree puts on the wire.
++# RE-PIN RULE: if the law changes, re-run this file's `_scenario_streams()` against the base tree and take its hashes;
++# do NOT re-pin from this tree (that is how a wire regression becomes invisible).
++# WHICH writes it catches (measured, not argued): the hold CEILING (FCA11_STANDSTILL_HOLD_LSB written down to 20), the
++# actuation GATE (self._actuating = False) and the panda's rate REFERENCE (self._dec_last_sent = 0) each change the
++# sha256 or the sent count and fail this test.
++GOLDEN_BASE_SHA256 = "133319d868752ebf419a9a1e181590b74ca44e8828c74f1cf4643dce490db0de"
++GOLDEN_BASE_SENT_FRAMES = 35753
++# 722 s: approach 5 s; hold 130 s; brake tap; re-engage; hold 200 s; gas; N; re-engage; hold 190 s; disengage; hold
++# 190 s; launch. 72 200 controller frames at 100 Hz.
++GOLDEN_SCRIPT = (
++  (5, {"v": 3.0, "ss": False, "ask": -1.5}),
++  (130, {}),
++  (0.3, {"brake": True}),
++  (0.1, {"eng": False, "long": False}),
++  (200, {}),
++  (0.5, {"gas": True}),
++  (2, {"gear": structs.CarState.GearShifter.neutral}),
++  (0.1, {"eng": False, "long": False}),
++  (190, {}),
++  (1, {"long": False, "eng": False}),
++  (190, {}),
++  (3, {"v": 2.0, "ss": False, "ask": 0.5}),
++)
++
++
++def _scenario_streams():
++  """Run GOLDEN_SCRIPT through the REAL class.
++
++  Returns (sha256, sent_frames, armed_frames, nag-per-frame, [(frame, level)] of every sent frame).
++  """
++  brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++  brake._dyn_log = None
++  brake._mark_log = None
++  h = hashlib.sha256()
++  sent = armed = 0
++  frame = 0
++  nag, levels = [], []
++  for dur, kw in GOLDEN_SCRIPT:
++    for _ in range(int(dur * 100)):
++      v = kw.get("v", 0.0)
++      cs = _CS(v_ego=v, cam=(0, CAM), standstill=kw.get("ss", True),
++               a_ego=-1.5 if kw.get("ask", -2.0) < 0 else 0.3,
++               brake=kw.get("brake", False), gear=kw.get("gear", structs.CarState.GearShifter.drive))
++      cs.out.gasPressed = kw.get("gas", False)
++      cs.fca11_wheel_max_kph = v * 3.6
++      cc = _cc(kw.get("ask", -2.0))
++      cc.longActive = kw.get("long", True)
++      cc.enabled = kw.get("eng", True)
++      for s in brake.update(cc, cs, frame):
++        if s.address == fl.FCA11_ADDR:
++          h.update(frame.to_bytes(4, "little") + bytes(s.dat))
++          sent += 1
++          lv = fl._get_bits(s.dat, 8, 8)
++          armed += lv >= ARM_LSB
++          levels.append((frame, lv))
++      nag.append(int(getattr(brake, "hold_nag", NONE)))
++      frame += 1
++  return h.hexdigest(), sent, armed, nag, levels
++
++
++class TestGoldenStreamOnTheBase(unittest.TestCase):
++  """The CROSS-TREE golden: a 722 s scripted drive with every reset event, hashed against the tree without the
++  countdown."""
++
++  def test_j_a_722_s_scripted_hold_reproduces_the_base_bytes(self):
++    sha, sent, armed, nag, levels = _scenario_streams()
++    self.assertEqual(GOLDEN_BASE_SENT_FRAMES, sent)
++    self.assertEqual(GOLDEN_BASE_SHA256, sha, "the countdown must not change ONE byte of the base stream")
++    # the stream IS a real hold (>= 20 LSB on 99 % of sent frames), so the identity above means something
++    self.assertGreaterEqual(armed, int(0.99 * sent))
++    # and the countdown really ran across that stream: every tier was reached in the first 130 s hold, and each tier
++    # landed on its own ARMED SENT FRAME count (3000 / 4500 / 5500 / 6000), not on wall time
++    armed_frames = [f for f, lv in levels if lv >= ARM_LSB]
++    self.assertGreaterEqual(len(armed_frames), EXPIRE_F, "activity: the first hold must reach expiry")
++    for want, threshold in ((SOFT, SOFT_F), (LOUD, LOUD_F), (FINAL, FINAL_F), (EXPIRED, EXPIRE_F)):
++      f_want = nag.index(want)
++      self.assertEqual(threshold, sum(1 for f in armed_frames if f <= f_want),
++                       f"tier {want} must land on armed sent frame {threshold}")
++    ends, stop = [], 0
++    for dur, _kw in GOLDEN_SCRIPT:
++      stop += int(dur * 100)
++      ends.append(nag[stop - 1])
++    # brake / gas / N / disengage: the two holds both expire, so 4 survives every phase end after them - the brake
++    # tap at 135 s is the ONE thing that drops it back to 0, and nothing after it (gas, N, disengage, moving) clears it
++    self.assertEqual([0, EXPIRED, NONE, NONE, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED],
++                     ends)
++
++  def test_k_a_disengage_at_the_expiry_boundary_is_byte_identical_to_the_base(self):
++    """P1(b): the same hold, disengaged one armed sent frame before expiry (5999), exactly at it (6000) and one after
++    (6001), plus a 130 s hold that is never disengaged. Every one must hash to what the BASE tree produces for that
++    exact stream: the observer cannot change a byte, not even on the frame it expires on."""
++    for n in (5999, 6000, 6001):
++      sha, sent, armed, nag = _disengage_stream(n_armed=n)
++      self.assertEqual(n, armed, "activity: exactly n armed sent frames before the disengage")
++      self.assertEqual(BASE_DISENGAGE_SHA[("armed", n)], sha, f"disengage at armed sent frame {n}")
++      # the nag is non-decreasing up to the disengage and drops to 0 the frame the counter resets, unless the latch
++      # caught it - so max() is the state the disengage arrived in
++      self.assertEqual(EXPIRED if n >= EXPIRE_F else FINAL, max(nag),
++                       f"the latch state when the disengage lands {n} armed frames in")
++    # the brief words this as "sent frame N": same measurement, and it lands 4 armed frames short of the boundary
++    # because the onset ramp is below the arming level. The wire is identical either way; the latch is not.
++    sha, sent, armed, nag = _disengage_stream(n_sent=6000)
++    self.assertEqual(6000, sent)
++    self.assertEqual(5996, armed)
++    self.assertEqual(BASE_DISENGAGE_SHA[("sent", 6000)], sha, "disengage at the 6000th SENT frame")
++    self.assertEqual(FINAL, max(nag), "4 armed frames short of expiry is not expiry")
++    self.assertEqual(NONE, nag[-1], "and with no latch the counter reset takes the banner away")
++    # and a plain 130 s hold that is never disengaged
++    sha, sent, armed, nag = _disengage_stream(None, hold_frames=13000)
++    self.assertEqual(6500, sent)
++    self.assertEqual(BASE_130S_SHA, sha, "a 130 s hold")
++    self.assertEqual(EXPIRED, nag[-1])
++def _disengage_stream(n_armed=None, n_sent=None, hold_frames=12600):
++  """Feed a steady standstill hold and drop longActive on the frame the boundary is reached.
++
++  `n_armed` counts SENT frames at or above the arming level (what the countdown counts); `n_sent` counts every SENT
++  0x38D (what P1(b)'s wording says). They are NOT the same number: the first 4 sent frames of an episode are the onset
++  ramp and sit below 20 LSB, so "sent frame 6000" is "armed frame 5996" - which is why BOTH are measured here.
++  Returns (sha256 of frame+bytes over every sent 0x38D, sent count, armed count, nag per controller frame).
++  """
++  brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++  brake._dyn_log = None
++  brake._mark_log = None
++  h = hashlib.sha256()
++  sent = armed = 0
++  nag = []
++  for f in range(hold_frames):
++    long_active = not ((n_armed is not None and armed >= n_armed) or (n_sent is not None and sent >= n_sent))
++    cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++    cs.fca11_wheel_max_kph = 0.0
++    for s in brake.update(_cc(-2.0, engaged=long_active, long_active=long_active), cs, f):
++      if s.address == fl.FCA11_ADDR:
++        h.update(f.to_bytes(4, "little") + bytes(s.dat))
++        sent += 1
++        armed += fl._get_bits(s.dat, 8, 8) >= ARM_LSB
++    nag.append(int(getattr(brake, "hold_nag", NONE)))
++  return h.hexdigest(), sent, armed, nag
++
++
++# Hashes of the same streams produced by the BASE tree (aa9bff6f + 0001..0040 + 0042, no countdown at all), taken by
++# running this file's `_disengage_stream` against it. See the RE-PIN RULE above.
++BASE_DISENGAGE_SHA = {
++  ("armed", 5999): "969c68f3bf5a724f13be8a7d8165bafb6e910b484c597f44c706c3f877ee16c9",
++  ("armed", 6000): "ecbe08bed6cd9d808e8c40d13e10452b99c0d2b72743bd484dd1e76d2961bd69",
++  ("armed", 6001): "7de985a07e05dd90d19f05de52ba8758c02dcb75f322f04eacc50e1d4c3eeae4",
++  ("sent", 6000): "b098e3e8a5fb5adbd90c63108b7b9baca91f55583685583874b9438d33332ef1",
++}
++BASE_130S_SHA = "a3efc997d1302589fc4ff20c14616aa19513ae22733ac12164c4f9167329304c"
++
++

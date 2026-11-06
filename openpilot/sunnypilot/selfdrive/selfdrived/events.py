@@ -279,8 +279,9 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # fork (0043): the standstill HOLD COUNTDOWN v2 (owner, 2026-11-06: "silent banner after 1 min / an audio alert after
   # 1:30 / release the brakes after 2 mins"). The car is held stopped by ESC pressure + a live clutch torque; the hold is
-  # NOT a parking brake, so it is BOUNDED now: at 2:00 openpilot disengages and the reviewed driver-disengage release
-  # path (soft release ramp + passive close frame) takes the brakes off. Raised from CarStateSP.holdNag (opendbc half:
+  # NOT a parking brake, so it is BOUNDED now: at 2:00 openpilot disengages and the deployed driver-disengage release
+  # takes the brakes off (the law stops sending 0x38D; the panda hands it back to the camera's passive frame within its
+  # 100 ms TX_STALE - measured in lane-X3/proof_release_panda.py). Raised from CarStateSP.holdNag (opendbc half:
   # Fca11LongBrake.hold_nag, a pure observer of the SENT level - the law's wire is untouched, proved byte-identical).
   #   1 soft     60 s  LOW, silent, MID - a notice that the bound exists. `mid`, not `small` (review D4 of 0041): the
   #                    renderer never draws a `small` alert's text_2, and the second line is the part that says when the

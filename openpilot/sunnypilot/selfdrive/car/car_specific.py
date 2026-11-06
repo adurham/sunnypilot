@@ -78,8 +78,10 @@ class CarSpecificEventsSP:
           #   * `pcmDisable` (ET.USER_DISABLE) on the STANDARD events object this function is handed. selfdrived.py
           #     l.284 passes `self.events` in and l.660 feeds exactly that object to `state_machine.update` in the SAME
           #     update, so the disengage lands on this frame with no selfdrived.py change, no new cereal enum and no
-          #     compiled code. The reviewed driver-disengage release path (soft release ramp + passive close frame)
-          #     then does the brake release - the law's own wire is untouched (STATE.md, checkpoint 1).
+          #     compiled code. The release is then the DEPLOYED driver-disengage release, measured in
+          #     lane-X3/proof_release_panda.py: the law stops putting 0x38D on the wire (0 frames), the panda's own
+          #     TX_STALE (100 ms) hands 0x38D back to the camera's passive frame, and the ESC input goes 30 -> 0
+          #     monotonically. The law's own bytes are untouched (P1).
           #   * while the latch is set, `buttonEnable`/`pcmEnable` are removed - the idiom MADS itself uses
           #     (mads.py l.163-164) - so a RES press cannot re-engage until the driver brakes. This is how the main
           #     state machine is blocked WITHOUT inventing a standard ET.NO_ENTRY: every USER_DISABLE+NO_ENTRY standard
