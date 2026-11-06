@@ -263,7 +263,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
     // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
     // "REGISTRATION ONLY ... Setting it here is INERT" note here was stale - it described the pre-merge state.)
-    // Default OFF.
+    // It also only runs in NORMAL drive mode: gas_interceptor.py:734 gates the measured law on driveMode == NORMAL
+    // (the table was fit on route 17c, which ran in NORMAL), so ECO / SPORT / N and an undecoded mode keep the
+    // deployed linear pedal law. Default OFF.
     // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
     // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
     // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
