@@ -45,9 +45,11 @@ class HyundaiSettings(BrandSettings):
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
     # 0034: EXPERIMENTAL — asks the ESC for its own stop hold at a standstill so the transmission releases the clutch.
-    # RETIRED ROW (settings tidy): hidden on every car by fca11_stop_hold_toggle_state — the hold has never been
-    # validated (FORK.md row 137) and the TCU reads the brake pedal switch, not 0x38D (row 140); the key, its reader,
-    # capnp @11 and the stored value stay, and restoring that rule brings the row back.
+    # LISTED ONLY WHILE ITS OWN VALUE IS ON (fca11_stop_hold_toggle_state): per FORK.md row 137 the hold has never been
+    # validated, and the TCU reads the brake pedal switch, not 0x38D (row 141), so the row is out of the way at its
+    # default 0 — but the key is BACKUP-flagged and was 1 on route 195, and a restore writes it back with no switch in
+    # sight. Showing the row while the value is ON gives the owner that switch. Key, reader, capnp @11 and value stay;
+    # the panel never writes the param.
     self.fca11_stop_hold_toggle = toggle_item_sp(tr("Hold Clutch Release (experimental)"), "", param="HyundaiFca11StopHoldClutch",
                                                  callback=self._on_fca11_toggle_changed)
     # fork: ELASTIC FOLLOW DISTANCE (AdaptiveFollowDistance) - the owner's follow law: one gap for every personality
@@ -244,13 +246,15 @@ class HyundaiSettings(BrandSettings):
     self.fca11_dynamic_release_toggle.set_visible(dynamic_state.visible)
 
     # 0034: Hold Clutch Release (experimental) - the FCA11 frame also asks for the ESC's own stop hold at a standstill.
-    hold_state = fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad)
+    hold_raw = ui_state.params.get("HyundaiFca11StopHoldClutch")
+    hold_state = fca11_stop_hold_toggle_state(pedal_raw, brake_raw, hold_raw, offroad)
     self.fca11_stop_hold_toggle.action_item.set_enabled(hold_state.enabled)
     hold_desc = tr("EXPERIMENTAL. While holding the car stopped, the FCA11 frame also asks the ESC for its own stop " +
                    "hold, which is the condition under which the transmission releases the clutch (the car sits at " +
                    "about 26 Nm of creep torque otherwise). Only sent at walking pace, at a real hold level, with FCA11 " +
-                   "Braking on. Unproven: whether the car holds on an incline this way, and how it lets go. Requires " +
-                   "FCA11 Braking. Takes effect at the next ignition.")
+                   "Braking on. Unproven: whether the car holds on an incline this way, and how it lets go. This row " +
+                   "is only listed while the switch is ON - the stored value came from a backup restore - so turning " +
+                   "it OFF here hides the row again. Requires FCA11 Braking. Takes effect at the next ignition.")
     if hold_state.visible and not offroad:
       hold_desc = offroad_hint + hold_desc
     self.fca11_stop_hold_toggle.set_description(hold_desc)

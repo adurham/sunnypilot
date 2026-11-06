@@ -115,7 +115,7 @@ class TestFca11SettingsRules(unittest.TestCase):
       "Dynamic Brakes": fca11_dynamic_release_toggle_state(pedal, brake, True),
       "Stop-Approach Commitment": stop_approach_toggle_state(True),
       "Custom Longitudinal Tuning": tuning(pedal, True),
-      "Hold Clutch Release (experimental)": fca11_stop_hold_toggle_state(pedal, brake, True),
+      "Hold Clutch Release (experimental)": fca11_stop_hold_toggle_state(pedal, brake, "0", True),
     }
     hidden = {title for title, state in rows.items() if not state.visible}
     self.assertEqual({"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}, hidden)
@@ -147,12 +147,22 @@ class TestFca11SettingsRules(unittest.TestCase):
     for pat in (r"FCA11 Braking OFF", r"Shaping ON", r"Dynamic Brakes ON", r"Shadow OFF"):
       self.assertRegex(off, pat)
 
-  def test_stop_hold_row_is_retired_hidden(self):
-    """SETTINGS TIDY: the 0034 row is hidden on every car - the ESC hold has never been validated (FORK.md row 137)
-    and the TCU opens the clutch on the brake pedal switch, not on 0x38D (lane-U report, summarised in row 140). The
-    rule keeps the pedal/brake arguments so the row comes back by reverting it."""
-    for pedal, brake, offroad in itertools.product(ON_VALUES + OFF_VALUES, ON_VALUES + OFF_VALUES, (True, False)):
-      self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state(pedal, brake, offroad), (pedal, brake, offroad))
+  def test_stop_hold_row_is_listed_only_while_its_value_is_on(self):
+    """R4 (Opus re-review (f)): the 0034 row is hidden at its value 0 and SHOWN at value 1, in every pedal/brake/onroad
+    state. The key is BACKUP-flagged and was 1 on route 195, so a device backup restore can write 1 and the reader
+    honours it with no switch in sight — the row is that switch. The panel never writes the param (the write test
+    below pins update_settings at zero writes)."""
+    for pedal, brake, hold, offroad in itertools.product(ON_VALUES + OFF_VALUES, ON_VALUES + OFF_VALUES,
+                                                         ON_VALUES + OFF_VALUES, (True, False)):
+      vis = pedal in ON_VALUES and brake in ON_VALUES and hold in ON_VALUES
+      self.assertEqual(ToggleState(visible=vis, enabled=vis and offroad),
+                       fca11_stop_hold_toggle_state(pedal, brake, hold, offroad), (pedal, brake, hold, offroad))
+    # the four corners the review named, spelled out
+    self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state("1", "1", "0", True))   # OFF => hidden
+    self.assertEqual(ToggleState(True, True), fca11_stop_hold_toggle_state("1", "1", "1", True))     # ON  => shown
+    self.assertEqual(ToggleState(True, False), fca11_stop_hold_toggle_state("1", "1", "1", False))   # offroad only
+    self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state("0", "1", "1", True))   # still needs the
+    self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state("1", "0", "1", True))   # pedal + braking
 
   def test_stop_hold_key_is_never_deleted_or_re_defaulted(self):
     """Hidden, not removed: the registry entry, its default and the car's stored value (0) stay exactly as they are."""
@@ -299,16 +309,18 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("self.longitudinal_tuning_item.set_visible(self.alpha_long_available and tuning_state.visible)", self.src)
 
   def test_stop_hold_row_wiring(self):
-    """SETTINGS TIDY: the retired row keeps title -> param -> attribute wiring; only its visibility is forced off."""
+    """SETTINGS TIDY + R4: the row keeps title -> param -> attribute wiring, and its visibility comes from the pure rule
+    WITH the row's own value (listed only while ON, pedal and braking on)."""
     self.assertRegex(self.src, r'toggle_item_sp\(tr\("Hold Clutch Release \(experimental\)"\),\s*"",\s*'
                                r'param="HyundaiFca11StopHoldClutch"')
     m = re.search(r"self\.items = \[(.*?)\]", self.src, re.S)
     self.assertIsNotNone(m)
     self.assertIn("self.fca11_stop_hold_toggle", m.group(1))
-    self.assertIn("fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad)", self.src)
+    self.assertIn('hold_raw = ui_state.params.get("HyundaiFca11StopHoldClutch")', self.src)
+    self.assertIn("fca11_stop_hold_toggle_state(pedal_raw, brake_raw, hold_raw, offroad)", self.src)
     self.assertIn("self.fca11_stop_hold_toggle.set_visible(hold_state.visible)", self.src)
-    self.assertIn("FORK.md row 137", self.src)   # how to bring it back is written next to the row
-    self.assertIn("(row 140)", self.src)         # ... and the TCU evidence it may not cite otherwise
+    self.assertIn("FORK.md row 137", self.src)   # why the row is out of the way is written next to the row
+    self.assertIn("(row 141)", self.src)         # ... and the TCU evidence it may not cite otherwise
 
 
 # --- D4: the brake-law text, checked against the REAL controller for every (Shaping, Dynamic, Shadow) combination ---
@@ -401,6 +413,19 @@ for b in (True, False):
         out["%d%d%d%d" % (b, s, d, h)] = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled,
                                                      "desc": it.desc} for it in panel.items}
 update_writes = list(WRITES)     # R3 (F4): update_settings alone, 16 combinations
+# R4: the stop-hold row's own value ON (what a route-195-era backup restore writes) - the row must be SHOWN then.
+hold_on = {}
+ui_state.params.d["HyundaiFca11StopHoldClutch"] = True
+for b in (True, False):
+  for s in (True, False):
+    for d in (True, False):
+      for h in (True, False):
+        ui_state.params.d.update({"HyundaiFca11Brake": b, "HyundaiFca11AffineGain": s,
+                                  "HyundaiFca11DynamicBrakes": d, "HyundaiFca11Shadow": h})
+        panel.update_settings()
+        hold_on["%d%d%d%d" % (b, s, d, h)] = {"visible": bool(panel.fca11_stop_hold_toggle.visible),
+                                              "enabled": panel.fca11_stop_hold_toggle.action_item.enabled}
+ui_state.params.d["HyundaiFca11StopHoldClutch"] = False
 ui_state.params.d.update({"HyundaiFca11Brake": True, "HyundaiFca11AffineGain": True,
                           "HyundaiFca11DynamicBrakes": True, "HyundaiFca11Shadow": False})
 ui_state.off = False
@@ -419,7 +444,7 @@ for it in panel.items:
     it.callback(2)
   else:
     it.callback(True)
-print(json.dumps({"combos": out, "onroad": onroad, "update_writes": update_writes,
+print(json.dumps({"combos": out, "hold_on": hold_on, "onroad": onroad, "update_writes": update_writes,
                   "callback_writes": list(WRITES)}))
 '''
 
@@ -664,6 +689,16 @@ class TestBrakeLawMatrix(unittest.TestCase):
       if not brake:
         expected |= {"FCA11 Brake Shaping (Beta)", "Dynamic Brakes"}
       self.assertEqual(expected, {t for t, r in rows.items() if not r["visible"]}, combo)
+
+  def test_the_stop_hold_row_is_shown_only_while_its_value_is_on(self):
+    """R4: at its default 0 the 0034 row stays out of the way in all 16 states; with the value ON (a backup restore
+    from the route-195 era) it is LISTED and settable offroad, so the owner has the switch the review asked for."""
+    for combo, rows in self.matrix["combos"].items():
+      self.assertFalse(rows["Hold Clutch Release (experimental)"]["visible"], combo)
+    for combo, row in self.matrix["hold_on"].items():
+      brake = bool(int(combo[0]))
+      self.assertEqual(brake, row["visible"], f"hold value ON at {combo}: the row must be listed iff Braking is on")
+      self.assertEqual(brake, row["enabled"], f"hold value ON at {combo}: settable offroad")
 
   def test_the_brake_rows_are_listed_and_settable_offroad_in_every_combination(self):
     for combo, rows in self.matrix["combos"].items():

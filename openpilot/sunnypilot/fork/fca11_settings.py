@@ -12,7 +12,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
   Dynamic Brake Release         HyundaiFca11DynamicBrakes visible: pedal on AND braking on; enabled: offroad
   Stop-Approach Commitment      StopApproachCommit      visible: always (planner-side);   enabled: offroad
   Custom Longitudinal Tuning    HyundaiLongitudinalTuning visible: pedal OFF (inert with the pedal on; upstream key)
-  Hold Clutch Release           HyundaiFca11StopHoldClutch visible: never (retired row; key + reader untouched)
+  Hold Clutch Release           HyundaiFca11StopHoldClutch visible: pedal on AND braking on AND its own value ON
 
 Both keys are read at CarParams build time, so a change takes effect at the NEXT ignition; offroad-only enabling makes
 that consistent. The dependency (shaping needs braking) is ALSO enforced in the car layer (opendbc setup_interfaces), so
@@ -136,14 +136,20 @@ def fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad: bool) -> T
   return ToggleState(visible=visible, enabled=visible and bool(offroad))
 
 
-def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleState:
-  """0034 Hold Clutch Release — RETIRED as a row, and the citation is precise: the ESC's own stop hold has NEVER been
-  validated on the car (FORK.md row 137: "Not validated (drive-gated)"), and the reason the pair was expected to
-  matter is not in 0x38D at all — the TCU opens the DCT clutch on the BRAKE PEDAL switch, not on any bit we send
-  (the lane-U report, UREPORT.md Q2-Q3; summarised in FORK.md row 140). So the row is hidden everywhere. The key, its
-  reader, the capnp slot @11 and the stored value stay untouched. To bring the row back, restore the visibility
-  expression below (`visible = _on(pedal_raw) and _on(brake_raw)`) and update the tests that pin it hidden."""
-  return ToggleState(visible=False, enabled=False)
+def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, hold_raw, offroad: bool) -> ToggleState:
+  """0034 Hold Clutch Release — the row is listed ONLY while its own param is ON (R4, Opus re-review (f)).
+
+  The citation is precise: the ESC's own stop hold has NEVER been validated on the car (FORK.md row 137: "Not
+  validated (drive-gated)"), and the reason the pair was expected to matter is not in 0x38D at all — the TCU opens the
+  DCT clutch on the BRAKE PEDAL switch, not on any bit we send (the lane-U report, UREPORT.md Q2-Q3; summarised in
+  FORK.md row 141). So the row is out of the way by default. But hiding it while the value is ON would be unsafe: the
+  key is `PERSISTENT | BACKUP` and was 1 on route 195, a device backup restore writes every BACKUP key back
+  (backups/manager.py), and the reader honours the value at ignition (setup_interfaces -> CarParamsSP ->
+  fca11_long), so the lane can be live with no switch in sight. Listing the row while the value is ON gives the owner
+  that switch back; the panel never writes the param itself (update_settings stays write-free). The key, its reader,
+  the capnp slot @11 and the stored value stay untouched."""
+  visible = _on(pedal_raw) and _on(brake_raw) and _on(hold_raw)
+  return ToggleState(visible=visible, enabled=visible and bool(offroad))
 
 
 def stop_approach_toggle_state(offroad: bool) -> ToggleState:
