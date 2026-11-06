@@ -11,6 +11,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
   Gas Rise Lag                  HyundaiGasRiseLag      visible: pedal on;                 enabled: offroad   (0042-Z)
   Dynamic Brake Release         HyundaiFca11DynamicBrakes visible: pedal on AND braking on; enabled: offroad
   Stop-Approach Commitment      StopApproachCommit      visible: always (planner-side);   enabled: offroad
+  Custom Longitudinal Tuning    HyundaiLongitudinalTuning visible: pedal OFF (inert with the pedal on; upstream key)
 
 Both keys are read at CarParams build time, so a change takes effect at the NEXT ignition; offroad-only enabling makes
 that consistent. The dependency (shaping needs braking) is ALSO enforced in the car layer (opendbc setup_interfaces), so
@@ -77,3 +78,14 @@ def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleS
 def stop_approach_toggle_state(offroad: bool) -> ToggleState:
   """17c lane C: Stop-Approach Commitment is planner-side (no pedal dependency), always listed, settable offroad only."""
   return ToggleState(visible=True, enabled=bool(offroad))
+
+
+def longitudinal_tuning_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
+  """UPSTREAM sunnypilot key HyundaiLongitudinalTuning (the Off/Dynamic/Predictive row). It is INERT on a
+  gas-interceptor car: with the pedal on, `scc_long` is False so the tuned accel is only published, never sent, and
+  this car's tuning config resolves to the 0.50 s the interceptor already sets (the wire is byte-identical for
+  0/1/2). So the row is HIDDEN while the pedal is on and comes back the moment it is off - a visibility rule only:
+  the key, its reader, initialize_params' feed and the stored value are all untouched (other cars still use it)."""
+  pedal_on = _on(pedal_raw)
+  visible = not pedal_on
+  return ToggleState(visible=visible, enabled=visible and bool(offroad))

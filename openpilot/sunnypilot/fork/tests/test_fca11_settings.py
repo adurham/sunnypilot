@@ -7,11 +7,20 @@ import re
 import unittest
 from pathlib import Path
 
+from openpilot.sunnypilot.fork import fca11_settings
 from openpilot.sunnypilot.fork.fca11_settings import ToggleState, fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, \
+  gas_rise_lag_toggle_state
 
 REPO = Path(__file__).resolve().parents[4]
 PANEL = REPO / "openpilot" / "selfdrive" / "ui" / "sunnypilot" / "layouts" / "settings" / "vehicle" / "brands" / "hyundai.py"
+
+
+def _row_rule(name):
+  """The settings-tidy row rules are the subject of this file. On a tree that predates them the row is listed
+  unconditionally; the tests below must FAIL BY VALUE there (the row is visible) and never by ImportError."""
+  return getattr(fca11_settings, name, None)
+
 
 ON_VALUES = (True, "1", b"1", 1)
 OFF_VALUES = (False, "0", b"0", None, "", 0, "junk")
@@ -63,6 +72,47 @@ class TestFca11SettingsRules(unittest.TestCase):
     """17c lane C: always listed (planner-side, no pedal dependency); settable offroad only."""
     self.assertEqual(ToggleState(True, True), stop_approach_toggle_state(True))
     self.assertEqual(ToggleState(True, False), stop_approach_toggle_state(False))
+
+  def test_longitudinal_tuning_toggle_full_truth_table(self):
+    """SETTINGS TIDY: visible <=> pedal OFF (the row is inert with the pedal on); enabled <=> visible AND offroad."""
+    rule = _row_rule("longitudinal_tuning_toggle_state")
+    self.assertIsNotNone(rule, "no visibility rule for HyundaiLongitudinalTuning: the row is listed unconditionally")
+    for pedal, offroad in itertools.product(ON_VALUES + OFF_VALUES, (True, False)):
+      vis = pedal not in ON_VALUES
+      self.assertEqual(ToggleState(visible=vis, enabled=vis and offroad), rule(pedal, offroad), (pedal, offroad))
+
+  def test_longitudinal_tuning_row_is_hidden_on_this_car(self):
+    """The car's real value is HyundaiGasInterceptor=1, so the row must NOT be listed - offroad or onroad."""
+    rule = _row_rule("longitudinal_tuning_toggle_state")
+    self.assertIsNotNone(rule, "no visibility rule for HyundaiLongitudinalTuning: the row is listed unconditionally")
+    self.assertEqual(ToggleState(False, False), rule("1", True))
+    self.assertEqual(ToggleState(False, False), rule("1", False))
+    # ... and it comes back, unchanged, on a car without the pedal (the key is upstream and shared).
+    self.assertEqual(ToggleState(True, True), rule("0", True))
+
+  def test_longitudinal_tuning_key_is_never_deleted_or_re_defaulted(self):
+    """It is an UPSTREAM sunnypilot key (present in the sync target): hiding the row must not touch registry or value."""
+    keys_src = (REPO / "openpilot" / "common" / "params_keys.h").read_text(encoding="utf-8")
+    self.assertRegex(keys_src, r'\{"HyundaiLongitudinalTuning", \{PERSISTENT \| BACKUP, INT, "0"\}\}')
+
+  def test_the_cars_real_param_combination(self):
+    """Every row decided with the car's own values (gas interceptor 1, Brake 1, Shaping 1, Dynamic 1, Shadow 0,
+    PedalDeliveryLaw 1, GasRiseLag 1): the inert rows are hidden, every live row is still listed."""
+    pedal, brake = "1", "1"
+    tuning = _row_rule("longitudinal_tuning_toggle_state")
+    self.assertIsNotNone(tuning, "no visibility rule for HyundaiLongitudinalTuning: the row is listed unconditionally")
+    rows = {
+      "FCA11 Braking": fca11_brake_toggle_state(pedal, True),
+      "FCA11 Brake Shaping": fca11_shaping_toggle_state(pedal, brake, True),
+      "FCA11 Shadow": fca11_shadow_toggle_state(pedal, True),
+      "Pedal Delivery Law": pedal_delivery_toggle_state(pedal, True),
+      "Gas Rise Lag": gas_rise_lag_toggle_state(pedal, True),
+      "Dynamic Brakes": fca11_dynamic_release_toggle_state(pedal, brake, True),
+      "Stop-Approach Commitment": stop_approach_toggle_state(True),
+      "Custom Longitudinal Tuning": tuning(pedal, True),
+    }
+    hidden = {title for title, state in rows.items() if not state.visible}
+    self.assertEqual({"Custom Longitudinal Tuning"}, hidden)
 
 
 class TestPanelWiring(unittest.TestCase):
@@ -128,6 +178,13 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("Requires FCA11 Braking", self.src)            # dynamic release
     self.assertIn("never raises it", self.src)                   # stop-approach commitment
     self.assertNotIn("you must enable it with a param", self.src)
+
+  def test_longitudinal_tuning_row_wiring(self):
+    """SETTINGS TIDY: the upstream row stays wired to its key but its visibility goes through the pure rule."""
+    self.assertRegex(self.src, r'multiple_button_item_sp\(tr\("Custom Longitudinal Tuning"\),\s*"",\s*tuning_texts,')
+    self.assertIn('param="HyundaiLongitudinalTuning"', self.src)
+    self.assertIn("longitudinal_tuning_toggle_state(pedal_raw, offroad)", self.src)
+    self.assertIn("self.longitudinal_tuning_item.set_visible(self.alpha_long_available and tuning_state.visible)", self.src)
 
 
 if __name__ == "__main__":

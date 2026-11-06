@@ -9,7 +9,8 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp, toggle_item_sp
 from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, fca11_stop_hold_toggle_state, gas_rise_lag_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, \
+  fca11_stop_hold_toggle_state, gas_rise_lag_toggle_state, longitudinal_tuning_toggle_state
 from opendbc.car.hyundai.values import CAR, UNSUPPORTED_LONGITUDINAL_CAR
 
 
@@ -80,6 +81,13 @@ class HyundaiSettings(BrandSettings):
     elif ui_state.CP is not None:
       self.alpha_long_available = ui_state.CP.alphaLongitudinalAvailable
 
+    # Read once: the pedal switch decides which FCA11 rows can do anything on this car, and it also hides the upstream
+    # Custom Longitudinal Tuning row (inert while the pedal is on).
+    pedal_raw = ui_state.params.get("HyundaiGasInterceptor")
+    brake_raw = ui_state.params.get("HyundaiFca11Brake")
+    offroad = ui_state.is_offroad()
+    offroad_hint = tr("Enable \"Always Offroad\" in the Device panel, or turn the vehicle off to toggle.") + "<br><br>"
+
     tuning_param = int(ui_state.params.get("HyundaiLongitudinalTuning") or "0")
     long_enabled = ui_state.has_longitudinal_control
 
@@ -90,7 +98,10 @@ class HyundaiSettings(BrandSettings):
     ]
     long_tuning_desc = long_tuning_descs[tuning_param] if tuning_param < len(long_tuning_descs) else long_tuning_descs[0]
 
-    longitudinal_tuning_disabled = not ui_state.is_offroad() or not long_enabled
+    # HIDE the upstream Custom Longitudinal Tuning row while the pedal is on: it is inert there (phase-1 inventory:
+    # the CAN stream is byte-identical for 0/1/2 and scc_long is False). Pure visibility rule; key + value untouched.
+    tuning_state = longitudinal_tuning_toggle_state(pedal_raw, offroad)
+    longitudinal_tuning_disabled = not ui_state.is_offroad() or not long_enabled or not tuning_state.visible
     if longitudinal_tuning_disabled:
       if not ui_state.is_offroad():
         long_tuning_desc = tr("This feature is unavailable while the car is onroad.")
@@ -101,14 +112,10 @@ class HyundaiSettings(BrandSettings):
     self.longitudinal_tuning_item.set_description(long_tuning_desc)
     self.longitudinal_tuning_item.show_description(True)
     self.longitudinal_tuning_item.action_item.set_selected_button(tuning_param)
-    self.longitudinal_tuning_item.set_visible(self.alpha_long_available)
+    self.longitudinal_tuning_item.set_visible(self.alpha_long_available and tuning_state.visible)
 
     # fork: FCA11 Braking (Beta) — production longitudinal braking on top of the comma pedal. Only meaningful when the
     # gas interceptor is on (it is the same car layer), and only settable offroad. Default OFF; the caveat is explicit.
-    pedal_raw = ui_state.params.get("HyundaiGasInterceptor")
-    brake_raw = ui_state.params.get("HyundaiFca11Brake")
-    offroad = ui_state.is_offroad()
-    offroad_hint = tr("Enable \"Always Offroad\" in the Device panel, or turn the vehicle off to toggle.") + "<br><br>"
     brake_state = fca11_brake_toggle_state(pedal_raw, offroad)
     self.fca11_brake_toggle.action_item.set_enabled(brake_state.enabled)
     # 0044: the old text claimed braking hands over to the driver at a speed floor and at every stop - stale since patch 0040
