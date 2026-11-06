@@ -143,14 +143,15 @@ class HyundaiSettings(BrandSettings):
     # fast-step bypass (0037 deleted it, FORK row 135): a -3.5 m/s^2 step reaches 20 LSB at 640 ms there, 80 ms on
     # the OLD law.
     shaping_desc = tr("This car runs the continuous linear law: Shaping ON, Dynamic Brakes ON, Shadow OFF. It has no "
-                      "fast-step bypass - a hard stop ramps in over about a second, where the OLD law steps to full in "
-                      "a tenth of a second. Shaping ON, Dynamic Brakes ON and Shadow OFF gives the continuous linear "
-                      "law: 1 LSB onset, smooth builds both ways, rate-limited falls, a soft standstill release. "
-                      "Shaping ON with Dynamic Brakes OFF gives the 0043 shaped law: open loop, it maps the plan's ask "
-                      "and never corrects it. Shaping OFF with Dynamic Brakes ON gives the OLD law plus the 18x "
-                      "release ramp (a gentle ask starts at 1 LSB, a hard ask still jumps). Shadow ON, or Shaping and "
-                      "Dynamic Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at the "
-                      "next ignition.")
+                      "fast-step bypass - a hard stop ramps in over about a second, where the plain OLD law opens 4 "
+                      "LSB per frame and is at full strength in 140 ms. Shaping ON, Dynamic Brakes ON and Shadow OFF "
+                      "gives the continuous linear law: 1 LSB onset, smooth builds both ways, rate-limited falls, a "
+                      "soft standstill release. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 "
+                      "shaped law: open loop, it maps the plan's ask and never corrects it. Shaping OFF with Dynamic "
+                      "Brakes ON and Shadow OFF gives the OLD law plus the 18x release ramp: a gentle ask starts at 1 "
+                      "LSB, and even a hard ask is ramped in rather than stepped. Shadow ON, or Shaping and Dynamic "
+                      "Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at the next "
+                      "ignition.")
     if shaping_state.visible and not offroad:
       shaping_desc = offroad_hint + shaping_desc
     self.fca11_shaping_toggle.set_description(shaping_desc)
@@ -162,13 +163,18 @@ class HyundaiSettings(BrandSettings):
     self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)
     # D3: the logged core is the 0043 SHAPED law (fca11_long.py l.1483 `_shadow_core_params` -> l.1881: core =>
     # shape_track False), NOT "the new law": say exactly that.
-    shadow_desc = tr("This car runs the continuous linear law: Shaping ON, Dynamic Brakes ON, this OFF. ON switches "
-                     "braking back to the plain OLD law - it forces Shaping and Dynamic Brakes off - and logs the 0043 "
-                     "shaped law in the background: the open-loop law that maps the plan's ask and never corrects it, "
-                     "computed on every frame and never sent to the car. Shaping ON with Dynamic Brakes OFF gives the "
-                     "0043 shaped law. Shaping OFF with Dynamic Brakes ON gives the OLD law plus the 18x release ramp. "
-                     "Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires the comma "
-                     "pedal. Takes effect at the next ignition.")
+    shadow_desc = tr("This car runs the continuous linear law: Shaping ON, Dynamic Brakes ON, Shadow OFF. Shaping "
+                     "ON, Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth "
+                     "builds both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a "
+                     "hard stop ramps in over about a second, where the plain OLD law opens 4 LSB per frame and is "
+                     "at full strength in 140 ms. ON switches braking back to the plain OLD law - it forces Shaping "
+                     "and Dynamic Brakes off - and logs the 0043 shaped law in the background: the open-loop law that "
+                     "maps the plan's ask and never corrects it, computed on every frame and never sent to the car. "
+                     "Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law. Shaping OFF with "
+                     "Dynamic Brakes ON and Shadow OFF gives the OLD law plus the 18x release ramp: a gentle ask "
+                     "starts at 1 LSB, and even a hard ask is ramped in rather than stepped. Shadow ON, or Shaping "
+                     "and Dynamic Brakes both OFF, gives the plain OLD law. Requires the comma pedal. Takes effect "
+                     "at the next ignition.")
     if shadow_state.visible and not offroad:
       shadow_desc = offroad_hint + shadow_desc
     self.fca11_shadow_toggle.set_description(shadow_desc)
@@ -209,15 +215,16 @@ class HyundaiSettings(BrandSettings):
     # D1/D2: same four states as the shaping row. The "emergency ask and a step demand still go at full rate" claim is
     # DELETED - it was pinned on the continuous law, where 0037 removed the bypass; the fast jump it described is the
     # 18x ramp's own hard-ask path, which is what this switch gives you with Shaping OFF.
-    dynamic_desc = tr("This car runs the continuous linear law: Shaping ON, Dynamic Brakes ON, Shadow OFF. Shaping ON, "
-                      "Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
-                      "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop "
-                      "ramps in over about a second, where the OLD law steps to full in a tenth of a second. Shaping ON "
-                      "with Dynamic Brakes OFF gives the 0043 shaped law: open loop, it maps the plan's ask and never "
-                      "corrects it. Shaping OFF with Dynamic Brakes ON gives the OLD law plus this switch's 18x release "
-                      "ramp (a gentle ask starts at 1 LSB, a hard ask still jumps). Shadow ON, or Shaping and Dynamic "
-                      "Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at the next "
-                      "ignition.")
+    dynamic_desc = tr("This car runs the continuous linear law: Shaping ON, Dynamic Brakes ON, Shadow OFF. Shaping "
+                      "ON, Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth "
+                      "builds both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a "
+                      "hard stop ramps in over about a second, where the plain OLD law opens 4 LSB per frame and is "
+                      "at full strength in 140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 "
+                      "shaped law: open loop, it maps the plan's ask and never corrects it. Shaping OFF with Dynamic "
+                      "Brakes ON and Shadow OFF gives the OLD law plus this switch's 18x release ramp: a gentle ask "
+                      "starts at 1 LSB, and even a hard ask is ramped in rather than stepped. Shadow ON, or Shaping "
+                      "and Dynamic Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at "
+                      "the next ignition.")
     if dynamic_state.visible and not offroad:
       dynamic_desc = offroad_hint + dynamic_desc
     self.fca11_dynamic_release_toggle.set_description(dynamic_desc)

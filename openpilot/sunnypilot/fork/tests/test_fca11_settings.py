@@ -203,13 +203,17 @@ class TestPanelWiring(unittest.TestCase):
     for var in ("shaping_desc", "dynamic_desc", "shadow_desc"):
       block = self._description(var)
       self.assertIn("continuous linear law", block, var)
-      self.assertIn("Shaping ON with Dynamic Brakes OFF gives the 0043 shaped law", block, var)
-      self.assertIn("Shaping OFF with Dynamic Brakes ON gives the OLD law", block, var)
+      # R1 (N2): the 0043 and 18x sentences say the Shadow condition they need - Shadow ON overrides both, so
+      # "Shaping ON with Dynamic Brakes OFF gives 0043" is only true with Shadow OFF (101/011 really run the OLD law).
+      self.assertIn("Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law", block, var)
+      self.assertIn("Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law", block, var)
       self.assertIn("Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law", block, var)
       self.assertIn("at the next ignition", block, var)
-    # D2: no bypass on the continuous law - the correction the first brief got wrong.
+    # D2 / nit: no bypass on the continuous law, and the OLD law's measured number, not "a tenth of a second".
     for var in ("shaping_desc", "dynamic_desc"):
       self.assertIn("no fast-step bypass", self._description(var), var)
+      self.assertIn("at full strength in 140 ms", self._description(var), var)
+      self.assertNotIn("a tenth of a second", self._description(var), var)
     # D3: Shadow names the LOGGED law correctly.
     self.assertIn("logs the 0043 shaped law", self._description("shadow_desc"))
 
@@ -425,32 +429,50 @@ def _real_law(shaping, dynamic, shadow):
 def _law_table(desc):
   """{condition: law token} parsed out of a description's own four-state sentences.
 
-  Conditions are (Shaping, DynamicBrakes, 0); "else" is the Shadow-ON / both-OFF row. The law token is whatever the
-  sentence itself names - the parser never assumes which law a condition gets."""
+  R1 (Opus re-review N2): the Shadow condition is read FROM EACH SENTENCE, never assumed. A sentence that claims a
+  law for a Shaping/Dynamic combination but names no Shadow state is an ERROR here - that is exactly the mutant
+  "S1D0 gives the 0043 shaped law whatever Shadow is set to", which must die by value on 101/011, where Shadow ON
+  really overrides. The law token is whatever the sentence itself names - the parser never assumes which law a
+  condition gets."""
   table = {}
   for sent in re.split(r"(?<=\.)\s+", desc):
+    if not sent.startswith("Shaping ") or "gives the" not in sent:
+      continue
+    m = re.search(r"gives the ([^:.]*)", sent)
+    law = ("continuous" if "continuous" in m.group(1) else
+           "0043" if "0043" in m.group(1) else
+           "18x" if "18x" in m.group(1) else
+           "OLD" if "OLD law" in m.group(1) else None)
+    if law is None:
+      continue
+    s = 1 if re.search(r"Shaping ON", sent) else 0
+    d = 1 if re.search(r"Dynamic Brakes ON", sent) else 0
     if "Shadow ON" in sent:
-      cond = "else"
+      h = 1
+    elif "Shadow OFF" in sent:
+      h = 0
     else:
-      s = re.search(r"Shaping (ON|OFF)", sent)
-      d = re.search(r"Dynamic Brakes (ON|OFF)", sent)
-      if s is None or d is None:
-        continue
-      cond = (int(s.group(1) == "ON"), int(d.group(1) == "ON"), 0)
-    law = ("continuous" if "continuous" in sent else
-           "0043" if "0043" in sent else
-           "18x" if "18x" in sent else
-           "OLD" if "OLD law" in sent else None)
-    if law is not None:
-      table[cond] = law
+      raise AssertionError(f"this sentence claims {law} without naming the Shadow state it needs: {sent!r}")
+    if (s, d, h) in table:
+      raise AssertionError(f"two sentences claim Shaping={s} Dynamic={d} Shadow={h}: {sent!r}")
+    table[(s, d, h)] = law
+  # the catch-all: "Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law."
+  for sent in re.split(r"(?<=\.)\s+", desc):
+    if sent.startswith("Shadow ON") and "gives the" in sent:
+      m = re.search(r"gives the ([^:.]*)", sent)
+      table["else"] = "OLD" if "OLD law" in m.group(1) else None
   return table
 
 
 def _table_law(table, shaping, dynamic, shadow):
-  """What the TEXT says the law is for this combination (Shadow ON is the else row: it forces the other two off)."""
-  if shadow:
-    return table.get("else")
-  return table.get((shaping, dynamic, 0), table.get("else"))
+  """What the TEXT says the law is for this combination - keyed on the sentence's OWN Shadow condition.
+
+  There is no "shadow means else" shortcut any more: a sentence only speaks for the Shadow state it names, so
+  Shaping=1 Dynamic=0 Shadow=1 falls through to the catch-all (the plain OLD law), which is what the car does."""
+  key = (shaping, dynamic, shadow)
+  if key in table:
+    return table[key]
+  return table.get("else")
 
 
 class TestBrakeLawMatrix(unittest.TestCase):
