@@ -300,7 +300,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,1014 @@
 +"""
 +0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
 +
@@ -1217,6 +1217,95 @@ new file mode 100644
 +    self.assertEqual(3000, sum(1 for fr, _lv in armed if fr <= f_soft),
 +                     "the fresh count must be 3000 armed SENT frames from the new stop, not a continuation")
 +    self.assertEqual({NONE, SOFT}, {n for _fr, _s, n in fresh}, "a 62 s hold cannot reach a tier past SOFT")
++
++  def test_l4_a_WHEEL_GLITCH_at_a_standstill_cannot_clear_the_latch(self):
++    """CD6: the clear must not be reachable by ONE bad wheel-speed frame.
++
++    The mechanism is real on this car, and it is the reason the clear needs a pedal. `vEgo` is a Kalman filter of the
++    MEAN of the four wheel speeds (opendbc/car/interfaces.py:359-361) that RESETS to the raw value on any jump above
++    2.0 m/s (:364-365); WHL_SPD11 is unsigned (`@1+`) and the DBC has no checksum/counter check (can/dbc.py:219-256
++    returns None). So ONE frame of ONE wheel at 43.3 km/h at a standstill is vEgo 3.01 on that frame and 0.00 on the
++    next - and since the latch is permanent, that single frame used to end the alert, the NO_ENTRY and the enable
++    strip for good, i.e. a RES press would then engage with no brake press. Opus measured exactly that on the old tip
++    (probe B: 4 -> 0 and it stays 0).
++
++    Here the spike is fed straight into the observer after a REAL expiry, at a dead stop, with the driver's foot OFF
++    the gas, and the latch must survive it on EVERY following frame - so the value the car layer reads (nag == 4) never
++    leaves 4, and the enable strip / PERMANENT alert stay up (their refusal is pinned in the superproject by
++    test_latched_frames_refuse_engage_requests).
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    f = 12600
++    # the glitch frame: the 4-wheel mean is 12 m/s (one wheel would read ~172 km/h) for exactly ONE frame
++    spike = _hold(b, 1, start=f, v=12.0, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(1, len(spike), "activity: the glitch frame really ran")
++    self.assertEqual(EXPIRED, spike[0][2], "ONE bad wheel-speed frame must NOT clear the latch")
++    # ... and the very next frame, back at a dead stop, is still latched: the clear would have been PERMANENT
++    after = _hold(b, 300, start=f, v=0.0, standstill=True, gas=False, engaged=False, long_active=False)
++    f += 300
++    self.assertEqual(300, len(after), "activity: 300 frames after the glitch")
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in after},
++                     "after the glitch the latch must still read 4 on every frame (so RES stays refused)")
++    self.assertTrue(b._hold_expired)
++    self.assertEqual([], _wire(spike) + _wire(after), "no 0x38D frame may go out after the disengage")
++    # (2) THE DOCUMENTED RESIDUAL: the SAME one-frame spike with the driver's foot ON the gas pedal. That is a
++    # physically-pressed driver pedal (> 4 % of travel, and openpilot's own command cannot make it true - see
++    # _hold_nag_driven_away's docstring), so it is a driver who is in the car and driving: the latch clears on that
++    # frame. This is deliberate: the alternative is the roll-away above, which is worse. Pinned so nobody "fixes" one
++    # half of this trade without seeing the other.
++    spike_gas = _hold(b, 1, start=f, v=12.0, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(NONE, spike_gas[0][2],
++                     "a glitch WITH the gas pedal held clears it - accepted: that is a driver on the pedal, and the "
++                     "roll-away hazard is the worse one")
++
++  def test_l5_a_BACKWARD_roll_reads_like_a_forward_one_and_stays_latched_without_gas(self):
++    """CD6: wheel speeds carry NO DIRECTION, so a car rolling BACKWARD reports the same positive vEgo as one rolling
++    forward. That is why a speed-only clear could not tell "the driver pulled away" from "the car is rolling away" in
++    either direction. Both signs, no pedal: latched. (The law does not take abs() - it does not need to: without a
++    driver on the gas, no sign of vEgo clears the latch.)
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertEqual(EXPIRED, hold[-1][2])
++    f = 12600
++    fwd = _hold(b, 60, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    rev_pos = _hold(b, 60, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    rev_neg = _hold(b, 60, start=f, v=-3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    for label, leg in (("forward 3.01", fwd), ("backward as the bus reports it (+3.01)", rev_pos),
++                       ("backward as a signed reader reports it (-3.01)", rev_neg)):
++      self.assertEqual(60, len(leg), f"{label}: activity")
++      self.assertEqual({EXPIRED}, {n for _fr, _s, n in leg}, f"{label} with no pedal must NOT clear the latch")
++    self.assertTrue(b._hold_expired)
++
++  def test_l6_the_clear_fails_CLOSED_on_an_unreadable_gas_pedal(self):
++    """CD6: the gas pedal is now a TERM OF THE CLEAR, so an unreadable one must never count as pressed - exactly the
++    same rule the vEgo term already had. A missing attribute, None or a non-bool-ish object all fail closed.
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertEqual(EXPIRED, hold[-1][2])
++    # 3.01 m/s, no gasPressed attribute at all
++    missing = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, standstill=False, brakePressed=False,
++                                                 gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(EXPIRED, b._hold_nag_step(missing, 12700, 30), "a MISSING gasPressed must NOT clear the latch")
++    # 3.01 m/s, gasPressed explicitly None (a partially-filled sample, e.g. an old CarState double)
++    none_gas = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, gasPressed=None, standstill=False, brakePressed=False,
++                                                   gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(EXPIRED, b._hold_nag_step(none_gas, 12702, 30), "a None gasPressed must NOT clear the latch")
++    self.assertTrue(b._hold_expired, "fail closed: the latch must survive both unreadable pedals")
++    # the CONTROL: the same frame with a real True does clear, so the two legs above fail by VALUE, not by a harness
++    # that never reached the clear
++    ok = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, gasPressed=True, standstill=False, brakePressed=False,
++                                             gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(NONE, b._hold_nag_step(ok, 12704, 30), "control: gas + 3.01 m/s must clear it")
 +
 +  def test_m_the_latch_lands_on_the_6000th_armed_frame_under_deployed(self):
 +    """Off-by-one under the deployed config: 5999 armed sent frames in, the disengage arrives at FINAL; at 6000 it
