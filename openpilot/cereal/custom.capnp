@@ -511,9 +511,10 @@ struct CarStateSP @0xb86e6369214c01c8 {
   fca11Divergence @19 :Bool;     # fork (0053): panda refused FCA11 while the car layer saw no camera braking
   driverMark @20 :UInt8;         # fork (17c FEEDBACK): TRANSIENT driver-mark confirmation, 0 none / 1 "marked GOOD" /
                                  # 2 "marked BAD" (see fca11_long.on_driver_mark + driver_mark.py)
-  holdNag @21 :UInt8;            # fork (0043): standstill hold countdown, 0 none / 1 soft (60 s) / 2 loud (90 s) /
-                                 # 3 final (110 s) / 4 EXPIRED (120 s, a STICKY latch). Raised as EventNameSP.fca11HoldNagSoft
-                                 # / fca11HoldNagLoud / fca11HoldNagFinal / fca11HoldExpired. At 4 the superproject
+  holdNag @21 :UInt8;            # fork (0043): standstill hold countdown MEASURED FROM THE DEAD STOP (all four wheels at
+                                 # rest, not just FL/RR), 0 none / 1 soft (60 s) / 2 loud (90 s) / 3 final (110 s) /
+                                 # 4 EXPIRED (120 s, a STICKY latch). Raised as EventNameSP.fca11HoldNagSoft /
+                                 # fca11HoldNagLoud / fca11HoldNagFinal / fca11HoldExpired. At 4 the superproject
                                  # DISENGAGES and the brakes ARE released; the latch survives the counter reset and clears
                                  # only on the driver's brake press (the counter itself is a pure observer of the SENT level)
 }

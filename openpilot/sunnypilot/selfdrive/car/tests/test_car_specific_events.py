@@ -265,6 +265,10 @@ class TestFca11HoldNagEvents:
       for dead in ("2 minutes", "over 2 min", "so long", "keep holding"):
         assert dead not in text, f"{dead!r} is the OLD (never-release) wording: {text}"
     assert "2:00" in (soft.alert_text_2 + loud.alert_text_2).lower(), "the release time is stated where the driver reads it"
+    # CD3 (owner): the 2:00 is measured from the DEAD STOP, and the driver is told so
+    for a in (soft, loud):
+      assert "stop" in a.alert_text_2.lower(), \
+             f"the countdown starts at a dead stop - the alert must say so: {a.alert_text_2!r}"
     assert "released" in expired_perm.alert_text_1.lower(), "at 2:00 the banner must say the brakes ARE released"
     # NoEntryAlert puts the reason in the second line and "openpilot Unavailable" first (swapped on mici)
     assert "press the brake pedal first" in (expired_ne.alert_text_1 + " " + expired_ne.alert_text_2).lower(), \

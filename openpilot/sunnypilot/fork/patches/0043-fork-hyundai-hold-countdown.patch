@@ -1,10 +1,11 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -978,7 +978,74 @@
+@@ -977,8 +977,80 @@
+ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
  FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
  FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
- 
++
 +# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
 +# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
 +# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
@@ -20,8 +21,13 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +#                                   (sound_list[warningSoft] has num_loops None), so the old 30 s repeat / 3 s
 +#                                   pulse logic is GONE - there is nothing left to re-chime;
 +#   3 final    5500 frames = 110 s  HIGHEST + AudibleAlert.warningImmediate ("the brakes are about to release");
-+#   4 expired  6000 frames = 120 s  STICKY. openpilot DISENGAGES (superproject) and the reviewed driver-disengage
-+#                                   release path - soft release ramp + passive close frame - takes the brakes off.
++#   4 expired  6000 frames = 120 s  STICKY. openpilot DISENGAGES (superproject) and the DEPLOYED driver-disengage
++#                                   release takes the brakes off: this car sends NOTHING on 0x38D after the disengage
++#                                   and the panda hands 0x38D back to the camera's idle frame at +90 ms (compiled
++#                                   libsafety, lane-X3/proof_release_compiled.py). There is NO host release ramp here
++#                                   (`dynamic_brakes` is False on the shaped instance). A DRIVER-BRAKE release is the
++#                                   one path that emits a host passive frame: exactly one, at level 0.
++# The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition).
 +# THE LAW IS NOT TOUCHED BY ANY OF IT. The disengage is raised in the superproject from CarStateSP.holdNag == 4, and
 +# the law releases because `longActive` goes False, exactly as on any driver disengage. This block only counts.
 +# COUNTING UNIT: SENT frames, not wall clock - the sent stream is exactly what the ESC is holding on, it is
@@ -45,7 +51,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD_FRAMES = 4500    # 90.0 s: audible and continuous
 +FCA11_HOLD_NAG_FINAL_FRAMES = 5500   # 110.0 s: warningImmediate
 +FCA11_HOLD_NAG_EXPIRE_FRAMES = 6000  # 120.0 s: latch + disengage + brake release
-+
+ 
 +# The five published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud/Final and
 +# fca11HoldExpired). 4 is a LATCH, not a tier: it is not derived from the counter (the counter resets on the frame
 +# openpilot disengages) and it only clears on the driver's brake press.
@@ -54,7 +60,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD = 2
 +FCA11_HOLD_NAG_FINAL = 3
 +FCA11_HOLD_NAG_EXPIRED = 4
-+
+ 
 +
 +def hold_nag_level(frames: int) -> int:
 +  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
@@ -70,13 +76,13 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +  if n < FCA11_HOLD_NAG_LOUD_FRAMES:
 +    return FCA11_HOLD_NAG_SOFT
 +  return FCA11_HOLD_NAG_LOUD if n < FCA11_HOLD_NAG_FINAL_FRAMES else FCA11_HOLD_NAG_FINAL
- 
++
 +
 +
  def stop_hold_enabled(CP_SP) -> bool:
    """0034: the stop-hold clutch lane switch, read from CP_SP only (getattr: an un-wired CP_SP is OFF)."""
    return bool(getattr(CP_SP, "fca11StopHoldClutch", False))
-@@ -1897,6 +1964,13 @@
+@@ -1897,6 +1969,13 @@
      self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
      # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
      self.stop_hold_blockers: dict[str, int] = {}
@@ -90,7 +96,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
      # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
      # throttle (see sub_bite_gate). A counter only - it never feeds the law.
-@@ -2153,6 +2227,7 @@
+@@ -2153,6 +2232,7 @@
        self._noresp_cmd_since = None
        self._hold_lost_armed = False
        self._brake_now_clear_since = None
@@ -98,7 +104,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
        return
      now_us = time.monotonic() * 1e6
      gas = bool(CS.out.gasPressed)
-@@ -2242,6 +2317,9 @@
+@@ -2242,6 +2322,9 @@
        self.brake_now = False
        self.brake_now_reason = ""
        self.low_speed_alert = False
@@ -108,14 +114,14 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
      """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
-@@ -2530,7 +2608,64 @@
+@@ -2530,7 +2613,64 @@
      if why:
        self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
      return want
 +
 +  def _hold_nag_still(self, CS) -> bool:
 +    """CD3: a DEAD STOP - openpilot's standstill bit AND every one of the four wheels at rest.
-+
+ 
 +    `CS.out.standstill` is only FL and RR (carstate.py:117). The strict signal is `CS.fca11_wheel_max_kph`, the FASTEST
 +    of the four wheels (carstate.py:127), which the real CarState populates whenever CP_SP.fca11Brake is on - the only
 +    case this countdown can run in. A double (or a CarState without the signal) returns False here rather than raising,
@@ -145,7 +151,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    frame openpilot disengages (we stop actuating) and the latch has to survive exactly that, so it is stored
 +    separately and is cleared ONLY by `CS.out.brakePressed` - not by gas, not by gear, not by the disengage, not by
 +    re-engaging and not by time. A new ignition is a new instance (`__init__`).
- 
++
 +    NOTHING here touches the level: the wire is identical with and without this function (pinned by test).
 +    """
 +    if not self.enabled:
@@ -173,7 +179,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
    def _passive_frame(self, CS, frame: int) -> list[CanData]:
      """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
      DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
-@@ -3629,6 +3764,9 @@
+@@ -3629,6 +3769,9 @@
        # 0041: and the gating timers, so a disable is a clean start.
        self._noresp_cmd_since = None
        self._brake_now_clear_since = None
@@ -231,7 +237,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,807 @@
 +"""
 +0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
 +
@@ -243,9 +249,13 @@ new file mode 100644
 +  2 loud     4500 frames =  90 s   audible and CONTINUOUS (no repeat/pulse logic any more)
 +  3 final    5500 frames = 110 s   warningImmediate
 +  4 EXPIRED  6000 frames = 120 s   a STICKY latch: the superproject disengages openpilot, the law stops sending and
-+                                   the ESC is released (the panda hands FCA11 back to the camera's idle frame). The
-+                                   latch survives the counter reset that the disengage itself causes and clears
-+                                   ONLY on the driver's brake press.
++                                   the ESC is released (the panda hands FCA11 back to the camera's idle frame at
++                                   +90 ms, compiled libsafety - lane-X3/proof_release_compiled.py). The latch
++                                   survives the counter reset that the disengage itself causes and clears ONLY on
++                                   the driver's brake press.
++The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition), and
++EVERY proof that says "deployed" runs the CAR'S CarParamsSP (continuous brake law ON, see _cp_sp_deployed), not the
++Brake-only arm; both arms are in the matrix.
 +The law is UNTOUCHED: this block is a pure observer of the sent level and never writes it. The tests below prove the
 +wire is byte-identical to the tree without the countdown, including through a disengage at 5999/6000/6001 sent frames.
 +

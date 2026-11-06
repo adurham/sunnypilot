@@ -279,10 +279,15 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   # fork (0043): the standstill HOLD COUNTDOWN v2 (owner, 2026-11-06: "silent banner after 1 min / an audio alert after
   # 1:30 / release the brakes after 2 mins"). The car is held stopped by ESC pressure + a live clutch torque; the hold is
-  # NOT a parking brake, so it is BOUNDED now: at 2:00 openpilot disengages and the deployed driver-disengage release
-  # takes the brakes off (the law stops sending 0x38D; the panda hands it back to the camera's passive frame within its
-  # 100 ms TX_STALE - measured in lane-X3/proof_release_panda.py). Raised from CarStateSP.holdNag (opendbc half:
-  # Fca11LongBrake.hold_nag, a pure observer of the SENT level - the law's wire is untouched, proved byte-identical).
+  # NOT a parking brake, so it is BOUNDED now: 2:00 FROM THE MOMENT THE CAR IS FULLY STOPPED BY OPENPILOT (the clock
+  # starts at a dead stop - all four wheels at rest - not when the braking began and not while the car still creeps).
+  # At 2:00 openpilot disengages and the deployed driver-disengage release takes the brakes off. MEASURED under the
+  # car's configuration (continuous law ON) through the COMPILED libsafety TX hook
+  # (lane-X3/proof_release_compiled.py): the law sends NOTHING on 0x38D after the disengage (6 046/6 046 hold frames
+  # accepted, 0 refused) and the panda stops blocking the camera's 0x38D at +90 ms, inside its 100 ms TX_STALE, so the
+  # ESC is on the camera's idle level 0. There is no host release ramp on this car (`dynamic_brakes` is False on the
+  # shaped instance). Raised from CarStateSP.holdNag (opendbc half: Fca11LongBrake.hold_nag, a pure observer of the
+  # SENT level - the law's wire is untouched, proved byte-identical on both configurations).
   #   1 soft     60 s  LOW, silent, MID - a notice that the bound exists. `mid`, not `small` (review D4 of 0041): the
   #                    renderer never draws a `small` alert's text_2, and the second line is the part that says when the
   #                    brakes go. The time is stated ONCE, here, in the same words as the release.
@@ -299,13 +304,13 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # that never ended and is gone with it: not one string here may imply the hold is still being held at 2:00.
   EventNameSP.fca11HoldNagSoft: {
     ET.WARNING: Alert("Stopped - press the brake",
-                      "The brakes release at 2:00 unless you take them",
+                      "Brakes release 2:00 after openpilot stops the car",
                       AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
   },
 
   EventNameSP.fca11HoldNagLoud: {
     ET.WARNING: Alert("Press the brake now",
-                      "FCA11 releases the brakes at 2:00",
+                      "Brakes release 2:00 after the car stopped",
                       AlertStatus.critical, AlertSize.mid, Priority.HIGH, VisualAlert.none,
                       AudibleAlert.warningSoft, 2.),
   },

@@ -78,10 +78,16 @@ class CarSpecificEventsSP:
           #   * `pcmDisable` (ET.USER_DISABLE) on the STANDARD events object this function is handed. selfdrived.py
           #     l.284 passes `self.events` in and l.660 feeds exactly that object to `state_machine.update` in the SAME
           #     update, so the disengage lands on this frame with no selfdrived.py change, no new cereal enum and no
-          #     compiled code. The release is then the DEPLOYED driver-disengage release, measured in
-          #     lane-X3/proof_release_panda.py: the law stops putting 0x38D on the wire (0 frames), the panda's own
-          #     TX_STALE (100 ms) hands 0x38D back to the camera's passive frame, and the ESC input goes 30 -> 0
-          #     monotonically. The law's own bytes are untouched (P1).
+          #     compiled code. The release is then the DEPLOYED driver-disengage release, MEASURED under the car's
+          #     own configuration (continuous law ON) through the COMPILED libsafety TX hook
+          #     (lane-X3/proof_release_compiled.py): the law puts NOTHING on 0x38D after the disengage (0 frames),
+          #     every one of the 6 046 hold frames is ACCEPTED and none refused, and the panda's own fwd rule stops
+          #     blocking the camera's 0x38D at +90 ms - inside its 100 ms TX_STALE - so the ESC is back on the
+          #     camera's idle level 0. There is NO host ramp on this car: `dynamic_brakes` is False on the shaped
+          #     instance (the release ramp is a feel-path feature), so the disengage release is the camera
+          #     hand-back. A DRIVER-BRAKE release is different and is also measured: exactly ONE host passive frame
+          #     at level 0 (30 -> 0 in one frame, accepted - passive frames carry no rate gate). The law's own
+          #     bytes are untouched (P1).
           #   * while the latch is set, `buttonEnable`/`pcmEnable` are removed - the idiom MADS itself uses
           #     (mads.py l.163-164) - so a RES press cannot re-engage until the driver brakes. This is how the main
           #     state machine is blocked WITHOUT inventing a standard ET.NO_ENTRY: every USER_DISABLE+NO_ENTRY standard
