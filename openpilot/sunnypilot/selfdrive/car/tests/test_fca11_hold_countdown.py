@@ -175,12 +175,12 @@ class Rig:
                                   ('mads', prev_mads, self.mads.state_machine.state, _MADS_NAMES)):
       if prev != now:
         self.transitions.append((tag, names[prev], names[now]))
-    return dict(main=self.main_state(), mads=self.mads_state(), mads_active=mads_active,
-                enabled=enabled, pcm_disable=pcm_disable,
-                # `mads.update_events` removes pcmDisable (mads.py l.205) before the MADS state machine runs: that is
-                # exactly why lateral survives the expiry, so it is recorded rather than asserted away
-                pcm_disable_stripped=not self.events.has(EventName.pcmDisable),
-                expired=self.events_sp.has(EventNameSP.fca11HoldExpired))
+    return {"main": self.main_state(), "mads": self.mads_state(), "mads_active": mads_active,
+            "enabled": enabled, "pcm_disable": pcm_disable,
+            # `mads.update_events` removes pcmDisable (mads.py l.205) before the MADS state machine runs: that is
+            # exactly why lateral survives the expiry, so it is recorded rather than asserted away
+            "pcm_disable_stripped": not self.events.has(EventName.pcmDisable),
+            "expired": self.events_sp.has(EventNameSP.fca11HoldExpired)}
 
   # -- state accessors ----------------------------------------------------------------------------------------------
   _brake = False
