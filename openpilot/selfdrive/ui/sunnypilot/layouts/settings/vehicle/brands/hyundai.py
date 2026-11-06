@@ -157,11 +157,13 @@ class HyundaiSettings(BrandSettings):
     shaping_desc = tr(state_sent) + " " + tr(
       "Shaping ON with Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
       "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop ramps in over "
-      "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
-      "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
-      "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus the "
-      "18x release ramp: a gentle ask starts at 1 LSB and ramps in; an emergency ask (-3.0 m/s^2 or harder) steps "
-      "like the OLD law, 4 LSB per sent frame up to the ask's own level (capped at the wire limit). Shadow "
+      "about a second (20 LSB at 640 ms), where the plain OLD law steps 4 LSB per sent frame up to the ask's own "
+      "level, capped at the wire limit. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped "
+      "law: open loop, it maps the plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow "
+      "OFF gives the OLD law plus the "
+      "18x release ramp: above crawl speed (about 7 km/h) a gentle ask starts at 1 LSB and ramps in; an emergency "
+      "ask (-3.0 m/s^2 or harder) steps like the OLD law, 4 LSB per sent frame up to the ask's own level (capped at "
+      "the wire limit). Shadow "
       "ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires FCA11 Braking. Takes effect at "
       "the next ignition.")
     if shaping_state.visible and not offroad:
@@ -186,11 +188,13 @@ class HyundaiSettings(BrandSettings):
     shadow_table = tr(
       "Shaping ON with Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
       "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop ramps in over "
-      "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
-      "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
-      "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus the "
-      "18x release ramp: a gentle ask starts at 1 LSB and ramps in; an emergency ask (-3.0 m/s^2 or harder) steps "
-      "like the OLD law, 4 LSB per sent frame up to the ask's own level (capped at the wire limit). Shadow "
+      "about a second (20 LSB at 640 ms), where the plain OLD law steps 4 LSB per sent frame up to the ask's own "
+      "level, capped at the wire limit. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped "
+      "law: open loop, it maps the plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow "
+      "OFF gives the OLD law plus the "
+      "18x release ramp: above crawl speed (about 7 km/h) a gentle ask starts at 1 LSB and ramps in; an emergency "
+      "ask (-3.0 m/s^2 or harder) steps like the OLD law, 4 LSB per sent frame up to the ask's own level (capped at "
+      "the wire limit). Shadow "
       "ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. Requires the comma pedal. Takes effect at "
       "the next ignition.")
     # N1: with FCA11 Braking OFF this row is still listed (only Shaping/Dynamic depend on Braking), so the four-state
@@ -239,20 +243,23 @@ class HyundaiSettings(BrandSettings):
     # what runs: a sub-emergency ask (even a -2.8 m/s^2 step) ramps in from 1 LSB, but an EMERGENCY ask
     # (accel <= FCA11_DYN_EMERGENCY_ACCEL, -3.0 m/s^2) keeps the panda's RATE_STEP and is byte-identical to the OLD
     # law there (measured: -3.0 -> 4,8,12,16,20,24,26; -3.5 -> 4,8,12,16,20,24,28,31).
-    # R6: the rise stops at the ASK's own level and the wire caps it at 46 LSB (values.py l.62 = safety/hyundai.h
+    # R6: the rise stops at the ASK's own level and the wire caps it at 46 LSB (values.py l.62 = safety/modes/hyundai.h
     # l.136), so NO single time holds for every ask: -3.5 -> 31 LSB @140 ms, -4.0 -> 36 @160, -4.5 -> 41 @200,
     # -5.0 or harder -> the 46 LSB cap @220 (and -5.0 IS reachable with Braking ON: car/hyundai/interface.py l.39-41).
+    # R7: the gentle ask's 1 LSB onset is an ABOVE-CRAWL-SPEED statement - at 1.8 m/s the crawl floor opens it 4 then
+    # 7 (FCA11_CRAWL_V_MAX 2.0), so the sentence says which side of it.
     # The row therefore quotes the clause QUALITATIVELY, with no millisecond figure; the measured table lives in FORK
     # row 141 and the tests pin it there (test_the_18x_clause_states_what_the_real_controller_does and
     # test_the_fork_row_quotes_the_measured_table).
     dynamic_desc = tr(state_sent) + " " + tr(
       "Shaping ON with Dynamic Brakes ON and Shadow OFF gives the continuous linear law: 1 LSB onset, smooth builds "
       "both ways, rate-limited falls, a soft standstill release, and no fast-step bypass - a hard stop ramps in over "
-      "about a second (20 LSB at 640 ms), where the plain OLD law opens 4 LSB per frame and is at full strength in "
-      "140 ms. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped law: open loop, it maps the "
-      "plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law plus "
-      "this switch's 18x release ramp: a gentle ask starts at 1 LSB and ramps in; an emergency ask (-3.0 m/s^2 or "
-      "harder) steps like the OLD law, 4 LSB per sent frame up to the ask's own level (capped at the wire limit). "
+      "about a second (20 LSB at 640 ms), where the plain OLD law steps 4 LSB per sent frame up to the ask's own "
+      "level, capped at the wire limit. Shaping ON with Dynamic Brakes OFF and Shadow OFF gives the 0043 shaped "
+      "law: open loop, it maps the plan's ask and never corrects it. Shaping OFF with Dynamic Brakes ON and Shadow "
+      "OFF gives the OLD law plus this switch's 18x release ramp: above crawl speed (about 7 km/h) a gentle ask "
+      "starts at 1 LSB and ramps in; an emergency ask (-3.0 m/s^2 or harder) steps like the OLD law, 4 LSB per sent "
+      "frame up to the ask's own level (capped at the wire limit). "
       "Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law. "
       "Requires FCA11 Braking. Takes effect at the next ignition.")
     if dynamic_state.visible and not offroad:

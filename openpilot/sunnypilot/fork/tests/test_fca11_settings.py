@@ -271,11 +271,18 @@ class TestPanelWiring(unittest.TestCase):
       self.assertIn("Shaping OFF with Dynamic Brakes ON and Shadow OFF gives the OLD law", block, var)
       self.assertIn("Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law", block, var)
       self.assertIn("at the next ignition", block, var)
-    # D2 / nit: no bypass on the continuous law, and the OLD law's measured number, not "a tenth of a second".
+    # D2 / nit: no bypass on the continuous law, and the OLD law's rise stated by its OWN numbers, not by a time - no
+    # single millisecond figure holds for every ask (R7: the sentence printed "at full strength in 140 ms", true only
+    # at -3.5 and 220 ms at -5.0). The value half is measured in the 18x test below.
     for var in ("shaping_desc", "dynamic_desc"):
-      self.assertIn("no fast-step bypass", self._description(var), var)
-      self.assertIn("at full strength in 140 ms", self._description(var), var)
-      self.assertNotIn("a tenth of a second", self._description(var), var)
+      desc = self._description(var)
+      self.assertIn("no fast-step bypass", desc, var)
+      head = desc.split("where the plain OLD law", 1)
+      self.assertEqual(2, len(head), f"{var}: the OLD law clause is missing")
+      clause = head[1].split("Shaping ON with Dynamic Brakes OFF", 1)[0]
+      self.assertIn("steps 4 LSB per sent frame up to the ask's own level, capped at the wire limit", clause, var)
+      self.assertIsNone(re.search(r"\d\s*ms\b", clause), f"{var}: a time figure on the OLD law's rise: {clause}")
+      self.assertNotIn("a tenth of a second", desc, var)
     # D3: Shadow names the LOGGED law correctly.
     self.assertIn("logs the 0043 shaped law", self._description("shadow_desc"))
 
@@ -806,14 +813,14 @@ class TestBrakeLawMatrix(unittest.TestCase):
     """R6 (Opus re-review #4): the 18x sentence must be TRUE for every ask the car can send, not just up to -3.5.
 
     R5 quoted "(-2.8 m/s^2: 20 LSB at 780 ms) ... full strength within 140 ms"; the second is FALSE past -3.6 (the
-    wire caps at 46 LSB, values.py l.62 = safety/hyundai.h l.136: -4.0 reaches 36 LSB at 160 ms, -5.0 the cap at
-    220 ms, and -5.0 is reachable with Braking ON). A precise time on screen cannot hold for every ask, so the row
+    wire caps at 46 LSB, values.py l.62 = safety/modes/hyundai.h l.136: -4.0 reaches 36 LSB at 160 ms, -5.0 the cap
+    at 220 ms, and -5.0 is reachable with Braking ON). A precise time on screen cannot hold for every ask, so the row
     now states the clause QUALITATIVELY - 1 LSB opening and a ramp for a gentle ask, the OLD law's 4 LSB per sent
     frame up to the ask's own level (capped at the wire limit) for an emergency one - and this test pins the
-    measurement underneath it: -2.0/-2.8/-2.99 open at 1 LSB and climb, and -3.0/-3.5/-3.62/-4.0/-4.5/-5.0/-6.0
-    are 4,8,12,16... and BYTE-IDENTICAL to the OLD law, through `setup_interfaces` + `Fca11LongBrake`, not copied
-    from a comment. The numbers themselves are pinned in FORK row 141 by
-    `test_the_fork_row_quotes_the_measured_table`."""
+    measurement underneath it: -2.0/-2.8/-2.99 open at 1 LSB and climb ABOVE crawl speed, -3.0/-3.5/-3.62/-4.0/-4.5/
+    -5.0/-6.0 are 4,8,12,16... and BYTE-IDENTICAL to the OLD law, and at 1.8 m/s (the crawl floor, R7) a gentle ask
+    opens 4 then 7 - through `setup_interfaces` + `Fca11LongBrake`, not copied from a comment. The numbers themselves
+    are pinned in FORK row 141 by `test_the_fork_row_quotes_the_measured_table`."""
     from opendbc.sunnypilot.car.hyundai import fca11_long as fl
     from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_MAX_DEC
     self.assertEqual(-3.0, fl.FCA11_DYN_EMERGENCY_ACCEL, "the sentence quotes -3.0 m/s^2: the boundary moved")
@@ -828,6 +835,17 @@ class TestBrakeLawMatrix(unittest.TestCase):
     for ask, frames in ramp.items():
       self.assertEqual(1, frames[0][0], f"a sub-emergency ask ({ask}) must open at 1 LSB, not step")
       self.assertLess(frames[0][0], frames[-1][0], f"a sub-emergency ask ({ask}) must ramp, not jump")
+    # R7 (Opus #5, (b)): the 1 LSB onset is an ABOVE-CRAWL-SPEED statement. In the crawl band the floor opens a gentle
+    # ask at 4 and then 7 (FCA11_CRAWL_V_MAX 2.0 / FCA11_CRAWL_MIN_LSB 7), so the screen has to say which side of it.
+    self.assertEqual(2.0, fl.FCA11_CRAWL_V_MAX)
+    self.assertEqual(7, fl.FCA11_CRAWL_MIN_LSB)
+    for ask in (-1.0, -2.0):
+      crawl = [lv for lv, _ in _sent_levels(0, 1, 0, ask, v_ego=1.8)]
+      self.assertEqual([4, 7], crawl[:2], f"at 1.8 m/s a gentle ask ({ask}) must open at 4, then the 7 LSB crawl floor")
+    for v_ego in (2.0, 5.0):
+      for ask in (-1.0, -2.0):
+        self.assertEqual(1, [lv for lv, _ in _sent_levels(0, 1, 0, ask, v_ego=v_ego)][0],
+                         f"above crawl speed ({v_ego} m/s) a gentle ask ({ask}) must open at 1 LSB")
     t20 = next((i * dt_ms for i, (lv, _) in enumerate(ramp[-2.8]) if lv >= 20), None)
     self.assertIsNotNone(t20, "the -2.8 ask must reach 20 LSB on the ramp")
     for ask, (frames, old) in emerg.items():
@@ -844,11 +862,12 @@ class TestBrakeLawMatrix(unittest.TestCase):
 
     for row in BRAKE_ROWS:
       clause = _eighteen_clause(self.matrix["combos"]["1010"][row]["desc"])
-      self.assertIn("a gentle ask starts at 1 LSB", clause, row)
+      self.assertIn("above crawl speed (about 7 km/h) a gentle ask starts at 1 LSB", clause, row)
       self.assertIn(f"{fl.FCA11_DYN_EMERGENCY_ACCEL:.1f} m/s^2 or harder", clause, row)
       self.assertIn("steps like the OLD law", clause, row)
       self.assertIn(f"{fl.HYUNDAI_FCA11_LONG_RATE_STEP} LSB per sent frame", clause, row)
-      self.assertIn("capped at the wire limit", clause, row)
+      # Both halves of the level claim, so "up to the wire limit" (the G4 gap probe) cannot stand in for the first.
+      self.assertIn("up to the ask's own level (capped at the wire limit)", clause, row)
       # No other level figure belongs on screen: 1 (the ramp's opening) and 4 (the step) are the only LSB numbers
       # that hold for EVERY ask - "31 LSB" or "46 LSB" would be true only for some (R6's defect class).
       self.assertLessEqual({int(n) for n in re.findall(r"(\d+)\s*LSB\b", clause)}, {1, 4}, row)
@@ -873,11 +892,14 @@ class TestBrakeLawMatrix(unittest.TestCase):
     """R6 (Opus re-review #4): the measured table lives in FORK row 141 and must BE the measurement.
 
     R5's row said "full scale at 140 ms" (the 46 LSB cap is reached at 220 ms) and nothing read the row, so M4
-    ("within 140 ms" -> "within 60 ms") survived. This reads row 141 and requires every number it quotes - the ramp
-    time, the whole emergency table, the wire cap - to be what `setup_interfaces` + `Fca11LongBrake` measures right
-    now, so a changed time OR a swapped level dies by value. The two overreaches R5 also carried ("The three rows
-    say exactly that", and the test "fails if the rendered sentence and the wire disagree") must stay out: the rows
-    state the clause qualitatively and this file's own assertions are named above."""
+    ("within 140 ms" -> "within 60 ms") survived. R6 still read a NAMED subset (the -2.8 pair, the seven entries,
+    "46 LSB"), so R4's false "46 at 140 ms" and a mutated "-4.0 ... 60 ms" both survived again: R7 therefore reads
+    EVERY "N at T ms" pair the row quotes for the 18x law and requires each one to be what `setup_interfaces` +
+    `Fca11LongBrake` measures right now, so a changed time OR a swapped level dies by value. The continuous law's
+    own 20 @640 / 30 @1080 ms are credited in the row to `step_ask.py` (a different harness) and are not re-measured
+    here. The two overreaches R5 also carried ("The three rows say exactly that", and the test "fails if the rendered
+    sentence and the wire disagree") must stay out: the rows state the clause qualitatively and this file's own
+    assertions are named above."""
     from opendbc.sunnypilot.car.hyundai import fca11_long as fl
     from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_MAX_DEC
     found = [ln for ln in (REPO / "FORK.md").read_text().splitlines() if ln.startswith("| 141 |")]
@@ -903,6 +925,31 @@ class TestBrakeLawMatrix(unittest.TestCase):
       self.assertIn(f"−{_num(ask)} → {final} at {t_final} ms", row,
                     f"row 141's {ask} entry must be the measured one ({final} LSB at {t_final} ms)")
     self.assertIn(f"{HYUNDAI_FCA11_LONG_MAX_DEC} LSB", row, "the row must name the wire cap by its value")
+
+    # R7 (c): EVERY "N at T ms" pair the row quotes for the 18x law, not the subset this test names above - G2
+    # ("-4.0 needs 60 ms") and G3 ("(46 at 140 ms;") both survived R6 for exactly that reason.
+    measured = set()
+    for ask in (-2.0, -2.8, -2.99, -3.0, -3.5, -3.62, -4.0, -4.5, -5.0, -6.0):
+      frames = [lv for lv, _ in _sent_levels(0, 1, 0, ask)]
+      for level in set(frames):
+        measured.add((level, next(i * dt_ms for i, lv in enumerate(frames) if lv >= level)))
+    quoted = [(int(a), int(b)) for sent in re.split(r"(?<=\.)\s+", row) if "step_ask.py" not in sent
+              for a, b in re.findall(r"(\d+) at (\d+) ms", sent)]
+    self.assertIn((36, 160), quoted, f"the row's own pairs are not all being read: {quoted}")
+    for level, t in quoted:
+      self.assertIn((level, t), measured, f"row 141 quotes {level} at {t} ms, which the real controller does not do")
+
+    # ... and the rev-3 paragraph states the same three times in words ("−4.0 needs 160 ms, −4.5 200 ms, −5.0 or
+    # harder 220 ms"), which a pair scan cannot see: G2 ("−4.0 needs 60 ms") survived R6 for exactly that reason.
+    rev3 = [sent for sent in re.split(r"(?<=\.)\s+", row) if "Rev 3 printed" in sent]
+    self.assertEqual(1, len(rev3), f"the row must keep exactly one 'Rev 3 printed' sentence: {rev3}")
+    spoken = re.findall(r"−([\d.]+)(?: or harder)?(?: needs)? (\d+) ms", rev3[0])
+    self.assertEqual(3, len(spoken), f"the rev-3 sentence must name its three times: {spoken}")
+    for ask, t in spoken:
+      frames = [lv for lv, _ in _sent_levels(0, 1, 0, -float(ask))]
+      final = frames[-1]
+      self.assertEqual(next(i * dt_ms for i, lv in enumerate(frames) if lv >= final), int(t),
+                       f"the rev-3 sentence says the -{ask} ask needs {t} ms")
 
     for overreach in ("full scale", "within 140 ms", "The three rows say exactly that",
                       "fails if the rendered sentence and the wire disagree"):
