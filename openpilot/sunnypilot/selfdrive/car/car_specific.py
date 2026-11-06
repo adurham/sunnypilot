@@ -68,13 +68,37 @@ class CarSpecificEventsSP:
         # already know. The CarStateSP.superviseStop flag stays in the log for analysis; nothing raises an event.
         # The old hand-over alert ("FCA11: Take Over Below 12 km/h") is DELETED with the floors it warned about.
         if self.CP_SP.fca11Brake:
-          # fork (0041): the standstill HOLD COUNTDOWN sits between the two existing alerts. brakeNow still wins (a
-          # real brake fault outranks a nag), the nag replaces stopComplete while it is up (it says the same thing with
-          # the countdown attached), and stopComplete still covers every hold shorter than FCA11_HOLD_NAG_SOFT_S - so
-          # the screen never shows two overlapping hold banners.
+          # fork (0043): the standstill HOLD COUNTDOWN v2. brakeNow still outranks every nag TIER (a real brake fault
+          # outranks a nag), the nag replaces stopComplete while it is up (it says the same thing with the countdown
+          # attached), and stopComplete still covers every hold shorter than 60 s - so the screen never shows two
+          # overlapping hold banners.
+          #
+          # nag == 4 IS NOT A TIER: it is the expiry latch, and it is the one state that ACTS. The hold has ended at
+          # 2:00, so this frame both tells the driver and takes openpilot out:
+          #   * `pcmDisable` (ET.USER_DISABLE) on the STANDARD events object this function is handed. selfdrived.py
+          #     l.284 passes `self.events` in and l.660 feeds exactly that object to `state_machine.update` in the SAME
+          #     update, so the disengage lands on this frame with no selfdrived.py change, no new cereal enum and no
+          #     compiled code. The reviewed driver-disengage release path (soft release ramp + passive close frame)
+          #     then does the brake release - the law's own wire is untouched (STATE.md, checkpoint 1).
+          #   * while the latch is set, `buttonEnable`/`pcmEnable` are removed - the idiom MADS itself uses
+          #     (mads.py l.163-164) - so a RES press cannot re-engage until the driver brakes. This is how the main
+          #     state machine is blocked WITHOUT inventing a standard ET.NO_ENTRY: every USER_DISABLE+NO_ENTRY standard
+          #     event is already bound to a real signal on this car (buttonCancel is genuinely raised by its CANCEL
+          #     button, car_events l.162 since pcmCruise is False), and a new standard EventName would be an
+          #     upstream-owned cereal change. The SP event below carries NO_ENTRY for MADS (it reads events_sp), which
+          #     is what refuses LATERAL. Cost, stated plainly: `engageable` stays True while latched (it is
+          #     `not events.contains(ET.NO_ENTRY)`), so the engage is offered and refused - the red PERMANENT banner is
+          #     the feedback. Reported to the owner, not hidden.
           nag = int(getattr(CS_SP, "holdNag", 0))
-          if CS_SP.brakeNow:
+          if nag == 4:
+            events_sp.add(EventNameSP.fca11HoldExpired)
+            events.add(EventName.pcmDisable)
+            events.remove(EventName.buttonEnable)
+            events.remove(EventName.pcmEnable)
+          elif CS_SP.brakeNow:
             events_sp.add(EventNameSP.fca11BrakeNow)
+          elif nag == 3:
+            events_sp.add(EventNameSP.fca11HoldNagFinal)
           elif nag == 2:
             events_sp.add(EventNameSP.fca11HoldNagLoud)
           elif nag == 1:

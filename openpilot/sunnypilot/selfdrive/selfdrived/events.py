@@ -277,29 +277,50 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
                         AudibleAlert.warningImmediate, 3.),
   },
 
-  # fork (0041): the standstill HOLD COUNTDOWN. The car is being held stopped by ESC pressure + a live clutch torque;
-  # the hold is NOT a parking brake, so after FCA11_HOLD_NAG_SOFT_S the driver is told to put a foot on the brake, and
-  # after FCA11_HOLD_NAG_LOUD_S the nag becomes loud and re-chimes every FCA11_HOLD_NAG_REPEAT_S. NOTHING HERE CAPS THE
-  # HOLD: the brake command keeps flowing and the hold stays on the wire until the driver brakes / shifts / disengages.
-  # Raised from CarStateSP.holdNag (opendbc half: Fca11LongBrake.hold_nag, a pure observer of the SENT level).
-  #   soft - LOW, silent, MID: a notice, never in the way of steering. `mid`, not `small` (review D4): the second line
-  #          is the part that explains WHY the banner appeared, and the renderer never draws a `small` alert's text_2 -
-  #          the upstream invariant is explicit (selfdrived/tests/test_alerts.py: `small` => text_2 empty, `mid` =>
-  #          text_2 non-empty), the same rule NormalPermanentAlert applies. Dropping the line instead would have been
-  #          the other honest fix; keeping it is worth one extra line at a stop the driver is being asked to take over.
-  #   loud - HIGH (below BRAKE NOW's HIGHEST so a real brake fault still wins), audible, 3 s at the head of each
-  #          repeat period, then back to the soft banner for the rest of it.
+  # fork (0043): the standstill HOLD COUNTDOWN v2 (owner, 2026-11-06: "silent banner after 1 min / an audio alert after
+  # 1:30 / release the brakes after 2 mins"). The car is held stopped by ESC pressure + a live clutch torque; the hold is
+  # NOT a parking brake, so it is BOUNDED now: at 2:00 openpilot disengages and the reviewed driver-disengage release
+  # path (soft release ramp + passive close frame) takes the brakes off. Raised from CarStateSP.holdNag (opendbc half:
+  # Fca11LongBrake.hold_nag, a pure observer of the SENT level - the law's wire is untouched, proved byte-identical).
+  #   1 soft     60 s  LOW, silent, MID - a notice that the bound exists. `mid`, not `small` (review D4 of 0041): the
+  #                    renderer never draws a `small` alert's text_2, and the second line is the part that says when the
+  #                    brakes go. The time is stated ONCE, here, in the same words as the release.
+  #   2 loud     90 s  HIGH, AudibleAlert.warningSoft, asserted EVERY frame: soundd loops warningSoft for as long as the
+  #                    alert is up (sound_list[warningSoft] has num_loops None), so there is no repeat/pulse logic here
+  #                    and no 30 s re-chime any more. HIGH is below BRAKE NOW's HIGHEST, so a real brake fault wins.
+  #   3 final   110 s  HIGHEST + warningImmediate: "ten seconds to release" - the same authority as an urgent alert,
+  #                    because this one is a hand-off, not a notice.
+  #   4 expired 120 s  PERMANENT + NO_ENTRY. The hold HAS ended: the car is disengaged and the ESC is released, so this
+  #                    says so and asks for the brake pedal. NO_ENTRY is what refuses a re-engage until the driver brakes
+  #                    (MADS reads events_sp too - sunnypilot/mads/state.py check_contains), and it is cleared only by the
+  #                    brake press that clears the opendbc latch.
+  # The old 0041 wording ("FCA11 has held this stop for over 2 minutes", "can only hold for so long") was about a hold
+  # that never ended and is gone with it: not one string here may imply the hold is still being held at 2:00.
   EventNameSP.fca11HoldNagSoft: {
-    ET.WARNING: Alert("Stopped - press brake to keep holding",
-                      "FCA11 has held this stop for over 2 minutes",
+    ET.WARNING: Alert("Stopped - press the brake",
+                      "The brakes release at 2:00 unless you take them",
                       AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
   },
 
   EventNameSP.fca11HoldNagLoud: {
-    ET.WARNING: Alert("Press the brake to keep holding",
-                      "FCA11 can only hold this stop for so long - take the brake",
+    ET.WARNING: Alert("Press the brake now",
+                      "FCA11 releases the brakes at 2:00",
                       AlertStatus.critical, AlertSize.mid, Priority.HIGH, VisualAlert.none,
                       AudibleAlert.warningSoft, 2.),
+  },
+
+  EventNameSP.fca11HoldNagFinal: {
+    ET.WARNING: Alert("Brakes release in 10 seconds",
+                      "Press the brake now to stay stopped",
+                      AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                      AudibleAlert.warningImmediate, 2.),
+  },
+
+  EventNameSP.fca11HoldExpired: {
+    ET.PERMANENT: Alert("BRAKES RELEASED", "PRESS BRAKE PEDAL",
+                        AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                        AudibleAlert.warningImmediate, 3.),
+    ET.NO_ENTRY: NoEntryAlert("Press the brake pedal first"),
   },
 
   EventNameSP.bigModelReady: {

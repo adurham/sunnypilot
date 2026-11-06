@@ -372,8 +372,10 @@ struct OnroadEventSP @0xda96579883444c35 {
     fca11Divergence @35;  # fork (0053): panda refused FCA11 while the car layer saw no camera braking (Python <-> panda disagreement)
     driverMarkGood @36;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked GOOD" - one bookmark press (verdict landed)
     driverMarkBad @37;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked BAD" - two bookmark presses within 2 s
-    fca11HoldNagSoft @38;  # fork (0041): SOFT standstill hold countdown "Stopped - press brake to keep holding" (120 s)
-    fca11HoldNagLoud @39;  # fork (0041): LOUD hold countdown (180 s, re-chiming every 30 s); the hold itself is NOT released
+    fca11HoldNagSoft @38;  # fork (0043): hold countdown 1/4 - SILENT banner at 60 s ("Stopped - press the brake")
+    fca11HoldNagLoud @39;  # fork (0043): hold countdown 2/4 - audible and CONTINUOUS from 90 s (soundd loops warningSoft)
+    fca11HoldExpired @40;  # fork (0043): hold countdown 4/4 - 120 s: the brakes ARE released (PERMANENT + NO_ENTRY until brake)
+    fca11HoldNagFinal @41;  # fork (0043): hold countdown 3/4 - warningImmediate at 110 s ("brakes release in 10 s")
   }
 }
 
@@ -509,9 +511,11 @@ struct CarStateSP @0xb86e6369214c01c8 {
   fca11Divergence @19 :Bool;     # fork (0053): panda refused FCA11 while the car layer saw no camera braking
   driverMark @20 :UInt8;         # fork (17c FEEDBACK): TRANSIENT driver-mark confirmation, 0 none / 1 "marked GOOD" /
                                  # 2 "marked BAD" (see fca11_long.on_driver_mark + driver_mark.py)
-  holdNag @21 :UInt8;            # fork (0041): standstill hold countdown, 0 none / 1 soft (120 s) / 2 loud (180 s + every
-                                 # 30 s). Raised to the driver as EventNameSP.fca11HoldNagSoft / fca11HoldNagLoud; the hold
-                                 # itself is NEVER released on expiry (the counter is a pure observer of the SENT level)
+  holdNag @21 :UInt8;            # fork (0043): standstill hold countdown, 0 none / 1 soft (60 s) / 2 loud (90 s) /
+                                 # 3 final (110 s) / 4 EXPIRED (120 s, a STICKY latch). Raised as EventNameSP.fca11HoldNagSoft
+                                 # / fca11HoldNagLoud / fca11HoldNagFinal / fca11HoldExpired. At 4 the superproject
+                                 # DISENGAGES and the brakes ARE released; the latch survives the counter reset and clears
+                                 # only on the driver's brake press (the counter itself is a pure observer of the SENT level)
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
