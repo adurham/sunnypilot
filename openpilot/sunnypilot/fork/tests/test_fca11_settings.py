@@ -4,7 +4,11 @@ The raylib panel cannot run headless; this pins the decision it delegates to, pl
 actually wires the shaping toggle to HyundaiFca11AffineGain through these functions."""
 import ast
 import itertools
+import json
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -249,6 +253,265 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("self.fca11_stop_hold_toggle.set_visible(hold_state.visible)", self.src)
     self.assertIn("FORK.md row 137", self.src)   # how to bring it back is written next to the row
     self.assertIn("(row 140)", self.src)         # ... and the TCU evidence it may not cite otherwise
+
+
+# --- D4: the brake-law text, checked against the REAL controller for every (Shaping, Dynamic, Shadow) combination ---
+#
+# The three brake descriptions are not pinned as strings here. Each one states the FOUR real states ("condition gives
+# law"), that table is PARSED out of the panel's own description, and it is evaluated at each of the 8 combinations
+# against the law the REAL car layer selects for the same combination (`setup_interfaces` + `Fca11LongBrake`, reading
+# cont_law / shape_track / feel / dynamic_brakes). A description with the wrong condition - or a panel line that
+# flips a row after `update_settings` set it - therefore fails BY VALUE, on the combination it got wrong.
+LAW_CONT, LAW_SHAPED, LAW_RAMP, LAW_OLD = "continuous", "0043", "18x", "OLD"
+BRAKE_ROWS = ("FCA11 Brake Shaping (Beta)", "Dynamic Brakes", "FCA11 Shadow (Log-Only)")
+HIDDEN_ROWS = {"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}
+
+# The REAL panel (this tree's hyundai.py + fca11_settings.py) executed headless: the widget/ui_state/multilang modules
+# are recording stubs, the panel file is the tree's own. Prints one JSON object: every row's visible/enabled/description
+# for all 8 Shaping/Dynamic/Shadow combinations, the same onroad, and every param write seen.
+_PANEL_PROBE = r'''
+import importlib.util, json, os, sys, types
+
+tree, odbc = sys.argv[1], sys.argv[2]
+sys.path[:0] = [tree, odbc]
+
+PARAMS = {"HyundaiGasInterceptor": True, "HyundaiFca11Brake": True, "HyundaiPedalDeliveryLaw": True,
+          "HyundaiGasRiseLag": True, "HyundaiFca11StopHoldClutch": False, "HyundaiLongitudinalTuning": 0,
+          "AdaptiveFollowDistance": True, "NoCloseOnLead": True, "StopApproachCommit": True,
+          "CarPlatformBundle": {"platform": "HYUNDAI_ELANTRA_2021"}}
+WRITES = []
+
+
+class Params:
+  def __init__(self, d): self.d = dict(d)
+  def get(self, k, *a, **kw): return self.d.get(k)
+  def get_bool(self, k, *a, **kw): return bool(self.d.get(k))
+  def put(self, k, v, *a, **kw):
+    WRITES.append([k, str(v)])
+    self.d[k] = v
+  put_bool = put_nonblocking = put
+
+
+class UIState:
+  def __init__(self):
+    self.params = Params(PARAMS)
+    self.CP = None
+    self.has_longitudinal_control = True
+    self.off = True
+  def is_offroad(self): return self.off
+
+
+class Action:
+  def __init__(self): self.enabled = None; self.selected = None
+  def set_enabled(self, e): self.enabled = e
+  def set_selected_button(self, i): self.selected = i
+
+
+class Item:
+  def __init__(self, title, param, callback):
+    self.title, self.param, self.callback = title, param, callback
+    self.action_item = Action(); self.visible = True; self.desc = ""
+  def set_visible(self, v): self.visible = v
+  def set_description(self, d): self.desc = d
+  def show_description(self, s): pass
+
+
+def mod(name, **attrs):
+  m = types.ModuleType(name); m.__dict__.update(attrs); sys.modules[name] = m
+
+
+ui_state = UIState()
+mod("openpilot.selfdrive.ui.ui_state", ui_state=ui_state)
+mod("openpilot.selfdrive.ui.sunnypilot.layouts.settings.vehicle.brands.base", BrandSettings=type("BrandSettings", (), {}))
+mod("openpilot.system.ui.lib.multilang", tr=lambda s: s)
+mod("openpilot.system.ui.sunnypilot.widgets.list_view",
+    toggle_item_sp=lambda title, desc="", param=None, callback=None, **kw: Item(title, param, callback),
+    multiple_button_item_sp=lambda title, desc, buttons, param=None, callback=None, **kw: Item(title, param, callback))
+
+spec = importlib.util.spec_from_file_location(
+  "panel_under_test", os.path.join(tree, "openpilot/selfdrive/ui/sunnypilot/layouts/settings/vehicle/brands/hyundai.py"))
+hy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hy)
+
+panel = hy.HyundaiSettings()
+out = {}
+for s in (True, False):
+  for d in (True, False):
+    for h in (True, False):
+      ui_state.params.d["HyundaiFca11AffineGain"] = s
+      ui_state.params.d["HyundaiFca11DynamicBrakes"] = d
+      ui_state.params.d["HyundaiFca11Shadow"] = h
+      panel.update_settings()
+      out["%d%d%d" % (s, d, h)] = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled,
+                                              "desc": it.desc} for it in panel.items}
+ui_state.off = False
+panel.update_settings()
+onroad = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled, "desc": it.desc}
+          for it in panel.items}
+for it in panel.items:
+  if it.callback is not None and it.param != "HyundaiLongitudinalTuning":
+    it.callback(True)
+print(json.dumps({"combos": out, "onroad": onroad, "writes": WRITES}))
+'''
+
+
+def _panel_matrix():
+  """Run the real panel headless in its own process and return its row matrix (see `_PANEL_PROBE`).
+
+  A separate process on purpose: importing the panel pulls raylib in, which the rest of this suite must never load,
+  and the stub modules must not leak into `sys.modules` for the other tests. It also means a panel that raises
+  (e.g. a NameError from a deleted read) fails the test with its own traceback instead of poisoning this process."""
+  try:
+    import opendbc
+  except Exception as e:   # no opendbc: the panel cannot be imported, and neither can the car layer
+    raise unittest.SkipTest(f"opendbc is not importable: {e}")
+  odbc = Path(opendbc.__file__).resolve().parents[1]
+  env = {k: v for k, v in os.environ.items() if k != "PYTHONHOME"}
+  env["PYTHONPATH"] = os.pathsep.join([str(REPO), str(odbc)])
+  r = subprocess.run([sys.executable, "-B", "-c", _PANEL_PROBE, str(REPO), str(odbc)],
+                     capture_output=True, text=True, env=env, timeout=300)
+  if r.returncode != 0:
+    raise AssertionError("the panel did not survive update_settings headless:\n" + (r.stderr or r.stdout)[-3000:])
+  return json.loads(r.stdout)
+
+
+def _real_law(shaping, dynamic, shadow):
+  """The law the REAL car layer selects for this combination, as a token.
+
+  Built through the real `setup_interfaces` (the one the car boots with - it is where Shadow forces Shaping and
+  Dynamic Brakes off) and read off the controller's own switches, never re-derived from the UI rule under test."""
+  try:
+    from opendbc.car import structs
+    from opendbc.car.hyundai.interface import CarInterface
+    from opendbc.car.hyundai.values import CAR
+    from opendbc.sunnypilot.car.interfaces import setup_interfaces
+    from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+  except Exception as e:
+    raise unittest.SkipTest(f"the fork's fca11_long is not in this tree: {e}")
+
+  saved = {k: os.environ.get(k) for k in ("FCA11_LOG_DIR", "FCA11_CAL_DIR")}
+  os.environ["FCA11_LOG_DIR"] = "0"    # never touch /data/fca11-log from a test host
+  os.environ["FCA11_CAL_DIR"] = "0"
+  try:
+    cp = structs.CarParams()
+    cp.brand = "hyundai"
+    cp.carFingerprint = CAR.HYUNDAI_ELANTRA_2021
+    cp_sp = structs.CarParamsSP()
+    cp_sp.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
+    setup_interfaces(CarInterface, cp, cp_sp, [
+      {"HyundaiGasInterceptor": "1"}, {"HyundaiFca11Brake": True},
+      {"HyundaiFca11AffineGain": bool(shaping)}, {"HyundaiFca11DynamicBrakes": bool(dynamic)},
+      {"HyundaiFca11Shadow": bool(shadow)}, {"HyundaiLongitudinalTuning": 0},
+    ])
+    brake = fl.Fca11LongBrake(cp, cp_sp)
+  finally:
+    for k, v in saved.items():
+      if v is None:
+        os.environ.pop(k, None)
+      else:
+        os.environ[k] = v
+
+  if brake.cont_law:
+    return LAW_CONT
+  if brake.affine_gain:
+    return LAW_SHAPED
+  if brake.feel:
+    return LAW_RAMP if brake.dynamic_brakes else LAW_OLD
+  raise AssertionError(f"no law flag is set for Shaping={shaping} Dynamic={dynamic} Shadow={shadow}: "
+                       f"cont_law={brake.cont_law} affine_gain={brake.affine_gain} feel={brake.feel}")
+
+
+def _law_table(desc):
+  """{condition: law token} parsed out of a description's own four-state sentences.
+
+  Conditions are (Shaping, DynamicBrakes, 0); "else" is the Shadow-ON / both-OFF row. The law token is whatever the
+  sentence itself names - the parser never assumes which law a condition gets."""
+  table = {}
+  for sent in re.split(r"(?<=\.)\s+", desc):
+    if "Shadow ON" in sent:
+      cond = "else"
+    else:
+      s = re.search(r"Shaping (ON|OFF)", sent)
+      d = re.search(r"Dynamic Brakes (ON|OFF)", sent)
+      if s is None or d is None:
+        continue
+      cond = (int(s.group(1) == "ON"), int(d.group(1) == "ON"), 0)
+    law = ("continuous" if "continuous" in sent else
+           "0043" if "0043" in sent else
+           "18x" if "18x" in sent else
+           "OLD" if "OLD law" in sent else None)
+    if law is not None:
+      table[cond] = law
+  return table
+
+
+def _table_law(table, shaping, dynamic, shadow):
+  """What the TEXT says the law is for this combination (Shadow ON is the else row: it forces the other two off)."""
+  if shadow:
+    return table.get("else")
+  return table.get((shaping, dynamic, 0), table.get("else"))
+
+
+class TestBrakeLawMatrix(unittest.TestCase):
+  """D4 (Opus): the descriptions must survive the mutations the string checks could not see. The rows are read out of
+  the panel AFTER its own `update_settings`, and the law the text claims is compared with the law the REAL controller
+  selects - for every one of the 8 Shaping / Dynamic Brakes / Shadow combinations."""
+
+  @classmethod
+  def setUpClass(cls):
+    cls.matrix = _panel_matrix()
+
+  def combos(self):
+    return list(itertools.product((1, 0), (1, 0), (1, 0)))
+
+  def test_every_row_states_the_law_the_real_controller_picks(self):
+    for shaping, dynamic, shadow in self.combos():
+      expected = _real_law(shaping, dynamic, shadow)
+      combo = f"{shaping}{dynamic}{shadow}"
+      self.assertIn(combo, self.matrix["combos"])
+      for row in BRAKE_ROWS:
+        desc = self.matrix["combos"][combo][row]["desc"]
+        table = _law_table(desc)
+        self.assertEqual(expected, _table_law(table, shaping, dynamic, shadow),
+                         f"{row} at Shaping={shaping} DynamicBrakes={dynamic} Shadow={shadow}: the text says "
+                         f"{_table_law(table, shaping, dynamic, shadow)}, the car layer says {expected}\n{desc}")
+
+  def test_every_row_states_all_four_states(self):
+    for row in BRAKE_ROWS:
+      table = _law_table(self.matrix["combos"]["110"][row]["desc"])
+      self.assertEqual({"else", (1, 1, 0), (1, 0, 0), (0, 1, 0)}, set(table), row)
+
+  def test_the_continuous_row_is_the_one_the_car_runs(self):
+    """The car's own combination (Shaping 1, Dynamic 1, Shadow 0) must be the continuous law, and the text must say
+    the car is on it - the point of describing the car's state first."""
+    self.assertEqual(LAW_CONT, _real_law(1, 1, 0))
+    for row in BRAKE_ROWS:
+      self.assertIn("This car runs the continuous linear law", self.matrix["combos"]["110"][row]["desc"], row)
+
+  def test_the_two_hidden_rows_are_hidden_in_every_combination(self):
+    """A rule that flips a retired row back on after the fact (a late `set_visible(brake_state.visible)` or a late
+    tuning re-show) lands here: the rows are read after update_settings, not inferred from the source."""
+    for combo, rows in self.matrix["combos"].items():
+      self.assertEqual(HIDDEN_ROWS, {t for t, r in rows.items() if not r["visible"]}, combo)
+
+  def test_the_brake_rows_are_listed_and_settable_offroad_in_every_combination(self):
+    for combo, rows in self.matrix["combos"].items():
+      for row in BRAKE_ROWS:
+        self.assertTrue(rows[row]["visible"], f"{row} hidden at {combo}")
+        self.assertTrue(rows[row]["enabled"], f"{row} not settable offroad at {combo}")
+
+  def test_onroad_hides_nothing_extra_and_disables_the_editable_rows(self):
+    rows = self.matrix["onroad"]
+    self.assertEqual(HIDDEN_ROWS, {t for t, r in rows.items() if not r["visible"]})
+    for title, row in rows.items():
+      if title in HIDDEN_ROWS or title == "Drive Mode Personality":
+        continue
+      self.assertFalse(row["enabled"], f"{title} is settable onroad")
+
+  def test_update_settings_and_every_row_callback_write_no_param(self):
+    """The tidy is a visibility/text change: 8 combinations plus every row callback = 0 param writes."""
+    self.assertEqual([], self.matrix["writes"])
 
 
 class TestEveryRowWiring(unittest.TestCase):
