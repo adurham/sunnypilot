@@ -797,23 +797,28 @@ class TestBrakeLawMatrix(unittest.TestCase):
       self.assertEqual((1, 1, 1, 0), conds, f"{row}: {sent}")
 
   def test_the_18x_clause_states_what_the_real_controller_does(self):
-    """R5 (Opus re-review #3): "a gentle ask starts at 1 LSB and a hard ask is ramped in (-2.8 m/s^2: 20 LSB at
-    780 ms), but an emergency ask (-3.0 m/s^2 or harder) still steps like the OLD law" must be what the controller
-    DOES at the asks it names - measured here, through the real car layer, not copied from a comment.
+    """R6 (Opus re-review #4): the 18x sentence must be TRUE for every ask the car can send, not just up to -3.5.
 
-    The lane measured -2.8 only; the wire is a ramp down to -2.99 and a STEP from -3.0 (that is
-    `accel <= FCA11_DYN_EMERGENCY_ACCEL` in `_dyn_first_lsb`, plus the panda's RATE_STEP on the rise), so "even a
-    hard ask is ramped in rather than stepped" was false and N5 (a clause saying a hard ask jumps) is the mutant this
-    test exists for: the ramp asks fail it, the byte-identity with the OLD law fails the opposite claim."""
+    R5 quoted "(-2.8 m/s^2: 20 LSB at 780 ms) ... full strength within 140 ms"; the second is FALSE past -3.6 (the
+    wire caps at 46 LSB, values.py l.62 = safety/hyundai.h l.136: -4.0 reaches 36 LSB at 160 ms, -5.0 the cap at
+    220 ms, and -5.0 is reachable with Braking ON). A precise time on screen cannot hold for every ask, so the row
+    now states the clause QUALITATIVELY - 1 LSB opening and a ramp for a gentle ask, the OLD law's 4 LSB per sent
+    frame up to the ask's own level (capped at the wire limit) for an emergency one - and this test pins the
+    measurement underneath it: -2.0/-2.8/-2.99 open at 1 LSB and climb, and -3.0/-3.5/-3.62/-4.0/-4.5/-5.0/-6.0
+    are 4,8,12,16... and BYTE-IDENTICAL to the OLD law, through `setup_interfaces` + `Fca11LongBrake`, not copied
+    from a comment. The numbers themselves are pinned in FORK row 141 by
+    `test_the_fork_row_quotes_the_measured_table`."""
     from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_MAX_DEC
     self.assertEqual(-3.0, fl.FCA11_DYN_EMERGENCY_ACCEL, "the sentence quotes -3.0 m/s^2: the boundary moved")
     self.assertEqual(4, fl.HYUNDAI_FCA11_LONG_RATE_STEP, "the sentence quotes 4 LSB per sent frame")
     # 0x38D leaves the controller on SENT frames only; the module's own period is what turns frames into ms.
     dt_ms = int(round(fl.FCA11_SHAPE_SENT_DT * 1000))
-    self.assertEqual(20, dt_ms)   # 50 Hz on the wire; the quoted 140 ms / 780 ms are SENT-frame times
+    self.assertEqual(20, dt_ms)   # 50 Hz on the wire; the times in FORK row 141 are SENT-frame times
 
     ramp = {ask: _sent_levels(0, 1, 0, ask) for ask in (-2.0, -2.8, -2.99)}   # S0D1H0, the 18x law
-    emerg = {ask: (_sent_levels(0, 1, 0, ask), _sent_levels(0, 0, 0, ask)) for ask in (-3.0, -3.5)}
+    emerg = {ask: (_sent_levels(0, 1, 0, ask), _sent_levels(0, 0, 0, ask))
+             for ask in (-3.0, -3.5, -3.62, -4.0, -4.5, -5.0, -6.0)}
     for ask, frames in ramp.items():
       self.assertEqual(1, frames[0][0], f"a sub-emergency ask ({ask}) must open at 1 LSB, not step")
       self.assertLess(frames[0][0], frames[-1][0], f"a sub-emergency ask ({ask}) must ramp, not jump")
@@ -823,15 +828,37 @@ class TestBrakeLawMatrix(unittest.TestCase):
       self.assertEqual([4, 8, 12, 16], [lv for lv, _ in frames[:4]], f"an emergency ask ({ask}) must keep the step")
       self.assertEqual([d for _, d in old], [d for _, d in frames],
                        f"an emergency ask ({ask}) must be BYTE-IDENTICAL to the OLD law")
+    # "up to the ask's own level (capped at the wire limit)": a deeper ask climbs deeper, until the wire cap.
+    finals = [emerg[ask][0][-1][0] for ask in (-3.0, -3.5, -3.62, -4.0, -4.5)]
+    self.assertEqual(sorted(set(finals)), finals, f"a deeper emergency ask must reach a deeper level: {finals}")
+    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, emerg[-6.0][0][-1][0],
+                     "an ask past the cap must stop at the wire's own limit, not at its own level")
+    self.assertLess(finals[-1], HYUNDAI_FCA11_LONG_MAX_DEC, "the -4.5 ask must still be under the cap")
+    self.assertGreater(finals[-1], emerg[-3.5][0][-1][0], "the -4.5 ask must be past the -3.5 level")
 
     for row in BRAKE_ROWS:
       clause = _eighteen_clause(self.matrix["combos"]["1010"][row]["desc"])
       self.assertIn("a gentle ask starts at 1 LSB", clause, row)
-      self.assertIn(f"-2.8 m/s^2: 20 LSB at {t20} ms", clause, f"{row}: the quoted ramp number must be the measured one")
       self.assertIn(f"{fl.FCA11_DYN_EMERGENCY_ACCEL:.1f} m/s^2 or harder", clause, row)
-      self.assertIn("still steps like the OLD law", clause, row)
+      self.assertIn("steps like the OLD law", clause, row)
       self.assertIn(f"{fl.HYUNDAI_FCA11_LONG_RATE_STEP} LSB per sent frame", clause, row)
+      self.assertIn("capped at the wire limit", clause, row)
       self.assertNotIn("even a hard ask is ramped in rather than stepped", clause, f"{row}: the false clause is back")
+
+  def test_the_on_screen_clause_names_no_time(self):
+    """R6 (Opus re-review #4): no millisecond figure on screen - no single one holds for every ask.
+
+    M4 ("within 140 ms" -> "within 60 ms") SURVIVED R5 because nothing read the sentence's number; and the true
+    numbers run 120 ms (-3.0) to 220 ms (-5.0 and harder), so a screen that prints one is wrong for the rest. The
+    rendered 18x sentence of every brake row, in every one of the 16 Braking/Shaping/Dynamic/Shadow states, must
+    carry NO digit followed by "ms"; the measured table lives in FORK row 141, pinned there by
+    `test_the_fork_row_quotes_the_measured_table`."""
+    for combo, rows in self.matrix["combos"].items():
+      for row in BRAKE_ROWS:
+        clause = _eighteen_clause(rows[row]["desc"])
+        self.assertIsNone(re.search(r"\d\s*ms\b", clause),
+                          f"{row} at {combo}: a millisecond figure on screen must hold for EVERY ask, and none does "
+                          f"- the table belongs in FORK row 141\n{clause}")
 
   def test_the_braking_off_sentence_never_appears_with_braking_on(self):
     """N7 (Opus): the Shadow row's Braking-OFF branch must be unreachable while Braking is ON. The `if True:` form
