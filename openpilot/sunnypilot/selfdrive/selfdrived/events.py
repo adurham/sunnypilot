@@ -296,10 +296,13 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   #                    and no 30 s re-chime any more. HIGH is below BRAKE NOW's HIGHEST, so a real brake fault wins.
   #   3 final   110 s  HIGHEST + warningImmediate: "ten seconds to release" - the same authority as an urgent alert,
   #                    because this one is a hand-off, not a notice.
-  #   4 expired 120 s  PERMANENT + NO_ENTRY. The hold HAS ended: the car is disengaged and the ESC is released, so this
-  #                    says so and asks for the brake pedal. NO_ENTRY is what refuses a re-engage until the driver brakes
-  #                    (MADS reads events_sp too - sunnypilot/mads/state.py check_contains), and it is cleared only by the
-  #                    brake press that clears the opendbc latch.
+  #   4 expired 120 s  PERMANENT + NO_ENTRY. The hold HAS ended: at 2:00 longitudinal control disengages and the brakes
+  #                    release; lateral (MADS) stays engaged by design (mads.py l.205 strips `pcmDisable` inside
+  #                    update_events, so the MADS state machine never sees it). The banner says exactly that - BRAKES
+  #                    RELEASED, PRESS BRAKE PEDAL - and never implies steering is off. NO_ENTRY is what refuses a
+  #                    longitudinal re-engage until the driver brakes (MADS reads events_sp too -
+  #                    sunnypilot/mads/state.py check_contains - so it also refuses lateral RE-entry), and it is cleared
+  #                    only by the brake press that clears the opendbc latch.
   # The old 0041 wording ("FCA11 has held this stop for over 2 minutes", "can only hold for so long") was about a hold
   # that never ended and is gone with it: not one string here may imply the hold is still being held at 2:00.
   EventNameSP.fca11HoldNagSoft: {

@@ -170,8 +170,9 @@ class TestFca11HoldNagEvents:
   """fork (0043): the standstill HOLD COUNTDOWN v2. CarStateSP.holdNag (0 none / 1 soft 60 s / 2 loud 90 s / 3 final
   110 s / 4 EXPIRED 120 s) sits BETWEEN the existing alerts: brakeNow outranks every TIER, the nag replaces
   stopComplete while it is up, and stopComplete still covers every hold shorter than 60 s - so the screen never shows
-  two hold banners at once. 4 is not a tier: it is the latch, and it is the only state that acts (disengage + refuse a
-  re-engage until the driver brakes). The state-machine proof is in tests/test_fca11_hold_countdown.py."""
+  two hold banners at once. 4 is not a tier: it is the latch, and it is the only state that acts - at 2:00 longitudinal
+  control disengages and the brakes release; lateral (MADS) stays engaged by design - and it refuses a longitudinal
+  re-engage until the driver brakes. The state-machine proof is in tests/test_fca11_hold_countdown.py."""
 
   def _run(self, hold_nag=0, brake_now=False, stop_complete=False, armed=True, button_enable=False):
     CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
