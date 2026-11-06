@@ -152,7 +152,11 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("Takes effect", self.src)
     self.assertIn("at the next ignition", self.src)
     self.assertIn("Requires FCA11 Braking", self.src)
-    self.assertIn("Hard stops are NOT", self.src)
+    # SETTINGS TIDY (D2): 0037 deleted the continuous law's fast-step bypass (FORK row 135), so the old
+    # "Hard stops are NOT slowed ... full rate" claim is FALSE on the law the car runs. It must not come back.
+    self.assertNotIn("Hard stops are NOT", self.src)
+    for var in ("shaping_desc", "dynamic_desc", "shadow_desc"):
+      self.assertNotIn("full rate", self._description(var), var)
     # 0044: the stale pre-0040 claim is gone (both speed floors were deleted in 0040)
     self.assertNotIn("below 12 km/h", self.src)
 
@@ -164,10 +168,11 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("fca11_shadow_toggle_state(pedal_raw, offroad)", self.src)
     self.assertIn("self.fca11_shadow_toggle.set_visible(shadow_state.visible)", self.src)
     self.assertIn("self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)", self.src)
-    self.assertIn("V3 NEVER acts on the car", self.src)
-    self.assertIn("Data collection only", self.src)
-    self.assertIn("(OLD-LAW)", self.src)
-    self.assertIn("ON switches braking back to the OLD law", self.src)
+    self.assertIn("never sent to the car", self._description("shadow_desc"))
+    self.assertIn("ON switches braking back to the plain OLD law", self._description("shadow_desc"))
+    # SETTINGS TIDY (D3): the logged core is the 0043 SHAPED law, not "the new law (V3)".
+    self.assertIn("logs the 0043 shaped law", self._description("shadow_desc"))
+    self.assertNotIn("(V3)", self.src)
     self.assertNotIn("you brake for every stop", self.src)   # the first build's FCA11-DISABLED reading is gone
 
   def _description(self, var):
@@ -184,17 +189,24 @@ class TestPanelWiring(unittest.TestCase):
 
     return join(ast.parse("(" + blocks[0] + ")", mode="eval").body)
 
-  def test_brake_law_descriptions_stay_in_step_with_the_two_states(self):
-    """SETTINGS TIDY (§2.3): the new continuous (linear) law is ON only with Brake Shaping AND Dynamic Brakes ON and
-    Shadow OFF, so flipping ANY of the three gives the OLD law - each of the three rows must say so, and the
-    next-ignition sentence must survive."""
+  def test_brake_law_descriptions_state_the_four_states(self):
+    """SETTINGS TIDY (D1): the brake law has FOUR states, not two (measured with the real setup_interfaces +
+    Fca11LongBrake): Shaping ON + Dynamic ON + Shadow OFF is the continuous law; Shaping ON + Dynamic OFF is the 0043
+    shaped law; Shaping OFF + Dynamic ON is the OLD law + the 18x ramp; Shadow ON (or both OFF) is the plain OLD law.
+    Each of the three rows must state all four and keep the next-ignition sentence. (The value check - the text
+    against the REAL controller's flags for every combination - is TestBrakeLawMatrix below.)"""
     for var in ("shaping_desc", "dynamic_desc", "shadow_desc"):
       block = self._description(var)
-      self.assertIn("continuous (linear)", block, var)
-      self.assertIn("OLD law", block, var)
-      self.assertIn("ANY of the three", block, var)
+      self.assertIn("continuous linear law", block, var)
+      self.assertIn("Shaping ON with Dynamic Brakes OFF gives the 0043 shaped law", block, var)
+      self.assertIn("Shaping OFF with Dynamic Brakes ON gives the OLD law", block, var)
+      self.assertIn("Shadow ON, or Shaping and Dynamic Brakes both OFF, gives the plain OLD law", block, var)
       self.assertIn("at the next ignition", block, var)
-    self.assertIn("ON switches braking back to the OLD law", self._description("shadow_desc"))
+    # D2: no bypass on the continuous law - the correction the first brief got wrong.
+    for var in ("shaping_desc", "dynamic_desc"):
+      self.assertIn("no fast-step bypass", self._description(var), var)
+    # D3: Shadow names the LOGGED law correctly.
+    self.assertIn("logs the 0043 shaped law", self._description("shadow_desc"))
 
   def test_new_lane_toggles_wiring(self):
     """17c/18x: the three param-only lane switches are real UI toggles now, on the right keys and the right rules."""
