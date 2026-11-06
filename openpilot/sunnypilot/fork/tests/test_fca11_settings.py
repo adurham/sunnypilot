@@ -120,6 +120,33 @@ class TestFca11SettingsRules(unittest.TestCase):
     hidden = {title for title, state in rows.items() if not state.visible}
     self.assertEqual({"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}, hidden)
 
+  def test_brake_state_rule_and_sentence(self):
+    """R2: the law token mirrors the car layer from the VALUES (Braking off => no law; Shadow => the plain OLD law;
+    Shaping+Dynamic => continuous; Shaping => 0043; Dynamic => 18x; neither => OLD), and the sentence names all four."""
+    want = {  # (Braking, Shaping, Dynamic, Shadow) -> law token
+      (0, 1, 1, 0): fca11_settings.LAW_NONE, (0, 0, 0, 1): fca11_settings.LAW_NONE,
+      (1, 1, 1, 0): fca11_settings.LAW_CONTINUOUS, (1, 1, 0, 0): fca11_settings.LAW_SHAPED,
+      (1, 0, 1, 0): fca11_settings.LAW_RAMP, (1, 0, 0, 0): fca11_settings.LAW_OLD,
+      (1, 1, 1, 1): fca11_settings.LAW_OLD, (1, 1, 0, 1): fca11_settings.LAW_OLD,
+      (1, 0, 1, 1): fca11_settings.LAW_OLD,
+    }
+    for (b, s, d, h), law in want.items():
+      self.assertEqual(law, fca11_settings.fca11_brake_state(b, s, d, h).law, (b, s, d, h))
+      self.assertEqual(law, fca11_settings.fca11_brake_state(bool(b), bool(s), bool(d), bool(h)).law)
+    # the string forms the params actually hold ("1" is what Params.get() answers for a BOOL key)
+    self.assertEqual(fca11_settings.LAW_CONTINUOUS, fca11_settings.fca11_brake_state("1", "1", "1", "0").law)
+    self.assertEqual(fca11_settings.LAW_OLD, fca11_settings.fca11_brake_state("1", "1", "1", "1").law)
+    # the sentence follows the values, and the Braking-OFF one keeps the old "nothing changes" meaning
+    cont = fca11_settings.fca11_brake_state_sentence("1", "1", "1", "0")
+    self.assertTrue(cont.startswith("This car runs the continuous linear law"), cont)
+    for pat in (r"FCA11 Braking ON", r"Shaping ON", r"Dynamic Brakes ON", r"Shadow OFF"):
+      self.assertRegex(cont, pat)
+    off = fca11_settings.fca11_brake_state_sentence("0", "1", "1", "0")
+    self.assertIn("no FCA11 brake law", off)
+    self.assertIn("nothing changes while Braking is off", off)
+    for pat in (r"FCA11 Braking OFF", r"Shaping ON", r"Dynamic Brakes ON", r"Shadow OFF"):
+      self.assertRegex(off, pat)
+
   def test_stop_hold_row_is_retired_hidden(self):
     """SETTINGS TIDY: the 0034 row is hidden on every car - the ESC hold has never been validated (FORK.md row 137)
     and the TCU opens the clutch on the brake pedal switch, not on 0x38D (lane-U report, summarised in row 140). The
@@ -181,18 +208,43 @@ class TestPanelWiring(unittest.TestCase):
     self.assertNotIn("you brake for every stop", self.src)   # the first build's FCA11-DISABLED reading is gone
 
   def _description(self, var):
-    """The whole tr(...) string of a panel description (`shaping_desc`, `dynamic_desc`, `shadow_desc`)."""
-    blocks = re.findall(var + r" = tr\((.*?)\)\n", self.src, re.S)
-    self.assertTrue(blocks, f"no {var} description in the panel")
+    """The whole rendered text of a panel description (`shaping_desc`, `dynamic_desc`, `shadow_desc`).
 
-    def join(node):
-      if isinstance(node, ast.Constant):
+    R2: the description is now assembled (`tr(state_sent) + " " + tr("...")`), so this joins every string constant of
+    the assignment's expression; the generated car-state sentence is the `state_sent` name and renders as <STATE>
+    here. Both branches of the Shadow row's `shadow_law` conditional are joined, so the static checks below see the
+    whole vocabulary (the RENDERED text per combination is what TestBrakeLawMatrix checks)."""
+    module = ast.parse(self.src)
+    assign = None
+    for node in ast.walk(module):
+      if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == var for t in node.targets):
+        assign = node.value   # the first (main) assignment; a later `var = offroad_hint + var` is skipped
+        break
+    self.assertIsNotNone(assign, f"no {var} description in the panel")
+
+    def named(name, seen=()):
+      """Every assignment of a local name (e.g. `shadow_law`, which has a Braking-OFF variant), joined."""
+      if name in seen:
+        raise AssertionError(f"recursive description name: {name}")
+      values = [n.value for n in ast.walk(module)
+                if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == name for t in n.targets)]
+      self.assertTrue(values, f"{name} is used in a description but never assigned")
+      return " ".join(join(v, seen + (name,)) for v in values)
+
+    def join(node, seen=()):
+      if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
       if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return join(node.left) + join(node.right)
+        return join(node.left, seen) + join(node.right, seen)
+      if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "tr":
+        return join(node.args[0], seen)
+      if isinstance(node, ast.Name):
+        return "<STATE>" if node.id == "state_sent" else named(node.id, seen)
+      if isinstance(node, ast.IfExp):
+        return join(node.body, seen) + " " + join(node.orelse, seen)
       raise AssertionError(f"unexpected description node: {type(node).__name__}")
 
-    return join(ast.parse("(" + blocks[0] + ")", mode="eval").body)
+    return join(assign)
 
   def test_brake_law_descriptions_state_the_four_states(self):
     """SETTINGS TIDY (D1): the brake law has FOUR states, not two (measured with the real setup_interfaces +
@@ -266,7 +318,7 @@ class TestPanelWiring(unittest.TestCase):
 # against the law the REAL car layer selects for the same combination (`setup_interfaces` + `Fca11LongBrake`, reading
 # cont_law / shape_track / feel / dynamic_brakes). A description with the wrong condition - or a panel line that
 # flips a row after `update_settings` set it - therefore fails BY VALUE, on the combination it got wrong.
-LAW_CONT, LAW_SHAPED, LAW_RAMP, LAW_OLD = "continuous", "0043", "18x", "OLD"
+LAW_CONT, LAW_SHAPED, LAW_RAMP, LAW_OLD, LAW_NONE = "continuous", "0043", "18x", "OLD", "none"
 BRAKE_ROWS = ("FCA11 Brake Shaping (Beta)", "Dynamic Brakes", "FCA11 Shadow (Log-Only)")
 HIDDEN_ROWS = {"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}
 
@@ -339,23 +391,36 @@ spec.loader.exec_module(hy)
 
 panel = hy.HyundaiSettings()
 out = {}
-for s in (True, False):
-  for d in (True, False):
-    for h in (True, False):
-      ui_state.params.d["HyundaiFca11AffineGain"] = s
-      ui_state.params.d["HyundaiFca11DynamicBrakes"] = d
-      ui_state.params.d["HyundaiFca11Shadow"] = h
-      panel.update_settings()
-      out["%d%d%d" % (s, d, h)] = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled,
-                                              "desc": it.desc} for it in panel.items}
+for b in (True, False):
+  for s in (True, False):
+    for d in (True, False):
+      for h in (True, False):
+        ui_state.params.d.update({"HyundaiFca11Brake": b, "HyundaiFca11AffineGain": s,
+                                  "HyundaiFca11DynamicBrakes": d, "HyundaiFca11Shadow": h})
+        panel.update_settings()
+        out["%d%d%d%d" % (b, s, d, h)] = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled,
+                                                     "desc": it.desc} for it in panel.items}
+update_writes = list(WRITES)     # R3 (F4): update_settings alone, 16 combinations
+ui_state.params.d.update({"HyundaiFca11Brake": True, "HyundaiFca11AffineGain": True,
+                          "HyundaiFca11DynamicBrakes": True, "HyundaiFca11Shadow": False})
 ui_state.off = False
 panel.update_settings()
 onroad = {it.title: {"visible": bool(it.visible), "enabled": it.action_item.enabled, "desc": it.desc}
           for it in panel.items}
+ui_state.off = True
+panel.update_settings()
+# R3 (F4): EVERY row callback runs, including the Custom Longitudinal Tuning button handler the old probe skipped.
+# The multi-button handler takes an index (the 3-way Off/Dynamic/Predictive choice), the toggles take the new value.
+WRITES.clear()
 for it in panel.items:
-  if it.callback is not None and it.param != "HyundaiLongitudinalTuning":
+  if it.callback is None:
+    continue
+  if it.param == "HyundaiLongitudinalTuning":
+    it.callback(2)
+  else:
     it.callback(True)
-print(json.dumps({"combos": out, "onroad": onroad, "writes": WRITES}))
+print(json.dumps({"combos": out, "onroad": onroad, "update_writes": update_writes,
+                  "callback_writes": list(WRITES)}))
 '''
 
 
@@ -379,11 +444,13 @@ def _panel_matrix():
   return json.loads(r.stdout)
 
 
-def _real_law(shaping, dynamic, shadow):
+def _real_law(brake, shaping, dynamic, shadow):
   """The law the REAL car layer selects for this combination, as a token.
 
   Built through the real `setup_interfaces` (the one the car boots with - it is where Shadow forces Shaping and
-  Dynamic Brakes off) and read off the controller's own switches, never re-derived from the UI rule under test."""
+  Dynamic Brakes off, and where a Braking-off car gets no FCA11 at all) and read off the controller's own switches,
+  never re-derived from the UI rule under test. R2 adds the Braking dimension: `enabled` is the controller's own
+  answer to "does any of this reach the car", so Braking off is LAW_NONE by value, not by assumption."""
   try:
     from opendbc.car import structs
     from opendbc.car.hyundai.interface import CarInterface
@@ -404,11 +471,11 @@ def _real_law(shaping, dynamic, shadow):
     cp_sp = structs.CarParamsSP()
     cp_sp.flags |= HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED.value
     setup_interfaces(CarInterface, cp, cp_sp, [
-      {"HyundaiGasInterceptor": "1"}, {"HyundaiFca11Brake": True},
+      {"HyundaiGasInterceptor": "1"}, {"HyundaiFca11Brake": bool(brake)},
       {"HyundaiFca11AffineGain": bool(shaping)}, {"HyundaiFca11DynamicBrakes": bool(dynamic)},
       {"HyundaiFca11Shadow": bool(shadow)}, {"HyundaiLongitudinalTuning": 0},
     ])
-    brake = fl.Fca11LongBrake(cp, cp_sp)
+    brake_obj = fl.Fca11LongBrake(cp, cp_sp)
   finally:
     for k, v in saved.items():
       if v is None:
@@ -416,14 +483,52 @@ def _real_law(shaping, dynamic, shadow):
       else:
         os.environ[k] = v
 
-  if brake.cont_law:
+  if not brake:
+    assert brake_obj.enabled is False, "a Braking-OFF controller must be disabled"
+    assert not (brake_obj.cont_law or brake_obj.affine_gain or brake_obj.feel or brake_obj.dynamic_brakes), \
+      "a Braking-OFF controller must not select any law"
+    return LAW_NONE
+  assert brake_obj.enabled is True, "a Braking-ON controller must be enabled"
+  if brake_obj.cont_law:
     return LAW_CONT
-  if brake.affine_gain:
+  if brake_obj.affine_gain:
     return LAW_SHAPED
-  if brake.feel:
-    return LAW_RAMP if brake.dynamic_brakes else LAW_OLD
-  raise AssertionError(f"no law flag is set for Shaping={shaping} Dynamic={dynamic} Shadow={shadow}: "
-                       f"cont_law={brake.cont_law} affine_gain={brake.affine_gain} feel={brake.feel}")
+  if brake_obj.feel:
+    return LAW_RAMP if brake_obj.dynamic_brakes else LAW_OLD
+  raise AssertionError(f"no law flag is set for Braking={brake} Shaping={shaping} Dynamic={dynamic} Shadow={shadow}: "
+                       f"cont_law={brake_obj.cont_law} affine_gain={brake_obj.affine_gain} feel={brake_obj.feel}")
+
+
+def _sentences(desc):
+  return [s for s in re.split(r"(?<=\.)\s+", desc) if s.strip()]
+
+
+def _state_claim(desc):
+  """The car-state sentence a row opens with (R2: `fca11_brake_state_sentence`, rendered by the panel).
+
+  Returns (law token, (Braking, Shaping, Dynamic, Shadow) as the SENTENCE names them). Every one of the four must be
+  named: the sentence is the reader's summary, so a sentence that names the wrong combination (or drops a switch)
+  fails here by value - that is the X4 mutant."""
+  sent = next((s for s in _sentences(desc) if s.startswith("This car runs")), None)
+  if sent is None:
+    raise AssertionError(f"no car-state sentence in this description: {desc[:200]!r}")
+  head = re.search(r"This car runs (.*?):", sent)
+  if head is None:
+    raise AssertionError(f"unparsable car-state sentence: {sent!r}")
+  law = ("none" if "no FCA11 brake law" in head.group(1) else
+         "continuous" if "continuous" in head.group(1) else
+         "0043" if "0043" in head.group(1) else
+         "18x" if "18x" in head.group(1) else
+         "OLD" if "OLD law" in head.group(1) else None)
+  if law is None:
+    raise AssertionError(f"the car-state sentence names no known law: {sent!r}")
+  conds = []
+  for pat in (r"FCA11 Braking (ON|OFF)", r"Shaping (ON|OFF)", r"Dynamic Brakes (ON|OFF)", r"Shadow (ON|OFF)"):
+    m = re.search(pat, sent)
+    if m is None:
+      raise AssertionError(f"the car-state sentence does not name {pat}: {sent!r}")
+    conds.append(int(m.group(1) == "ON"))
+  return law, tuple(conds), sent
 
 
 def _law_table(desc):
@@ -476,21 +581,57 @@ def _table_law(table, shaping, dynamic, shadow):
 
 
 class TestBrakeLawMatrix(unittest.TestCase):
-  """D4 (Opus): the descriptions must survive the mutations the string checks could not see. The rows are read out of
-  the panel AFTER its own `update_settings`, and the law the text claims is compared with the law the REAL controller
-  selects - for every one of the 8 Shaping / Dynamic Brakes / Shadow combinations."""
+  """D4 + R1 + R2 (Opus): the descriptions must survive the mutations the string checks could not see. The rows are
+  read out of the real panel AFTER its own `update_settings`, and BOTH what the text claims is compared with what the
+  REAL controller does - for all 16 Braking / Shaping / Dynamic Brakes / Shadow combinations:
+
+    * the car-state sentence must name the ACTUAL four values and the law the controller selects (R2/N1/N3);
+    * the four-state table must give the law the controller selects, keyed on each sentence's OWN Shadow condition
+      (R1/N2);
+    * Braking OFF must say that no FCA11 brake law runs and that nothing changes (N3)."""
 
   @classmethod
   def setUpClass(cls):
     cls.matrix = _panel_matrix()
 
   def combos(self):
-    return list(itertools.product((1, 0), (1, 0), (1, 0)))
+    return list(itertools.product((1, 0), (1, 0), (1, 0), (1, 0)))
+
+  def test_the_state_sentence_names_the_actual_params_and_the_real_law(self):
+    """R2: the sentence is built from the values, so it names the combination the car is really in and the law the
+    real controller selects - in all 16 states, including Braking OFF (where no law runs at all)."""
+    for brake, shaping, dynamic, shadow in self.combos():
+      combo = f"{brake}{shaping}{dynamic}{shadow}"
+      expected = _real_law(brake, shaping, dynamic, shadow)
+      for row in BRAKE_ROWS:
+        desc = self.matrix["combos"][combo][row]["desc"]
+        law, conds, sent = _state_claim(desc)
+        self.assertEqual((brake, shaping, dynamic, shadow), conds,
+                         f"{row} at {combo}: the state sentence names {conds}, the params are "
+                         f"{(brake, shaping, dynamic, shadow)}\n{sent}")
+        self.assertEqual(expected, law,
+                         f"{row} at {combo}: the state sentence says {law}, the car layer says {expected}\n{sent}")
+
+  def test_braking_off_says_no_law_runs_and_nothing_changes(self):
+    """N3: Braking OFF leaves the Shadow row listed while the controller is `enabled=False`; 'this car runs the
+    continuous linear law' and 'ON switches braking back' were false there. The old meaning is back."""
+    for shaping, dynamic, shadow in itertools.product((1, 0), (1, 0), (1, 0)):
+      combo = f"0{shaping}{dynamic}{shadow}"
+      for row in BRAKE_ROWS:
+        desc = self.matrix["combos"][combo][row]["desc"]
+        self.assertIn("no FCA11 brake law", desc, row)
+        self.assertIn("nothing changes while Braking is off", desc, row)
+        self.assertNotIn("This car runs the continuous linear law", desc, row)
+    # the Shadow row, where it matters most, says what Shadow still does with nothing to brake
+    self.assertIn("only logs", self.matrix["combos"]["0110"]["FCA11 Shadow (Log-Only)"]["desc"])
 
   def test_every_row_states_the_law_the_real_controller_picks(self):
-    for shaping, dynamic, shadow in self.combos():
-      expected = _real_law(shaping, dynamic, shadow)
-      combo = f"{shaping}{dynamic}{shadow}"
+    """R1: the four-state table of every row, against the real controller, for every Braking-ON combination."""
+    for brake, shaping, dynamic, shadow in self.combos():
+      if not brake:
+        continue
+      expected = _real_law(brake, shaping, dynamic, shadow)
+      combo = f"{brake}{shaping}{dynamic}{shadow}"
       self.assertIn(combo, self.matrix["combos"])
       for row in BRAKE_ROWS:
         desc = self.matrix["combos"][combo][row]["desc"]
@@ -501,27 +642,36 @@ class TestBrakeLawMatrix(unittest.TestCase):
 
   def test_every_row_states_all_four_states(self):
     for row in BRAKE_ROWS:
-      table = _law_table(self.matrix["combos"]["110"][row]["desc"])
+      table = _law_table(self.matrix["combos"]["1110"][row]["desc"])
       self.assertEqual({"else", (1, 1, 0), (1, 0, 0), (0, 1, 0)}, set(table), row)
 
   def test_the_continuous_row_is_the_one_the_car_runs(self):
-    """The car's own combination (Shaping 1, Dynamic 1, Shadow 0) must be the continuous law, and the text must say
-    the car is on it - the point of describing the car's state first."""
-    self.assertEqual(LAW_CONT, _real_law(1, 1, 0))
+    """The car's own combination (Braking 1, Shaping 1, Dynamic 1, Shadow 0) is the continuous law, and every brake
+    row's car-state sentence says so - the point of describing the car's own state first."""
+    self.assertEqual(LAW_CONT, _real_law(1, 1, 1, 0))
     for row in BRAKE_ROWS:
-      self.assertIn("This car runs the continuous linear law", self.matrix["combos"]["110"][row]["desc"], row)
+      law, conds, sent = _state_claim(self.matrix["combos"]["1110"][row]["desc"])
+      self.assertEqual(LAW_CONT, law, row)
+      self.assertEqual((1, 1, 1, 0), conds, f"{row}: {sent}")
 
-  def test_the_two_hidden_rows_are_hidden_in_every_combination(self):
+  def test_hidden_rows_are_the_two_retired_rows_plus_braking_dependents(self):
     """A rule that flips a retired row back on after the fact (a late `set_visible(brake_state.visible)` or a late
-    tuning re-show) lands here: the rows are read after update_settings, not inferred from the source."""
+    tuning re-show) lands here: the rows are read after update_settings, not inferred from the source. The Shaping and
+    Dynamic Brakes rows exist only with FCA11 Braking on, which is their own rule, not a tidy."""
     for combo, rows in self.matrix["combos"].items():
-      self.assertEqual(HIDDEN_ROWS, {t for t, r in rows.items() if not r["visible"]}, combo)
+      brake = int(combo[0])
+      expected = set(HIDDEN_ROWS)
+      if not brake:
+        expected |= {"FCA11 Brake Shaping (Beta)", "Dynamic Brakes"}
+      self.assertEqual(expected, {t for t, r in rows.items() if not r["visible"]}, combo)
 
   def test_the_brake_rows_are_listed_and_settable_offroad_in_every_combination(self):
     for combo, rows in self.matrix["combos"].items():
+      brake = int(combo[0])
       for row in BRAKE_ROWS:
-        self.assertTrue(rows[row]["visible"], f"{row} hidden at {combo}")
-        self.assertTrue(rows[row]["enabled"], f"{row} not settable offroad at {combo}")
+        want = bool(brake) or row == "FCA11 Shadow (Log-Only)"
+        self.assertEqual(want, rows[row]["visible"], f"{row} at {combo}")
+        self.assertEqual(want, rows[row]["enabled"], f"{row} not settable offroad at {combo}")
 
   def test_onroad_hides_nothing_extra_and_disables_the_editable_rows(self):
     rows = self.matrix["onroad"]
@@ -531,9 +681,13 @@ class TestBrakeLawMatrix(unittest.TestCase):
         continue
       self.assertFalse(row["enabled"], f"{title} is settable onroad")
 
-  def test_update_settings_and_every_row_callback_write_no_param(self):
-    """The tidy is a visibility/text change: 8 combinations plus every row callback = 0 param writes."""
-    self.assertEqual([], self.matrix["writes"])
+  def test_update_settings_writes_no_param_and_only_the_tuning_handler_does(self):
+    """R3 (F4): `update_settings` writes NOTHING - all 16 combinations plus onroad. Exactly ONE row callback writes:
+    the Custom Longitudinal Tuning row's own button handler, which puts the chosen index into
+    HyundaiLongitudinalTuning - its documented job, unchanged by this patch. The probe calls it now instead of
+    skipping it (Opus: 'every row callback writes 0 params' was wrong)."""
+    self.assertEqual([], self.matrix["update_writes"])
+    self.assertEqual([["HyundaiLongitudinalTuning", "2"]], self.matrix["callback_writes"])
 
 
 class TestEveryRowWiring(unittest.TestCase):

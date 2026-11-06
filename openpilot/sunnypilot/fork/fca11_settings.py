@@ -26,6 +26,72 @@ class ToggleState(NamedTuple):
   enabled: bool
 
 
+# R2: the four laws an FCA11 Braking car can run, plus "none" (Braking off => the controller is enabled=False and
+# nothing is sent). Tokens only - the panel turns them into words, and the test compares them with the REAL car layer.
+LAW_NONE = "none"
+LAW_CONTINUOUS = "continuous"
+LAW_SHAPED = "shaped"
+LAW_RAMP = "ramp"
+LAW_OLD = "old"
+
+
+class BrakeState(NamedTuple):
+  law: str
+  brake: bool
+  shaping: bool
+  dynamic: bool
+  shadow: bool
+
+
+def fca11_brake_state(brake_raw, shaping_raw, dynamic_raw, shadow_raw) -> BrakeState:
+  """Which FCA11 brake law a car built with these four params will run, from the VALUES, not from a fixed sentence.
+
+  Mirrors the car layer exactly (re-verified against the real `setup_interfaces` + `Fca11LongBrake` over all 16
+  Braking x Shaping x Dynamic x Shadow combinations): Braking off => `enabled=False`, no law at all (the reader is
+  where the keys land, so nothing else can matter); Shadow on => the plain OLD law (setup_interfaces refuses to write
+  fca11AffineGain / fca11DynamicBrakes under Shadow, i.e. it forces both switches off); Shaping AND Dynamic on => the
+  continuous linear law (cont_law); Shaping only => the 0043 shaped law; Dynamic only => the OLD law plus the 18x
+  release ramp; neither => the plain OLD law."""
+  brake, shaping, dynamic, shadow = _on(brake_raw), _on(shaping_raw), _on(dynamic_raw), _on(shadow_raw)
+  if not brake:
+    law = LAW_NONE
+  elif shadow:
+    law = LAW_OLD
+  elif shaping and dynamic:
+    law = LAW_CONTINUOUS
+  elif shaping:
+    law = LAW_SHAPED
+  elif dynamic:
+    law = LAW_RAMP
+  else:
+    law = LAW_OLD
+  return BrakeState(law, brake, shaping, dynamic, shadow)
+
+
+_LAW_WORDS = {
+  LAW_NONE: "no FCA11 brake law",
+  LAW_CONTINUOUS: "the continuous linear law",
+  LAW_SHAPED: "the 0043 shaped law",
+  LAW_RAMP: "the OLD law plus the 18x release ramp",
+  LAW_OLD: "the plain OLD law",
+}
+
+
+def fca11_brake_state_sentence(brake_raw, shaping_raw, dynamic_raw, shadow_raw) -> str:
+  """The car-state sentence the three brake rows open with, built from the ACTUAL param values (R2/N1).
+
+  It names the law AND all four switches, so a reader can check it and the test can compare it with the real
+  controller; the Braking-OFF case says that no law runs and that nothing changes, which is what the controller does
+  (`enabled=False`, no frame sent) - a static "this car runs the continuous linear law" was false in 7 of 8 states."""
+  st = fca11_brake_state(brake_raw, shaping_raw, dynamic_raw, shadow_raw)
+  on = lambda b: "ON" if b else "OFF"   # noqa: E731 - one-line formatter, no state
+  if st.law == LAW_NONE:
+    return ("This car runs no FCA11 brake law: FCA11 Braking OFF, Shaping %s, Dynamic Brakes %s, Shadow %s - nothing "
+            "changes while Braking is off." % (on(st.shaping), on(st.dynamic), on(st.shadow)))
+  return "This car runs %s: FCA11 Braking ON, Shaping %s, Dynamic Brakes %s, Shadow %s." % (
+    _LAW_WORDS[st.law], on(st.shaping), on(st.dynamic), on(st.shadow))
+
+
 def _on(raw) -> bool:
   """BOOL-param truthiness for a UI read: Params.get() returns a python bool for BOOL keys; tolerate "1"/b"1"/1."""
   if isinstance(raw, bytes):
