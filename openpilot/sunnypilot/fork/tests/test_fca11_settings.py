@@ -10,7 +10,7 @@ from pathlib import Path
 from openpilot.sunnypilot.fork import fca11_settings
 from openpilot.sunnypilot.fork.fca11_settings import ToggleState, fca11_brake_toggle_state, fca11_shaping_toggle_state, \
   fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, \
-  gas_rise_lag_toggle_state
+  gas_rise_lag_toggle_state, fca11_stop_hold_toggle_state
 
 REPO = Path(__file__).resolve().parents[4]
 PANEL = REPO / "openpilot" / "selfdrive" / "ui" / "sunnypilot" / "layouts" / "settings" / "vehicle" / "brands" / "hyundai.py"
@@ -97,7 +97,7 @@ class TestFca11SettingsRules(unittest.TestCase):
 
   def test_the_cars_real_param_combination(self):
     """Every row decided with the car's own values (gas interceptor 1, Brake 1, Shaping 1, Dynamic 1, Shadow 0,
-    PedalDeliveryLaw 1, GasRiseLag 1): the inert rows are hidden, every live row is still listed."""
+    PedalDeliveryLaw 1, GasRiseLag 1, StopHoldClutch 0): the inert rows are hidden, every live row is still listed."""
     pedal, brake = "1", "1"
     tuning = _row_rule("longitudinal_tuning_toggle_state")
     self.assertIsNotNone(tuning, "no visibility rule for HyundaiLongitudinalTuning: the row is listed unconditionally")
@@ -110,9 +110,21 @@ class TestFca11SettingsRules(unittest.TestCase):
       "Dynamic Brakes": fca11_dynamic_release_toggle_state(pedal, brake, True),
       "Stop-Approach Commitment": stop_approach_toggle_state(True),
       "Custom Longitudinal Tuning": tuning(pedal, True),
+      "Hold Clutch Release (experimental)": fca11_stop_hold_toggle_state(pedal, brake, True),
     }
     hidden = {title for title, state in rows.items() if not state.visible}
-    self.assertEqual({"Custom Longitudinal Tuning"}, hidden)
+    self.assertEqual({"Custom Longitudinal Tuning", "Hold Clutch Release (experimental)"}, hidden)
+
+  def test_stop_hold_row_is_retired_hidden(self):
+    """SETTINGS TIDY: the 0034 row is hidden on every car - the pair was never carried on the wire and the TCU does not
+    act on 0x38D (FORK.md rows 130/137). The rule keeps the pedal/brake arguments so the row comes back by reverting it."""
+    for pedal, brake, offroad in itertools.product(ON_VALUES + OFF_VALUES, ON_VALUES + OFF_VALUES, (True, False)):
+      self.assertEqual(ToggleState(False, False), fca11_stop_hold_toggle_state(pedal, brake, offroad), (pedal, brake, offroad))
+
+  def test_stop_hold_key_is_never_deleted_or_re_defaulted(self):
+    """Hidden, not removed: the registry entry, its default and the car's stored value (0) stay exactly as they are."""
+    keys_src = (REPO / "openpilot" / "common" / "params_keys.h").read_text(encoding="utf-8")
+    self.assertRegex(keys_src, r'\{"HyundaiFca11StopHoldClutch", \{PERSISTENT \| BACKUP, BOOL, "0"\}\}')
 
 
 class TestPanelWiring(unittest.TestCase):
@@ -185,6 +197,17 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn('param="HyundaiLongitudinalTuning"', self.src)
     self.assertIn("longitudinal_tuning_toggle_state(pedal_raw, offroad)", self.src)
     self.assertIn("self.longitudinal_tuning_item.set_visible(self.alpha_long_available and tuning_state.visible)", self.src)
+
+  def test_stop_hold_row_wiring(self):
+    """SETTINGS TIDY: the retired row keeps title -> param -> attribute wiring; only its visibility is forced off."""
+    self.assertRegex(self.src, r'toggle_item_sp\(tr\("Hold Clutch Release \(experimental\)"\),\s*"",\s*'
+                               r'param="HyundaiFca11StopHoldClutch"')
+    m = re.search(r"self\.items = \[(.*?)\]", self.src, re.S)
+    self.assertIsNotNone(m)
+    self.assertIn("self.fca11_stop_hold_toggle", m.group(1))
+    self.assertIn("fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad)", self.src)
+    self.assertIn("self.fca11_stop_hold_toggle.set_visible(hold_state.visible)", self.src)
+    self.assertIn("FORK.md rows 130/137", self.src)   # how to bring it back is written next to the row
 
 
 if __name__ == "__main__":

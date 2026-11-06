@@ -44,6 +44,8 @@ class HyundaiSettings(BrandSettings):
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
                                                callback=self._on_fca11_toggle_changed)
     # 0034: EXPERIMENTAL — asks the ESC for its own stop hold at a standstill so the transmission releases the clutch.
+    # RETIRED ROW (settings tidy): hidden on every car by fca11_stop_hold_toggle_state — see FORK.md rows 130/137; the
+    # key, its reader, capnp @11 and the stored value stay, and restoring that rule brings the row back.
     self.fca11_stop_hold_toggle = toggle_item_sp(tr("Hold Clutch Release (experimental)"), "", param="HyundaiFca11StopHoldClutch",
                                                  callback=self._on_fca11_toggle_changed)
     # fork: ELASTIC FOLLOW DISTANCE (AdaptiveFollowDistance) - the owner's follow law: one gap for every personality

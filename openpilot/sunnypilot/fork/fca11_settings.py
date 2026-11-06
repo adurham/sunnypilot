@@ -12,6 +12,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
   Dynamic Brake Release         HyundaiFca11DynamicBrakes visible: pedal on AND braking on; enabled: offroad
   Stop-Approach Commitment      StopApproachCommit      visible: always (planner-side);   enabled: offroad
   Custom Longitudinal Tuning    HyundaiLongitudinalTuning visible: pedal OFF (inert with the pedal on; upstream key)
+  Hold Clutch Release           HyundaiFca11StopHoldClutch visible: never (retired row; key + reader untouched)
 
 Both keys are read at CarParams build time, so a change takes effect at the NEXT ignition; offroad-only enabling makes
 that consistent. The dependency (shaping needs braking) is ALSO enforced in the car layer (opendbc setup_interfaces), so
@@ -70,9 +71,11 @@ def fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad: bool) -> T
 
 
 def fca11_stop_hold_toggle_state(pedal_raw, brake_raw, offroad: bool) -> ToggleState:
-  """0034: Hold Clutch Release — a property of the FCA11 brake law (needs FCA11 Braking on), settable offroad only."""
-  visible = _on(pedal_raw) and _on(brake_raw)
-  return ToggleState(visible=visible, enabled=visible and bool(offroad))
+  """0034 Hold Clutch Release — RETIRED as a row: the FCA11 frame never carried the ESC stop-hold pair on the car and
+  the TCU does not act on 0x38D (FORK.md rows 130/137), so the row is hidden everywhere. The key, its reader, the capnp
+  slot @11 and the stored value stay untouched. To bring the row back, restore the visibility expression below
+  (`visible = _on(pedal_raw) and _on(brake_raw)`) and update the tests that pin it hidden."""
+  return ToggleState(visible=False, enabled=False)
 
 
 def stop_approach_toggle_state(offroad: bool) -> ToggleState:
