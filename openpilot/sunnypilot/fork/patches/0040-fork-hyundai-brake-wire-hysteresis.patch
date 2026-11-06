@@ -221,7 +221,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py b/o
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,836 @@
 +"""0040 (lane L, brake slice 1a): the WIRE quantiser rounds with hysteresis; the aEgo feedback trim STAYS ON.
 +Owner (2026-11-05), routes 195/196: "Braking is properly linear now. Brake fluttering is bad though ... We
 +don't just tap the brakes 10 times in a second ... tune it based on my typical braking behavior; smoothness for
@@ -914,6 +914,146 @@ new file mode 100644
 +    finally:
 +      if had:
 +        fl.FCA11_CONT_QHYST_LSB = old
++
++
++class Test0040FloorPins(unittest.TestCase):
++  """Lane P: the 1 LSB floor is applied to `target`, BEFORE the hysteresis comparator and its zero-snap.
++
++  Ordering, `fca11_long.py` `_cont_level` (shipped slice 1b): the untrimmed LSB demand is l.2756, `target` l.2757, the
++  stop-band blend l.2769 and the `[0, CEIL]` clip l.2770; the floor is l.2784-2785 (`if FCA11_CONT_TRIM_ENABLED and
++  untrimmed >= 0.5 and int(self._cont_q_last) > 0: target = max(target, 1.0)`), the jerk slew l.2786-2793, and the wire
++  quantiser l.2805. The quantiser's first statement is the zero-snap (`target < 0.5 -> 0`, l.1207-1208), so the floor
++  must have decided the frame BEFORE that line: a floor applied after the decision is a patch on the emitted integer,
++  not a level, and it leaves the continuous accumulator at 0. That is what (1) pins.
++  """
++
++  V = 35.0
++  # Asks that put the UNTRIMMED demand at 0.70 / 0.49 LSB at 35 m/s, standard personality. Both are asserted below, so a
++  # plant-curve change cannot silently move the pin. (0.5 itself is not reachable from an ask: the inverse of the plant
++  # table gives 0.4999999999999997 / 0.5000000000000001 for the two bracketing asks, 1 ulp either side - see (4).)
++  AT_070 = -0.5179109776862992
++  AT_049 = -0.4835759776862993
++
++  @staticmethod
++  def _ff(ask, v=V):
++    """The untrimmed demand in LSB, exactly as `_cont_level` derives it (``v`` m/s, as `_Drive.run` takes it)."""
++    bn = fl.fca11_cont_brake_need(max(0.0, -float(ask)), float(v))
++    return fl.fca11_cont_lsb(fl.fca11_cont_gain(STD) * bn)
++
++  @staticmethod
++  def _pin(d, n, ask, trim, v=V):
++    """Run ``n`` frames with the feedback trim PINNED at ``trim`` LSB before every frame (the rail, not a frozen law)."""
++    for _ in range(n):
++      d.b._track_trim = float(trim)
++      d.run(1, ask, v=v, a_ego=0.0)
++    return d
++
++  def _open(self):
++    """An open episode at >= 1 LSB, then the 0035 dynamic release ramp switched OFF.
++
++    The ramp is a separate downstream path (`_dyn_release_level`, l.4062) that re-emits decaying levels after the law
++    has already released; these pins are about `_cont_level`'s own ordering, so the observation is kept on the law.
++    """
++    d = _Drive().run(120, -0.60, v=self.V, a_ego=0.0)
++    d.b.dynamic_brakes = False
++    self.assertGreaterEqual(max(d.wire()), 1, "the episode never opened")
++    return d
++
++  # ---- (1) floor -> target -> slew -> comparator ---------------------------------------------------------------------
++  def test_the_floor_reaches_the_target_before_the_quantiser_so_the_accumulator_itself_is_pinned(self):
++    """(1) a level held (`_cont_q_last > 0`), untrimmed 0.70 LSB, trim at its -6 LSB down rail: the target is floored to
++    1.0 BEFORE the slew and the comparator, so the WIRE is 1 for the whole rail with no 1 -> 0 edge, the episode stays
++    open, AND the law's accumulator sits exactly on the floor (`_shape_acc == 1.0`). The last assertion is the one a
++    floor applied after the hysteresis decision fails: that variant emits the same integer 1 but leaves `_shape_acc`
++    at 0, i.e. it patches the wire while the law has already released."""
++    ff = self._ff(self.AT_070)
++    self.assertAlmostEqual(ff, 0.70, places=12, msg=f"untrimmed {ff!r} is not the pinned 0.70 LSB")
++    self.assertLess(ff - 6.0, 0.5, "the rail must be able to push the sum under the snap, else the pin is vacuous")
++    d = self._open()
++    self._pin(d, 60, self.AT_070, -6.0)
++    lv = d.wire()
++    tail = lv[-20:]   # the first sent frames under the rail are the 2 -> 1 walk-down, the tail is the floor itself
++    self.assertEqual(set(tail), {1}, f"the floored level moved off 1: {tail}")
++    self.assertEqual([b for a, b in zip(lv, lv[1:]) if a and not b], [], f"a 1 -> 0 release under the floor: {lv}")
++    self.assertTrue(d.b._actuating, "the episode closed under the floor")
++    self.assertEqual(d.b._cont_q_last, 1)
++    self.assertEqual(d.b._shape_acc, 1.0,
++                     f"the floor did not reach the target/slew (accumulator {d.b._shape_acc}), it was applied after the "
++                     f"quantiser")
++
++  # ---- (2) under the boundary the zero-snap still releases -----------------------------------------------------------
++  def test_under_half_an_lsb_the_floor_is_absent_and_the_zero_snap_releases(self):
++    """(2) the same held level and the same -6 rail, untrimmed 0.49 LSB: the floor condition is false, the target is
++    `0.49 - 6 -> 0`, and the quantiser's zero-snap releases to 0 and closes the episode within a few sent frames. The
++    floor may hold a level, never create one."""
++    ff = self._ff(self.AT_049)
++    self.assertAlmostEqual(ff, 0.49, places=12, msg=f"untrimmed {ff!r} is not the pinned 0.49 LSB")
++    self.assertLess(ff, 0.5, "the pin demands a demand below the snap")
++    d = self._open()
++    first_zero = None
++    for k in range(30):
++      self._pin(d, 1, self.AT_049, -6.0)
++      if d.b._cont_q_last == 0:
++        first_zero = k
++        break
++    lv = d.wire()
++    self.assertIsNotNone(first_zero, f"a sub-half-LSB demand never released: {lv[-12:]}")
++    self.assertLessEqual(first_zero, 6, f"release took {first_zero} sent frames (pinned <= 6): {lv[-12:]}")
++    self.assertEqual(lv[-1], 0, f"the level did not reach 0: {lv[-12:]}")
++    self.assertFalse(d.b._actuating, "the episode is still open at level 0")
++    self.assertLess(d.b._shape_acc, 0.5, f"the accumulator was floored below the snap: {d.b._shape_acc}")
++    for a, b in zip(lv, lv[1:]):
++      self.assertLessEqual(a - b, int(fl.FCA11_CONT_DOWN_STEP_LSB), f"a frame dropped more than 3 LSB: {lv}")
++
++  # ---- (3) no held level -> no floor, so the OPENING threshold is unchanged -------------------------------------------
++  def test_without_a_held_level_there_is_no_floor_and_no_episode_opens(self):
++    """(3) `_cont_q_last == 0` (nothing on the wire) + untrimmed 0.70 LSB + the same -6 rail: NO floor, nothing is sent,
++    the level stays 0 and no episode opens. The `int(self._cont_q_last) > 0` half of the condition is what keeps the
++    floor from lowering the opening threshold from the band's full 1.0 LSB to 0.5 - an unconditional floor opens an
++    episode here, which is the slice-1a regression lane N measured (5 isolated zeros instead of 1)."""
++    ff = self._ff(self.AT_070)
++    self.assertAlmostEqual(ff, 0.70, places=12)
++    d = _Drive()
++    d.b.dynamic_brakes = False
++    self._pin(d, 60, self.AT_070, -6.0)
++    self.assertEqual(d.levels, [], f"the unfloored 0.5..1.0 LSB demand reached the wire: {d.levels[:8]}")
++    self.assertEqual(d.b._cont_q_last, 0)
++    self.assertEqual(d.b._shape_acc, 0.0, f"the accumulator was floored: {d.b._shape_acc}")
++    self.assertFalse(d.b._actuating, "an episode opened below a full LSB")
++    # the same frames WITH a level held do floor (1), so the difference is the gate and nothing else
++    self.assertEqual(d.b._track_trim, 0.0, f"the trim was applied to a closed episode: {d.b._track_trim}")
++
++  # ---- (4) the boundary: exactly 0.5 LSB is INCLUSIVE ----------------------------------------------------------------
++  def test_at_exactly_half_an_lsb_the_floor_is_inclusive_where_plain_rounding_would_release(self):
++    """(4) untrimmed EXACTLY 0.5 LSB, held level, -6 rail: the floor's `>= 0.5` is INCLUSIVE, so the target is 1.0 and
++    the level is held at 1 (`round(0.5) == 0` in Python, so the pre-0040 plain-rounding quantiser - band 0, and the
++    trim-off path on it - releases on this same frame). This is documented, not changed: at exactly half an LSB the
++    demand is the weakest level the quantiser refuses to snap, and the trim is NOT allowed to end an episode the
++    demand still asks for. NOTE the shipped 1.0 LSB band also holds 1 at exactly 0.5 when a level is already on the
++    wire (|0.5 - 1| = 0.5 < 1), so the inclusive edge agrees with the band it guards and differs from plain rounding
++    only on the trim-off/band-0 path."""
++    real = fl.fca11_cont_lsb
++    d = self._open()                       # opened on the real plant inverse, then the demand is pinned at exactly 0.5
++    fl.fca11_cont_lsb = lambda need, _real=real: 0.5 if float(need) > 0.0 else 0.0
++    try:
++      self._pin(d, 40, self.AT_070, -6.0)   # the ask is moot: the stub pins the derived demand at exactly 0.5 LSB
++    finally:
++      fl.fca11_cont_lsb = real
++    lv = d.wire()
++    self.assertEqual(set(lv[-10:]), {1}, f"exactly 0.5 LSB was not floored: {lv[-10:]}")
++    self.assertEqual(d.b._shape_acc, 1.0, f"exactly 0.5 LSB did not reach the target: {d.b._shape_acc}")
++    self.assertTrue(d.b._actuating, "exactly 0.5 LSB closed the episode")
++    # the comparison this pin documents: plain rounding releases at exactly 0.5, the floor and the band do not
++    self.assertEqual(int(round(0.5)), 0)
++    had, old = hasattr(fl, "FCA11_CONT_QHYST_LSB"), getattr(fl, "FCA11_CONT_QHYST_LSB", None)
++    try:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = 0.0
++      self.assertEqual(fl.fca11_cont_qhyst(0.5, 1), 0, "band 0 must release at exactly 0.5 (plain rounding)")
++    finally:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = old
++    self.assertEqual(fl.fca11_cont_qhyst(0.5, 1), 1, "band 1 must hold 1 at exactly 0.5")
 +
 +
 +if __name__ == "__main__":
