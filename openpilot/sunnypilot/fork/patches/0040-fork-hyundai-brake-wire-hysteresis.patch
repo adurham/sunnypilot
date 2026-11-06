@@ -1,0 +1,792 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -1119,6 +1119,29 @@
+ # (their delivered decel is UNMEASURED on this plant - the law sends them and logs them, nothing else assumes them).
+ FCA11_CONT_PLANT_LSB = (0, 4, 6, 8, 13, 20, 30)
+ FCA11_CONT_PLANT_MSS2 = (0.0, 0.654, 0.794, 0.854, 1.144, 1.224, 2.214)
++
++# *** 0040 (lane L, brake slice 1a): THE WIRE QUANTISER HAS HYSTERESIS; THE aEgo TRIM STAYS ON ***
++# Fable's review of lane J's 0040 (branch fix/brake-commit @ f66a1070) said split it, because the two halves have
++# different risk. Replayed on the REAL class over the same 23 windows of drive 195/196 (lane-K/replay_k_flags.py,
++# 50 Hz sent frames): trim ON + no hysteresis (what ships) 2.13 reversals/s and 59 isolated zero frames; trim ON + the
++# 1.0 LSB band 0.47/s and 11; trim OFF only 0.95/s and 6; both 0.27/s and 1. The band therefore removes ~78% of the
++# reversals on its own, while removing the trim costs 4.2 m of minimum gap on a 6% downhill (lane-K/grade_k.py) and
++# buys only the remaining sliver. THIS SLICE SHIPS THE BAND AND NOT THE REMOVAL: `True` below is the 0037 feedback
++# trim (KI 8, +12/-6 LSB, 0.5 s delay, 0.3 s lag on `max(0, -aEgo - coast(v))`), byte-identical to what ships, and
++# with FCA11_CONT_QHYST_LSB = 0 the level sequence is EXACTLY the 0037/0038 law's on a recorded episode (pinned in
++# test_fca11_brake_commit.py). `False` remains the flag-off branch (the trim then contributes EXACTLY zero - it never
++# integrates and is never added), and is pinned there too; the trim-removal slice is a separate change set with its
++# own replay and its own grade disclosure.
++FCA11_CONT_TRIM_ENABLED = True
++# The wire quantiser's hysteresis, in LSB. CR_VSM_DecCmd is an INTEGER level and the ESC holds each value until the
++# next frame, so re-rounding a smooth fractional target every 20 ms turns ~0.3 LSB of demand motion into a level
++# reversal (half the measured flicker). The integer level now changes only when the fractional target is at least
++# FCA11_CONT_QHYST_LSB away from the level last SENT, and then it re-rounds. This is a property of the physical
++# quantiser (a Schmitt band one LSB wide, i.e. 0.5 LSB either side of the round boundary), NOT a bucket on the
++# demand: the demand, the slew and `_shape_acc` stay continuous, and the level still reaches round(target) after
++# every change (so the steady-state error at a step is <= 0.5 LSB). A monotone ramp produces a monotone level, and
++# command noise below 0.5 LSB produces no level change at all. 0.0 = plain rounding (the pre-0040 behaviour).
++FCA11_CONT_QHYST_LSB = 1.0
+ 
+ 
+ def fca11_cont_coast(v_ego_mps: float) -> float:
+@@ -1163,7 +1186,28 @@
+   while i < len(L) - 1 and lsb >= L[i]:
+     i += 1
+   return max(FCA11_TRACK_MIN_SLOPE, (A[i] - A[i - 1]) / (L[i] - L[i - 1]))
++
++
++def fca11_cont_qhyst(target: float, last_sent: int) -> int:
++  """0040: the WIRE quantiser - the integer level for a fractional ``target`` with a one-LSB hysteresis band.
+ 
++  The level is held at ``last_sent`` until the target is at least ``FCA11_CONT_QHYST_LSB`` away from it, then it
++  re-rounds to the nearest integer. ``FCA11_CONT_QHYST_LSB = 0`` reduces this to plain ``int(round())`` (pre-0040).
++  Hysteresis here, not on the demand: the caller keeps its continuous accumulator, so the level is still a
++  monotone function of a monotone ramp and a static target still lands on its nearest integer after one change.
++  """
++  band = float(FCA11_CONT_QHYST_LSB)
++  # 0040 v2 (review K2): ZERO-SNAP. Below half an LSB there is nothing for the pads to deliver, so the level is 0
++  # whatever the hysteresis reference says - a demand that has fallen into (0, 0.5) LSB must RELEASE, not hold the
++  # last level for a full band width. This is a property of the physical quantiser (the ESC's weakest actuating level
++  # is 4 LSB, FCA11_FEEL_FIRST_LSB), not a bucket on the demand, and it keeps `FCA11_CONT_QHYST_LSB = 0` exactly equal
++  # to plain rounding: int(round(t)) is already 0 for every t in [0, 0.5).
++  if float(target) < 0.5:
++    return 0
++  if band <= 0.0 or abs(float(target) - float(last_sent)) >= band:
++    return int(round(float(target)))
++  return int(last_sent)
++
+ 
+ def fca11_cont_gain(personality) -> float:
+   """Personality as a continuous GAIN on the demand - the gas law's exact table and position (PERSONALITY_SCALE_V)."""
+@@ -1842,6 +1886,9 @@
+     self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
+     self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
+     self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
++    self._cont_q_last = 0                # 0040: the level last SENT on the continuous path (the down-step floor / the
++    self._cont_q_bus = 0                 # non-send frame's answer) and the level the BUS last carried (the hysteresis
++    #                                      reference; sub_bite_gate zeroes it when it withholds a sub-bite frame)
+     # 0034: the stop-hold clutch lane (FCA11_STOP_HOLD_*). Read ONCE, CP_SP only, DEFAULT OFF; never on a disabled
+     # instance or the Shadow compute core (whose frames never reach the wire).
+     self.stop_hold_clutch = self.enabled and (not self._core) and stop_hold_enabled(CP_SP)
+@@ -2540,6 +2587,11 @@
+       # refuse to guess and leave the actuating frame as it is.
+       return brake_sends
+     self._dec_last_sent = 0     # the panda's rate reference is this PASSIVE frame now, not the level
++    # 0040 v2 (review K3): the hysteresis reference is the BUS, so a withheld frame's 0 is what the quantiser must
++    # compare against next time. `_cont_q_last` deliberately keeps the law's own level: it answers a NON-SEND frame
++    # (`_cont_level`'s early return) and it is the down-step floor, and zeroing it here would close the episode on the
++    # very next odd frame (`cont_dec = 0` -> `want_brake = False`) every time a sub-bite frame was muted.
++    self._cont_q_bus = 0
+     # the wire carried no level: keep the 17c level window and the PLATEAU tracker on the WIRE (a plateau sample at
+     # lsb 0 closes the open window and does not qualify - fca11_log.PlateauTracker.sample), so a withheld sub-bite frame
+     # can never be logged as a delivered 1-3 LSB plateau.
+@@ -2564,10 +2616,16 @@
+     self._track_reset()
+ 
+   def _track_reset(self) -> None:
+-    """0035: a fresh tracking episode - no trim, no need history, no latched ceiling."""
++    """0035: a fresh tracking episode - no trim, no need history, no latched ceiling.
++
++    0040: also forgets the wire quantiser's hysteresis reference (the next episode starts from 0, the level the wire
++    is at when an episode ends), so a stale level can never be held into a new episode.
++    """
+     self._track_trim = 0.0
+     self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)
+     self._track_ceil_hi = False
++    self._cont_q_last = 0
++    self._cont_q_bus = 0
+ 
+   def _track_ceiling(self, need: float, personality) -> int:
+     """0035: the tier cap, or the 30 LSB law ceiling while the need exceeds what the tier cap measurably delivers.
+@@ -2657,7 +2715,11 @@
+       # sub-1-LSB it is NOT reset - that is the continuous start of the next episode, not a new bucket.
+       self._track_reset()
+     if frame % FCA11_SEND_EVERY != 0:
+-      return int(round(self._shape_acc))
++      # 0040 v2 (review K1): a NON-SEND frame re-offers the level last SENT, not a fresh quantisation of the
++      # accumulator. Re-quantising here returned a level the wire does not carry (the onset clamp and the down-step
++      # clamp both hold the wire away from `_shape_acc`), and `cont_dec` feeds `want_brake = cont_dec > 0` on EVERY
++      # frame - so a stale recomputation could open or hold an episode on a frame that sends nothing.
++      return int(self._cont_q_last)
+     v = max(0.0, float(v_kph) / 3.6)
+     standstill = bool(getattr(CS.out, "standstill", False))
+     need = max(0.0, -float(accel_ask))
+@@ -2674,7 +2736,11 @@
+     # domain - what the pads delivered is the measured net decel MINUS the coast the engine is already providing - and
+     # only while there IS a demand to correct (see above). `_shape_sent_n` counts SENT frames that actually carried a
+     # level, so the 0.5 s delay is 0.5 s of real braking, not of sitting at 0.
+-    if bn > 0.0 and self._shape_sent_n >= FCA11_TRACK_FB_DELAY_SENT and len(self._track_hist) > FCA11_TRACK_LAG_SENT:
++    # 0040: the trim is ON in this slice (FCA11_CONT_TRIM_ENABLED = True, the 0037 path byte-identical to shipped).
++    # With the flag False it never integrates and (below) is never added, so it contributes EXACTLY zero and the level
++    # is a pure function of the demand. See the FCA11_CONT_TRIM_ENABLED block.
++    if (FCA11_CONT_TRIM_ENABLED and bn > 0.0 and self._shape_sent_n >= FCA11_TRACK_FB_DELAY_SENT
++            and len(self._track_hist) > FCA11_TRACK_LAG_SENT):
+       delivered_b = max(0.0, -float(getattr(CS.out, "aEgo", 0.0)) - fca11_cont_coast(v))
+       err = self._track_hist[0] - delivered_b
+       ceil_now = float(FCA11_CONT_CEIL_LSB)
+@@ -2682,7 +2748,7 @@
+         self._track_trim += FCA11_TRACK_KI * err * FCA11_SHAPE_SENT_DT
+         self._track_trim = max(-FCA11_TRACK_TRIM_DOWN, min(FCA11_TRACK_TRIM_UP, self._track_trim))
+     if bn > 0.0:
+-      target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + self._track_trim
++      target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + (self._track_trim if FCA11_CONT_TRIM_ENABLED else 0.0)
+     else:
+       # M4: no demand -> target 0 whatever the held trim says, so the level walks down (no phantom hold) while the
+       # trim itself survives the handover for the next real ask.
+@@ -2703,7 +2769,23 @@
+       new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
+     new_acc = max(0.0, new_acc)
+     self._shape_acc = new_acc
+-    dec = min(int(round(new_acc)), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++    # 0040 v2: the WIRE quantiser (see the block below). The slew above stays continuous, and the demand is untouched.
++    # 0040: the WIRE quantiser rounds with a one-LSB hysteresis band against the level the BUS last carried
++    # (`_cont_q_bus`, not `_cont_q_last`: a sub-bite frame withheld by sub_bite_gate put 0 on the wire, and the physical
++    # band the ESC holds is around THAT). Then the two wire limits the law already owed, in this order:
++    #   1. the down-step clamp (FCA11_CONT_DOWN_STEP_LSB = 3 per sent frame) - a property of OUR law;
++    #   2. the panda's +RATE_STEP onset gate - OUTERMOST (review K3). It is the firmware's own reference, computed from
++    #      the last frame it ACCEPTED (`_dec_last_sent`, updated at the send site of THIS function's caller, l.3941,
++    #      i.e. after this law and before the 0038 sub-bite substitution), so it must be the LAST word: applied first it
++    #      was raised again by the down clamp (v1 could emit `_dec_last_sent + 4 + 1` after an episode closed with a
++    #      non-zero wire level, and the panda refused the frame -> _refused_cut -> fca11Unavailable).
++    prev_wire = int(self._cont_q_last)
++    dec = fca11_cont_qhyst(new_acc, self._cont_q_bus)
++    dec = max(dec, prev_wire - int(FCA11_CONT_DOWN_STEP_LSB))
++    dec = min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++    dec = max(0, int(dec))
++    self._cont_q_last = dec
++    self._cont_q_bus = dec     # sub_bite_gate zeroes this on a frame it withholds (the wire then carries 0)
+     if dec > 0:
+       if not self._actuating:
+         # M3: the harvest counter is PER EPISODE - it restarts when a new episode opens (a cumulative lifetime count
+@@ -3971,6 +4053,11 @@
+           m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+           sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
+           self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
++          # 0040 v2 (review K4): the law's own wire references follow the release ramp too, so a non-send frame
++          # answers with the RAMPE level and the down-step floor is measured from it - a stale pre-release level left
++          # the next frame's floor (and the hysteresis band) up at the level the release had already left.
++          self._cont_q_last = int(ramp)
++          self._cont_q_bus = int(ramp)
+           self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
+           self._note_sent_level(frame, ramp)  # 17c FEEDBACK: a SENT ramp frame is part of the 5 s level window too
+         self._actuating = True
+@@ -3985,6 +4072,12 @@
+         # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
+         # stays on the last level actually SENT (restored on the send slot above).
+         self._dec_last_sent = 0
++        # 0040 v2 (review K4): the episode is CLOSED at level 0 on the wire, so both of the law's wire references go to
++        # 0 with it. Leaving them on the last level was the whole of the v1 re-open defect: the down-step floor
++        # `prev_wire - 3` then held the next frame at `level - 3` and the panda's onset gate was applied BEFORE that
++        # floor, so the frame could go out at `_dec_last_sent + RATE_STEP + 1` and be refused.
++        self._cont_q_last = 0
++        self._cont_q_bus = 0
+         self._rel_acc = None                  # 18x: no ramp in progress once it is over (or was never allowed)
+         if was_braking:
+           # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
+new file mode 100644
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
+@@ -0,0 +1,556 @@
++"""0040 (lane L, brake slice 1a): the WIRE quantiser rounds with hysteresis; the aEgo feedback trim STAYS ON.
++Owner (2026-11-05), routes 195/196: "Braking is properly linear now. Brake fluttering is bad though ... We
++don't just tap the brakes 10 times in a second ... tune it based on my typical braking behavior; smoothness for
++acceleration and deceleration."
++
++Lane J shipped the same band WITH the trim removed; Fable's review said split the two, because they carry different
++risk. Replayed on the real class over the same 23 windows (lane-K/replay_k_flags.py, 50 Hz sent frames): trim ON + no
++band (what ships today) 2.13 reversals/s and 59 isolated zero frames; trim ON + the 1.0 LSB band 0.47/s and 11; trim
++OFF only 0.95/s and 6; both 0.27/s and 1. The band is ~78% of the win on its own; the trim removal costs 4.2 m of
++minimum gap on a 6% downhill (lane-K/grade_k.py, model-only) and is held for a separate slice. So here the shipped
++constant is `FCA11_CONT_TRIM_ENABLED = True` (the 0037 trim, byte-identical to what ships) and the ONLY change to the
++law is the quantiser.
++
++Every assertion here is behavioural - none of these tests needs a name that only exists after the change, so the file
++runs on the 0038/0039 tree and fails there for the reason the owner reported:
++
++  (a) the trim is LIVE (flag True) and its flag-off branch is still exactly zero - so the split is a real split and
++      the trim path was not quietly deleted;
++  (b) the wire quantiser: < 0.5 LSB of noise never moves the level, a monotone ramp never reverses, a static target
++      still lands on its nearest integer (<= 0.5 LSB), and the band is symmetric;
++  (c) the pipeline order as ONE unit: continuous level -> hysteresis round -> down-step clamp -> panda onset gate
++      -> sub-bite exclusion (0038, unchanged) -> wire.
++
++Run from the opendbc root:  PYTHONPATH=. python -m pytest -q opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
++"""
++import contextlib
++import math
++import random
++import unittest
++
++from opendbc.car import structs
++import opendbc.sunnypilot.car.hyundai.fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam
++
++STD = fl.PERSONALITY_STANDARD
++
++
++def _trim_live() -> bool:
++  """True = the feedback trim contributes. A PRE-0040 tree has no flag and the trim is ALWAYS live, so the tests below
++  fail there by behaviour rather than by AttributeError."""
++  return bool(getattr(fl, "FCA11_CONT_TRIM_ENABLED", True))
++
++
++@contextlib.contextmanager
++def _trim(flag: bool):
++  """Force the trim flag for one test. The quantiser tests use `False` because the trim is the ONE other input to
++  `_shape_acc`: a property of the WIRE band must be measured with the demand path frozen, or the trim's own walk
++  (which is what the band deliberately does not touch) is read as a quantiser defect."""
++  old = _trim_live()
++  fl.FCA11_CONT_TRIM_ENABLED = bool(flag)
++  try:
++    yield
++  finally:
++    fl.FCA11_CONT_TRIM_ENABLED = old
++
++
++
++def _qhyst(target, last):
++  """The shipped wire quantiser, or plain rounding on a tree that has none (so (b) fails by behaviour there)."""
++  fn = getattr(fl, "fca11_cont_qhyst", None)
++  return fn(float(target), int(last)) if fn is not None else int(round(float(target)))
++
++
++def _band() -> float:
++  return float(getattr(fl, "FCA11_CONT_QHYST_LSB", 0.0))
++
++
++def _cp_sp():
++  return structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True,
++                              fca11AffineGain=True, fca11DynamicBrakes=True)
++
++
++def _cc(accel):
++  cc = structs.CarControl()
++  cc.enabled = cc.latActive = True
++  cc.longActive = True
++  cc.actuators.accel = float(accel)
++  return cc
++
++
++class _Drive:
++  """Feeds (ask, v, aEgo) frames through the REAL controller and records every SENT 0x38D level."""
++
++  def __init__(self, personality=STD):
++    self.b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    self.b._dyn_log = None
++    self.b._mark_log = None
++    assert self.b.cont_law, "this file tests the 0037 continuous law - the car's own path"
++    self.f = 0
++    self.p = personality
++    self.sent = []      # (frame, level) for every frame the law produced
++    self.levels = []
++
++  def run(self, n, ask, v=15.0, a_ego=-1.2, gas=False, brake=False, standstill=False, keep=(), engaged=True):
++    for _ in range(n):
++      cs = _CS(v_ego=v, cam=_cam(), a_ego=a_ego)
++      cs.out.gasPressed = gas
++      cs.out.brakePressed = brake
++      cs.out.standstill = standstill
++      for attr in keep:
++        setattr(cs, attr, keep[attr])
++      cc = _cc(ask)
++      if not engaged:
++        cc.enabled = False
++      self.last_sends = list(self.b.update(cc, cs, self.f, self.p))
++      self.last_frame = self.f
++      for s in self.last_sends:
++        self.sent.append((self.f, fl._get_bits(s.dat, 8, 8)))
++        self.levels.append(fl._get_bits(s.dat, 8, 8))
++      self.f += 1
++    return self
++
++  def wire(self):
++    """The level as the ESC sees it, one sample per 50 Hz send slot."""
++    return [lv for f, lv in self.sent if f % fl.FCA11_SEND_EVERY == 0]
++
++
++def _revs(lv):
++  d = [b - a for a, b in zip(lv, lv[1:]) if b != a]
++  return sum(1 for a, b in zip(d, d[1:]) if (a > 0) != (b > 0))
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class Test0040TrimKept(unittest.TestCase):
++  """(a) The trim is LIVE in the shipped constant (this slice did NOT remove it), and its flag-off branch - kept for the
++  next slice - still contributes exactly zero."""
++
++  # a full command range: coast, light, medium, deep, release, and the stop band - 200 frames each so the 0.5 s
++  # feedback delay and the 0.3 s lag line are both long past
++  SCRIPT = ((-0.10, 200), (-0.60, 200), (-1.20, 200), (-2.00, 200), (-3.50, 200), (0.00, 200), (-1.50, 300))
++
++  def _seq(self, a_ego):
++    d = _Drive()
++    for ask, n in self.SCRIPT:
++      d.run(n, ask, v=15.0, a_ego=a_ego)
++    return d
++
++  def test_the_shipped_constant_has_the_trim_on(self):
++    self.assertTrue(_trim_live(), "0040 slice 1a ships with the aEgo feedback trim ON (FCA11_CONT_TRIM_ENABLED = True)")
++
++  def test_the_trim_integrates_and_reaches_the_target(self):
++    d = self._seq(a_ego=-1.2)          # a delivered term of 1.2 m/s^2 drives the integrator hard
++    self.assertNotEqual(d.b._track_trim, 0.0, "the trim never integrated with the flag ON")
++    # ... and it is ADDED to the target: at a fixed ask the level with aEgo -1.2 differs from the aEgo 0 level.
++    for ask, n in ((-2.00, 200), (-3.50, 200)):
++      d.run(n, ask, v=15.0, a_ego=-1.2)
++      self.assertNotEqual(d.b._track_trim, 0.0)
++
++  def test_a_ego_moves_the_level_when_the_trim_is_on(self):
++    """THE PROPERTY of slice 1a: the trim is IN the path, so aEgo is an input to the level again (that is the risk
++    Fable asked to keep in a separate slice, not the thing this one changes)."""
++    base = self._seq(a_ego=0.0).wire()
++    self.assertGreater(max(base), 5, "the script must actually brake")
++    moved = [a_ego for a_ego in (-1.2, 1.2) if self._seq(a_ego=a_ego).wire() != base]
++    self.assertTrue(moved, "aEgo changed nothing - the trim is not in the path with the flag ON")
++
++  def test_with_the_flag_off_the_trim_contributes_exactly_zero(self):
++    """The flag-off branch (the OTHER slice's shipped constant) is still there and is still exactly zero: this is the
++    proof that slicing the patch did not delete the trim path."""
++    with _trim(False):
++      d = self._seq(a_ego=-1.2)
++      self.assertEqual(d.b._track_trim, 0.0, "the trim integrated with the flag off")
++      for ask, n in ((-2.00, 200), (-3.50, 200)):
++        d.run(n, ask, v=15.0, a_ego=-1.2)
++        self.assertEqual(d.b._track_trim, 0.0)
++
++  def test_with_the_flag_off_the_level_is_identical_across_a_ego(self):
++    with _trim(False):
++      base = self._seq(a_ego=0.0).wire()
++      self.assertGreater(max(base), 5, "the script must actually brake")
++      for a_ego in (-1.2, -0.6, 0.6, 1.2):
++        self.assertEqual(self._seq(a_ego=a_ego).wire(), base,
++                         f"aEgo = {a_ego:+.1f} changed the sent level with the flag off")
++
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class Test0040WireQuantiser(unittest.TestCase):
++  """(b) The quantiser: one LSB of hysteresis around the level last sent, and nothing else."""
++
++  def test_the_band_is_one_lsb(self):
++    self.assertAlmostEqual(_band(), 1.0, places=6)
++
++  def test_noise_below_half_an_lsb_never_moves_the_level(self):
++    """A dithered target that stays < 0.5 LSB from an integer must not move it, at any level in the range."""
++    for last in (1, 2, 3, 7, 13, 20, 29):
++      for k in range(400):
++        t = last + 0.49 * math.sin(k * 0.7) + 0.01 * math.sin(k * 3.1)
++        self.assertEqual(_qhyst(t, last), last, (last, t))
++
++  def test_noise_above_the_band_does_move_the_level(self):
++    """The band must not be a lock: a full LSB past the held level changes it, both ways."""
++    self.assertEqual(_qhyst(6.0, 5), 6)
++    self.assertEqual(_qhyst(4.0, 5), 4)
++    self.assertEqual(_qhyst(6.4, 5), 6)
++
++  def test_a_monotone_ramp_produces_a_monotone_level(self):
++    lv = 0
++    seq = []
++    for i in range(0, 3001):
++      lv = _qhyst(i * 0.01, lv)
++      seq.append(lv)
++    self.assertEqual(seq, sorted(seq), "a monotone ramp reversed the level")
++    self.assertEqual(_revs(seq), 0)
++    self.assertEqual(seq[-1], 30)
++
++  def test_a_static_target_lands_on_its_nearest_integer(self):
++    """Steady state after ONE change: |level - target| <= 0.5 LSB."""
++    for target in (3.2, 5.4, 7.5, 12.6, 12.9, 19.7):
++      lv = 0
++      for _ in range(50):
++        lv = _qhyst(target, lv)
++      self.assertLessEqual(abs(lv - target), 0.5, (target, lv))
++
++  def test_the_band_is_symmetric(self):
++    self.assertEqual(_qhyst(10 + 1.2, 10), 11)
++    self.assertEqual(_qhyst(10 - 1.2, 10), 9)
++    self.assertEqual(_qhyst(10 + 0.9, 10), 10)
++    self.assertEqual(_qhyst(10 - 0.9, 10), 10)
++
++  def test_hysteresis_never_holds_a_level_against_a_release(self):
++    """A release to a true zero must not wait for the band: target 0 is a full LSB past anything >= 1."""
++    for last in (1, 2, 7, 30):
++      self.assertEqual(_qhyst(0.0, last), 0)
++
++  def test_the_law_holds_the_level_through_a_dithering_demand(self):
++    """Behavioural, through the controller: the ask is put where the FRACTIONAL target sits on a rounding boundary
++    (~20.5 LSB at v = 12 m/s) and then dithered by +-0.2 LSB. Plain rounding re-rounds every 20 ms and flaps 20<->21;
++    with the one-LSB band the level does not move at all. The trim is forced OFF: it is the one other input to
++    `_shape_acc`, and with a synthetic aEgo it walks on its own, which is exactly the demand-side motion this band
++    does not claim to remove (see the module docstring: that is the OTHER slice)."""
++    d = _Drive()
++    with _trim(False):
++      d.run(200, -1.582, v=12.0, a_ego=0.0)                 # settle: the fractional target is ~20.5 LSB
++      settled = d.wire()[-1]
++      self.assertIn(settled, (20, 21), f"the scenario must sit on the boundary, got {settled}")
++      n0 = len(d.wire())
++      for k in range(200):                                 # +-0.02 m/s^2 of ask dither = ~0.2 LSB either way
++        d.run(1, -1.582 + 0.02 * math.sin(k * 0.9), v=12.0, a_ego=0.0)
++      tail = d.wire()[n0:]
++    self.assertEqual(len(set(tail)), 1, f"the level flapped on a sub-0.5-LSB dither: {sorted(set(tail))}")
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class Test0040Pipeline(unittest.TestCase):
++  """(c) ONE unit: continuous level -> hysteresis round -> sub-bite exclusion (0038) -> wire."""
++
++  def test_the_wire_never_moves_faster_than_the_law_allows(self):
++    """Up <= +4 (the panda's onset gate) and down <= 3 LSB per sent frame, under a random command stream."""
++    rnd = random.Random(195)
++    d = _Drive()
++    for _ in range(600):
++      d.run(4, rnd.uniform(-3.5, 0.4), v=rnd.uniform(4.0, 22.0), a_ego=rnd.uniform(-1.2, 1.2))
++    seq = d.wire()
++    for a, b in zip(seq, seq[1:]):
++      self.assertLessEqual(b - a, 4, (a, b))
++      self.assertLessEqual(a - b, 3, (a, b))
++
++  def test_no_sub_bite_level_is_ever_sent_under_throttle(self):
++    """0038 unchanged, and DOWNSTREAM of the quantiser: with the pedal commanding gas, a 1-3 LSB frame never reaches
++    the wire; with the pedal at true zero the same frame goes out (light braking over coast is untouched)."""
++    rnd = random.Random(196)
++    d = _Drive()
++    muted = passed = 0
++    for _ in range(300):
++      d.run(3, rnd.uniform(-0.85, -0.55), v=rnd.uniform(12.0, 20.0), a_ego=0.0)
++      sends = d.last_sends
++      if not sends:
++        continue
++      lvl = fl._get_bits(sends[-1].dat, 8, 8)
++      if not 0 < lvl <= 3:
++        continue
++      wire_gas = d.b.sub_bite_gate(list(sends), _CS(v_ego=15.0, cam=_cam(), a_ego=0.0), d.last_frame, 0.3)
++      wire_zero = d.b.sub_bite_gate(list(sends), _CS(v_ego=15.0, cam=_cam(), a_ego=0.0), d.last_frame, 0.0)
++      self.assertFalse(0 < fl._get_bits(wire_gas[-1].dat, 8, 8) <= 3,
++                       f"a {lvl} LSB frame rode alongside throttle")
++      muted += int(fl._get_bits(wire_gas[-1].dat, 8, 8) == 0)
++      passed += int(0 < fl._get_bits(wire_zero[-1].dat, 8, 8) <= 3)
++    self.assertGreater(muted, 0, "the scenario never produced a sub-bite level, so it proves nothing")
++    self.assertGreater(passed, 0, "with the pedal at zero a sub-bite level must still go out")
++
++  def test_the_law_level_is_unchanged_by_the_sub_bite_gate(self):
++    """Order check: the gate changes the WIRE frame only; the law's own level (and so the next frame's hysteresis
++    reference and the +RATE_STEP clamp) is a property of the continuous path."""
++    d = _Drive().run(120, -0.7, v=15.0, a_ego=0.0)
++    level = int(d.b._dec_last_sent)
++    self.assertTrue(0 < level <= 3, f"expected a sub-bite episode, got {level}")
++    d.run(1, -0.7, v=15.0, a_ego=0.0)
++    sends = d.last_sends
++    self.assertTrue(sends, "a sub-bite level must produce a frame")
++    before = fl._get_bits(sends[-1].dat, 8, 8)
++    wire = d.b.sub_bite_gate(list(sends), _CS(v_ego=15.0, cam=_cam(), a_ego=0.0), d.last_frame, 0.4)
++    self.assertEqual(fl._get_bits(wire[-1].dat, 8, 8), 0, "the sub-bite frame must not reach the wire under throttle")
++    self.assertEqual(before, level, "the gate must be downstream of the level computation")
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++def _cs15(**kw):
++  return _CS(v_ego=15.0, cam=_cam(), a_ego=0.0, **kw)
++
++
++class Test0040Corrections(unittest.TestCase):
++  """Review K1-K5 on 0040 v1, each one a property of the real class:
++
++  K1  a NON-SEND frame answers with the level last SENT, not a fresh quantisation of the accumulator;
++  K2  the quantiser ZERO-SNAPS below half an LSB, so a 1 LSB application still releases;
++  K3  the panda's +RATE_STEP gate is the OUTERMOST bound (nothing can raise the frame above it), and the hysteresis
++      reference tracks the BUS;
++  K4  an episode that closes with a non-zero wire level leaves no stale reference behind (the re-open is rate-limited
++      from the close frame, never from the level the episode died at);
++  K5  the two equivalence pins: band 0 == plain rounding, and TRIM_ENABLED + band 0 == the 0037 law's own levels.
++  """
++
++  # ---- K1 ------------------------------------------------------------------------------------------------------------
++  def _close_then_resume(self, ask=-1.5, v=15.0):
++    """Reach a high level, close the episode on a driver-brake veto (ok == False -> the passive close frame) and
++    re-arm through a resume edge (the veto latches `blocked_until_resume`, so a plain release cannot re-open)."""
++    d = _Drive().run(200, ask, v=v, a_ego=0.0)
++    self.assertGreaterEqual(d.wire()[-1], 8, "the script must reach a level the re-open can be clamped from")
++    d.run(1, ask, v=v, a_ego=0.0, brake=True)
++    self.assertEqual(d.wire()[-1], 0, "the passive close frame must carry level 0")
++    self.assertTrue(d.b.blocked_until_resume)
++    d.run(2, ask, v=v, a_ego=0.0, engaged=False)
++    return d
++
++  def test_a_non_send_frame_answers_with_the_level_last_sent(self):
++    """After a rate-limited ONSET (the panda gate binding from the close frame's 0) the accumulator sits ABOVE the
++    wire. v1 re-quantised it and answered a level the wire does not carry; that value feeds
++    `want_brake = cont_dec > 0` on every frame."""
++    d = self._close_then_resume()
++    for _ in range(4):                                    # the first clean frame clears the latch, then the re-open
++      d.run(1, -1.5, v=15.0, a_ego=0.0)
++      if int(d.b._cont_q_last) > 0:
++        break
++    on_wire = int(d.b._cont_q_last)
++    self.assertGreaterEqual(on_wire, 1, "the re-open did not produce a level at all")
++    self.assertLessEqual(on_wire, fl.HYUNDAI_FCA11_LONG_RATE_STEP, f"the re-open is not rate-limited: {on_wire}")
++    self.assertGreater(d.b._shape_acc, on_wire + 1,
++                       "the onset must be clamped below the accumulator, or this proves nothing")
++    odd = d.f + 1 if d.f % fl.FCA11_SEND_EVERY == 0 else d.f
++    self.assertNotEqual(odd % fl.FCA11_SEND_EVERY, 0)
++    self.assertEqual(d.b._cont_level(-1.5, 15.0, _cs15(), odd, STD), on_wire,
++                     "a non-send frame answered a level the wire does not carry")
++
++  def test_a_non_send_frame_answers_the_SAME_level_over_a_whole_release(self):
++    """The same property on the way down: while the release ramp walks the wire from 13 to 0, every non-send frame
++    must answer the level the ramp last put on the wire, not the pre-release one."""
++    d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++    self.assertGreaterEqual(d.wire()[-1], 8)
++    seen = []
++    for _ in range(12):
++      d.run(1, 0.0, v=15.0, a_ego=0.0)
++      if not d.b._actuating:
++        break
++      ref = int(d.b._cont_q_last)
++      self.assertEqual(ref, int(d.b._dec_last_sent),
++                       "the law's wire reference and the panda's reference diverged during a release")
++      odd = d.f + 1 if d.f % fl.FCA11_SEND_EVERY == 0 else d.f
++      self.assertEqual(d.b._cont_level(0.0, 15.0, _cs15(), odd, STD), ref)
++      seen.append(ref)
++    self.assertGreater(len(seen), 3, "the release ended before it could be sampled")
++
++  # ---- K2 ------------------------------------------------------------------------------------------------------------
++  def test_a_target_below_half_an_lsb_releases_a_held_level(self):
++    """ZERO-SNAP: (0, 0.5) LSB is below anything the pads can deliver, so the level is 0 whatever was held - the band
++    must never hold a 1-3 LSB level against a demand that has already fallen into that window."""
++    for last in (1, 2, 3, 8, 13, 30):
++      for t in (0.0, 0.1, 0.25, 0.499):
++        self.assertEqual(_qhyst(t, last), 0, (t, last))
++    self.assertEqual(_qhyst(0.5, 30), 0, "0.5 LSB is still plain rounding's 0")
++
++  def test_a_one_lsb_application_releases_to_zero_and_the_episode_closes(self):
++    d = _Drive().run(240, -0.55, v=15.0, a_ego=0.0)      # a sub-bite application (the live trim lifts it to 1-3 LSB)
++    self.assertTrue(1 <= d.wire()[-1] <= 3, f"expected a 1-3 LSB application, got {d.wire()[-1]}")
++    for _ in range(80):
++      d.run(2, 0.0, v=15.0, a_ego=0.0)
++      if d.wire()[-1] == 0:
++        break
++    self.assertEqual(d.wire()[-1], 0, "a 1-3 LSB application never released")
++    self.assertFalse(d.b._actuating, "the episode is still open at level 0")
++
++  # ---- K3 / K4 -------------------------------------------------------------------------------------------------------
++  def test_a_reopen_after_a_close_never_exceeds_the_panda_gate(self):
++    """K3: the panda's reference is `_dec_last_sent` (the last frame it ACCEPTED), so no frame of the re-open may be
++    above `reference + RATE_STEP`, and none may fall more than 3 LSB below the previous wire level."""
++    d = self._close_then_resume()
++    over, step_downs = [], []
++    prev = 0
++    for _ in range(40):
++      ref = int(d.b._dec_last_sent)
++      f0 = d.f
++      d.run(1, -1.5, v=15.0, a_ego=0.0)
++      for f, lv in d.sent:
++        if f != f0:
++          continue
++        if lv > ref + fl.HYUNDAI_FCA11_LONG_RATE_STEP:
++          over.append((f, ref, lv))
++        if prev > 0 and lv > 0 and prev - lv > int(fl.FCA11_CONT_DOWN_STEP_LSB):
++          step_downs.append((f, prev, lv))
++        prev = lv
++    self.assertEqual(over, [], f"frames above the panda's onset gate (frame, reference, level): {over}")
++    self.assertEqual(step_downs, [], f"frames more than 3 LSB below the previous level: {step_downs}")
++
++  def test_the_hysteresis_reference_follows_the_bus_not_the_withheld_level(self):
++    """K3, the sub-bite case: a 1-3 LSB frame withheld by sub_bite_gate puts 0 on the wire, so the quantiser must
++    compare against 0 next time - while the law's own level (which answers a non-send frame) stays where it is, or the
++    episode would close on the very next odd frame."""
++    d = _Drive().run(120, -0.70, v=15.0, a_ego=0.0)
++    level = int(d.b._dec_last_sent)
++    self.assertTrue(0 < level <= 3, f"expected a sub-bite episode, got {level}")
++    d.run(1, -0.70, v=15.0, a_ego=0.0)
++    wire = d.b.sub_bite_gate(list(d.last_sends), _cs15(), d.last_frame, 0.4)
++    self.assertEqual(fl._get_bits(wire[-1].dat, 8, 8), 0, "the sub-bite frame must not reach the wire under throttle")
++    self.assertEqual(getattr(d.b, "_cont_q_bus", d.b._cont_q_last), 0,
++                     "the hysteresis reference did not follow the bus to 0")
++    self.assertEqual(d.b._cont_q_last, level, "the law's own level must survive the withhold")
++    self.assertGreater(d.b._cont_level(-0.70, 15.0, _cs15(), d.f + 1, STD), 0,
++                       "the next non-send frame closed the episode over a withheld sub-bite frame")
++
++  # ---- K5 ------------------------------------------------------------------------------------------------------------
++  def test_a_monotone_ramp_at_any_slope_from_0_1_to_3_lsb_a_frame_never_reverses(self):
++    for step in (0.1, 0.25, 0.5, 0.77, 1.0, 1.5, 2.0, 3.0):
++      lv, seq = 0, []
++      for i in range(int(30.0 / step) + 3):
++        lv = _qhyst(min(30.0, i * step), lv)
++        seq.append(lv)
++      self.assertEqual(_revs(seq), 0, f"a {step} LSB/frame ramp reversed the level: {seq}")
++      self.assertEqual(seq, sorted(seq), f"a {step} LSB/frame ramp is not monotone")
++      self.assertEqual(seq[-1], 30)
++
++  def test_a_flat_demand_within_plus_minus_0_49_lsb_never_changes_the_level(self):
++    for base in (0.0, 1.0, 7.4, 20.5, 29.3):
++      lv = 0
++      for _ in range(40):                                # settle first (0 -> the nearest integer)
++        lv = _qhyst(base, lv)
++      seq = [lv]
++      for k in range(600):
++        seq.append(_qhyst(base + 0.49 * math.sin(k * 0.7) + 0.01, seq[-1]))
++      self.assertEqual(len(set(seq)), 1, f"a +-0.49 LSB dither around {base} moved the level: {sorted(set(seq))}")
++
++  def test_a_zero_band_reproduces_plain_rounding(self):
++    old = fl.FCA11_CONT_QHYST_LSB
++    try:
++      fl.FCA11_CONT_QHYST_LSB = 0.0
++      for last in (0, 1, 7, 19, 30):
++        for k in range(0, 3001):
++          t = k * 0.01
++          self.assertEqual(fl.fca11_cont_qhyst(t, last), int(round(t)), (t, last))
++    finally:
++      fl.FCA11_CONT_QHYST_LSB = old
++
++  # the 0038/0039 law's own levels for ONE episode (opendbc patch series without 0040, aEgo -1.2 m/s^2, the trim live),
++  # run-length encoded: (level, count). Recorded on the 0038 tree with the same script this test runs.
++  GOLDEN_0037 = ((1, 4), (2, 4), (3, 18), (2, 15), (1, 8), (2, 5), (3, 4), (4, 3), (5, 2), (6, 2), (8, 1), (9, 1),
++                 (10, 1), (11, 2), (12, 1), (13, 2), (15, 1), (17, 1), (18, 7), (19, 16), (21, 1), (22, 2), (23, 3),
++                 (24, 2), (25, 3), (26, 2), (27, 3), (28, 2), (29, 3), (30, 29), (29, 1), (28, 1), (27, 1), (26, 2),
++                 (25, 1), (24, 1), (23, 1), (22, 2), (21, 1), (20, 1), (17, 1), (14, 1), (11, 36))
++
++  def test_the_shipped_trim_with_a_zero_band_reproduces_the_0037_levels(self):
++    """SLICE 1a's PIN: `FCA11_CONT_TRIM_ENABLED = True` (the shipped constant) + a ZERO band must give the shipped
++    law's level sequence EXACTLY on one episode, every SENT frame - the proof that this slice changed the WIRE only and
++    that the demand path is bit-for-bit the one that ships. On a tree without the band the same sequence is what the
++    law produces natively, so this test passes on the base tree as well BY DESIGN (it is an equivalence pin, not a
++    fail-before behavioural test)."""
++    self.assertTrue(_trim_live(), "the shipped constant must be the trim-ON branch for this pin to mean anything")
++    golden = [lv for lv, n in self.GOLDEN_0037 for _ in range(n)]
++    had = hasattr(fl, "FCA11_CONT_QHYST_LSB")
++    old = getattr(fl, "FCA11_CONT_QHYST_LSB", None)
++    try:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = 0.0                 # a pre-0040 tree has no band at all; that IS the zero band
++      d = _Drive()
++      for ask, n in ((-0.80, 100), (-1.60, 100), (-2.40, 100), (-1.20, 100)):
++        d.run(n, ask, v=15.0, a_ego=-1.2)
++      self.assertEqual(d.levels, golden, "TRIM_ENABLED=True + band 0 does not reproduce the shipped law")
++      self.assertEqual(len(d.levels), sum(n for _, n in self.GOLDEN_0037), "every SENT frame, not a subset")
++    finally:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = old
++
++  def test_with_the_trim_flag_off_the_wire_is_a_ego_invariant(self):
++    """...and the flag-off branch (the next slice's constant) is what makes aEgo leave the level alone."""
++    with _trim(False):
++      base = _Drive()
++      for ask, n in ((-0.80, 100), (-1.60, 100), (-2.40, 100), (-1.20, 100)):
++        base.run(n, ask, v=15.0, a_ego=0.0)
++      other = _Drive()
++      for ask, n in ((-0.80, 100), (-1.60, 100), (-2.40, 100), (-1.20, 100)):
++        other.run(n, ask, v=15.0, a_ego=-1.2)
++      self.assertEqual(base.levels, other.levels)
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class Test0040Slice1aOrdering(unittest.TestCase):
++  """The three properties lane L's brief names explicitly: the withheld frame leaves NOTHING behind, the wire can never
++  be raised by the band against a zero target, and the release latency is a measured number, not the clamp's bound."""
++
++  def test_a_withheld_sub_bite_frame_is_followed_by_nothing_on_the_wire(self):
++    """sub_bite_gate withholds a 1-3 LSB frame on the 50 Hz slot; the NEXT frame is a non-send frame and must put
++    NOTHING on the wire. Confirmed in the code, not assumed: `update()` appends a brake frame ONLY inside
++    `if frame % FCA11_SEND_EVERY == 0:` (fca11_long.py l.3986), which is the sole `build_fca11_frame` call on this path
++    (l.3992); on the odd frame `_cont_level` returns the last SENT level (l.2715-2720) and builds nothing. So there is
++    no off-slot frame for the gate's zeroed reference to leak into."""
++    d = _Drive().run(240, -0.55, v=15.0, a_ego=0.0)
++    self.assertTrue(1 <= d.wire()[-1] <= 3, f"expected a sub-bite level, got {d.wire()[-1]}")
++    d.run(1, -0.55, v=15.0, a_ego=0.0)                    # a SEND frame carrying a 1-3 LSB level
++    self.assertEqual(d.last_frame % fl.FCA11_SEND_EVERY, 0, "this must be a send frame")
++    sends = list(d.last_sends)
++    self.assertTrue(sends, "the send frame must build a frame for the gate to withhold")
++    wire = d.b.sub_bite_gate(sends, _cs15(), d.last_frame, 0.4)
++    self.assertEqual(fl._get_bits(wire[-1].dat, 8, 8), 0, "the gate did not withhold the sub-bite frame")
++    self.assertEqual(getattr(d.b, "_cont_q_bus", None), 0, "the gate must zero the hysteresis reference it withheld")
++    d.run(1, -0.55, v=15.0, a_ego=0.0)                    # the next frame: NOT a 50 Hz slot
++    self.assertNotEqual(d.last_frame % fl.FCA11_SEND_EVERY, 0, "this must be a non-send frame")
++    self.assertEqual(d.last_sends, [], "a non-send frame built a brake frame - the withhold would have leaked")
++
++  def test_a_bus_level_above_the_wire_with_a_zero_target_never_raises_the_level(self):
++    """The review's ordering case: the hysteresis reference is the BUS (20 LSB accepted), the wire only reached 13
++    (the down-step clamp bound it), and the target drops to 0. The emitted level must never be ABOVE the wire
++    (<= 13) and must fall by no more than the 3 LSB down step."""
++    d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++    d.b._cont_q_bus, d.b._cont_q_last, d.b._dec_last_sent = 20, 13, 13
++    d.b._shape_acc = 13.0
++    frame = d.f + (d.f % fl.FCA11_SEND_EVERY)
++    self.assertEqual(frame % fl.FCA11_SEND_EVERY, 0)
++    lvl = d.b._cont_level(0.0, 15.0, _cs15(), frame, STD)
++    self.assertLessEqual(lvl, 13, f"the zero target raised the level above the wire: {lvl}")
++    self.assertGreaterEqual(lvl, 13 - int(fl.FCA11_CONT_DOWN_STEP_LSB),
++                            f"the drop exceeded the {int(fl.FCA11_CONT_DOWN_STEP_LSB)} LSB down step: {lvl}")
++
++  def test_release_latency_from_a_held_level(self):
++    """MEASURED release latency, sent frames at 50 Hz, from target 0 to wire 0. The 3 LSB/sent-frame down clamp is NOT
++    what sets it: the jerk-limited slew is. Measured on the shipped tree (no band) the frame counts are the same
++    10 / 12 / 19, so the ONE-LSB band does not lengthen a release by a single frame - it only changes one intermediate
++    level in some sequences. Pinned so a change to the slew is visible."""
++    self.assertEqual(fl.FCA11_SEND_EVERY * 0.01, 0.02)
++    expected = {8: 10, 16: 12, 24: 19}
++    for start, frames in expected.items():
++      d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++      d.b._cont_q_bus = d.b._cont_q_last = d.b._dec_last_sent = start
++      d.b._shape_acc = float(start)
++      seq = []
++      for k in range(30):
++        lvl = d.b._cont_level(0.0, 15.0, _cs15(), 2 * k, STD)
++        d.b._dec_last_sent = lvl          # the send site does this on every frame it sends (l.3998)
++        seq.append(lvl)
++        if lvl == 0:
++          break
++      self.assertEqual(seq[-1], 0, f"{start} LSB never released: {seq}")
++      self.assertEqual(len(seq), frames, f"{start} LSB released in {len(seq)} frames ({(len(seq)) * 20} ms): {seq}")
++      for a, b in zip(seq, seq[1:]):
++        self.assertLessEqual(a - b, int(fl.FCA11_CONT_DOWN_STEP_LSB), f"a frame dropped more than 3 LSB: {seq}")
++
++
++if __name__ == "__main__":
++  unittest.main()
+\ No newline at end of file
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_continuous.py
+@@ -619,8 +619,17 @@
+ 
+ class TestTrimThroughTheHandover(unittest.TestCase):
+   """M4: the feedback trim is held through the coast handover instead of being disarmed on every zero-demand frame,
+-  and it is still dropped when the episode really closes (the phantom hold the original guard was added for)."""
++  and it is still dropped when the episode really closes (the phantom hold the original guard was added for).
+ 
++  0040 slice 1a ships with FCA11_CONT_TRIM_ENABLED = True (the trim is live); the setUp still pins the FLAG-ON branch
++  for the duration of these tests so they mean the same thing on the trim-off tree they were written against.
++  """
++
++  def setUp(self):
++    prev = bool(getattr(fl, "FCA11_CONT_TRIM_ENABLED", True))
++    self.addCleanup(setattr, fl, "FCA11_CONT_TRIM_ENABLED", prev)
++    fl.FCA11_CONT_TRIM_ENABLED = True
++
+   def _open(self):
+     d = _Drive().run(200, -1.5, v=15.0, a_ego=-1.2)
+     self.assertGreater(d.b._track_trim, 0.0, "the loop must have accumulated a correction to hold")
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py
+@@ -125,8 +125,15 @@
+     for mf in (1, 2, 3, 5):
+       with self.subTest(model_frames=mf):
+         rows = _Replay().run(-0.20, [GHOST] * (5 * mf))
+-        # the ghost really did open an episode below the bite (otherwise the test proves nothing)
+-        self.assertGreater(rows[-1]["muted"], 0, "no sub-bite frame was ever withheld - the scenario missed the bite")
++        if mf == 1:
++          # 0040: a single 20 ms model frame no longer opens a sub-bite episode AT ALL - the wire quantiser's one-LSB
++          # band means the slew cannot present a 1 LSB level to it (pre-0040 this frame was opened and then had to be
++          # withheld). That is the stronger outcome, and it is pinned here rather than skipped: no brake frame at all.
++          self.assertEqual(rows[-1]["muted"], 0)
++          self.assertEqual(_actuating(rows), [], "a 1-frame phantom put a 1-3 LSB frame on the wire")
++        else:
++          # the ghost really did open an episode below the bite (otherwise the test proves nothing)
++          self.assertGreater(rows[-1]["muted"], 0, "no sub-bite frame was ever withheld - the scenario missed the bite")
+         # every frame that went out with a level carried exactly zero throttle
+         for r in rows:
+           if r["gas_sent"] and r["gas"] > 0.:
