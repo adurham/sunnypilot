@@ -28,6 +28,9 @@ The contract asserted here is the one the car actually implements (owner decisio
     SP `ET.NO_ENTRY` is what refuses it;
   * the FIRST brake press clears the latch (holdNag back to 0 - the car layer's `CS.out.brakePressed`) and engagement is
     allowed again: the driver is never locked out;
+  * the same is true of the law's OTHER clear (CD5): a car DRIVEN AWAY above FCA11_HOLD_NAG_CLEAR_V_MS (3.0 m/s) ends the
+    latch, so the PERMANENT alert and the enable strip stop on that frame too - the car layer reads the value, never the
+    reason, so the two clears are the same code path (pinned by test_any_clear_drops_the_alert_...);
   * `pcmDisable` is re-written on EVERY latched frame, including a frame on which carStateSP did NOT update (SubMaster
     keeps only the latest message): that repetition is what keeps the latch effective when the CS_SP edge is skipped.
 
@@ -321,6 +324,31 @@ def test_brake_press_clears_the_latch_and_reengage_is_allowed(rig):
   r.brake(False)
   out = r.step(0, engage=True)
   assert out["main"] == 'enabled', f"after the brake press the driver may engage again: {out}"
+  assert r.main_state() == 'enabled'
+
+
+def test_any_clear_drops_the_alert_and_the_enable_strip_on_that_frame(rig):
+  """CD5: the car layer cannot tell WHY the latch cleared (fca11_long clears it on the brake press or, above 3.0 m/s,
+  on a car driven away) - it only reads `nag == 4` vs not. Both clears must therefore end the PERMANENT alert AND the
+  pcmDisable/ENABLE strip on the frame the value drops, and the engage offered on that frame must be honoured.
+
+  This is the driven-away half's superproject contract: without it the hazard is fixed in the law and left standing in
+  the alerts (the driver pulls away and keeps the red banner and the strip).
+  """
+  r = rig()
+  _engage_both(r)
+  r.step(4)
+  assert r.events_sp.has(EventNameSP.fca11HoldExpired)
+  # while latched the carrier is stripped, so a RES press is refused (the contract test above)
+  assert not r.events.has(EventName.buttonEnable)
+  out = r.step(0, engage=True)     # the frame the law's value drops to 0, with an engage request on it
+  assert out["expired"] is False, "the PERMANENT alert must be gone on the clear frame"
+  assert out["pcm_disable"] is False, "no standard disengage may be written once the latch is clear"
+  assert r.events_sp.names == [], f"no SP alert may survive the clear: {r.events_sp.names}"
+  # the proof that the ENABLE strip stopped is the honoured engage below: `mads.update_events` consumes the press for
+  # its own machine on the way through (mads.py l.170-181), so the carrier is gone from `events` by here either way -
+  # while the car layer's strip (which runs BEFORE both machines) would have left `main` disabled.
+  assert out["main"] == 'enabled', f"the engage on that frame must be honoured: {out}"
   assert r.main_state() == 'enabled'
 
 

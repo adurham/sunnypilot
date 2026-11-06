@@ -303,7 +303,9 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   #                    RELEASED, PRESS BRAKE PEDAL - and never implies steering is off. NO_ENTRY is what refuses a
   #                    longitudinal re-engage until the driver brakes (MADS reads events_sp too -
   #                    sunnypilot/mads/state.py check_contains - so it also refuses lateral RE-entry), and it is cleared
-  #                    only by the brake press that clears the opendbc latch.
+  #                    only by the clear that ends the opendbc latch: the driver's brake press, or (CD5) the car being
+  #                    DRIVEN AWAY above 3.0 m/s - a driver who pulls away on the GAS must not keep a permanent red
+  #                    banner and the engage strip for the rest of the drive.
   # The old 0041 wording ("FCA11 has held this stop for over 2 minutes", "can only hold for so long") was about a hold
   # that never ended and is gone with it: not one string here may imply the hold is still being held at 2:00.
   EventNameSP.fca11HoldNagSoft: {

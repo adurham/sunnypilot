@@ -517,8 +517,10 @@ struct CarStateSP @0xb86e6369214c01c8 {
                                  # fca11HoldNagLoud / fca11HoldNagFinal / fca11HoldExpired. At 4 LONGITUDINAL control
                                  # disengages and the brakes ARE released; lateral (MADS) stays engaged by design
                                  # (mads.py l.205 strips pcmDisable before the MADS state machine). The latch survives
-                                 # the counter reset and clears only on the driver's brake press (the counter itself is
-                                 # a pure observer of the SENT level)
+                                 # the counter reset and clears on the driver's brake press OR once the car is DRIVEN
+                                 # AWAY (vEgo > FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s, CD5 - so a driver who pulls away
+                                 # on the gas is not left under a permanent red alert); the counter itself is a pure
+                                 # observer of the SENT level
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
