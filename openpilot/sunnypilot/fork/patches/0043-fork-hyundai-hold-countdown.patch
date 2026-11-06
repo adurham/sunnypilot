@@ -1,11 +1,10 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -977,8 +977,94 @@
- FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
+@@ -978,7 +978,95 @@
  FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
  FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
-+
+ 
 +# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
 +# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
 +# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
@@ -56,26 +55,28 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD_FRAMES = 4500    # 90.0 s: audible and continuous
 +FCA11_HOLD_NAG_FINAL_FRAMES = 5500   # 110.0 s: warningImmediate
 +FCA11_HOLD_NAG_EXPIRE_FRAMES = 6000  # 120.0 s: latch + LONGITUDINAL disengage + brake release (lateral stays)
-+
+ 
 +# The five published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud/Final and
 +# fca11HoldExpired). 4 is a LATCH, not a tier: it is not derived from the counter (the counter resets on the frame
-+# openpilot disengages) and it clears on the driver's brake press OR on a car that has been DRIVEN AWAY (below).
++# openpilot disengages) and it clears on the driver's brake press OR on a car DRIVEN AWAY ON THE GAS (below).
 +FCA11_HOLD_NAG_NONE = 0
 +FCA11_HOLD_NAG_SOFT = 1
 +FCA11_HOLD_NAG_LOUD = 2
 +FCA11_HOLD_NAG_FINAL = 3
 +FCA11_HOLD_NAG_EXPIRED = 4
 +
-+# CD5: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off on the GAS. The red alert
++# CD6: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off ON THE GAS. The red alert
 +# asks for the brake pedal, and the brake is still the only thing that clears a LATCHED, STOPPED car; but a driver who
 +# instead accelerates must not carry a PERMANENT full-screen red alert (and the engage strip that goes with it) for
-+# the rest of the drive. vEgo, not the gas pedal: gas alone does NOT clear it (M5) and neither does gear or the
-+# disengage (M6/M7) - only the car actually MOVING away does. 3.0 m/s = 10.8 km/h: creep on this car is estimated at
-+# <= 1.5 m/s, so creep alone can never clear the latch. Strict `>` and a FINITE value only (fail closed: a missing or
-+# NaN vEgo is not evidence that the driver has taken over).
++# the rest of the drive. The clear is `gasPressed AND vEgo > this value`, never speed alone: a latched car with nobody
++# in it can ROLL to 3 m/s in about 6 s (down a grade, or BACKWARD - the wheel speeds are unsigned, so a backward roll
++# reads exactly like a forward one), and one bad wheel-speed frame reaches it at a standstill too, so speed is not
++# evidence that a driver is there. 3.0 m/s = 10.8 km/h: creep on this car is estimated at <= 1.5 m/s, so creep with no
++# gas pedal can never clear it. Strict `>` and a FINITE value only (fail closed: a missing or NaN vEgo, or a missing
++# gasPressed, is not evidence that the driver has taken over).
 +FCA11_HOLD_NAG_CLEAR_V_MS = 3.0
- 
- 
++
++
 +def hold_nag_level(frames: int) -> int:
 +  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
 +
@@ -96,7 +97,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  def stop_hold_enabled(CP_SP) -> bool:
    """0034: the stop-hold clutch lane switch, read from CP_SP only (getattr: an un-wired CP_SP is OFF)."""
    return bool(getattr(CP_SP, "fca11StopHoldClutch", False))
-@@ -1897,6 +1983,13 @@
+@@ -1897,6 +1985,15 @@
      self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
      # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
      self.stop_hold_blockers: dict[str, int] = {}
@@ -105,12 +106,14 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    # (0 none / 1 soft / 2 loud / 3 final / 4 EXPIRED-LATCH) the superproject turns into an alert. Neither is ever
 +    # read by the law.
 +    self._nag_frames = 0
-+    self._hold_expired = False         # 0043-CD: the sticky latch (hold_nag == 4). Cleared ONLY by the driver brake.
++    self._hold_expired = False         # 0043-CD: the sticky latch (hold_nag == 4). Cleared by the driver's brake press
++    #                                    or by a car DRIVEN AWAY ON THE GAS (> 3 m/s); never by gas alone, gear, the
++    #                                    disengage or time.
 +    self.hold_nag = FCA11_HOLD_NAG_NONE
      self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
      # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
      # throttle (see sub_bite_gate). A counter only - it never feeds the law.
-@@ -2153,6 +2246,7 @@
+@@ -2153,6 +2250,7 @@
        self._noresp_cmd_since = None
        self._hold_lost_armed = False
        self._brake_now_clear_since = None
@@ -118,7 +121,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
        return
      now_us = time.monotonic() * 1e6
      gas = bool(CS.out.gasPressed)
-@@ -2242,6 +2336,10 @@
+@@ -2242,6 +2340,10 @@
        self.brake_now = False
        self.brake_now_reason = ""
        self.low_speed_alert = False
@@ -129,7 +132,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
      """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
-@@ -2530,6 +2628,86 @@
+@@ -2530,6 +2632,107 @@
      if why:
        self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
      return want
@@ -150,17 +153,38 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    return float(wheel_max) <= FCA11_HOLD_NAG_STILL_KPH
 +
 +  def _hold_nag_driven_away(self, CS) -> bool:
-+    """CD5: the latch's second clear - the car has been DRIVEN AWAY, not just crept.
++    """CD6: the latch's second clear - the DRIVER has driven the car away, on the gas, above 3 m/s.
 +
 +    The red alert asks for the brake pedal, and the brake is what clears a latched car that is still stopped. A driver
 +    who wakes at "BRAKES RELEASED" and presses the GAS instead would otherwise drive off at speed under a PERMANENT
-+    red full-screen alert - and under the engage strip - until their next brake press. So vEgo above
-+    FCA11_HOLD_NAG_CLEAR_V_MS (10.8 km/h) clears it: creep (<= 1.5 m/s estimated) cannot, driver gas alone cannot (M5),
-+    gear and the disengage cannot (M6/M7).
++    red full-screen alert - and under the engage strip - until their next brake press.
 +
-+    FAIL CLOSED: a missing, non-numeric or non-finite vEgo returns False. A signal we cannot read is not evidence that
-+    the driver has taken over, and this latch must never be released on a guess.
++    SPEED ALONE IS NOT EVIDENCE THAT A DRIVER IS THERE. A latched car with nobody in it gains speed on its own: a
++    roll-away down a grade reaches FCA11_HOLD_NAG_CLEAR_V_MS in about 6 s at 0.5 m/s^2, and a backward roll reads
++    EXACTLY like a forward one because the wheel speeds are unsigned (WHL_SPD11 is `@1+`). One bad wheel-speed frame
++    reaches it too: the speed filter jumps to the raw mean on any change above 2 m/s, so a single frame of one wheel
++    at 43.3 km/h at a standstill is vEgo 3.01 - and this latch is permanent, so one frame would end the alarm for
++    good. Ending the alarm exactly while an unattended car is gaining speed is the worst possible moment. So the gas
++    pedal is required as well: `gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS`, which is a driver who is driving.
++
++    WHY THE GAS PEDAL CANNOT BE OPENPILOT'S OWN COMMAND (this car runs the interceptor): `gasPressed` is the
++    GAS_SENSOR (0x201/0x701) ADC of the DRIVER's pedal, assigned after carstate.py's EMS16 value and replacing it
++    (carstate_ext.py:194-200). The pedal applies max(driver, openpilot) only at its DAC output, never on GAS_SENSOR
++    (gas_interceptor.py:80-83), and while latched the car is disengaged so openpilot commands no throttle at all.
++    The threshold is 420 raw counts against a measured foot-off rest of 353 +/- 12, i.e. ~4 % of travel - a foot
++    actually on the pedal.
++
++    On the recorded drives (2026-11-06, `cd6_launches.py`): 24 manual dead-stop launches cross 3.0 m/s, and NONE of
++    them has neither pedal down - 14 with the gas, 10 with the brake (the brake is the first clear and needs no
++    help from this one). Every gas launch held the gas for at least 98 consecutive frames past the crossing, so
++    requiring the pedal costs 0 of the 24.
++
++    FAIL CLOSED: a missing gasPressed, or a missing/non-numeric/non-finite vEgo, returns False. A signal we cannot
++    read is not evidence that the driver has taken over, and this latch must never be released on a guess.
 +    """
++    # the pedal FIRST: it is the "a driver is in the car" term, and an unreadable one must never count as pressed
++    if not bool(getattr(CS.out, "gasPressed", False)):
++      return False
 +    v = getattr(CS.out, "vEgo", None)
 +    if v is None:
 +      return False
@@ -185,10 +209,10 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    `_hold_expired` goes True and `hold_nag` becomes FCA11_HOLD_NAG_EXPIRED (4) for as long as the latch lasts, which
 +    is what makes the superproject disengage and the release path take the brakes off. The counter resets on the very
 +    frame openpilot disengages (we stop actuating) and the latch has to survive exactly that, so it is stored
-+    separately and is cleared ONLY by `CS.out.brakePressed` - not by gas, not by gear, not by the disengage, not by
-+    re-engaging and not by time - or (CD5) by the car being DRIVEN AWAY: `CS.out.vEgo` above
-+    FCA11_HOLD_NAG_CLEAR_V_MS, which is what takes the permanent red alert off a driver who accelerates instead of
-+    braking. A new ignition is a new instance (`__init__`).
++    separately and is cleared ONLY by `CS.out.brakePressed` - not by gas alone, not by gear, not by the disengage, not
++    by re-engaging and not by time - or (CD6) by the car being DRIVEN AWAY: the driver's gas pedal down AND
++    `CS.out.vEgo` above FCA11_HOLD_NAG_CLEAR_V_MS, which is what takes the permanent red alert off a driver who
++    accelerates instead of braking. A new ignition is a new instance (`__init__`).
 +
 +    NOTHING here touches the level: the wire is identical with and without this function (pinned by test).
 +    """
@@ -216,7 +240,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _passive_frame(self, CS, frame: int) -> list[CanData]:
      """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
-@@ -3629,6 +3807,9 @@
+@@ -3629,6 +3832,9 @@
        # 0041: and the gating timers, so a disable is a clean start.
        self._noresp_cmd_since = None
        self._brake_now_clear_since = None
@@ -276,7 +300,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,925 @@
 +"""
 +0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
 +
@@ -292,9 +316,12 @@ new file mode 100644
 +                                   released (the panda hands FCA11 back to the camera's idle frame at +90 ms,
 +                                   compiled libsafety - lane-X3/proof_release_compiled.py). The latch survives the
 +                                   counter reset that the disengage itself causes and clears on the driver's brake
-+                                   press OR once the car is DRIVEN AWAY (vEgo > FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s,
-+                                   CD5: a driver who pulls away on the gas is not left under a permanent red alert;
-+                                   gas, gear, the disengage and creep still do not clear it).
++                                   press OR once the car is DRIVEN AWAY ON THE GAS (gasPressed AND vEgo >
++                                   FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s, CD6): a driver who pulls away on the gas is
++                                   not left under a permanent red alert, while speed ALONE is not evidence that a
++                                   driver is there (an unattended roll, forward or backward, reaches 3 m/s, and one bad
++                                   wheel-speed frame does too). Gas alone, gear, the disengage and creep still do not
++                                   clear it.
 +The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition), and
 +EVERY proof that says "deployed" runs the CAR'S CarParamsSP (continuous brake law ON, see _cp_sp_deployed), not the
 +Brake-only arm; both arms are in the matrix.
@@ -1106,11 +1133,16 @@ new file mode 100644
 +    for nag in (n for _f, _s, n in _hold(b, 5, start=12601, brake_pressed=True)):
 +      self.assertEqual(NONE, nag, "the latch must not come back on the frames after the press")
 +
-+  def test_l3_a_car_DRIVEN_AWAY_clears_the_latch_and_creep_does_not(self):
-+    """CD5: the latch's second clear. The brake pedal is what the red alert asks for, but a driver who wakes at
++  def test_l3_a_car_DRIVEN_AWAY_ON_THE_GAS_clears_the_latch_and_speed_alone_does_not(self):
++    """CD6: the latch's second clear. The brake pedal is what the red alert asks for, but a driver who wakes at
 +    "BRAKES RELEASED" and accelerates must not drive off under a PERMANENT red full-screen alert (and its engage
-+    strip) until their next brake press. `CS.out.vEgo > FCA11_HOLD_NAG_CLEAR_V_MS` clears it; creep, gas, gear and the
-+    disengage still do not (M5/M6/M7), and a vEgo we cannot read never does (fail closed).
++    strip) until their next brake press. `gasPressed AND CS.out.vEgo > FCA11_HOLD_NAG_CLEAR_V_MS` clears it.
++
++    SPEED ALONE DOES NOT (Opus re-review 2, and the reason this test exists in this shape): a latched car with nobody
++    in it ROLLS past 3 m/s in about 6 s on a grade, a backward roll reads the SAME value (the wheel speeds are
++    unsigned), and one bad wheel-speed frame is enough too. Ending a PERMANENT alert in exactly that state is the
++    hazard, so the clear also needs a driver on the gas pedal. Creep, gas alone at 0 m/s, gear and the disengage still
++    do not clear it (M5/M6/M7), and a vEgo or gasPressed we cannot read never does (fail closed).
 +
 +    Every leg is driven on the DEPLOYED config, after a REAL expiry, with the car disengaged - which is the state the
 +    superproject leaves it in at 2:00 - so the wire claim below is about the frames that really follow the release.
@@ -1121,40 +1153,57 @@ new file mode 100644
 +    self.assertEqual(EXPIRED, hold[-1][2])
 +    self.assertTrue(b._hold_expired)
 +    f = 12600
-+    # (1) CREEP can NEVER clear it: 1.5 m/s is the top of the estimated creep band, and it is 40 frames of it
++    # (1) CREEP can NEVER clear it, even with the gas down: 1.5 m/s is the top of the estimated creep band, and it is
++    # 40 frames of it (gas alone is not the clear either - the SPEED has to be above the threshold).
 +    creep = _hold(b, 40, start=f, v=1.5, standstill=False, gas=True, engaged=False, long_active=False)
 +    f += 40
 +    self.assertEqual(40, len(creep), "activity: 40 frames driven")
 +    self.assertEqual({EXPIRED}, {n for _fr, _s, n in creep}, "creep must NOT clear the latch")
 +    self.assertTrue(b._hold_expired, "creep must NOT clear the latch")
 +    self.assertEqual(0, b._nag_frames, "activity: those frames really reached the observer (motion reset the count)")
-+    # (2) an off-by-one BY VALUE: 2.99 stays latched, 3.0 exactly stays latched (strict `>`), 3.01 clears
-+    l299 = _hold(b, 20, start=f, v=2.99, standstill=False, engaged=False, long_active=False)
++    # (2) GAS ALONE at a dead stop stays latched - the old M5, unchanged by CD6
++    gas0 = _hold(b, 40, start=f, v=0.0, standstill=True, gas=True, engaged=False, long_active=False)
++    f += 40
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in gas0}, "gas at a standstill must NOT clear the latch")
++    # (3) THE ROLL-AWAY (Opus re-review 2, the finding): 3.01 m/s for 300 frames with NO pedal at all. This is the
++    # unattended car, and it is also what one bad wheel-speed frame looks like. The latch must hold on EVERY frame.
++    roll = _hold(b, 300, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 300
++    rolled = [n for _fr, _s, n in roll]
++    self.assertEqual(300, len(rolled), "activity: 300 frames of a real roll")
++    self.assertEqual({EXPIRED}, set(rolled), "a ROLL with no pedal must NOT clear the latch on any frame")
++    self.assertTrue(b._hold_expired, "a roll must leave the latch set, so the alert and the enable strip stay up")
++    # (4) an off-by-one BY VALUE, now on the clear's OTHER term: 2.99 with the gas stays latched, 3.00 exactly stays
++    # latched (strict `>`), 3.01 with the gas clears
++    l299 = _hold(b, 20, start=f, v=2.99, standstill=False, gas=True, engaged=False, long_active=False)
 +    f += 20
-+    self.assertEqual({EXPIRED}, {n for _fr, _s, n in l299}, "2.99 m/s must NOT clear the latch")
-+    l300 = _hold(b, 1, start=f, v=3.0, standstill=False, engaged=False, long_active=False)
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in l299}, "2.99 m/s with the gas must NOT clear the latch")
++    l300 = _hold(b, 1, start=f, v=3.0, standstill=False, gas=True, engaged=False, long_active=False)
 +    f += 1
 +    self.assertEqual(EXPIRED, l300[0][2], "3.00 m/s exactly must NOT clear it - the test is `>`")
-+    # (3) FAIL CLOSED: a vEgo that is NaN, or missing, never clears it. Fed straight into the observer: the controller
-+    # path needs a numeric vEgo before it reaches _alerts, and _hold_nag_step is the function under test.
++    # (5) FAIL CLOSED: a vEgo that is NaN, or missing, never clears it - even with the gas down. Fed straight into the
++    # observer: the controller path needs a numeric vEgo before it reaches _alerts, and _hold_nag_step is the function
++    # under test.
 +    nan_cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=False, a_ego=-1.5)
 +    nan_cs.out.vEgo = float("nan")
-+    self.assertEqual(EXPIRED, b._hold_nag_step(nan_cs, 12700, 30), "a NaN vEgo must NOT clear the latch")
-+    no_vego = SimpleNamespace(out=SimpleNamespace(standstill=False, brakePressed=False, gasPressed=False,
++    nan_cs.out.gasPressed = True
++    self.assertEqual(EXPIRED, b._hold_nag_step(nan_cs, 12900, 30), "a NaN vEgo must NOT clear the latch")
++    no_vego = SimpleNamespace(out=SimpleNamespace(standstill=False, brakePressed=False, gasPressed=True,
 +                                                  gearShifter=structs.CarState.GearShifter.drive))
-+    self.assertEqual(EXPIRED, b._hold_nag_step(no_vego, 12702, 30), "a MISSING vEgo must NOT clear the latch")
++    self.assertEqual(EXPIRED, b._hold_nag_step(no_vego, 12902, 30), "a MISSING vEgo must NOT clear the latch")
 +    self.assertTrue(b._hold_expired, "fail closed: the latch must survive both unreadable values")
-+    # (4) the clear lands on the FIRST frame above the threshold, and only then
-+    l301 = _hold(b, 1, start=f, v=3.01, standstill=False, engaged=False, long_active=False)
++    # (6) the clear lands on the FIRST frame above the threshold WITH the gas down, and only then
++    l301 = _hold(b, 1, start=f, v=3.01, standstill=False, gas=True, engaged=False, long_active=False)
 +    f += 1
 +    self.assertEqual(1, len(l301), "activity: exactly one frame is driven")
-+    self.assertEqual(NONE, l301[0][2], "3.01 m/s must clear the latch on THAT frame")
-+    self.assertFalse(b._hold_expired, "3.01 m/s must clear the latch on THAT frame")
-+    # (5) the clear cannot move a byte: every frame after the expiry, on every leg above, put nothing on 0x38D (the
++    self.assertEqual(NONE, l301[0][2], "3.01 m/s with the gas must clear the latch on THAT frame")
++    self.assertFalse(b._hold_expired, "3.01 m/s with the gas must clear the latch on THAT frame")
++    # (7) the clear cannot move a byte: every frame after the expiry, on every leg above, put nothing on 0x38D (the
 +    # disengage already ended the stream - the observer only flips `_hold_expired`, which the level never reads)
-+    for label, leg in (("creep", creep), ("2.99", l299), ("3.00", l300), ("3.01", l301)):
++    for label, leg in (("creep", creep), ("gas@0", gas0), ("roll", roll), ("2.99", l299), ("3.00", l300),
++                       ("3.01", l301)):
 +      self.assertEqual([], _wire(leg), f"{label}: the law must send nothing after the disengage")
-+    # (6) a fresh stop after the clear starts a FRESH count from zero - the whole 2:00 must be earned again
++    # (8) a fresh stop after the clear starts a FRESH count from zero - the whole 2:00 must be earned again
 +    _hold(b, 2, start=f, v=0.0, standstill=True, engaged=False, long_active=False)   # the resume edge re-arms the
 +    f += 2                                                                          # driver cut (test_d)
 +    _hold(b, 2, start=f)

@@ -312,7 +312,9 @@ def test_latched_frames_refuse_engage_requests(rig, carrier):
 
 
 def test_brake_press_clears_the_latch_and_reengage_is_allowed(rig):
-  """The ONLY clear, end to end: holdNag back to 0 (the car layer's latch cleared by CS.out.brakePressed)."""
+  """The BRAKE clear, end to end: holdNag back to 0 (the car layer's latch cleared by CS.out.brakePressed). The law's
+  other clear - a car driven away on the gas - ends in the same value drop, and test_any_clear_... below pins that the
+  car layer treats the two identically (it reads the value, never the reason)."""
   r = rig()
   _engage_both(r)
   r.step(4)
@@ -328,9 +330,11 @@ def test_brake_press_clears_the_latch_and_reengage_is_allowed(rig):
 
 
 def test_any_clear_drops_the_alert_and_the_enable_strip_on_that_frame(rig):
-  """CD5: the car layer cannot tell WHY the latch cleared (fca11_long clears it on the brake press or, above 3.0 m/s,
-  on a car driven away) - it only reads `nag == 4` vs not. Both clears must therefore end the PERMANENT alert AND the
-  pcmDisable/ENABLE strip on the frame the value drops, and the engage offered on that frame must be honoured.
+  """CD6: the car layer cannot tell WHY the latch cleared (fca11_long clears it on the brake press or, above 3.0 m/s
+  WITH THE DRIVER'S GAS PEDAL DOWN, on a car driven away - speed alone never clears it, so an unattended roll and a
+  one-frame wheel-speed glitch keep the alarm up) - it only reads `nag == 4` vs not. Both clears must therefore end the
+  PERMANENT alert AND the pcmDisable/ENABLE strip on the frame the value drops, and the engage offered on that frame
+  must be honoured.
 
   This is the driven-away half's superproject contract: without it the hazard is fixed in the law and left standing in
   the alerts (the driver pulls away and keeps the red banner and the strip).

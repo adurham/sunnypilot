@@ -94,7 +94,7 @@ class CarSpecificEventsSP:
           #     bytes are untouched (P1).
           #   * while the latch is set, `buttonEnable`/`pcmEnable` are removed - the idiom MADS itself uses
           #     (mads.py l.163-164) - so a RES press cannot re-engage while the latch is set. The latch ends on the
-          #     driver's brake press or, since CD5, once the car is DRIVEN AWAY above 3.0 m/s (fca11_long
+          #     driver's brake press or, since CD6, once the car is DRIVEN AWAY ON THE GAS above 3.0 m/s (fca11_long
           #     FCA11_HOLD_NAG_CLEAR_V_MS) - the car layer only ever reads the value, `nag == 4` vs not, so both clears
           #     drop the strip on the frame they happen. This is how the main
           #     state machine is blocked WITHOUT inventing a standard ET.NO_ENTRY: every USER_DISABLE+NO_ENTRY standard
