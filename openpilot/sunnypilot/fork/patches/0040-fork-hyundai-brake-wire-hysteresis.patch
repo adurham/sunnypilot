@@ -32,12 +32,10 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  def fca11_cont_coast(v_ego_mps: float) -> float:
    """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
    return FCA11_CONT_COAST_C * (1.0 - math.exp(-max(0.0, float(v_ego_mps)) / FCA11_CONT_COAST_TAU))
-@@ -1163,6 +1186,29 @@
-   while i < len(L) - 1 and lsb >= L[i]:
-     i += 1
+@@ -1165,6 +1188,29 @@
    return max(FCA11_TRACK_MIN_SLOPE, (A[i] - A[i - 1]) / (L[i] - L[i - 1]))
-+
-+
+ 
+ 
 +def fca11_cont_qhyst(target: float, last_sent: int) -> int:
 +  """0040: the WIRE quantiser - the integer level for a fractional ``target`` with a one-LSB hysteresis band.
 +
@@ -59,9 +57,11 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +  if band <= 0.0 or abs(float(target) - float(last_sent)) >= band:
 +    return int(round(float(target)))
 +  return int(last_sent)
- 
- 
++
++
  def fca11_cont_gain(personality) -> float:
+   """Personality as a continuous GAIN on the demand - the gas law's exact table and position (PERSONALITY_SCALE_V)."""
+   try:
 @@ -1842,6 +1888,9 @@
      self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
      self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
@@ -145,7 +145,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
        target = 0.0
      # the stop/hold band is a BLEND now: the creep floor (or the standstill hold) fades in over 3->5 km/h instead of
      # swapping the law at 3 km/h. Only while the demand is a stop demand (bn > 0) - the planner asking to move must
-@@ -2695,6 +2768,21 @@
+@@ -2695,6 +2768,33 @@
        hold = float(fca11_standstill_hold_lsb()) if standstill else float(FCA11_CONT_HOLD_FLOOR_LSB)
        target = (1.0 - bw) * target + bw * max(target, hold)
      target = max(0.0, min(float(FCA11_CONT_CEIL_LSB), target))
@@ -159,15 +159,27 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    # `_cont_q_last > 0` is the "a level is actually being held" half, and it is NOT cosmetic: a level of 0 has nothing
 +    # to refine, and without it the floor also raises the OPENING threshold from 1.0 LSB (the band holds 0 until the
 +    # target is a full LSB away) to 0.5 LSB, i.e. this fix would start episodes slice 1a never starts (measured: 5
-+    # isolated zeros instead of 1 on the 23 windows). Gated, the opening path is byte-identical to slice 1a and the
-+    # only change is that an open episode cannot be ended by the trim. The release path is untouched as well: below
-+    # 0.5 LSB the untrimmed demand is not asking for the pads, nothing is floored, and the target walks to 0 as before.
++    # isolated zeros instead of 1 on the 23 windows).
++    # NOT confined to the sub-1-LSB regime (lane W, review D2 - the earlier "byte-identical opening path" claim was
++    # false): holding an episode open also changes the trim's own walk, so later levels differ too. Measured against
++    # slice 1a: brake-on 95.4 -> 105.2 s (195/196) and 211.2 -> 233.6 s (197); time at level 1 16.7 -> 30.9 s and
++    # 32.0 -> 61.5 s; 23 / 42 frames above 0 where 1a sends 0; levels up to 16 differ. What IS unchanged is the
++    # release: below 0.5 LSB of untrimmed demand nothing is floored and the target walks to 0 exactly as 1a does.
 +    if FCA11_CONT_TRIM_ENABLED and untrimmed >= 0.5 and int(self._cont_q_last) > 0:
++      if target < 1.0:
++        # 0040-nz3 (lane W, review D1): BACK-CALCULATE the trim from the correction actually applied. Without this the
++        # floor holds `_shape_acc` at 1.0, so the trim's own anti-windup guard above (`err < 0 and prev <= 0.5`) can
++        # never fire: the trim integrates to its -6 rail while the level sits on the floor, and the next real demand
++        # starts 4-8 LSB short of slice 1a for 1-3 s (195 t=11022-11025: 1,1,2,4,8,11,15 where 1a sends
++        # 5,6,8,10,12,16,20). The applied correction here IS `1.0 - untrimmed` - that is what the floor puts on the
++        # wire - so the integrator state is pinned to it (the textbook back-calculation). A no-op whenever the floor
++        # does not bind (`target >= 1.0` implies the trim is already above `1.0 - untrimmed`).
++        self._track_trim = max(self._track_trim, 1.0 - untrimmed)
 +      target = max(target, 1.0)
      rate = FCA11_CONT_JERK * FCA11_SHAPE_SENT_DT / fca11_cont_slope(prev)
      step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
      if target >= prev:
-@@ -2703,7 +2791,23 @@
+@@ -2703,7 +2803,23 @@
        new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
      new_acc = max(0.0, new_acc)
      self._shape_acc = new_acc
@@ -192,7 +204,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      if dec > 0:
        if not self._actuating:
          # M3: the harvest counter is PER EPISODE - it restarts when a new episode opens (a cumulative lifetime count
-@@ -3971,6 +4075,11 @@
+@@ -3971,6 +4087,11 @@
            m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
            sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
            self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
@@ -204,7 +216,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
            self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
            self._note_sent_level(frame, ramp)  # 17c FEEDBACK: a SENT ramp frame is part of the 5 s level window too
          self._actuating = True
-@@ -3985,6 +4094,12 @@
+@@ -3985,6 +4106,25 @@
          # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
          # stays on the last level actually SENT (restored on the send slot above).
          self._dec_last_sent = 0
@@ -214,6 +226,19 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +        # floor, so the frame could go out at `_dec_last_sent + RATE_STEP + 1` and be refused.
 +        self._cont_q_last = 0
 +        self._cont_q_bus = 0
++        # 0040-nz3 (lane W, review D3): a VETO close (`ok == False`: driver gas / driver brake / gear / pedal fault /
++        # stale or absent camera / camera braking / the divergence latch / blocked_until_resume) ends the episode
++        # without ever calling `_cont_level`, so the trim was never reset: `_track_reset()` at the top of `_cont_level`
++        # only fires once `_shape_acc` <= 1e-9, and the -6 LSB rail then crossed the gas-press gap and shortened the
++        # next demand (1a leaves 0.46 / -2.66 on the same frames). The floor makes that railed state routine, so the
++        # trim side goes with the episode. A release the ask itself drove (`ok == True`) still keeps the trim for the
++        # next ask - that is the M4 note in `_cont_level`.
++        # `_shape_acc` is deliberately NOT zeroed: it is the level the ESC may still be holding, and it is what the
++        # re-open walks down onto the 1 LSB floor from (pinned by Test0040Corrections K1 and Test0040NoTrimClose (d)).
++        # The defect this closes is the TRIM crossing the gap, and `_track_reset()` also drops the hysteresis
++        # references - the whole of the stale state that is a correction rather than a level.
++        if not ok and self.cont_law:
++          self._track_reset()
          self._rel_acc = None                  # 18x: no ramp in progress once it is over (or was never allowed)
          if was_braking:
            # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
@@ -221,7 +246,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py b/o
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,1001 @@
 +"""0040 (lane L, brake slice 1a): the WIRE quantiser rounds with hysteresis; the aEgo feedback trim STAYS ON.
 +Owner (2026-11-05), routes 195/196: "Braking is properly linear now. Brake fluttering is bad though ... We
 +don't just tap the brakes 10 times in a second ... tune it based on my typical braking behavior; smoothness for
@@ -470,15 +495,35 @@ new file mode 100644
 +  """(c) ONE unit: continuous level -> hysteresis round -> sub-bite exclusion (0038) -> wire."""
 +
 +  def test_the_wire_never_moves_faster_than_the_law_allows(self):
-+    """Up <= +4 (the panda's onset gate) and down <= 3 LSB per sent frame, under a random command stream."""
++    """Up <= +4 (the panda's onset gate) over the level the panda LAST ACCEPTED, and down <= 3 LSB per sent frame, under
++    a random command stream - measured on the frame that actually reaches the WIRE (through `sub_bite_gate`, which
++    replaces a 1-3 LSB frame with the passive 0 when the pedal commands gas) against the panda's own reference
++    `_dec_last_sent`, not against our wire deltas (review: the earlier version never called the gate)."""
 +    rnd = random.Random(195)
 +    d = _Drive()
-+    for _ in range(600):
-+      d.run(4, rnd.uniform(-3.5, 0.4), v=rnd.uniform(4.0, 22.0), a_ego=rnd.uniform(-1.2, 1.2))
-+    seq = d.wire()
-+    for a, b in zip(seq, seq[1:]):
-+      self.assertLessEqual(b - a, 4, (a, b))
-+      self.assertLessEqual(a - b, 3, (a, b))
++    panda_ref = 0
++    accepted = muted = 0
++    ask = -0.5
++    for k in range(1200):
++      if k % 50 == 0:
++        ask = rnd.uniform(-3.5, 0.4)          # a piecewise-constant ask, so the level has time to build
++      d.run(1, ask, v=rnd.uniform(4.0, 22.0), a_ego=rnd.uniform(-1.2, 1.2))
++      sends = list(d.last_sends)
++      if not sends:
++        continue
++      wire = d.b.sub_bite_gate(sends, _cs15(), d.last_frame, 0.3 if k % 3 == 0 else 0.0)
++      if not wire:
++        continue
++      lvl = fl._get_bits(wire[-1].dat, 8, 8)
++      self.assertLessEqual(lvl, panda_ref + fl.HYUNDAI_FCA11_LONG_RATE_STEP,
++                           f"frame {k}: wire {lvl} over the panda's last accepted {panda_ref} + RATE_STEP")
++      if lvl == 0 and fl._get_bits(sends[-1].dat, 8, 8) > 0:
++        muted += 1
++      else:
++        accepted += 1
++      panda_ref = lvl
++    self.assertGreater(accepted, 100, "the scenario never produced an accepted frame, so it proves nothing")
++    self.assertGreater(muted, 0, "the scenario never exercised the sub-bite withhold")
 +
 +  def test_no_sub_bite_level_is_ever_sent_under_throttle(self):
 +    """0038 unchanged, and DOWNSTREAM of the quantiser: with the pedal commanding gas, a 1-3 LSB frame never reaches
@@ -722,8 +767,8 @@ new file mode 100644
 +  def test_a_withheld_sub_bite_frame_is_followed_by_nothing_on_the_wire(self):
 +    """sub_bite_gate withholds a 1-3 LSB frame on the 50 Hz slot; the NEXT frame is a non-send frame and must put
 +    NOTHING on the wire. Confirmed in the code, not assumed: `update()` appends a brake frame ONLY inside
-+    `if frame % FCA11_SEND_EVERY == 0:` (fca11_long.py l.3986), which is the sole `build_fca11_frame` call on this path
-+    (l.3992); on the odd frame `_cont_level` returns the last SENT level (l.2715-2720) and builds nothing. So there is
++    `if frame % FCA11_SEND_EVERY == 0:` (fca11_long.py l.4020), which is the sole `build_fca11_frame` call on this path
++    (l.4026); on the odd frame `_cont_level` returns the last SENT level (l.2719-2724) and builds nothing. So there is
 +    no off-slot frame for the gate's zeroed reference to leak into."""
 +    d = _Drive().run(240, -0.55, v=15.0, a_ego=0.0)
 +    self.assertTrue(1 <= d.wire()[-1] <= 3, f"expected a sub-bite level, got {d.wire()[-1]}")
@@ -766,7 +811,7 @@ new file mode 100644
 +      seq = []
 +      for k in range(30):
 +        lvl = d.b._cont_level(0.0, 15.0, _cs15(), 2 * k, STD)
-+        d.b._dec_last_sent = lvl          # the send site does this on every frame it sends (l.3998)
++        d.b._dec_last_sent = lvl          # the send site does this on every frame it sends (l.4032)
 +        seq.append(lvl)
 +        if lvl == 0:
 +          break
@@ -848,9 +893,14 @@ new file mode 100644
 +
 +  # ---- (c) -----------------------------------------------------------------------------------------------------------
 +  def test_c_release_latency_from_a_held_level_is_unchanged(self):
-+    """(c) the pinned release latency 8/16/24 -> 10/12/19 sent frames, measured with the trim at its down-rail: the floor
-+    is a floor on the TARGET, it must not add a frame to a release (ask 0 => untrimmed 0 => no floor at all)."""
++    """(c) the pinned release latency 8/16/24 -> 10/12/19 sent frames, measured with the trim at its down-rail AND THE
++    TRIM IN THE SUM: the demand is 0.28 LSB at 126 km/h, i.e. under the half-LSB snap, so `bn > 0`, the trim IS added
++    to the target (and takes it negative), the floor is NOT applied (untrimmed < 0.5) and the level still walks to 0.
++    With ask 0 the whole trim term is skipped (bn == 0 -> target 0), which is what made the earlier version of this pin
++    unable to fail on its own claim (review: `Test0040NoTrimClose.test_c`)."""
 +    expected = {8: 10, 16: 12, 24: 19}
++    ask, v_kph = self.BELOW, 126.0        # untrimmed 0.28 LSB at 35 m/s: the trim is live, the floor is not
++    self.assertLess(self._ff(ask, 35.0), 0.5)
 +    for start, frames in expected.items():
 +      d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
 +      d.b._cont_q_bus = d.b._cont_q_last = d.b._dec_last_sent = start
@@ -858,7 +908,9 @@ new file mode 100644
 +      seq = []
 +      for k in range(30):
 +        d.b._track_trim = -6.0
-+        lvl = d.b._cont_level(0.0, 15.0, _cs15(), 2 * k, STD)
++        before = d.b._track_trim
++        lvl = d.b._cont_level(ask, v_kph, _cs15(), 2 * k, STD)
++        self.assertNotEqual(d.b._track_trim, before, "the trim must be IN the target, else this pin is the old vacuous one")
 +        d.b._dec_last_sent = lvl        # as the send site does
 +        seq.append(lvl)
 +        if lvl == 0:
@@ -1054,6 +1106,144 @@ new file mode 100644
 +      if had:
 +        fl.FCA11_CONT_QHYST_LSB = old
 +    self.assertEqual(fl.fca11_cont_qhyst(0.5, 1), 1, "band 1 must hold 1 at exactly 0.5")
++
++
++# ----------------------------------------------------------------------------------------------------------------------
++class Test0040FloorWindup(unittest.TestCase):
++  """Lane W (review D1/D3): the 1 LSB FLOOR must not wind the aEgo trim up against itself, and a veto must not carry the
++  wound trim across the gap.
++
++  The floor holds `_shape_acc` at 1.0, so the trim's own anti-windup guard in `_cont_level` (`err < 0 and prev <= 0.5`)
++  can never fire: with the pads delivering more than the model says at 1 LSB - the low-level gain is the least-known
++  part of this plant, which is why the trim exists - the integrator walks to its -6 rail while the level sits on the
++  floor, and the next REAL demand starts 4-8 LSB short of slice 1a for 1-3 s (review, 195 t=11022-11025: 1,1,2,4,8,11,15
++  where 1a sends 5,6,8,10,12,16,20). Both drives are replayed through the real class from the RECORDED plan ask and
++  speed of that onset (knots every 0.25 s), against the same demand with the trim PINNED AT ZERO - the demand-only arm,
++  which is the trajectory slice 1a tracks.
++  """
++
++  # RECORDED onsets, plan aTarget / vEgo, one knot per 0.25 s (segment and absolute time in the header of each table).
++  K195 = [  # 196--9f739d721d--3, t=11022..11026   (drive 195/196)
++    (0.00, -1.087, 14.512), (0.25, -1.206, 14.273), (0.50, -1.176, 14.036), (0.75, -1.180, 13.783),
++    (1.00, -1.263, 13.545), (1.25, -1.297, 13.237), (1.50, -1.365, 12.932), (1.75, -1.385, 12.643),
++    (2.00, -1.409, 12.332), (2.25, -1.494, 12.015), (2.50, -1.573, 11.688), (2.75, -1.536, 11.275),
++    (3.00, -1.560, 10.838), (3.25, -1.585, 10.396), (3.50, -1.568, 9.927), (3.75, -1.599, 9.477),
++    (4.00, -1.618, 9.040),
++  ]
++  K197 = [  # 197--d3d743112e--8, t=23263..23267
++    (0.00, -1.058, 8.776), (0.25, -1.060, 8.593), (0.50, -0.974, 8.425), (0.75, -0.876, 8.317),
++    (1.00, -0.871, 8.101), (1.25, -0.943, 7.941), (1.50, -0.993, 7.783), (1.75, -0.996, 7.613),
++    (2.00, -0.963, 7.411), (2.25, -1.080, 7.246), (2.50, -1.039, 7.043), (2.75, -0.991, 6.824),
++    (3.00, -0.959, 6.589), (3.25, -1.009, 6.385), (3.50, -1.031, 6.181), (3.75, -1.068, 5.975),
++    (4.00, -1.033, 5.744),
++  ]
++  FLOORED = -0.52          # 0.71 LSB of untrimmed demand at 35 m/s: the floor, not the demand, is what holds the level
++  MISMATCH = 3.0           # the pads deliver 3x the documented model at 1 LSB: the plant error the trim exists to take out
++
++  @staticmethod
++  def _plant(lsb: float) -> float:
++    """The documented plant, LSB -> m/s^2 (FCA11_CONT_PLANT_LSB/MSS2), linearly between its knots."""
++    L, A = fl.FCA11_CONT_PLANT_LSB, fl.FCA11_CONT_PLANT_MSS2
++    lsb = max(0.0, min(float(A[-1]), float(lsb)))
++    for k in range(len(L) - 1):
++      if L[k] <= lsb <= L[k + 1]:
++        f = (lsb - L[k]) / (L[k + 1] - L[k])
++        return A[k] + f * (A[k + 1] - A[k])
++    return A[-1]
++
++  @staticmethod
++  def _knot(knots, t: float):
++    if t <= knots[0][0]:
++      return knots[0][1:]
++    for (t0, *a), (t1, *b) in zip(knots, knots[1:]):
++      if t0 <= t <= t1:
++        f = (t - t0) / (t1 - t0)
++        return tuple(x + f * (y - x) for x, y in zip(a, b))
++    return knots[-1][1:]
++
++  def _wound(self, seconds: int, pin: bool = False):
++    """A deep demand, then the sag to the floored one held ``seconds`` 100 Hz frames with the pads over-delivering.
++    ``pin`` keeps the trim at zero (the demand-only reference arm)."""
++    d = _Drive()
++    coast = fl.fca11_cont_coast(35.0)
++    for _ in range(120):
++      if pin:
++        d.b._track_trim = 0.0
++      d.run(1, -1.5, v=35.0, a_ego=-(coast + self._plant(d.b._cont_q_last)))
++    for _ in range(seconds):
++      if pin:
++        d.b._track_trim = 0.0
++      d.run(1, self.FLOORED, v=35.0, a_ego=-(coast + self.MISMATCH * self._plant(d.b._cont_q_last)))
++    return d
++
++  def _ramp(self, d, knots, pin: bool = False):
++    """The recorded onset, 4 s at 100 Hz, aEgo from the DOCUMENTED plant (so the comparison measures the trim state, not
++    a plant artefact). Returns the sent levels of the ramp."""
++    out = []
++    for i in range(400):
++      ask, v = self._knot(knots, i * 0.01)
++      if pin:
++        d.b._track_trim = 0.0
++      before = len(d.sent)
++      d.run(1, ask, v=v, a_ego=-(fl.fca11_cont_coast(v) + self._plant(d.b._cont_q_last)))
++      for f, lv in d.sent[before:]:
++        if f % fl.FCA11_SEND_EVERY == 0:
++          out.append(lv)
++    return out
++
++  # ---- (a) onset tracking ---------------------------------------------------------------------------------------------
++  def test_a_the_recorded_onset_tracks_the_demand_within_one_lsb_after_a_floored_hold(self):
++    """(a) a 5 s floored hold, then the REAL onset of 195 t=11022 and 197 t=23263: every SENT frame of the ramp is within
++    1 LSB of the demand-only arm. On 3269e8fd the trim is at -5 LSB at the ramp start, the floor holds the level at 1
++    while the demand asks 4-5, and the deficit reaches 4-5 LSB for ~0.4 s of sent frames (review D1)."""
++    for knots, tag in ((self.K195, "195 t=11022"), (self.K197, "197 t=23263")):
++      d = self._wound(250)
++      self.assertEqual(int(d.b._cont_q_last), 1, f"{tag}: the hold did not sit on the floor")
++      self.assertEqual(d.b._shape_acc, 1.0, f"{tag}: the floor is not what held the level")
++      got = self._ramp(d, knots)
++      ref = self._ramp(self._wound(250, pin=True), knots)
++      self.assertGreaterEqual(max(ref), 5, f"{tag}: the reference arm never asked for a real level: {ref[:20]}")
++      self.assertEqual(len(got), len(ref), f"{tag}: the two arms did not send the same frames")
++      deficit = [ref[i] - got[i] for i in range(len(got))]
++      self.assertLessEqual(max(deficit), 1,
++                           f"{tag}: level {max(deficit)} LSB below the demand at the onset\n"
++                           f"    this {got[:30]}\n    demand {ref[:30]}")
++
++  # ---- (b) the wind-up itself -----------------------------------------------------------------------------------------
++  def test_b_three_seconds_on_the_floor_leaves_the_trim_above_minus_two_lsb(self):
++    """(b) 3 s floored at 1 LSB with the pads over-delivering: the trim stays above -2 LSB. It integrates at
++    KI*err*dt = 8 * -0.33 * 0.02 = -0.05 LSB per sent frame if nothing stops it, i.e. -2.4 LSB in the 3 s the brief
++    names, and on to the -6 rail - which is exactly the review's state at the next onset."""
++    d = self._wound(300)
++    self.assertEqual(int(d.b._cont_q_last), 1, "the hold did not sit on the floor")
++    self.assertGreater(d.b._track_trim, -2.0,
++                       f"3 s on the floor wound the trim to {d.b._track_trim:+.2f} LSB")
++    # and it is the BACK-CALCULATION that bounds it: the applied correction is 1 - untrimmed
++    untrimmed = Test0040NoTrimClose._ff(self.FLOORED, 35.0)
++    self.assertGreaterEqual(d.b._track_trim, 1.0 - untrimmed - 1e-9,
++                            f"the trim is below the correction actually applied ({1.0 - untrimmed:+.2f})")
++
++  # ---- (c) the veto gap ----------------------------------------------------------------------------------------------
++  def test_c_a_gas_veto_does_not_carry_the_wound_trim_across_the_gap(self):
++    """(c) review D3: a gas press closes the episode WITHOUT calling `_cont_level`, so a -5 LSB trim used to survive the
++    gap (`_track_reset` only fires once the accumulator decays) and the demand after the lift started 4-5 LSB short.
++    Measured: the trim is exactly 0 on the first frame after the gap, and every sent frame of the resumed ramp is
++    within 1 LSB of the demand-only arm."""
++    d = self._wound(250)
++    self.assertEqual(int(d.b._cont_q_last), 1, "the scenario did not sit on the floor, so it proves nothing")
++    self.assertEqual(d.b._shape_acc, 1.0, "the scenario's level is not held by the floor")
++    d.run(20, -0.7, v=35.0, a_ego=-0.9, gas=True)      # the driver presses the gas: ok == False, the episode closes
++    self.assertFalse(d.b._actuating, "the gas press did not close the episode")
++    self.assertEqual(d.b._track_trim, 0.0,
++                     f"the wound trim ({d.b._track_trim:+.2f} LSB) crossed the gas gap")
++    got = self._ramp(d, self.K195)
++    ref = self._ramp(self._wound(250, pin=True), self.K195)
++    n = min(len(got), len(ref))
++    self.assertGreater(n, 50, "the resumed ramp never ran")
++    deficit = [ref[i] - got[i] for i in range(n)]
++    self.assertLessEqual(max(deficit), 1,
++                         f"after the gas gap the level is {max(deficit)} LSB below the demand\n"
++                         f"    this {got[:30]}\n    demand {ref[:30]}")
 +
 +
 +if __name__ == "__main__":
