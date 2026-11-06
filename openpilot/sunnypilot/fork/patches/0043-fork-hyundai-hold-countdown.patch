@@ -206,7 +206,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,633 @@
 +"""
 +0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
 +
@@ -256,6 +256,63 @@ new file mode 100644
 +  cp_sp.fca11Brake = fca11
 +  cp_sp.enableGasInterceptor = True
 +  return cp_sp
++
++
++# *** THE CAR'S DEPLOYED CONFIGURATION (device snapshot 2026-11-06 12:00) ***
++# Every CP_SP field the car has ON at runtime, by its STRUCT name (opendbc/car/structs.py CarParamsSP), not by the
++# params key that writes it:
++#   HyundaiFca11Brake=1          -> fca11Brake
++#   HyundaiFca11AffineGain=1     -> fca11AffineGain
++#   HyundaiFca11DynamicBrakes=1  -> fca11DynamicBrakes
++#   HyundaiPedalDeliveryLaw=1    -> pedalDeliveryLaw
++#   HyundaiGasRiseLag=1          -> gasRiseLag
++#   HyundaiGasInterceptor=1      -> enableGasInterceptor
++#   HyundaiFca11Shadow=0         -> fca11Shadow          (OFF)
++#   HyundaiFca11StopHoldClutch=0 -> fca11StopHoldClutch  (OFF)
++# The countdown proofs used to be built with `_cp_sp()` (Brake + interceptor only), which leaves the CONTINUOUS brake
++# law OFF - so they measured a configuration the car does not run. Everything that says "deployed" below uses this.
++DEPLOYED_ON = ("fca11Brake", "fca11AffineGain", "fca11DynamicBrakes", "pedalDeliveryLaw", "gasRiseLag",
++               "enableGasInterceptor")
++DEPLOYED_OFF = ("fca11Shadow", "fca11StopHoldClutch")
++
++
++def _cp_sp_deployed():
++  """CarParamsSP exactly as the car builds it (see DEPLOYED_ON / DEPLOYED_OFF)."""
++  cp_sp = structs.CarParamsSP()
++  for name in DEPLOYED_ON:
++    setattr(cp_sp, name, True)
++  for name in DEPLOYED_OFF:
++    setattr(cp_sp, name, False)
++  return cp_sp
++
++
++def _assert_deployed(brake):
++  """Fail LOUDLY if the harness is not really running the car's configuration.
++
++  The instance attributes are the law's own resolution of CP_SP (Fca11LongBrake.__init__), so this catches a
++  mis-built struct rather than re-asserting the fields back at itself. Measured on this tree:
++    cont_law      True   <- FCA11_CONT_ENABLED and shape_track (the continuous law the car runs)
++    shape_track   True   <- affine_gain AND fca11DynamicBrakes AND not shadow/core
++    affine_gain   True   <- fca11AffineGain AND fca11Brake AND not shadow
++    feel          False  <- the 0049 feel layer is OLD-LAW-instance only (`and not self.affine_gain`)
++    dynamic_brakes False <- scoped to the feel path, so it is False on the shaped/continuous instance even with
++                            CP_SP.fca11DynamicBrakes True. The release RAMP is a feel-path feature and therefore
++                            does NOT run on the car; the passive close frame (_release_pending) does.
++  """
++  assert brake.enabled, "deployed config must actuate (fca11Brake AND the gas interceptor)"
++  assert brake.affine_gain, "deployed config must resolve affine_gain"
++  assert brake.shape_track, "deployed config must resolve shape_track (affine AND fca11DynamicBrakes AND not shadow)"
++  assert brake.cont_law, "deployed config must resolve cont_law - the continuous brake law the car runs"
++  assert not brake.shadow, "the car runs Shadow OFF"
++  assert not brake.feel, "affine_gain supersedes the feel layer - feel must be False on the deployed instance"
++  assert not brake.dynamic_brakes, "the release ramp is feel-path only: dynamic_brakes is False on the shaped instance"
++  assert not brake.standstill_hold, "standstill_hold is feel-path only"
++
++
++def _assert_brake_only(brake):
++  """The OTHER arm of the matrix: Brake + interceptor only, i.e. the pre-0043 continuous law OFF."""
++  assert brake.enabled and brake.feel
++  assert not brake.affine_gain and not brake.shape_track and not brake.cont_law
 +
 +
 +def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None,
@@ -573,12 +630,16 @@ new file mode 100644
 +)
 +
 +
-+def _scenario_streams():
++def _scenario_streams(cp_sp=None, check=None):
 +  """Run GOLDEN_SCRIPT through the REAL class.
 +
++  `cp_sp` selects the configuration (default: the Brake-only harness arm) and `check` is called with the built
++  instance so a caller can ASSERT the configuration really resolved (see _assert_deployed).
 +  Returns (sha256, sent_frames, armed_frames, nag-per-frame, [(frame, level)] of every sent frame).
 +  """
-+  brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++  brake = fl.Fca11LongBrake(structs.CarParams(), cp_sp if cp_sp is not None else _cp_sp())
++  if check is not None:
++    check(brake)
 +  brake._dyn_log = None
 +  brake._mark_log = None
 +  h = hashlib.sha256()
@@ -660,7 +721,7 @@ new file mode 100644
 +    self.assertEqual(6500, sent)
 +    self.assertEqual(BASE_130S_SHA, sha, "a 130 s hold")
 +    self.assertEqual(EXPIRED, nag[-1])
-+def _disengage_stream(n_armed=None, n_sent=None, hold_frames=12600):
++def _disengage_stream(n_armed=None, n_sent=None, hold_frames=12600, cp_sp=None, check=None):
 +  """Feed a steady standstill hold and drop longActive on the frame the boundary is reached.
 +
 +  `n_armed` counts SENT frames at or above the arming level (what the countdown counts); `n_sent` counts every SENT
@@ -668,7 +729,9 @@ new file mode 100644
 +  ramp and sit below 20 LSB, so "sent frame 6000" is "armed frame 5996" - which is why BOTH are measured here.
 +  Returns (sha256 of frame+bytes over every sent 0x38D, sent count, armed count, nag per controller frame).
 +  """
-+  brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++  brake = fl.Fca11LongBrake(structs.CarParams(), cp_sp if cp_sp is not None else _cp_sp())
++  if check is not None:
++    check(brake)
 +  brake._dyn_log = None
 +  brake._mark_log = None
 +  h = hashlib.sha256()
@@ -696,5 +759,84 @@ new file mode 100644
 +  ("sent", 6000): "b098e3e8a5fb5adbd90c63108b7b9baca91f55583685583874b9438d33332ef1",
 +}
 +BASE_130S_SHA = "a3efc997d1302589fc4ff20c14616aa19513ae22733ac12164c4f9167329304c"
++
++
++# *** THE DEPLOYED-CONFIG PINS (CD3). ***
++# Same golden streams, same re-pin rule - but built with _cp_sp_deployed(), i.e. the configuration the CAR runs
++# (continuous brake law ON). Taken FROM /tmp/CD-base with pin_deployed.py; the base publishes no nag at all
++# (max_nag 0 on every stream), so these hashes cannot carry a countdown side effect.
++# MEASURED (CD3): the deployed stream is NOT the brake-only stream - 35 765 sent 0x38D against 35 753, because the
++# continuous law ramps 1..30 LSB instead of stepping 4..30 - so the pins are a separate set, and the Brake-only set stays
++# as the second arm of the matrix.
++DEPLOYED_GOLDEN_SHA256 = "0eb2cf024e7ff9cc3e5ae9e61c4fdd3d3097d97adafdf427d8a7b63df1aeec4f"
++DEPLOYED_GOLDEN_SENT_FRAMES = 35765
++DEPLOYED_DISENGAGE_SHA = {
++  ("armed", 5999): "ac73d663b05074b3e7f03ee579dc48cd4441b3f650f838093946b6c8f8f6813c",
++  ("armed", 6000): "d529b6a94cb8cb012c552634962d1a22b6788878207c4c7900b49a7058a7bec7",
++  ("armed", 6001): "ca64ee24ba9268f45c9f4dc66584e8ebb2ec5193e76faaf0b6cb015379057e96",
++  ("sent", 6000): "d1c9cda9fd0893f4564935fb8fa767b482844adf8b4403f09f65becaf04aa39a",
++}
++DEPLOYED_130S_SHA = "a0b2df95e70df93fbc24a70d312d88c0e1fb5dbdaafa9c1313d94ff1366d7f4f"
++
++
++class TestDeployedConfig(unittest.TestCase):
++  """CD3: the SAME proofs under the configuration the car actually runs.
++
++  The gap this closes: `_cp_sp()` sets fca11Brake + enableGasInterceptor only, so `cont_law` is False in every proof
++  above - the plain Brake-only (feel) law. The car runs affine gain + dynamic brakes, which resolves cont_law True
++  (the continuous brake law, fca11_long.py `self.cont_law = FCA11_CONT_ENABLED and self.shape_track`). Every test here
++  asserts the RESOLVED law attributes first, so a mis-built config fails loudly instead of silently measuring the wrong
++  law.
++  """
++
++  def test_config_resolves_the_continuous_law_and_not_the_brake_only_arm(self):
++    dep = fl.Fca11LongBrake(structs.CarParams(), _cp_sp_deployed())
++    _assert_deployed(dep)          # cont_law/shape_track/affine_gain True; feel/dynamic_brakes/shadow False
++    bo = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    _assert_brake_only(bo)         # feel True; affine/cont_law False
++    # the two arms really are different laws, not a relabelled struct
++    self.assertTrue(dep.cont_law and not bo.cont_law)
++    self.assertTrue(bo.feel and not dep.feel)
++
++  def test_j_deployed_722_s_hold_is_byte_identical_to_the_base(self):
++    """P1(a) under the deployed config: the 722 s scripted drive (every reset event) hashes to what the tree WITHOUT
++    the countdown produces for the same configuration - frame number + every 0x38D byte of 35 765 sent frames."""
++    sha, sent, armed, nag, levels = _scenario_streams(cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(DEPLOYED_GOLDEN_SENT_FRAMES, sent, "activity: the deployed stream must put frames on the wire")
++    self.assertEqual(DEPLOYED_GOLDEN_SHA256, sha, "the countdown must not change ONE byte of the deployed stream")
++    self.assertGreaterEqual(armed, int(0.99 * sent))
++    # the countdown really ran on THIS stream, and each tier landed 3000/4500/5500/6000 ARMED SENT frames after the
++    # stop - the 218 armed frames of the 5 s approach (v = 3 m/s, standstill False) are NOT counted, which is the
++    # dead-stop rule measured on the deployed law.
++    armed_frames = [f for f, lv in levels if lv >= ARM_LSB]
++    stop = 500                                   # the approach is the first 5 s of GOLDEN_SCRIPT
++    self.assertEqual(218, sum(1 for f in armed_frames if f < stop), "activity: the approach must be armed and uncounted")
++    for want, threshold in ((SOFT, SOFT_F), (LOUD, LOUD_F), (FINAL, FINAL_F), (EXPIRED, EXPIRE_F)):
++      self.assertIn(want, nag, f"tier {want} must be reached on the deployed stream")
++      f_want = nag.index(want)
++      self.assertEqual(threshold, sum(1 for f in armed_frames if stop <= f <= f_want),
++                       f"tier {want} must land {threshold} armed sent frames after the stop")
++
++  def test_k_deployed_disengage_at_the_expiry_boundary_is_byte_identical_to_the_base(self):
++    """P1(b) under the deployed config: disengage at armed sent frame 5999 / 6000 / 6001, at the 6000th SENT frame,
++    and a plain 130 s hold. Every hash must equal the base tree's hash for that exact stream, and the latch must still
++    land exactly on the 6000th armed frame (5999 -> FINAL, 6000 -> EXPIRED)."""
++    for n in (5999, 6000, 6001):
++      sha, sent, armed, nag = _disengage_stream(n_armed=n, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++      self.assertEqual(n, armed, "activity: exactly n armed sent frames before the disengage")
++      self.assertEqual(DEPLOYED_DISENGAGE_SHA[("armed", n)], sha, f"disengage at armed sent frame {n}")
++      self.assertEqual(EXPIRED if n >= EXPIRE_F else FINAL, max(nag),
++                       f"the latch state when the disengage lands {n} armed frames in")
++    sha, sent, armed, nag = _disengage_stream(n_sent=6000, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(6000, sent)
++    self.assertEqual(5972, armed)
++    self.assertEqual(DEPLOYED_DISENGAGE_SHA[("sent", 6000)], sha, "disengage at the 6000th SENT frame")
++    self.assertEqual(FINAL, max(nag), "28 armed frames short of expiry is not expiry")
++    sha, sent, armed, nag = _disengage_stream(None, hold_frames=13000, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(6496, sent)
++    self.assertEqual(6468, armed)
++    self.assertEqual(DEPLOYED_130S_SHA, sha, "a 130 s deployed hold")
++    self.assertEqual(EXPIRED, nag[-1])
++
 +
 +
