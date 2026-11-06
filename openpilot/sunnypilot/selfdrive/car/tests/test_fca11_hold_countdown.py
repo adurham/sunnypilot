@@ -231,6 +231,11 @@ CONFIGS = [
   ("mode_remain", {"MadsSteeringMode": 0}, True),
   ("mode_pause", {"MadsSteeringMode": 1}, True),
   ("mode_disengage", {"MadsSteeringMode": 2}, True),
+  # MADS itself OFF is a real configuration on this car (params_keys.h: Mads = "0" is the stock-lateral setting) and it is
+  # the one that makes the `else` branch of the contract test run at all (Opus re-review D1(b): FORK.md and this file's
+  # docstring claimed it was covered while no config had Mads=False, so that branch was dead). There is no lateral
+  # machine to keep here, so the mads assertions invert rather than vanish.
+  ("mads_off", {"Mads": False}, False),
 ]
 
 
@@ -245,7 +250,9 @@ def test_tiers_change_neither_machine(rig, name, overrides, uem):
   for nag, sp_event in ((1, EventNameSP.fca11HoldNagSoft), (2, EventNameSP.fca11HoldNagLoud),
                         (3, EventNameSP.fca11HoldNagFinal)):
     out = r.step(nag)
-    assert (out["main"], out["mads"]) == ('enabled', 'enabled'), f"[{name}] nag {nag} must not disengage: {out}"
+    # with MADS off there is no lateral machine to run, so its only correct state is 'disabled' - it must stay that way
+    want_mads = 'enabled' if r.params.get_bool("Mads") else 'disabled'
+    assert (out["main"], out["mads"]) == ('enabled', want_mads), f"[{name}] nag {nag} must not disengage: {out}"
     assert r.events_sp.has(sp_event)
     assert not out["pcm_disable"], f"[{name}] nag {nag} must not write a standard disengage event"
   assert r.transitions == [], f"[{name}] no transition may have happened: {r.transitions}"
@@ -273,7 +280,10 @@ def test_expiry_drops_longitudinal_and_keeps_lateral(rig, name, overrides, uem):
     # anything. Pinned so the reason lateral survives cannot be lost with the behaviour.
     assert out["pcm_disable_stripped"] is True, "mads.update_events must strip pcmDisable before its state machine"
   else:
+    # MADS off: no lateral machine is running, so the expiry cannot "drop" one - assert it is off on both sides of the
+    # frame instead of pretending this branch measured a lateral hand-off (that is what the Mads=True configs do).
     assert out["mads"] == 'disabled' and out["mads_active"] is False, f"[{name}] no MADS, no lateral: {out}"
+    assert ('mads', 'enabled', 'disabled') not in r.transitions, r.transitions
   # the driver is told, in a PERMANENT alert that only a brake press takes away
   assert out["expired"]
   assert r.events_sp.contains(ET.PERMANENT) and r.events_sp.contains(ET.NO_ENTRY)
