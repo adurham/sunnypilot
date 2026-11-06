@@ -237,5 +237,45 @@ class TestPanelWiring(unittest.TestCase):
     self.assertIn("FORK.md rows 130/137", self.src)   # how to bring it back is written next to the row
 
 
+class TestEveryRowWiring(unittest.TestCase):
+  """Every row must resolve title -> param -> attribute, and every param must be a registered key. This is the guard
+  the two hidden rows are expected to keep passing: they are hidden by a rule, not unwired."""
+
+  @classmethod
+  def setUpClass(cls):
+    cls.src = PANEL.read_text(encoding="utf-8")
+    cls.keys_src = (REPO / "openpilot" / "common" / "params_keys.h").read_text(encoding="utf-8")
+    m = re.search(r"self\.items = \[(.*?)\]", cls.src, re.S)
+    cls.items = m.group(1) if m else ""
+
+  def rows(self):
+    """(attribute, title, param) for every toggle / multi-button row the panel builds."""
+    out = []
+    for m in re.finditer(r"self\.(\w+) = (?:toggle_item_sp|multiple_button_item_sp)\(\s*tr\(\"([^\"]+)\"\)", self.src):
+      tail = self.src[m.end():m.end() + 400]
+      hits = re.findall(r'param="(\w+)"', tail)
+      self.assertTrue(hits, f"{m.group(1)} row has no param= (title -> param broken)")
+      out.append((m.group(1), m.group(2), hits[0]))
+    return out
+
+  # The one row the panel never hides (it has no visibility write at all, and never had one).
+  ALWAYS_VISIBLE = {"Drive Mode Personality"}
+
+  def test_every_row_resolves_title_param_attribute(self):
+    rows = self.rows()
+    self.assertEqual(12, len(rows), [r[1] for r in rows])   # 11 toggles + the 3-way tuning row
+    for attr, title, param in rows:
+      self.assertIn(f"self.{attr}", self.items, f"{title}: not in self.items")
+      self.assertRegex(self.keys_src, r'\{"' + param + r'", ', f"{title}: {param} is not a registered key")
+      if title not in self.ALWAYS_VISIBLE:
+        self.assertIn(f"self.{attr}.set_visible(", self.src, f"{title}: no visibility write")
+
+  def test_the_two_hidden_rows_are_still_wired(self):
+    """Hiding must not be done by deleting the row: both retired/inert rows stay in the panel and keep their key."""
+    by_param = {param: (attr, title) for attr, title, param in self.rows()}
+    self.assertIn("HyundaiLongitudinalTuning", by_param)
+    self.assertIn("HyundaiFca11StopHoldClutch", by_param)
+
+
 if __name__ == "__main__":
   unittest.main()
