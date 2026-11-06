@@ -244,7 +244,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opend
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
-@@ -0,0 +1,810 @@
+@@ -0,0 +1,834 @@
 +"""
 +0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
 +
@@ -1046,6 +1046,30 @@ new file mode 100644
 +    rec = _hold(b, 5, start=f, brake_pressed=True)
 +    self.assertEqual(NONE, rec[-1][2], "the brake press must clear the latch")
 +    self.assertFalse(b._hold_expired)
++
++  def test_l2_the_brake_clears_the_latch_on_the_FIRST_brake_frame(self):
++    """N2 (Opus re-review, D2): 'clear the latch one frame later' SURVIVED 25/25 - test_f and test_l only look at the
++    state AFTER the press (2 and 5 frames in), so an off-by-one in the clear went unseen.
++
++    The law clears on the very frame `CS.out.brakePressed` goes true (`_hold_nag_step`, the same frame the counter is
++    reset on). One frame at 50 Hz of a PERMANENT red "BRAKES RELEASED / PRESS BRAKE PEDAL" - and of the enable strip
++    that goes with it - while the driver's foot is ALREADY on the brake is one frame of the wrong instruction, so this
++    pins the FIRST frame and nothing later.
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)                                   # 126 s -> expiry at 120 s
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    self.assertTrue(b._hold_expired)
++    # ONE frame with the brake down
++    rec = _hold(b, 1, start=12600, brake_pressed=True)
++    self.assertEqual(1, len(rec), "activity: exactly one frame must be driven")
++    self.assertEqual([12600], [f for f, _s, _n in rec])
++    self.assertEqual(NONE, rec[0][2], "the FIRST brake frame must already read NONE (a one-frame-late clear fails here)")
++    self.assertFalse(b._hold_expired, "the FIRST brake frame must already clear the latch")
++    # and it is cleared for good: the next frames cannot resurrect it off the counter (the count was already 0)
++    for nag in (n for _f, _s, n in _hold(b, 5, start=12601, brake_pressed=True)):
++      self.assertEqual(NONE, nag, "the latch must not come back on the frames after the press")
 +
 +  def test_m_the_latch_lands_on_the_6000th_armed_frame_under_deployed(self):
 +    """Off-by-one under the deployed config: 5999 armed sent frames in, the disengage arrives at FINAL; at 6000 it
