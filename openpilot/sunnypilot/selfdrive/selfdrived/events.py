@@ -277,6 +277,27 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
                         AudibleAlert.warningImmediate, 3.),
   },
 
+  # fork (0041): the standstill HOLD COUNTDOWN. The car is being held stopped by ESC pressure + a live clutch torque;
+  # the hold is NOT a parking brake, so after FCA11_HOLD_NAG_SOFT_S the driver is told to put a foot on the brake, and
+  # after FCA11_HOLD_NAG_LOUD_S the nag becomes loud and re-chimes every FCA11_HOLD_NAG_REPEAT_S. NOTHING HERE CAPS THE
+  # HOLD: the brake command keeps flowing and the hold stays on the wire until the driver brakes / shifts / disengages.
+  # Raised from CarStateSP.holdNag (opendbc half: Fca11LongBrake.hold_nag, a pure observer of the SENT level).
+  #   soft - LOW, silent, small: a notice, never in the way of steering.
+  #   loud - HIGH (below BRAKE NOW's HIGHEST so a real brake fault still wins), audible, 3 s at the head of each
+  #          repeat period, then back to the soft banner for the rest of it.
+  EventNameSP.fca11HoldNagSoft: {
+    ET.WARNING: Alert("Stopped - press brake to keep holding",
+                      "FCA11 has held this stop for over 2 minutes",
+                      AlertStatus.normal, AlertSize.small, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  EventNameSP.fca11HoldNagLoud: {
+    ET.WARNING: Alert("Press the brake to keep holding",
+                      "FCA11 can only hold this stop for so long - take the brake",
+                      AlertStatus.critical, AlertSize.mid, Priority.HIGH, VisualAlert.none,
+                      AudibleAlert.warningSoft, 2.),
+  },
+
   EventNameSP.bigModelReady: {
     ET.PERMANENT: Alert(
       "Big Model Ready",

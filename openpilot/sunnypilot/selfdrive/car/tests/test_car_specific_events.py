@@ -163,3 +163,52 @@ class TestFca11SuperviseStopRemoved:
     # the enum ordinal stays reserved in custom.capnp (the log keeps the flag); only the alert dict entry is gone
     from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
     assert EventNameSP.fca11SuperviseStop not in EVENTS_SP
+
+
+class TestFca11HoldNagEvents:
+  """fork (0041): the standstill HOLD COUNTDOWN. CarStateSP.holdNag (0 none / 1 soft / 2 loud) sits BETWEEN the existing
+  alerts: brakeNow still wins, the nag replaces stopComplete while it is up, and stopComplete still covers every hold
+  shorter than the soft threshold - so the screen never shows two hold banners at once."""
+
+  def _run(self, hold_nag=0, brake_now=False, stop_complete=False, armed=True):
+    CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
+                         openpilotLongitudinalControl=True)
+    CP_SP = SimpleNamespace(enableGasInterceptor=True, fca11Brake=armed)
+    CS_SP = SimpleNamespace(brakeNow=brake_now, stopComplete=stop_complete, superviseStop=False, holdNag=hold_nag,
+                            fca11Unavailable=False, fca11CameraBraking=False, fca11Divergence=False)
+    CS = SimpleNamespace(vEgo=0., buttonEvents=[], cruiseState=SimpleNamespace(nonAdaptive=False))
+    return CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, Events(), True)
+
+  def test_soft_and_loud_are_raised(self):
+    soft = self._run(hold_nag=1, stop_complete=True)
+    assert soft.has(EventNameSP.fca11HoldNagSoft)
+    assert not soft.has(EventNameSP.fca11HoldNagLoud)
+    loud = self._run(hold_nag=2, stop_complete=True)
+    assert loud.has(EventNameSP.fca11HoldNagLoud)
+    assert not loud.has(EventNameSP.fca11HoldNagSoft)
+
+  def test_the_nag_replaces_stop_complete_and_brake_now_still_wins(self):
+    assert not self._run(hold_nag=1, stop_complete=True).has(EventNameSP.fca11StopComplete)
+    fault = self._run(hold_nag=2, stop_complete=True, brake_now=True)
+    assert fault.has(EventNameSP.fca11BrakeNow)
+    assert not fault.has(EventNameSP.fca11HoldNagLoud)
+    # below the soft threshold nothing changes: the existing hand-off banner is still the one that shows
+    assert self._run(hold_nag=0, stop_complete=True).has(EventNameSP.fca11StopComplete)
+
+  def test_nothing_when_the_feature_is_off(self):
+    for nag in (1, 2):
+      ev = self._run(hold_nag=nag, armed=False)
+      assert not ev.has(EventNameSP.fca11HoldNagSoft) and not ev.has(EventNameSP.fca11HoldNagLoud)
+
+  def test_alert_definitions(self):
+    from openpilot.selfdrive.selfdrived.events import ET
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
+    soft = EVENTS_SP[EventNameSP.fca11HoldNagSoft][ET.WARNING]
+    loud = EVENTS_SP[EventNameSP.fca11HoldNagLoud][ET.WARNING]
+    # the nag NEVER blocks: both are ET.WARNING (nothing disengages), the loud one is louder and higher, and it is
+    # audible where the soft one is silent.
+    assert loud.priority > soft.priority
+    assert loud.audible_alert != soft.audible_alert
+    assert soft.audible_alert == 0
+    assert "press brake" in soft.alert_text_1.lower()
+    assert loud.priority < EVENTS_SP[EventNameSP.fca11BrakeNow][ET.PERMANENT].priority   # a real fault outranks a nag
