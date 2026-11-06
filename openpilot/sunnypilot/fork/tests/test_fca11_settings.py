@@ -641,6 +641,12 @@ def _eighteen_clause(desc):
   return sent
 
 
+def _num(x):
+  """The decimal FORK row 141 writes for an ask: -3.0 -> '3.0', -3.62 -> '3.62', -5.0 -> '5.0'."""
+  s = f"{abs(x):.2f}".rstrip("0")
+  return s + "0" if s.endswith(".") else s
+
+
 def _sentences(desc):
   return [s for s in re.split(r"(?<=\.)\s+", desc) if s.strip()]
 
@@ -843,6 +849,9 @@ class TestBrakeLawMatrix(unittest.TestCase):
       self.assertIn("steps like the OLD law", clause, row)
       self.assertIn(f"{fl.HYUNDAI_FCA11_LONG_RATE_STEP} LSB per sent frame", clause, row)
       self.assertIn("capped at the wire limit", clause, row)
+      # No other level figure belongs on screen: 1 (the ramp's opening) and 4 (the step) are the only LSB numbers
+      # that hold for EVERY ask - "31 LSB" or "46 LSB" would be true only for some (R6's defect class).
+      self.assertLessEqual({int(n) for n in re.findall(r"(\d+)\s*LSB\b", clause)}, {1, 4}, row)
       self.assertNotIn("even a hard ask is ramped in rather than stepped", clause, f"{row}: the false clause is back")
 
   def test_the_on_screen_clause_names_no_time(self):
@@ -859,6 +868,45 @@ class TestBrakeLawMatrix(unittest.TestCase):
         self.assertIsNone(re.search(r"\d\s*ms\b", clause),
                           f"{row} at {combo}: a millisecond figure on screen must hold for EVERY ask, and none does "
                           f"- the table belongs in FORK row 141\n{clause}")
+
+  def test_the_fork_row_quotes_the_measured_table(self):
+    """R6 (Opus re-review #4): the measured table lives in FORK row 141 and must BE the measurement.
+
+    R5's row said "full scale at 140 ms" (the 46 LSB cap is reached at 220 ms) and nothing read the row, so M4
+    ("within 140 ms" -> "within 60 ms") survived. This reads row 141 and requires every number it quotes - the ramp
+    time, the whole emergency table, the wire cap - to be what `setup_interfaces` + `Fca11LongBrake` measures right
+    now, so a changed time OR a swapped level dies by value. The two overreaches R5 also carried ("The three rows
+    say exactly that", and the test "fails if the rendered sentence and the wire disagree") must stay out: the rows
+    state the clause qualitatively and this file's own assertions are named above."""
+    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_MAX_DEC
+    found = [ln for ln in (REPO / "FORK.md").read_text().splitlines() if ln.startswith("| 141 |")]
+    self.assertEqual(1, len(found), f"FORK.md must have exactly one row 141, found {len(found)}")
+    row = found[0]
+    dt_ms = int(round(fl.FCA11_SHAPE_SENT_DT * 1000))
+
+    def _reached(ask, level):
+      frames = [lv for lv, _ in _sent_levels(0, 1, 0, ask)]
+      self.assertEqual(sorted(frames), frames, f"the {ask} level must not fall: {frames[:20]}")
+      return next((i * dt_ms for i, lv in enumerate(frames) if lv >= level), None), frames[-1]
+
+    t20, _ = _reached(-2.8, 20)
+    self.assertIsNotNone(t20, "the -2.8 ask must reach 20 LSB")
+    self.assertIn(f"−2.8 reaches 20 LSB at {t20} ms", row, "the ramp time in the row must be the measured one")
+    t24, l24 = _reached(-2.8, 24)
+    self.assertIn(f", {l24} at {t24} ms", row, "the second ramp number in the row must be the measured one")
+
+    for ask in (-3.0, -3.5, -3.62, -4.0, -4.5, -5.0, -6.0):
+      frames = [lv for lv, _ in _sent_levels(0, 1, 0, ask)]
+      final = frames[-1]
+      t_final = next(i * dt_ms for i, lv in enumerate(frames) if lv >= final)
+      self.assertIn(f"−{_num(ask)} → {final} at {t_final} ms", row,
+                    f"row 141's {ask} entry must be the measured one ({final} LSB at {t_final} ms)")
+    self.assertIn(f"{HYUNDAI_FCA11_LONG_MAX_DEC} LSB", row, "the row must name the wire cap by its value")
+
+    for overreach in ("full scale", "within 140 ms", "The three rows say exactly that",
+                      "fails if the rendered sentence and the wire disagree"):
+      self.assertNotIn(overreach, row, f"row 141 must not carry the retracted claim {overreach!r}")
 
   def test_the_braking_off_sentence_never_appears_with_braking_on(self):
     """N7 (Opus): the Shadow row's Braking-OFF branch must be unreachable while Braking is ON. The `if True:` form
