@@ -102,6 +102,7 @@ class Rig:
     self.mads = ModularAssistiveDrivingSystem(self.sd)
     self.transitions = []
     self._last_cs_sp = None
+    self.cs_sp_updates = 0        # how many carStateSP SAMPLES the rig has delivered (a skip does not advance it)
     self._cs_prev = CS_prev
 
   # -- inputs -----------------------------------------------------------------------------------------------------
@@ -146,6 +147,7 @@ class Rig:
       cs_sp = self._last_cs_sp
     else:
       cs_sp = self._last_cs_sp = self._cs_sp(hold_nag, brake_now, stop_complete)
+      self.cs_sp_updates += 1
 
     ev_sp = self.car.update(C, cs_sp, self.events, long_active=self.sd.enabled)
 
@@ -386,17 +388,27 @@ def test_pcm_disable_is_written_on_every_latched_frame(rig):
   the car layer the same `holdNag == 4` sample twice (or more) while the main machine is already disabled."""
   r = rig()
   _engage_both(r)
+  samples = r.cs_sp_updates
   out = r.step(4)
   assert out["pcm_disable"] is True, "the expiry frame must write it"
   # five more latched frames, THREE of them with NO carStateSP update at all (a stale, repeated message)
+  trace = []
   for i, skip in enumerate((False, True, True, False, True)):
+    before = r.cs_sp_updates
     out = r.step(4, skip_cs_sp=skip)
     assert out["pcm_disable"] is True, \
       f"latched frame {i} (skipped carStateSP={skip}) MUST still write pcmDisable: {out}"
     assert out["main"] == 'disabled'
-  # and the frame that carries a fresh ENABLE request while the CS_SP is skipped is still refused
+    # a "skip" really is the same SubMaster sample, not a freshly built equal one: no new carStateSP arrived
+    assert (r.cs_sp_updates == before) is skip, f"frame {i}: skip={skip} but carStateSP updates moved"
+    trace.append(out["pcm_disable"])
+  assert trace == [True] * 5, trace
+  # and a frame that carries a fresh ENABLE request on a stale CS_SP is still refused, with the write still there
+  before = r.cs_sp_updates
   out = r.step(4, skip_cs_sp=True, engage=True)
+  assert r.cs_sp_updates == before, "this frame must carry the stale sample"
   assert out["main"] == 'disabled' and out["pcm_disable"] is True, out
+  assert r.cs_sp_updates - samples == 3, "activity: 3 fresh samples in 6 latched frames, 3 stale repeats"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
