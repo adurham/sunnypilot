@@ -167,10 +167,11 @@ class HyundaiSettings(BrandSettings):
     # fork (0042-Z): Gas Rise Lag - a rise-only first-order lag on the accel ask; pedal on, offroad only.
     rise_state = gas_rise_lag_toggle_state(pedal_raw, offroad)
     self.gas_rise_lag_toggle.action_item.set_enabled(rise_state.enabled)
-    rise_desc = tr("Slows how fast a GAS request is applied (about 0.6 s), so small planner corrections arrive as a " +
+    rise_desc = tr("Slows how fast a GAS request is applied (about 0.45 s), so small planner corrections arrive as a " +
                    "smooth build instead of a blip. Lifting off is NEVER delayed: a falling request reaches the " +
-                   "pedal on the same frame, and the car is never asked for more acceleration than the planner " +
-                   "asked for. Requires the comma pedal. Takes effect at the next ignition.")
+                   "pedal on the same frame, and the pedal never sits above where the same request would put it " +
+                   "without this. A launch on a ramped request gives up about 0.1-0.15 s to 1 m/s. Requires the comma " +
+                   "pedal. Takes effect at the next ignition.")
     if rise_state.visible and not offroad:
       rise_desc = offroad_hint + rise_desc
     self.gas_rise_lag_toggle.set_description(rise_desc)

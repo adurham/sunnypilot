@@ -270,10 +270,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // OFF (the default) = the deployed pedal law, byte for byte.
     {"HyundaiPedalDeliveryLaw", {PERSISTENT | BACKUP, BOOL, "0"}},
     // fork (0042-Z rise-lag): rise-only first-order lag on the accel ask ahead of the pedal law (lane Y: the small gas
-    // moves in NORMAL are real 1.3-2 s planner asks, so only the ASK can smooth them). Rises are slowed (tau 0.6 s);
-    // falls pass through unchanged, so lifting off is never delayed. Inert unless HyundaiGasInterceptor is armed
-    // (opendbc setup_interfaces). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
-    // OFF (the default) = the deployed pedal path, byte for byte.
+    // moves in NORMAL are real 1.3-2 s planner asks, so only the ASK can smooth them). Rises are slowed (tau 0.45 s);
+    // falls pass through unchanged, so lifting off is never delayed, and the pedal never sits above where the unlagged
+    // law would put it. Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
+    // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal path, byte for byte.
     {"HyundaiGasRiseLag", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
