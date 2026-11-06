@@ -1,0 +1,383 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -977,6 +977,50 @@
+ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
+ FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
+ FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
++
++# *** 0041-N: STANDSTILL HOLD COUNTDOWN + ESCALATING DRIVER NAG (owner decision, 2026-11-05) ***
++# The clutch cannot be opened without the owner's foot (the pedal switch is the TCU input; creep-off only latches it), so
++# a standstill hold is openpilot holding the car with ESC pressure + a live clutch torque. That is safe but it is NOT a
++# parking brake: it needs a bound and a nag. MEASURED (parent, drives 195-197): the longest real hold is 98.9 s and the
++# longest per-segment hold at level 30 is 60 s (drive 197 seg 9) - no ESC fault and no FCA_ACK loss during a plain hold,
++# and no cap exists anywhere in this file or in the panda. So the numbers below are the OWNER's, not a plant limit:
++#   soft 120 s  "Stopped - press brake to keep holding", LOW, silent, non-blocking;
++#   loud 180 s  HIGH, audible, and PULSED 3 s in every 30 s after that so the chime repeats without the banner ever
++#               leaving the screen (between pulses the soft banner stays up).
++# THE HOLD IS NEVER RELEASED ON EXPIRY. Expiry only escalates the alert. A released hold in D lets the car creep or
++# roll; the existing release paths (driver brake, gear != D, driver gas, disengage) are unchanged and are the ONLY ways
++# out. This block is a pure OBSERVER of the sent level: it writes one counter and one published state, never the level,
++# the cap, the rate gate, the ramp or any other law state - so the wire bytes are unchanged by construction.
++# COUNTING UNIT: SENT frames (20 ms each: controller 100 Hz / FCA11_SEND_EVERY == 2), NOT wall clock. The sent stream is
++# exactly what the ESC is holding on, it is reproducible frame-for-frame in a replay (this class's other timers use
++# time.monotonic(), which no replay can age), and a frame that was never sent cannot age the hold.
++FCA11_HOLD_NAG_SENT_HZ = 50.0        # SENT frames per second (controller 100 Hz, one sent frame per FCA11_SEND_EVERY)
++FCA11_HOLD_NAG_MIN_LSB = 20          # LSB: the hold level that arms the countdown (~0.20 g of held pressure)
++FCA11_HOLD_NAG_SOFT_S = 120.0        # s of CONTINUOUS >= 20 LSB hold at standstill before the soft banner
++FCA11_HOLD_NAG_LOUD_S = 180.0        # s before the loud (HIGH + audible) alert
++FCA11_HOLD_NAG_REPEAT_S = 30.0       # s: the loud alert re-chimes on this period after FCA11_HOLD_NAG_LOUD_S
++FCA11_HOLD_NAG_LOUD_PULSE_S = 3.0    # s the loud state is held inside each repeat period (the soft banner fills the gap)
++
++# The three published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud).
++FCA11_HOLD_NAG_NONE = 0
++FCA11_HOLD_NAG_SOFT = 1
++FCA11_HOLD_NAG_LOUD = 2
++
++
++def hold_nag_level(frames: int) -> int:
++  """0041-N: the pure countdown state for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
++
++  0 below FCA11_HOLD_NAG_SOFT_S, 1 from there, 2 from FCA11_HOLD_NAG_LOUD_S and for FCA11_HOLD_NAG_LOUD_PULSE_S at the
++  start of every FCA11_HOLD_NAG_REPEAT_S period after it (the rest of the period falls back to 1). Pure: no state, so
++  the escalation is testable on its own and cannot drift from the counter.
++  """
++  t = max(0, int(frames)) / FCA11_HOLD_NAG_SENT_HZ
++  if t < FCA11_HOLD_NAG_SOFT_S:
++    return FCA11_HOLD_NAG_NONE
++  if t < FCA11_HOLD_NAG_LOUD_S:
++    return FCA11_HOLD_NAG_SOFT
++  return FCA11_HOLD_NAG_LOUD if (t - FCA11_HOLD_NAG_LOUD_S) % FCA11_HOLD_NAG_REPEAT_S < FCA11_HOLD_NAG_LOUD_PULSE_S else FCA11_HOLD_NAG_SOFT
++
+ 
+ 
+ def stop_hold_enabled(CP_SP) -> bool:
+@@ -1897,6 +1941,11 @@
+     self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
+     # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
+     self.stop_hold_blockers: dict[str, int] = {}
++    # 0041-N: the standstill hold countdown. `_nag_frames` counts CONTINUOUS SENT frames that put a level
++    # >= FCA11_HOLD_NAG_MIN_LSB on the wire while the car is held at standstill; `hold_nag` is the published state
++    # (0 none / 1 soft / 2 loud) the superproject turns into an alert. Neither is ever read by the law.
++    self._nag_frames = 0
++    self.hold_nag = FCA11_HOLD_NAG_NONE
+     self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
+     # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
+     # throttle (see sub_bite_gate). A counter only - it never feeds the law.
+@@ -2153,6 +2202,7 @@
+       self._noresp_cmd_since = None
+       self._hold_lost_armed = False
+       self._brake_now_clear_since = None
++      self._hold_nag_step(CS, frame, 0)   # 0041-N: a disabled law holds nothing, so the countdown is not running
+       return
+     now_us = time.monotonic() * 1e6
+     gas = bool(CS.out.gasPressed)
+@@ -2242,6 +2292,9 @@
+       self.brake_now = False
+       self.brake_now_reason = ""
+       self.low_speed_alert = False
++    # 0041-N: the hold countdown. LAST, so it sees this frame's published level and the final availability state; it
++    # only writes `_nag_frames` / `hold_nag` - the level, the cap and the release paths above are already decided.
++    self._hold_nag_step(CS, frame, dec_cmd)
+ 
+   def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
+     """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
+@@ -2531,6 +2584,34 @@
+       self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
+     return want
+ 
++  def _hold_nag_step(self, CS, frame: int, dec_cmd: int) -> int:
++    """0041-N: the standstill hold countdown. Called on EVERY controller frame from _alerts() with the frame index and
++    the level the law commanded this frame.
++
++    Advance the clock only on a SENT frame (`frame % FCA11_SEND_EVERY == 0` - the only slot the law puts 0x38D on the
++    wire) at >= FCA11_HOLD_NAG_MIN_LSB while we are holding the car stopped; a SENT frame below the level does not
++    advance it and does not reset it (a dip from 30 to 7 mid-hold is still the same hold). Reset on anything that ends
++    the hold the timer is about: the car moves / standstill is lost, the DRIVER takes the brake (the nag exists to hand
++    off to exactly that), gear leaves D, driver gas, the panda marks the law unavailable, or we stop actuating (a
++    released hold is not a hold - and the next one is a new episode with a new countdown). NOTHING here touches the
++    level: expiry only changes the return value.
++    """
++    if not self.enabled:
++      self._nag_frames = 0
++      self.hold_nag = FCA11_HOLD_NAG_NONE
++      return FCA11_HOLD_NAG_NONE
++    holding = bool(self._actuating and getattr(CS.out, "standstill", False) and
++                   not bool(CS.out.brakePressed) and not bool(CS.out.gasPressed) and
++                   CS.out.gearShifter == structs.CarState.GearShifter.drive and not self.fca11_unavailable)
++    if not holding:
++      self._nag_frames = 0
++      self.hold_nag = FCA11_HOLD_NAG_NONE
++      return FCA11_HOLD_NAG_NONE
++    if frame % FCA11_SEND_EVERY == 0 and dec_cmd >= FCA11_HOLD_NAG_MIN_LSB:
++      self._nag_frames += 1
++    self.hold_nag = hold_nag_level(self._nag_frames)
++    return self.hold_nag
++
+   def _passive_frame(self, CS, frame: int) -> list[CanData]:
+     """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+@@ -3629,6 +3710,9 @@
+       # 0041: and the gating timers, so a disable is a clean start.
+       self._noresp_cmd_since = None
+       self._brake_now_clear_since = None
++      # 0041-N: and the hold countdown - a disabled law holds nothing.
++      self._nag_frames = 0
++      self.hold_nag = FCA11_HOLD_NAG_NONE
+       self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames,
+                      self.stop_hold_frames, self.stop_hold_blockers)
+       self.stop_hold_blockers = {}
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -702,6 +702,10 @@
+     CS.fca11_supervise_stop = bool(self.fca11_brake.supervise_stop)
+     CS.fca11_stop_complete = bool(self.fca11_brake.stop_complete)
+     CS.fca11_brake_now = bool(self.fca11_brake.brake_now)
++    # 0041-N: publish the standstill hold countdown (0 none / 1 soft / 2 loud). A pure observer of the SENT level - it
++    # never changes a byte on the wire; CarStateExt copies it into CarStateSP.holdNag and car_specific.py raises the
++    # two escalating alerts. 0 on every frame of a drive whose holds are shorter than FCA11_HOLD_NAG_SOFT_S.
++    CS.fca11_hold_nag = int(self.fca11_brake.hold_nag)
+     # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
+     # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
+     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -293,6 +293,9 @@
+     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
+     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
+     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
++    # 0041-N: the standstill hold countdown (0 none / 1 soft / 2 loud). Same 1-frame pattern and same `armed` gate, so
++    # the field is exactly "this alert is up right now"; car_specific.py raises the two escalating alerts.
++    ret_sp.holdNag = int(getattr(self, "fca11_hold_nag", 0)) if armed else 0
+     # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
+     # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
+     # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -219,6 +219,11 @@
+   superviseStop: bool = auto_field()
+   stopComplete: bool = auto_field()
+   brakeNow: bool = auto_field()
++  # 0041-N: the standstill hold countdown, 0 none / 1 soft (>= FCA11_HOLD_NAG_SOFT_S) / 2 loud (>= FCA11_HOLD_NAG_LOUD_S,
++  # pulsed FCA11_HOLD_NAG_LOUD_PULSE_S in every FCA11_HOLD_NAG_REPEAT_S period after it). Written by the controller from
++  # Fca11LongBrake.hold_nag (a pure observer of the SENT level - the wire is untouched) and read by car_specific.py ->
++  # events.py. Coupled with custom.capnp CarStateSP.holdNag (@21).
++  holdNag: int = auto_field()
+   # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
+   # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
+   # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+new file mode 100644
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+@@ -0,0 +1,207 @@
++"""
++0041: the standstill HOLD COUNTDOWN + escalating driver nag (fca11_long.py).
++
++The clutch cannot be opened without the driver's foot, so a standstill hold is openpilot holding the car with ESC
++pressure and a live clutch torque. It is bounded by an ALERT, never by a release: after FCA11_HOLD_NAG_SOFT_S the
++driver is told to put a foot on the brake, after FCA11_HOLD_NAG_LOUD_S the nag is loud and re-chimes every
++FCA11_HOLD_NAG_REPEAT_S, and THE HOLD STAYS ON THE WIRE. A released hold in D lets the car creep or roll.
++
++Every stream test here drives the REAL controller (Fca11LongBrake.update) with a CarState double, exactly as the
++stop-hold lane's tests do, and reads the state the superproject publishes (CarStateSP.holdNag) plus the level that
++actually went out on the wire.
++"""
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _real_camera_frame
++
++CAM = _real_camera_frame(alive=3)
++NONE, SOFT, LOUD = (int(getattr(fl, "FCA11_HOLD_NAG_NONE", 0)), int(getattr(fl, "FCA11_HOLD_NAG_SOFT", 1)),
++                     int(getattr(fl, "FCA11_HOLD_NAG_LOUD", 2)))
++# SENT frames per second is the counting unit: 100 Hz controller / FCA11_SEND_EVERY == 2.
++SENT_PER_S = float(getattr(fl, "FCA11_HOLD_NAG_SENT_HZ", 50.0))
++
++
++def _cp_sp(fca11=True):
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = fca11
++  cp_sp.enableGasInterceptor = True
++  return cp_sp
++
++
++def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None):
++  """Run n controller frames of a steady standstill hold. Returns [(frame, wire level, hold_nag)] for SENT frames.
++
++  `ask` is the planner ask; at a standstill a gentle ask (-0.30) holds ~8 LSB (the band floor) and a firm one (-2.0)
++  holds 30 LSB, which is the regime the countdown is about. The camera is fresh on every frame.
++  """
++  if record is None:
++    record = []
++  for f in range(start, start + n):
++    cs = _CS(v_ego=v, cam=(0, CAM), standstill=standstill, a_ego=-1.5 if ask < 0 else 0.3,
++              brake=brake_pressed, gear=gear or structs.CarState.GearShifter.drive)
++    cs.fca11_wheel_max_kph = v * 3.6
++    sends = brake.update(_cc(ask), cs, f)
++    if record is not None:
++      # getattr: on the pre-0041 tree the state does not exist, and the behavioural tests must then fail on the VALUE
++      # (it never nags) rather than on an AttributeError - the same standard lane V was reviewed against.
++      record.append((f, sends, int(getattr(brake, "hold_nag", NONE))))
++  return record
++
++
++def _wire(record):
++  """[(frame, bytes)] of every 0x38D actually sent, in order."""
++  out = []
++  for f, sends, _nag in record:
++    out.extend((f, bytes(s.dat)) for s in sends if s.address == fl.FCA11_ADDR)
++  return out
++
++
++def _levels(record):
++  return [(f, fl._get_bits(dat, 8, 8)) for f, dat in _wire(record)]
++
++
++def _first_nag(record, want):
++  for f, _sends, nag in record:
++    if nag == want:
++      return f
++  return None
++
++
++class TestCountdownShape(unittest.TestCase):
++  """The pure escalation: X1 soft, X2 loud, then a 3 s loud pulse at the head of every 30 s period."""
++
++  def test_named_constants(self):
++    self.assertEqual(120.0, fl.FCA11_HOLD_NAG_SOFT_S)
++    self.assertEqual(180.0, fl.FCA11_HOLD_NAG_LOUD_S)
++    self.assertEqual(30.0, fl.FCA11_HOLD_NAG_REPEAT_S)
++    self.assertEqual(20, fl.FCA11_HOLD_NAG_MIN_LSB)
++    self.assertEqual((NONE, SOFT, LOUD), (0, 1, 2))
++
++  def test_soft_then_loud_then_repeat(self):
++    f = lambda s: int(round(s * SENT_PER_S))     # noqa: E731
++    self.assertEqual(NONE, fl.hold_nag_level(0))
++    self.assertEqual(NONE, fl.hold_nag_level(f(119.98)))
++    self.assertEqual(SOFT, fl.hold_nag_level(f(120.0)))
++    self.assertEqual(SOFT, fl.hold_nag_level(f(179.98)))
++    self.assertEqual(LOUD, fl.hold_nag_level(f(180.0)))
++    self.assertEqual(LOUD, fl.hold_nag_level(f(182.9)))
++    self.assertEqual(SOFT, fl.hold_nag_level(f(183.1)))      # the banner stays up, the chime stops
++    self.assertEqual(SOFT, fl.hold_nag_level(f(209.9)))
++    self.assertEqual(LOUD, fl.hold_nag_level(f(210.0)))      # next repeat period
++    self.assertEqual(SOFT, fl.hold_nag_level(f(213.1)))
++    self.assertEqual(LOUD, fl.hold_nag_level(f(240.0)))
++    self.assertEqual(NONE, fl.hold_nag_level(-5))             # never negative
++
++
++class TestCounterOnTheRealClass(unittest.TestCase):
++  """The counter is armed by the SENT level, reset by anything that ends the hold, and never touches the wire."""
++
++  def test_a_the_lsb_arming_gate_is_what_starts_the_clock(self):
++    """The SAME 210 s standstill hold never nags when the arming level is above what the law sends, and nags when it is
++    at or below it: the clock is armed by the SENT level, not by "we are stopped"."""
++    real = fl.FCA11_HOLD_NAG_MIN_LSB
++    try:
++      fl.FCA11_HOLD_NAG_MIN_LSB = 31          # one LSB above the 30 LSB ceiling the wire allows
++      rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(210 * 100))
++      levels = [lv for _f, lv in _levels(rec)]
++      self.assertTrue(levels, "the law must still be holding")
++      self.assertEqual(30, max(levels))
++      self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++
++      fl.FCA11_HOLD_NAG_MIN_LSB = 30          # the level it actually sends
++      rec2 = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(121 * 100))
++      self.assertEqual(SOFT, rec2[-1][2])
++    finally:
++      fl.FCA11_HOLD_NAG_MIN_LSB = real
++
++  def test_b_a_firm_standstill_hold_nags_soft_at_120_s_and_loud_at_180_s(self):
++    """The real class, 240 s at 30 LSB: soft on the 6000th sent frame (120.00 s), loud on the 9000th (180.00 s),
++    loud again at 210 s and 240 s - and it is the SENT count, not a wall clock (the frames are fed in a tight loop)."""
++    rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++    levels = [lv for _f, lv in _levels(rec)]
++    self.assertGreaterEqual(max(levels), 20)
++    f_soft = _first_nag(rec, SOFT)
++    f_loud = _first_nag(rec, LOUD)
++    self.assertIsNotNone(f_soft)
++    self.assertIsNotNone(f_loud)
++    # the FIRST soft frame is the first SENT frame at >= 120 s of >= 20 LSB hold: the 6000th such frame has just gone out
++    armed = [(f, lv) for f, lv in _levels(rec) if lv >= fl.FCA11_HOLD_NAG_MIN_LSB]
++    self.assertEqual(6000, sum(1 for f, _lv in armed if f <= f_soft))
++    self.assertEqual(9000, sum(1 for f, _lv in armed if f <= f_loud))
++    louds = [nag for _f, _s, nag in rec if nag == LOUD]
++    self.assertGreaterEqual(len(louds), 3)
++
++  def test_c_motion_ends_the_standstill_and_resets_the_countdown(self):
++    """121 s of hold (nag up), then the car MOVES: the nag drops and the clock restarts from zero, so a further 119 s
++    of hold does not nag. This is the reset, not a pause."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertEqual(SOFT, rec[-1][2])
++    moving = [f for f in range(12100, 12140)]
++    for f in moving:
++      cs = _CS(v_ego=2.0, cam=(0, CAM), standstill=False, a_ego=-1.0)
++      cs.fca11_wheel_max_kph = 7.2
++      brake.update(_cc(-0.31), cs, f)
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    # and the next 119 s of the SAME episode cannot reach the soft threshold
++    rec2 = _hold(brake, int(119 * 100), start=12200)
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec2})
++
++  def test_d_the_driver_brake_takes_over_and_resets_the_countdown(self):
++    """The nag exists to hand the hold to the driver's foot: brakePressed drops it on the same frame and starts a new
++    countdown, so a later hold must run its own full 120 s."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertEqual(SOFT, rec[-1][2])
++    rec_b = _hold(brake, 10, brake_pressed=True, start=12100)
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec_b})
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    rec2 = _hold(brake, int(119.5 * 100), start=12110)
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec2})
++
++  def test_e_expiry_never_releases_the_hold(self):
++    """THE hard rule: at 120 s, at 180 s and 60 s after that the level on the wire is still the full hold. A released
++    hold in D lets the car creep; only the driver's brake / gear / disengage may end it."""
++    rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(245 * 100))
++    by_t = {}
++    sent = 0
++    for f, sends, _nag in rec:
++      for s in sends:
++        if s.address == fl.FCA11_ADDR:
++          sent += 1
++          by_t[sent] = fl._get_bits(s.dat, 8, 8)
++    self.assertGreater(sent, 9000)
++    for t_s in (119.9, 120.0, 130.0, 179.9, 180.0, 200.0, 240.0):
++      idx = int(round(t_s * SENT_PER_S))
++      self.assertEqual(30, by_t[idx], f"level at {t_s} s")
++    # and the law is still SENDING at the end (not a silent stop): the last 100 frames carry a level
++    self.assertEqual(30, by_t[sent])
++
++  def test_f_the_nag_changes_no_wire_byte(self):
++    """Golden stream: the same 240 s hold run twice through the REAL class, once with the escalation neutralised
++    (hold_nag_level pinned to 0). Every 0x38D byte and every frame number must be identical, and the level must not
++    move across the 120 s / 180 s boundaries in the normal run."""
++    real = fl.hold_nag_level
++    try:
++      normal = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++      fl.hold_nag_level = lambda _frames: 0
++      neutral = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++    finally:
++      fl.hold_nag_level = real
++    self.assertEqual(_wire(normal), _wire(neutral))
++    self.assertEqual({SOFT, LOUD}, {nag for _f, _s, nag in normal} - {NONE})
++
++  def test_g_disabled_feature_publishes_nothing(self):
++    """OFF is the deployed path: with fca11Brake off the law never actuates and the published state stays 0."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False))
++    rec = _hold(brake, 400)
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    self.assertEqual([], _wire(rec))
++
++
++if __name__ == "__main__":
++  unittest.main()

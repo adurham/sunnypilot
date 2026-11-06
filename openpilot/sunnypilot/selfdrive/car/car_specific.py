@@ -68,8 +68,17 @@ class CarSpecificEventsSP:
         # already know. The CarStateSP.superviseStop flag stays in the log for analysis; nothing raises an event.
         # The old hand-over alert ("FCA11: Take Over Below 12 km/h") is DELETED with the floors it warned about.
         if self.CP_SP.fca11Brake:
+          # fork (0041): the standstill HOLD COUNTDOWN sits between the two existing alerts. brakeNow still wins (a
+          # real brake fault outranks a nag), the nag replaces stopComplete while it is up (it says the same thing with
+          # the countdown attached), and stopComplete still covers every hold shorter than FCA11_HOLD_NAG_SOFT_S - so
+          # the screen never shows two overlapping hold banners.
+          nag = int(getattr(CS_SP, "holdNag", 0))
           if CS_SP.brakeNow:
             events_sp.add(EventNameSP.fca11BrakeNow)
+          elif nag == 2:
+            events_sp.add(EventNameSP.fca11HoldNagLoud)
+          elif nag == 1:
+            events_sp.add(EventNameSP.fca11HoldNagSoft)
           elif CS_SP.stopComplete:
             events_sp.add(EventNameSP.fca11StopComplete)
 
