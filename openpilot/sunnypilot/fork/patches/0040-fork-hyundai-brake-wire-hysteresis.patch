@@ -1,11 +1,10 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -1119,6 +1119,29 @@
- # (their delivered decel is UNMEASURED on this plant - the law sends them and logs them, nothing else assumes them).
+@@ -1120,7 +1120,30 @@
  FCA11_CONT_PLANT_LSB = (0, 4, 6, 8, 13, 20, 30)
  FCA11_CONT_PLANT_MSS2 = (0.0, 0.654, 0.794, 0.854, 1.144, 1.224, 2.214)
-+
+ 
 +# *** 0040 (lane L, brake slice 1a): THE WIRE QUANTISER HAS HYSTERESIS; THE aEgo TRIM STAYS ON ***
 +# Fable's review of lane J's 0040 (branch fix/brake-commit @ f66a1070) said split it, because the two halves have
 +# different risk. Replayed on the REAL class over the same 23 windows of drive 195/196 (lane-K/replay_k_flags.py,
@@ -29,9 +28,11 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +# command noise below 0.5 LSB produces no level change at all. 0.0 = plain rounding (the pre-0040 behaviour).
 +FCA11_CONT_QHYST_LSB = 1.0
  
- 
++
  def fca11_cont_coast(v_ego_mps: float) -> float:
-@@ -1163,7 +1186,28 @@
+   """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
+   return FCA11_CONT_COAST_C * (1.0 - math.exp(-max(0.0, float(v_ego_mps)) / FCA11_CONT_COAST_TAU))
+@@ -1163,6 +1186,29 @@
    while i < len(L) - 1 and lsb >= L[i]:
      i += 1
    return max(FCA11_TRACK_MIN_SLOPE, (A[i] - A[i - 1]) / (L[i] - L[i - 1]))
@@ -39,7 +40,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +
 +def fca11_cont_qhyst(target: float, last_sent: int) -> int:
 +  """0040: the WIRE quantiser - the integer level for a fractional ``target`` with a one-LSB hysteresis band.
- 
++
 +  The level is held at ``last_sent`` until the target is at least ``FCA11_CONT_QHYST_LSB`` away from it, then it
 +  re-rounds to the nearest integer. ``FCA11_CONT_QHYST_LSB = 0`` reduces this to plain ``int(round())`` (pre-0040).
 +  Hysteresis here, not on the demand: the caller keeps its continuous accumulator, so the level is still a
@@ -51,16 +52,17 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +  # last level for a full band width. This is a property of the physical quantiser (the ESC's weakest actuating level
 +  # is 4 LSB, FCA11_FEEL_FIRST_LSB), not a bucket on the demand, and it keeps `FCA11_CONT_QHYST_LSB = 0` exactly equal
 +  # to plain rounding: int(round(t)) is already 0 for every t in [0, 0.5).
++  # Lane N: the caller floors the TRIMMED sum at 1 LSB whenever the UNTRIMMED target is >= 0.5 LSB (`_cont_level`), so
++  # this snap only ever fires when the DEMAND - not the feedback trim - has fallen below half an LSB.
 +  if float(target) < 0.5:
 +    return 0
 +  if band <= 0.0 or abs(float(target) - float(last_sent)) >= band:
 +    return int(round(float(target)))
 +  return int(last_sent)
-+
+ 
  
  def fca11_cont_gain(personality) -> float:
-   """Personality as a continuous GAIN on the demand - the gas law's exact table and position (PERSONALITY_SCALE_V)."""
-@@ -1842,6 +1886,9 @@
+@@ -1842,6 +1888,9 @@
      self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
      self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
      self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
@@ -70,7 +72,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      # 0034: the stop-hold clutch lane (FCA11_STOP_HOLD_*). Read ONCE, CP_SP only, DEFAULT OFF; never on a disabled
      # instance or the Shadow compute core (whose frames never reach the wire).
      self.stop_hold_clutch = self.enabled and (not self._core) and stop_hold_enabled(CP_SP)
-@@ -2540,6 +2587,11 @@
+@@ -2540,6 +2589,11 @@
        # refuse to guess and leave the actuating frame as it is.
        return brake_sends
      self._dec_last_sent = 0     # the panda's rate reference is this PASSIVE frame now, not the level
@@ -82,7 +84,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      # the wire carried no level: keep the 17c level window and the PLATEAU tracker on the WIRE (a plateau sample at
      # lsb 0 closes the open window and does not qualify - fca11_log.PlateauTracker.sample), so a withheld sub-bite frame
      # can never be logged as a delivered 1-3 LSB plateau.
-@@ -2564,10 +2616,16 @@
+@@ -2564,10 +2618,16 @@
      self._track_reset()
  
    def _track_reset(self) -> None:
@@ -100,7 +102,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _track_ceiling(self, need: float, personality) -> int:
      """0035: the tier cap, or the 30 LSB law ceiling while the need exceeds what the tier cap measurably delivers.
-@@ -2657,7 +2715,11 @@
+@@ -2657,7 +2717,11 @@
        # sub-1-LSB it is NOT reset - that is the continuous start of the next episode, not a new bucket.
        self._track_reset()
      if frame % FCA11_SEND_EVERY != 0:
@@ -113,7 +115,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      v = max(0.0, float(v_kph) / 3.6)
      standstill = bool(getattr(CS.out, "standstill", False))
      need = max(0.0, -float(accel_ask))
-@@ -2674,7 +2736,11 @@
+@@ -2674,7 +2738,11 @@
      # domain - what the pads delivered is the measured net decel MINUS the coast the engine is already providing - and
      # only while there IS a demand to correct (see above). `_shape_sent_n` counts SENT frames that actually carried a
      # level, so the 0.5 s delay is 0.5 s of real braking, not of sitting at 0.
@@ -126,16 +128,46 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
        delivered_b = max(0.0, -float(getattr(CS.out, "aEgo", 0.0)) - fca11_cont_coast(v))
        err = self._track_hist[0] - delivered_b
        ceil_now = float(FCA11_CONT_CEIL_LSB)
-@@ -2682,7 +2748,7 @@
+@@ -2682,10 +2750,15 @@
          self._track_trim += FCA11_TRACK_KI * err * FCA11_SHAPE_SENT_DT
          self._track_trim = max(-FCA11_TRACK_TRIM_DOWN, min(FCA11_TRACK_TRIM_UP, self._track_trim))
      if bn > 0.0:
 -      target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + self._track_trim
-+      target = fca11_cont_lsb(fca11_cont_gain(personality) * bn) + (self._track_trim if FCA11_CONT_TRIM_ENABLED else 0.0)
++      # 0040-nz: the UNTRIMMED demand, in LSB - the feed-forward half of the target. Everything that decides whether this
++      # frame still brakes (the zero-snap in the quantiser, and the floor below) is decided on THIS value; the trim is
++      # added afterwards and may only refine the level.
++      untrimmed = fca11_cont_lsb(fca11_cont_gain(personality) * bn)
++      target = untrimmed + (self._track_trim if FCA11_CONT_TRIM_ENABLED else 0.0)
      else:
        # M4: no demand -> target 0 whatever the held trim says, so the level walks down (no phantom hold) while the
        # trim itself survives the handover for the next real ask.
-@@ -2703,7 +2769,23 @@
++      untrimmed = 0.0
+       target = 0.0
+     # the stop/hold band is a BLEND now: the creep floor (or the standstill hold) fades in over 3->5 km/h instead of
+     # swapping the law at 3 km/h. Only while the demand is a stop demand (bn > 0) - the planner asking to move must
+@@ -2695,6 +2768,21 @@
+       hold = float(fca11_standstill_hold_lsb()) if standstill else float(FCA11_CONT_HOLD_FLOOR_LSB)
+       target = (1.0 - bw) * target + bw * max(target, hold)
+     target = max(0.0, min(float(FCA11_CONT_CEIL_LSB), target))
++    # 0040-nz (lane N): a CORRECTION term must refine a level, never END an episode. The trim is a feedback term on the
++    # level, so while a level is on the wire it may lower it to the weakest actuating step (1 LSB) but not to 0 as long
++    # as the UNTRIMMED demand is still asking for the pads: an untrimmed demand of >= 0.5 LSB is exactly what
++    # `fca11_cont_qhyst` refuses to zero-snap, so the sum is floored at 1 LSB on that same condition. Measured cause of
++    # the 11 isolated zeros in 195/196 (lane L): the trim's down-rail (-0.2 .. -6.0 LSB) walked a 0.37..0.50 LSB target
++    # below the snap, the last level released, the episode closed, `_track_reset()` zeroed the trim and the SAME ask
++    # re-opened at 1 LSB one frame later - a 20 ms brake-off blip on the wire per occurrence.
++    # `_cont_q_last > 0` is the "a level is actually being held" half, and it is NOT cosmetic: a level of 0 has nothing
++    # to refine, and without it the floor also raises the OPENING threshold from 1.0 LSB (the band holds 0 until the
++    # target is a full LSB away) to 0.5 LSB, i.e. this fix would start episodes slice 1a never starts (measured: 5
++    # isolated zeros instead of 1 on the 23 windows). Gated, the opening path is byte-identical to slice 1a and the
++    # only change is that an open episode cannot be ended by the trim. The release path is untouched as well: below
++    # 0.5 LSB the untrimmed demand is not asking for the pads, nothing is floored, and the target walks to 0 as before.
++    if FCA11_CONT_TRIM_ENABLED and untrimmed >= 0.5 and int(self._cont_q_last) > 0:
++      target = max(target, 1.0)
+     rate = FCA11_CONT_JERK * FCA11_SHAPE_SENT_DT / fca11_cont_slope(prev)
+     step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+     if target >= prev:
+@@ -2703,7 +2791,23 @@
        new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
      new_acc = max(0.0, new_acc)
      self._shape_acc = new_acc
@@ -160,7 +192,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      if dec > 0:
        if not self._actuating:
          # M3: the harvest counter is PER EPISODE - it restarts when a new episode opens (a cumulative lifetime count
-@@ -3971,6 +4053,11 @@
+@@ -3971,6 +4075,11 @@
            m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
            sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
            self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
@@ -172,7 +204,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
            self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
            self._note_sent_level(frame, ramp)  # 17c FEEDBACK: a SENT ramp frame is part of the 5 s level window too
          self._actuating = True
-@@ -3985,6 +4072,12 @@
+@@ -3985,6 +4094,12 @@
          # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
          # stays on the last level actually SENT (restored on the send slot above).
          self._dec_last_sent = 0
@@ -189,7 +221,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py b/o
 new file mode 100644
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_brake_commit.py
-@@ -0,0 +1,556 @@
+@@ -0,0 +1,696 @@
 +"""0040 (lane L, brake slice 1a): the WIRE quantiser rounds with hysteresis; the aEgo feedback trim STAYS ON.
 +Owner (2026-11-05), routes 195/196: "Braking is properly linear now. Brake fluttering is bad though ... We
 +don't just tap the brakes 10 times in a second ... tune it based on my typical braking behavior; smoothness for
@@ -742,6 +774,146 @@ new file mode 100644
 +      self.assertEqual(len(seq), frames, f"{start} LSB released in {len(seq)} frames ({(len(seq)) * 20} ms): {seq}")
 +      for a, b in zip(seq, seq[1:]):
 +        self.assertLessEqual(a - b, int(fl.FCA11_CONT_DOWN_STEP_LSB), f"a frame dropped more than 3 LSB: {seq}")
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class Test0040NoTrimClose(unittest.TestCase):
++  """Lane N: the aEgo trim may lower a level to the 1 LSB floor, never to 0, while the UNTRIMMED demand still asks.
++
++  Measured on drive 195/196 (lane-K/replay_k_flags.py, 23 windows): with slice 1a every one of the 11 remaining isolated
++  zeros is the same chain - the trim walks its down-rail (-0.2 .. -6.0 LSB), a demand still at -0.45 .. -1.07 m/s^2 has
++  a 0.37..0.50 LSB target left, the zero-snap releases the last LSB, the episode closes, `_track_reset()` zeroes the
++  trim and the same ask re-opens at 1 LSB one frame later (a 20 ms CmdAct 0->1 edge per blip). The law now decides the
++  snap on the UNTRIMMED demand and floors the sum at 1 LSB on that same condition.
++  """
++
++  # 35 m/s, standard personality, gain 1.0: untrimmed LSB target for each ask (fca11_cont_lsb is the plant inverse; the
++  # coast term is ~0.364 m/s^2 there, so a -0.45 ask leaves only 0.047 m/s^2 above it). 0.71 .. 1.81 LSB spans the
++  # brief's 0.6..3.0 band; -0.45 gives 0.28 LSB, i.e. under the half-LSB snap.
++  ASKS = (-0.52, -0.55, -0.60, -0.70)
++  V = 35.0
++  OPEN = -0.60           # ff 1.20 LSB: the level slice 1a can open from (its 1 LSB band holds 0 until the target is a
++                         # full LSB away, so an untrimmed demand under 1.0 LSB never opens an episode on that tree)
++  BELOW = -0.45          # untrimmed 0.28 LSB: under the half-LSB snap
++
++  @staticmethod
++  def _ff(ask, v=V):
++    """The untrimmed demand in LSB, exactly as `_cont_level` derives it (``v`` is m/s, as `_Drive.run` takes it)."""
++    bn = fl.fca11_cont_brake_need(max(0.0, -float(ask)), float(v))
++    return fl.fca11_cont_lsb(fl.fca11_cont_gain(STD) * bn)
++
++  @staticmethod
++  def _pinned(d, n, ask, trim, v=V, a_ego=0.0):
++    """Run ``n`` frames with the feedback trim PINNED at ``trim`` LSB before every frame (its own integrator still runs
++    inside the frame, so this is the rail, not a frozen law)."""
++    for _ in range(n):
++      d.b._track_trim = float(trim)
++      d.run(1, ask, v=v, a_ego=a_ego)
++    return d
++
++  # ---- (a) -----------------------------------------------------------------------------------------------------------
++  def test_a_positive_untrimmed_demand_never_releases_under_a_down_rail_trim(self):
++    """(a) untrimmed 0.6..3.0 LSB + trim forced to -6 LSB (its down-rail): the level is the 1 LSB FLOOR from the first
++    actuating frame on, it is never 0, and the episode stays open. On the af4cd540 tree the same frames emit 0 and the
++    episode closes (the trim eats the whole target)."""
++    for ask in self.ASKS:
++      ff = self._ff(ask)
++      self.assertTrue(0.6 <= ff <= 3.0, f"ask {ask}: untrimmed demand {ff:.2f} LSB is outside the brief's 0.6..3.0")
++      self.assertLess(ff - 6.0, 0.5, f"ask {ask}: the trim must be able to push the sum under the snap, else vacuous")
++      d = _Drive().run(120, self.OPEN, v=self.V, a_ego=0.0)   # the episode is open at ~1.4 LSB
++      self.assertGreaterEqual(d.wire()[-1], 1, f"ask {ask}: the episode never opened")
++      self._pinned(d, 120, ask, -6.0)
++      lv = d.wire()
++      tail = lv[-40:]
++      self.assertEqual(tail[-1], 1, f"ask {ask}: expected the 1 LSB floor, got {tail[-1]}")
++      self.assertEqual(min(tail), 1, f"ask {ask}: the trim released the level: {tail}")
++      self.assertEqual([b for a, b in zip(lv, lv[1:]) if a and not b], [], f"ask {ask}: a 1 -> 0 release inside the "
++                                                                          f"episode: {lv}")
++      self.assertTrue(d.b._actuating, f"ask {ask}: the episode closed on the trim")
++
++  # ---- (b) -----------------------------------------------------------------------------------------------------------
++  def test_b_below_half_an_lsb_the_release_is_unchanged(self):
++    """(b) untrimmed < 0.5 LSB: nothing is asking for the pads, so the floor is NOT applied and the level walks to 0 and
++    the episode closes - exactly the pre-change behaviour (this test is a guard, it passes on af4cd540 too)."""
++    ff = self._ff(self.BELOW)
++    self.assertLess(ff, 0.5, f"ask {self.BELOW}: untrimmed demand {ff:.2f} LSB is not below the snap")
++    d = _Drive().run(120, self.OPEN, v=self.V, a_ego=0.0)    # open at a level the release has to walk down
++    self.assertGreaterEqual(d.wire()[-1], 1)
++    self._pinned(d, 80, self.BELOW, -6.0)                    # same trim rail, but no demand for the pads
++    lv = d.wire()
++    self.assertEqual(lv[-1], 0, f"a sub-half-LSB demand did not release: {lv[-20:]}")
++    self.assertFalse(d.b._actuating, "the episode is still open at level 0")
++    for a, b in zip(lv, lv[1:]):
++      self.assertLessEqual(a - b, int(fl.FCA11_CONT_DOWN_STEP_LSB), f"a frame dropped more than 3 LSB: {lv}")
++
++  # ---- (c) -----------------------------------------------------------------------------------------------------------
++  def test_c_release_latency_from_a_held_level_is_unchanged(self):
++    """(c) the pinned release latency 8/16/24 -> 10/12/19 sent frames, measured with the trim at its down-rail: the floor
++    is a floor on the TARGET, it must not add a frame to a release (ask 0 => untrimmed 0 => no floor at all)."""
++    expected = {8: 10, 16: 12, 24: 19}
++    for start, frames in expected.items():
++      d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++      d.b._cont_q_bus = d.b._cont_q_last = d.b._dec_last_sent = start
++      d.b._shape_acc = float(start)
++      seq = []
++      for k in range(30):
++        d.b._track_trim = -6.0
++        lvl = d.b._cont_level(0.0, 15.0, _cs15(), 2 * k, STD)
++        d.b._dec_last_sent = lvl        # as the send site does
++        seq.append(lvl)
++        if lvl == 0:
++          break
++      self.assertEqual(seq[-1], 0, f"{start} LSB never released: {seq}")
++      self.assertEqual(len(seq), frames, f"{start} LSB released in {len(seq)} frames, pinned {frames}: {seq}")
++
++  # ---- (d) -----------------------------------------------------------------------------------------------------------
++  def test_d_the_trim_up_rail_never_raises_past_the_panda_gate_and_the_down_rail_stops_at_one_lsb(self):
++    """(d) sign symmetry. +rail: a trim forced to +12 LSB cannot put a frame above the panda's +RATE_STEP over the level
++    it last accepted (the outermost bound). -rail: the same forced trim cannot put the level below the 1 LSB floor."""
++    d = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++    self.assertGreaterEqual(d.wire()[-1], 8)
++    d.run(1, -1.5, v=15.0, a_ego=0.0, brake=True)            # driver-brake veto: the passive close frame carries 0
++    self.assertEqual(d.wire()[-1], 0)
++    self.assertTrue(d.b.blocked_until_resume)
++    d.run(2, -1.5, v=15.0, a_ego=0.0, engaged=False)         # resume edge re-arms
++    over, prev = [], 0
++    for _ in range(30):
++      ref = int(d.b._dec_last_sent)
++      f0 = d.f
++      self._pinned(d, 1, -1.5, 12.0)
++      for f, lvl in d.sent:
++        if f != f0:
++          continue
++        if lvl > ref + fl.HYUNDAI_FCA11_LONG_RATE_STEP:
++          over.append((f, ref, lvl))
++        prev = lvl
++    self.assertEqual(over, [], f"frames above the panda's onset gate with trim +12 (frame, ref, level): {over}")
++    self.assertGreater(prev, 0, "the re-open never produced a level")
++    # the mirror: the same episode re-opened with the trim at -6 must sit on the floor, not on 0.
++    e = _Drive().run(200, -1.5, v=15.0, a_ego=0.0)
++    e.run(1, -1.5, v=15.0, a_ego=0.0, brake=True)
++    e.run(2, -1.5, v=15.0, a_ego=0.0, engaged=False)
++    self._pinned(e, 40, -0.55, -6.0)                         # untrimmed ~2.05 LSB while the trim is at -6
++    self.assertEqual(e.wire()[-1], 1, f"the down rail did not stop at the floor: {e.wire()[-8:]}")
++
++  # ---- (e) -----------------------------------------------------------------------------------------------------------
++  def test_e_band_zero_with_the_trim_on_still_reproduces_the_0037_levels(self):
++    """(e) the slice-1a equivalence pin still holds: band 0 + TRIM ON == the 0038/0039 law's level sequence. The floor is
++    part of the banded quantiser's zero-snap, so the band-0 path stays plain rounding - this is the pin's own golden."""
++    golden = [lv for lv, n in Test0040Corrections.GOLDEN_0037 for _ in range(n)]
++    had = hasattr(fl, "FCA11_CONT_QHYST_LSB")
++    old = getattr(fl, "FCA11_CONT_QHYST_LSB", None)
++    try:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = 0.0
++      self.assertTrue(_trim_live())
++      d = _Drive()
++      for ask, n in ((-0.80, 100), (-1.60, 100), (-2.40, 100), (-1.20, 100)):
++        d.run(n, ask, v=15.0, a_ego=-1.2)
++      self.assertEqual(d.levels, golden, "band 0 + TRIM ON no longer reproduces the shipped law's levels")
++    finally:
++      if had:
++        fl.FCA11_CONT_QHYST_LSB = old
 +
 +
 +if __name__ == "__main__":
