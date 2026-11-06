@@ -111,6 +111,7 @@ class TestPanelWiring(unittest.TestCase):
     """17c/18x: the three param-only lane switches are real UI toggles now, on the right keys and the right rules."""
     for title, param, attr, rule in (
       ("Pedal Delivery Law", "HyundaiPedalDeliveryLaw", "pedal_delivery_toggle", "pedal_delivery_toggle_state(pedal_raw, offroad)"),
+      ("Gas Rise Lag", "HyundaiGasRiseLag", "gas_rise_lag_toggle", "gas_rise_lag_toggle_state(pedal_raw, offroad)"),
       ("Dynamic Brakes", "HyundaiFca11DynamicBrakes", "fca11_dynamic_release_toggle",
        "fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)"),
       ("Stop-Approach Commitment", "StopApproachCommit", "stop_approach_toggle", "stop_approach_toggle_state(offroad)"),

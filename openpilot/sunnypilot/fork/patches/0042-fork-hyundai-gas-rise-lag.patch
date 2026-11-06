@@ -1,0 +1,333 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -484,8 +484,39 @@
+   if accel <= accel_prev:
+     return float(accel)
+   return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / DELIVERY_ASK_TAU_S)))
++
++
++# *** 0042-Z: RISE-ONLY FIRST-ORDER LAG ON THE ACCEL ASK (param HyundaiGasRiseLag, default OFF) ***
++# Lane Y (BRIEF-Y / YREPORT.md, routes 198 Normal + drive 197) measured the small gas moves: they are REAL 1.3-2 s
++# planner requests of 0.1-1.0 m/s^2 that the pedal reproduces with 0.04 s lag and 0.57 % mean error, so no pedal-side
++# slew, deadband or quantised-demand threshold can remove them (a 1.48 m/s^3 jerk limit keeps 94 % of the swing). The
++# only lever that cuts them is the ASK. A first-order lag on the ask cuts the amplitude of a RISE (tau 0.6 -> 35 % of
++# it removed, 65 % kept) in exchange for lag ON THAT RISE ONLY: a FALL passes through unchanged, so lifting off is
++# never delayed. A rise can only be SLOWED toward its own value - the output is bounded by max(ask, previous output)
++# and every fall frame IS the ask - so the filter can never create accel the plan did not ask for (the hard rule:
++# never accelerate while closing on a lead inside the following distance; a lag can only reduce that accel).
++# Continuous in the ask: no threshold, no bucket, no deadband, and no threshold on the DEMAND either.
++GAS_RISE_LAG_TAU_S = 0.6     # s; first-order time constant of a rise (the owner's start value; lane Y: 35 % cut)
++GAS_RISE_LAG_RESET_V = 0.2   # m/s; at/below this the state re-seeds to the current ask (== FCA11_STOP_HOLD_V_MAX_MPS)
+ 
+ 
++def filter_gas_rise(accel: float, accel_prev: float, dt: float = DT_CTRL,
++                    tau: float = GAS_RISE_LAG_TAU_S, reset: bool = False) -> float:
++  """0042-Z: rise-only first-order lag on the accel ask, in the ASK domain (m/s^2). Time-based (dt, seconds).
++
++  RISE (ask > previous output): approached with time constant `tau`. The output stays strictly between the previous
++  output and the ask, so on every rise frame output <= max(ask, previous output).
++  FALL (ask <= previous output): returned unchanged, so on every fall frame output == ask and a lift is never delayed.
++  RESET: re-seed to the current ask. The CALLER decides when (longitudinal inactive, driver gas/brake takeover,
++  standstill) so no stale value is ever carried into a new episode.
++  """
++  if reset:
++    return float(accel)
++  if accel <= accel_prev:
++    return float(accel)
++  return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / tau)))
++
++
+ def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+   """The measured-inverse law alone (blend weight 1). Accelerator only: <= 0 means the plateau floor or a coast,
+   never brake."""
+@@ -604,6 +635,10 @@
+     # unless CP_SP.pedalDeliveryLaw is set, so the OFF path stays byte-for-byte the deployed one.
+     self.delivery_law = bool(getattr(CP_SP, 'pedalDeliveryLaw', False))
+     self.delivery_ask = 0.
++    # 0042-Z (HyundaiGasRiseLag, default OFF): rise-only ask-lag state. Unused (and never advanced) unless the param is
++    # set, so the OFF path is the deployed one frame for frame.
++    self.gas_rise_lag = bool(getattr(CP_SP, 'gasRiseLag', False))
++    self.gas_ask = 0.
+     self.interceptor_ids = get_interceptor_ids(CP_SP)
+     self.interceptor_packer = CANPacker(dbc_names[GAS_INTERCEPTOR_BUS_KEY]) if CP_SP.enableGasInterceptor else None
+     self.fca11_brake = Fca11LongBrake(CP, CP_SP, dbc_names)
+@@ -669,6 +704,22 @@
+     delivery_on = self.delivery_law and int(drive_mode or 0) == DRIVE_MODE_NORMAL
+     if delivery_on:
+       self.delivery_ask = filter_delivery_ask(CC.actuators.accel, self.delivery_ask) if active else 0.
++
++    # 0042-Z (HyundaiGasRiseLag, default OFF): the rise-only ask lag, advanced on EVERY active frame and ahead of the
++    # paths below that can zero or bypass the law - the same placement as the delivery filter above, so the hand-back
++    # from a zero state (over-speed release, FCA11 brake, cal hold, cam brake, coast) is filtered as well.
++    # It RE-SEEDS to the current ask whenever longitudinal is inactive (so the first active frame of an episode starts
++    # at that frame's own ask: a launch is NOT delayed), the driver is on the gas or the brake, or the car is at a
++    # standstill. The state therefore never carries a stale value into a new episode (the 0040 trim lesson: reset on
++    # every episode close and veto). OFF = `ask` is the raw planner ask and not one frame of the path below changes.
++    ask_raw = float(CC.actuators.accel)
++    if self.gas_rise_lag:
++      self.gas_ask = filter_gas_rise(ask_raw, self.gas_ask, DT_CTRL, GAS_RISE_LAG_TAU_S,
++                                     reset=(not active) or bool(CS.out.gasPressed) or bool(CS.out.brakePressed)
++                                     or CS.out.vEgo <= GAS_RISE_LAG_RESET_V)
++    else:
++      self.gas_ask = ask_raw
++    ask = self.gas_ask
+ 
+     # fork: FCA11 long braking (HyundaiFca11Brake, default OFF). Decides FIRST: while it is braking, the pedal
+     # command is hard-zeroed this frame (gas and brake are never commanded together) and the pedal stream keeps
+@@ -745,7 +796,10 @@
+       self.gas = 0.
+       self.gas_launching = False
+     elif active and not self.fca11_brake.gas_hold and not self.fca11_brake._cal_active:
+-      accel = CC.actuators.accel
++      # 0042-Z: the pedal law below consumes the (optionally) lagged ask; the two LATCH decisions (launch latch,
++      # soft re-entry) stay on the RAW plan ask so their meaning cannot change when the lag is on.
++      accel_raw = CC.actuators.accel
++      accel = ask
+       # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
+       # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
+       # hold_cmd. Every other case falls through to the unchanged law below.
+@@ -772,9 +826,9 @@
+         # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
+         # (above LAUNCH_RAMP_V_MAX the two branches are the same function anyway). Cleared on any non-positive request
+         # or once vEgo exceeds LAUNCH_RAMP_V_MAX, so a rolling re-engagement at 11-19 m/s can never set it.
+-        if accel > 0. and CS.out.vEgo <= LAUNCH_RAMP_V_MAX:
++        if accel_raw > 0. and CS.out.vEgo <= LAUNCH_RAMP_V_MAX:
+           self.gas_launching = True
+-        elif accel <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
++        elif accel_raw <= 0. or CS.out.vEgo > LAUNCH_RAMP_V_MAX:
+           self.gas_launching = False
+         # 17c: soft recovery up to the hold for a non-deliberate ask (< OVERSPEED_EXIT_ACCEL); a deliberate ask keeps
+         # the unchanged jerk-rate response (lead pulling away, merge). rate_limit_pedal_command gates it off below
+@@ -812,7 +866,7 @@
+           self.gas = min(pedal_target, get_hold_command(CS.out.vEgo, personality),
+                          get_personality_ceiling(CS.out.vEgo, personality))
+         self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
+-                                            self.gas_launching, reentry=accel < OVERSPEED_EXIT_ACCEL)
++                                            self.gas_launching, reentry=accel_raw < OVERSPEED_EXIT_ACCEL)
+     elif self.fca11_brake.gas_hold or self.fca11_brake._cal_active:
+       self.gas = 0.
+       self.gas_launching = False
+@@ -826,6 +880,8 @@
+       # cam-brake, deep-ask coast): those frames advance the filter above, and re-arming it there was the second hole
+       # review C4 found (the coast -> live hand-back is exactly the transition that snaps the throttle).
+       self.delivery_ask = 0.
++      # 0042-Z: the rise-lag state needs no separate clear - it is re-seeded to the current ask on EVERY inactive frame
++      # by the advance block above, which is strictly stronger than clearing it here.
+ 
+     # 50 Hz; the pedal only accepts frames whose counter is exactly previous + 1
+     send_slot = frame % 2 == 0
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -85,6 +85,9 @@
+   # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+   # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+   pedalDeliveryLaw: bool = auto_field()
++  # 0042-Z: RISE-ONLY ask lag (param HyundaiGasRiseLag, default OFF). Written ONLY by setup_interfaces from that param;
++  # when unset no frame of the pedal path changes (the deployed tree skips the branch). Coupled with custom.capnp @22.
++  gasRiseLag: bool = auto_field()
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -203,6 +203,14 @@
+   # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
+   if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
+     CP_SP.pedalDeliveryLaw = True
++  # 0042-Z RISE-LAG (HyundaiGasRiseLag, PERSISTENT BOOL, default "0" = OFF): a first-order lag on the accel ask applied
++  # to RISES ONLY, ahead of the pedal law (gas_interceptor.filter_gas_rise). Lane Y measured the small NORMAL-mode gas
++  # moves as real 1.3-2 s planner requests, not pedal artefacts, so the ask is the only lever; the lag cuts a rise's
++  # amplitude (tau 0.6 -> 35 %) and never delays a fall. Same truthy parser and same "missing key on a stale libparams
++  # -> OFF" rule as the sibling Hyundai keys; it rides the pedal feature (this function only runs with the pedal
++  # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
++  if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
++    CP_SP.gasRiseLag = True
+ 
+ 
+ def _param_truthy(raw) -> bool:
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -2409,3 +2409,179 @@
+   def test_rise_limit_is_untouched(self):
+     out = gi.rate_limit_pedal_command(0.30, 0.10, 30.)
+     assert out == pytest.approx(0.10 + gi.get_pedal_rate_up(30.) * gi.DT_CTRL, abs=1e-9)
++
++
++def _get_ci_rise(rise: bool, pedal=REM):
++  """CarInterface with the pedal armed and the 0042 ask lag (HyundaiGasRiseLag) on/off."""
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **pedal}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  params_list: list = [{"HyundaiGasInterceptor": True}]
++  if rise:
++    params_list.append({"HyundaiGasRiseLag": True})
++  setup_interfaces(CarInterface, CP, CP_SP, params_list)
++  return CarInterface, CP, CP_SP
++
++
++class TestGasRiseLag42:
++  """0042-Z: rise-only first-order lag on the accel ask (HyundaiGasRiseLag, default OFF).
++
++  The lag lives BEFORE the pedal law, in the ASK domain, so these tests drive the real
++  GasInterceptorCarController through CarInterface.apply (the same path the car runs) and read the state the law
++  consumes. The wire-level OFF identity is checked against a filter pinned to identity (the deployed path).
++  """
++  V = 20.0
++  SET_KPH = 108.
++
++  def _ci(self, rise=True):
++    CarInterface, CP, CP_SP = _get_ci_rise(rise)
++    assert CP_SP.gasRiseLag is rise
++    return CarInterface(CP, CP_SP)
++
++  @staticmethod
++  def _sp(mode=1):
++    sp = structs.CarControlSP()
++    sp.driveMode = int(mode)
++    return sp
++
++  def _run(self, CI, series):
++    """[(accel, v_ego, long_active, brake, gas, v_cruise_kph)] per 100 Hz frame -> (gas_ask, gas) per frame."""
++    out = []
++    for i, (accel, v, active, brake, gas, vc) in enumerate(series):
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = True
++      CC.longActive = bool(active)
++      CC.actuators.accel = float(accel)
++      CI.update([])
++      CI.CS.out.vEgo = float(v)
++      CI.CS.out.vCruise = float(vc)
++      CI.CS.out.brakePressed = bool(brake)
++      CI.CS.out.gasPressed = bool(gas)
++      CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
++      out.append((CI.CC.gas_ask, CI.CC.gas))
++    return out
++
++  def _wire(self, CI, series):
++    """The 0x700 command bytes per SEND SLOT (even frames) - what the pedal actually receives."""
++    out = []
++    for i, accel in enumerate(series):
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = CC.longActive = True
++      CC.actuators.accel = float(accel)
++      CI.update([])
++      CI.CS.out.vEgo = 25.0
++      CI.CS.out.vCruise = 108.
++      CI.CS.out.brakePressed = False
++      CI.CS.out.gasPressed = False
++      _, sends = CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
++      for a, d, _ in sends:
++        if a == gi.REMAPPED_IDS.command_addr:
++          out.append((i, bytes(d)))
++    return out
++
++  # ---- the switch ---------------------------------------------------------------------------------------------------
++  def test_param_defaults_off_and_reads_the_key(self):
++    _, _, off = _get_ci_rise(False)
++    assert off.gasRiseLag is False
++    assert off.enableGasInterceptor is True
++    for val, want in ((True, True), ("1", True), (b"1", True), (False, False), ("0", False), ("true", False), (2, False)):
++      fingerprint = {i: {} for i in range(8)}
++      fingerprint[0] = {**BASE_FINGERPRINT, **REM}
++      CarInterface = interfaces[CAR_UNDER_TEST]
++      CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++      CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++      setup_interfaces(CarInterface, CP, CP_SP,
++                       [{"HyundaiGasInterceptor": True}, {"HyundaiGasRiseLag": val}])
++      assert CP_SP.gasRiseLag is want, (val, CP_SP.gasRiseLag)
++
++  # ---- the four behaviours the brief names ---------------------------------------------------------------------------
++  def test_rise_is_lagged_and_bounded_by_the_ask(self):
++    CI = self._ci(True)
++    series = [(0.0, self.V, True, False, False, self.SET_KPH)] * 2 + \
++             [(1.0, self.V, True, False, False, self.SET_KPH)] * 60
++    out = self._run(CI, series)
++    asks = [o[0] for o in out]
++    # first rise frame: one dt of a tau=0.6 s first-order response, NOT the ask
++    assert asks[2] == pytest.approx(1.0 - np.exp(-DT_CTRL / gi.GAS_RISE_LAG_TAU_S), abs=1e-9)
++    assert asks[2] < 0.02
++    # monotone, strictly below the ask, and ~63 % after one tau
++    for prev, cur in zip(asks[2:], asks[3:]):
++      assert prev <= cur < 1.0
++    assert asks[-1] == pytest.approx(1.0 - np.exp(-0.60 / gi.GAS_RISE_LAG_TAU_S), abs=2e-3)
++
++  def test_fall_passes_through_on_the_same_frame(self):
++    CI = self._ci(True)
++    up = [(0.0, self.V, True, False, False, self.SET_KPH)] * 2 + \
++         [(1.0, self.V, True, False, False, self.SET_KPH)] * 100
++    out = self._run(CI, up)
++    assert out[-1][0] < 1.0                      # still lagging upward
++    for ask, want in ((0.2, 0.2), (0.0, 0.0), (-1.0, -1.0), (-2.0, -2.0)):
++      CI.update([])
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = CC.longActive = True
++      CC.actuators.accel = ask
++      CI.CS.out.vEgo = self.V
++      CI.CS.out.vCruise = self.SET_KPH
++      CI.apply(CC.as_reader(), self._sp(1), 0)
++      assert CI.CC.gas_ask == pytest.approx(want, abs=2e-6), (ask, CI.CC.gas_ask)   # the FALL frame IS the ask
++
++  def test_reset_on_takeover_standstill_and_inactive(self):
++    for name, frame in (("driver brake", (1.0, self.V, True, True, False, self.SET_KPH)),
++                        ("driver gas", (1.0, self.V, True, False, True, self.SET_KPH)),
++                        ("standstill", (1.0, 0.0, True, False, False, self.SET_KPH)),
++                        ("inactive", (1.0, self.V, False, False, False, self.SET_KPH))):
++      CI = self._ci(True)
++      warm = [(0.0, self.V, True, False, False, self.SET_KPH)] * 2 + \
++             [(0.6, self.V, True, False, False, self.SET_KPH)] * 10
++      self._run(CI, warm)
++      assert CI.CC.gas_ask < 0.6                                     # lagging before the reset
++      ask = self._run(CI, [frame])[0][0]
++      assert ask == pytest.approx(frame[0], abs=2e-6), (name, ask)   # re-seeded to the current ask
++    # ... and the NEXT episode starts at its own ask, not at the old value
++    CI = self._ci(True)
++    self._run(CI, [(0.0, self.V, True, False, False, self.SET_KPH)] * 2 +
++                  [(0.9, self.V, True, False, False, self.SET_KPH)] * 20 +
++                  [(0.9, self.V, False, False, False, self.SET_KPH)] * 2)
++    first = self._run(CI, [(0.4, self.V, True, False, False, self.SET_KPH)])[0][0]
++    assert first == pytest.approx(0.4, abs=2e-6)
++
++  def test_never_exceeds_max_ask_prev_on_a_rise_and_equals_the_ask_on_a_fall(self):
++    rng = np.random.default_rng(42)
++    ask = 0.0
++    prev = 0.0
++    rises = falls = 0
++    for _ in range(20000):
++      ask = float(np.clip(ask + rng.normal(0., 0.15) * (1. if rng.random() < 0.05 else 0.05), -2.0, 2.0))
++      out = gi.filter_gas_rise(ask, prev)
++      if ask <= prev:
++        assert out == ask, (ask, prev, out)
++        falls += 1
++      else:
++        assert prev <= out <= ask                                     # never ABOVE the ask, never a new accel
++        assert out <= max(ask, prev) + 1e-12
++        rises += 1
++      prev = out
++    assert rises > 1000 and falls > 1000
++
++  def test_off_is_the_deployed_path_and_pinning_the_filter_reproduces_it(self):
++    series = ([(1.2, 1.0)] * 40 + [(0.0, 18.0)] * 60 +
++              [(0.3 if k % 7 else 0.06, 25.0) for k in range(400)] +
++              [(-0.05 if k % 4 else -0.20, 25.0) for k in range(100)] + [(0.9, 25.0)] * 60)
++    off = self._wire(self._ci(False), [a for a, _ in series])
++    # the OFF controller's ask state is the raw ask on every frame, and its wire is stable
++    CI_off = self._ci(False)
++    asks = self._run(CI_off, [(a, v, True, False, False, 108.) for a, v in series])
++    assert all(o[0] == pytest.approx(a, abs=2e-6) for o, (a, _v) in zip(asks, series))
++    assert len(off) == len([1 for i, _ in enumerate(series) if i % 2 == 0])
++    # ON, with the filter pinned to identity = the deployed path, byte for byte
++    real = gi.filter_gas_rise
++    try:
++      gi.filter_gas_rise = lambda *args, **kw: float(args[0])
++      on_identity = self._wire(self._ci(True), [a for a, _ in series])
++    finally:
++      gi.filter_gas_rise = real
++    assert on_identity == off
++    # and the real filter DOES change the wire on that same series (the test is not vacuous)
++    assert self._wire(self._ci(True), [a for a, _ in series]) != off

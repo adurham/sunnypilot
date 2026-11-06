@@ -49,7 +49,8 @@ FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonal
                      "StopApproachCommit",   # 17c lane C: a whole key, not a prefix; without this the compiled-libparams guard
                                              #          never checks it and a stale libparams_c.so would silently disable the feature
                      "AdaptiveFollowDistance",  # same class of miss (a fork key outside every Hyundai* prefix), covered now
-                     "HyundaiPedalDeliveryLaw")  # 17c delivery: inside Hyundai*, but named so a prefix edit cannot drop it
+                     "HyundaiPedalDeliveryLaw",  # 17c delivery: inside Hyundai*, but named so a prefix edit cannot drop it
+                     "HyundaiGasRiseLag")  # 0042-Z rise-lag: named for the same reason (a fork key that must stay registered)
 
 # CarParamsSP fields that are read but intentionally never written by the fork's wiring. Keep minimal; reason each.
 WRITER_ALLOWLIST: dict[str, str] = {}

@@ -195,5 +195,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
     params_list.append({"HyundaiPedalDeliveryLaw": params.get("HyundaiPedalDeliveryLaw", return_default=True)})
   except UnknownKeyName:
     cloudlog.warning("HyundaiPedalDeliveryLaw param unknown to libparams (not rebuilt?); the deployed pedal law stays active")
+  # fork (0042 rise-lag): rise-only first-order lag on the accel ask. Same stale-libparams guard: a missing key leaves
+  # the lag OFF (the deployed pedal path). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiGasRiseLag": params.get("HyundaiGasRiseLag", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasRiseLag param unknown to libparams (not rebuilt?); the ask lag stays OFF")
 
   return params_list

@@ -9,7 +9,7 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.widgets.list_view import multiple_button_item_sp, toggle_item_sp
 from openpilot.sunnypilot.fork.fca11_settings import fca11_brake_toggle_state, fca11_shaping_toggle_state, \
-  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, fca11_stop_hold_toggle_state
+  fca11_shadow_toggle_state, fca11_dynamic_release_toggle_state, pedal_delivery_toggle_state, stop_approach_toggle_state, fca11_stop_hold_toggle_state, gas_rise_lag_toggle_state
 from opendbc.car.hyundai.values import CAR, UNSUPPORTED_LONGITUDINAL_CAR
 
 
@@ -35,6 +35,9 @@ class HyundaiSettings(BrandSettings):
     # visible only where they can do anything, settable offroad only (CarParams/CarParamsSP are built at ignition).
     self.pedal_delivery_toggle = toggle_item_sp(tr("Pedal Delivery Law"), "", param="HyundaiPedalDeliveryLaw",
                                                 callback=self._on_fca11_toggle_changed)
+    # fork (0042-Z): the rise-only gas lag (HyundaiGasRiseLag). Pedal on, offroad only, same rules as the toggle above.
+    self.gas_rise_lag_toggle = toggle_item_sp(tr("Gas Rise Lag"), "", param="HyundaiGasRiseLag",
+                                              callback=self._on_fca11_toggle_changed)
     self.fca11_dynamic_release_toggle = toggle_item_sp(tr("Dynamic Brakes"), "", param="HyundaiFca11DynamicBrakes",
                                                        callback=self._on_fca11_toggle_changed)
     self.stop_approach_toggle = toggle_item_sp(tr("Stop-Approach Commitment"), "", param="StopApproachCommit",
@@ -53,7 +56,8 @@ class HyundaiSettings(BrandSettings):
       tr("Drive Mode Personality"), tr("ECO relaxed / NORMAL standard / SPORT aggressive; N blocks openpilot longitudinal"),
       param="DriveModePersonality", callback=self._on_drive_mode_toggle_changed)
     self.items = [self.longitudinal_tuning_item, self.fca11_brake_toggle, self.fca11_shaping_toggle,
-                  self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.fca11_dynamic_release_toggle,
+                  self.fca11_shadow_toggle, self.pedal_delivery_toggle, self.gas_rise_lag_toggle,
+                  self.fca11_dynamic_release_toggle,
                   self.fca11_stop_hold_toggle,
                   self.stop_approach_toggle, self.elastic_follow_toggle, self.no_close_toggle, self.drive_mode_personality_toggle]
 
@@ -159,6 +163,19 @@ class HyundaiSettings(BrandSettings):
     self.pedal_delivery_toggle.set_description(delivery_desc)
     self.pedal_delivery_toggle.show_description(True)
     self.pedal_delivery_toggle.set_visible(delivery_state.visible)
+
+    # fork (0042-Z): Gas Rise Lag - a rise-only first-order lag on the accel ask; pedal on, offroad only.
+    rise_state = gas_rise_lag_toggle_state(pedal_raw, offroad)
+    self.gas_rise_lag_toggle.action_item.set_enabled(rise_state.enabled)
+    rise_desc = tr("Slows how fast a GAS request is applied (about 0.6 s), so small planner corrections arrive as a " +
+                   "smooth build instead of a blip. Lifting off is NEVER delayed: a falling request reaches the " +
+                   "pedal on the same frame, and the car is never asked for more acceleration than the planner " +
+                   "asked for. Requires the comma pedal. Takes effect at the next ignition.")
+    if rise_state.visible and not offroad:
+      rise_desc = offroad_hint + rise_desc
+    self.gas_rise_lag_toggle.set_description(rise_desc)
+    self.gas_rise_lag_toggle.show_description(True)
+    self.gas_rise_lag_toggle.set_visible(rise_state.visible)
 
     # fork (18x): Dynamic Brake Release - the FCA11 brake becomes a ramp; needs FCA11 Braking, offroad only.
     dynamic_state = fca11_dynamic_release_toggle_state(pedal_raw, brake_raw, offroad)

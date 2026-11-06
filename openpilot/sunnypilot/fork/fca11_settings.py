@@ -8,6 +8,7 @@ headless, so the decision lives here, free of UI imports, and is unit-tested in 
   FCA11 Brake Shaping (Beta)    HyundaiFca11AffineGain  visible: pedal on AND braking on;  enabled: offroad
   FCA11 Shadow (Log-Only)       HyundaiFca11Shadow      visible: pedal on;                 enabled: offroad   (0045)
   Pedal Delivery Law            HyundaiPedalDeliveryLaw visible: pedal on;                 enabled: offroad
+  Gas Rise Lag                  HyundaiGasRiseLag      visible: pedal on;                 enabled: offroad   (0042-Z)
   Dynamic Brake Release         HyundaiFca11DynamicBrakes visible: pedal on AND braking on; enabled: offroad
   Stop-Approach Commitment      StopApproachCommit      visible: always (planner-side);   enabled: offroad
 
@@ -50,6 +51,13 @@ def fca11_shadow_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
 def pedal_delivery_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
   """17c: Pedal Delivery Law (measured inverse for light braking asks). It lives in the pedal path, so the pedal must be
   on; settable offroad only (CarParamsSP is built at ignition)."""
+  pedal_on = _on(pedal_raw)
+  return ToggleState(visible=pedal_on, enabled=pedal_on and bool(offroad))
+
+
+def gas_rise_lag_toggle_state(pedal_raw, offroad: bool) -> ToggleState:
+  """0042-Z: Gas Rise Lag. It lives in the pedal path (the accel ask before the pedal law), so the pedal must be on;
+  settable offroad only (CarParamsSP is built at ignition). Independent of FCA11 Braking - it is the accelerator."""
   pedal_on = _on(pedal_raw)
   return ToggleState(visible=pedal_on, enabled=pedal_on and bool(offroad))
 
