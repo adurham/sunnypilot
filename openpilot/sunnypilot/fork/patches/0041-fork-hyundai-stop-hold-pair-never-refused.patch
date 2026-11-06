@@ -1,0 +1,338 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -977,6 +977,21 @@
+ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
+ FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
+ FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
++# *** 0041: THE PAIR MAY NEVER MAKE THE PANDA REFUSE A FRAME (route 197: 3 refusals, each a 30 -> 4 brake cut at a stop) ***
++# MEASURED (route 197, 13 pair bursts, 194 TCS13 FCA_ACK 1->0 drops in the drive): the ESC drops FCA_ACK 0.0331-0.0449 s
++# after the FIRST pair frame that reaches it (median 0.035, 13/13), and the drop lasts 2-3 samples. The panda refuses any
++# frame carrying the pair while its own (fresher) TCS13 ack is 0; the car layer's view of that ack is 1-2 samples old, so
++# it keeps sending the pair for 1-2 frames after the drop has begun -> src 192 -> _refused_streak -> the hold is cut and
++# the level re-ramps from 4 while the car is stopped (seg 4 t=23048.70: 30,30,30 REFUSED, then 4-20, back to 24-30).
++# THE RULE (timing, not a latch): a pair frame is emitted only (a) once per standstill, and (b) a second time while the
++# frame is still inside the window in which pair #1 cannot yet have caused the drop, i.e. at most
++# FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES controller frames (== one 50 Hz send slot = 0.02 s) after it, with a hard cap of
++# FCA11_STOP_HOLD_PAIR_MAX_FRAMES. At the shipped 100 Hz loop that is exactly the frames at t0 and t0+0.02 s; a third
++# frame (t0+0.04 s) would land on the drop and is never sent, and a skipped send slot (the camera stalling for a tick)
++# also blocks the second. Pair-less frames are the plain hold frame, byte-identical to the pre-0041 one.
++FCA11_STOP_HOLD_PAIR_MAX_FRAMES = 2             # SENT pair frames per standstill (0.04 s of pair presence at 50 Hz)
++# (FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES, the controller-frame gap between pair #1 and pair #2, is defined next to
++#  FCA11_SEND_EVERY — it IS one send slot.)
+ 
+ 
+ def stop_hold_enabled(CP_SP) -> bool:
+@@ -1480,6 +1495,9 @@
+ 
+ # send rate divisor: controller frames are 100 Hz; every other frame = the camera's own 50 Hz.
+ FCA11_SEND_EVERY = 2
++# 0041: the most controller frames pair #2 may follow pair #1 by. The ESC's measured FCA_ACK drop starts 0.033 s after
++# the pair frame that causes it, so one send slot (0.02 s) is inside that window and two (0.04 s) are not.
++FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES = FCA11_SEND_EVERY
+ 
+ # bit positions of the camera's request fields (the shadow log's camera_warn reads CAM_ACT_WARN_BITS). 0053: the
+ # hand-back itself is decided ONLY by the shared masks (camera_braking below), never by hand-written bit tests.
+@@ -1860,6 +1878,10 @@
+     # at the light. Reset only by leaving standstill.
+     self._stop_hold_prev = False
+     self._stop_hold_spent = False
++    # 0041: how many pair frames this standstill has put on the wire, and the controller frame of the last one. The window
++    # (FCA11_STOP_HOLD_PAIR_MAX_*) is what keeps a pair frame off a frame the panda will refuse; reset by leaving standstill.
++    self._stop_hold_pairs = 0
++    self._stop_hold_pair_frame = -1
+     self._rel_acc: float | None = None  # 18x: the release ramp's level accumulator (None = no ramp in progress)
+     self._rel_sent = 0                 # 18x: the last level the ramp put on the wire (1-2 LSB per sent frame, enforced)
+     self._rel_fast = False             # 18x: this ramp is a standstill release (the 0.5 s rate), latched at its start
+@@ -2465,19 +2487,36 @@
+     returns True for is one the panda accepts; anything else keeps today's frame (the pair is never sent alone)."""
+     return self._stop_hold_blocker(CS, m, cal_on) == ""
+ 
+-  def _stop_hold_step(self, CS, m: Fca11MirrorFrame, cal_on: bool) -> bool:
++  def _stop_hold_step(self, CS, m: Fca11MirrorFrame, cal_on: bool, frame: int | None = None) -> bool:
+     """0036: _stop_hold_ok plus the once-per-standstill latch (see _stop_hold_spent). Called on every SENT actuating frame.
+-    0039: also counts WHY this frame did not carry the pair (diagnostics; the return value is unchanged)."""
++    0039: also counts WHY this frame did not carry the pair (diagnostics; the return value is unchanged).
++    0041: the pair is also confined to a WINDOW at the start of the standstill (see FCA11_STOP_HOLD_PAIR_MAX_*): the ESC
++    drops FCA_ACK 0.033-0.045 s after the first pair frame and the panda refuses the pair from then on, so a 3rd pair
++    frame is a refused actuating frame (route 197: three of them cut the hold to 4 LSB at a stop). Pair #2 goes out only
++    while it is still inside the window in which pair #1 cannot have caused the drop - at most one send slot later.
++    `frame` is the controller frame (None = the caller has no frame counter: only the first pair frame is allowed)."""
+     standstill = bool(getattr(CS.out, "standstill", False))
+     if not standstill:
+       self._stop_hold_spent = False
++      self._stop_hold_pairs = 0
++      self._stop_hold_pair_frame = -1
+     why = self._stop_hold_blocker(CS, m, cal_on)
+     want = (why == "") and not self._stop_hold_spent
+     if why == "" and self._stop_hold_spent:
+       why = "spent"              # every input held; the lane already used its one shot at this standstill
++    # 0041: every DATA clause holds and the latch is clear - is this frame still inside the pair window? (the window is
++    # checked last so the census keeps naming the data clause / the latch whenever those are the real reason)
++    if why == "" and (self._stop_hold_pairs >= FCA11_STOP_HOLD_PAIR_MAX_FRAMES or
++                      (self._stop_hold_pairs and (frame is None or
++                                                  (frame - self._stop_hold_pair_frame) > FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES))):
++      why = "pair_window"
++      want = False
+     if self._stop_hold_prev and not want and standstill:
+       self._stop_hold_spent = True
+     self._stop_hold_prev = want
++    if want:
++      self._stop_hold_pairs += 1
++      self._stop_hold_pair_frame = -1 if frame is None else int(frame)
+     if why:
+       self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
+     return want
+@@ -3905,7 +3944,7 @@
+         cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
+         m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+         # 0034: the ESC stop-hold pair rides THIS frame only if every lane condition holds; the level is not touched.
+-        m.stop_hold = self._stop_hold_step(CS, m, cal_on)
++        m.stop_hold = self._stop_hold_step(CS, m, cal_on, frame)
+         self.stop_hold_frames += int(m.stop_hold)
+         out = build_fca11_frame(dat, (cam_alive + 1) & 0xF, m)
+         sends.append(CanData(FCA11_ADDR, out, 0))
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py
+@@ -217,7 +217,9 @@
+             self.assertTrue(_pair(b), f"never one bit alone @{f}")
+             self.assertEqual((0, 0), _bits(a))
+             n_pair += 1
+-        self.assertGreater(n_pair, 200, "the hold at the light must actually carry the pair")
++        # 0041: only the pair WINDOW at the start of the standstill carries it (one send slot apart), so the toggle must
++        # differ on exactly those frames and on nothing else.
++        self.assertEqual(fl.FCA11_STOP_HOLD_PAIR_MAX_FRAMES, n_pair, "the hold at the light carries the pair window")
+         self.assertEqual(n_pair, b_on.stop_hold_frames)
+ 
+   def test_on_bits_only_on_standstill_hold_frames(self):
+@@ -341,7 +343,11 @@
+         v_off, v_on = self._verdicts(tc, off, spd), self._verdicts(tc, on, spd)
+         self.assertEqual(v_off, v_on, "the pair never costs the law a frame")
+         pair = [i for i, (_, d) in enumerate(on) if _pair(d)]
+-        self.assertGreater(len(pair), 200)
++        # 0041: the pair is a WINDOW at the start of the standstill (FCA11_STOP_HOLD_PAIR_MAX_FRAMES frames, one send slot
++        # apart), not a stream - the ESC drops FCA_ACK 0.033-0.045 s after the first one and the panda refuses the rest.
++        self.assertEqual(fl.FCA11_STOP_HOLD_PAIR_MAX_FRAMES, len(pair))
++        pair_f = [on[i][0] for i in pair]
++        self.assertEqual([pair_f[0], pair_f[0] + fl.FCA11_SEND_EVERY], pair_f, "one send slot apart, nothing later")
+         self.assertTrue(all(v_on[i] for i in pair), "every frame carrying the pair is ACCEPTED by the panda")
+ 
+   def test_contrast_same_frames_refused_above_walking_pace(self):
+@@ -351,7 +357,7 @@
+     tc = self._fixture()
+     on = _run(_cp_sp(stop_hold=True), _stop_and_hold_scenario, 1100)[1]
+     pair = [i for i, (_, d) in enumerate(on) if _pair(d)]
+-    self.assertGreater(len(pair), 200)
++    self.assertEqual(fl.FCA11_STOP_HOLD_PAIR_MAX_FRAMES, len(pair))
+     stop = lambda f: f >= 350    # noqa: E731 - the scenario's standstill
+     ok = self._verdicts(tc, on, lambda f: 0 if stop(f) else 640)
+     self.assertTrue(all(ok[i] for i in pair), "control: accepted at 0 km/h with the ESC reporting the hold")
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_no_refusal.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_no_refusal.py
+new file mode 100644
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_no_refusal.py
+@@ -0,0 +1,203 @@
++"""0041: the stop-hold pair may never make the panda REFUSE a frame (route 197's ack-drop sequence, replayed).
++
++MEASURED (drive 197, 31 segments, the lane-R bus-0 extraction): 194 TCS13 `FCA_ACK` 1->0 drops in the drive. 13 of them
++sit within 0.2 s after one of our 30 pair frames - the ESC drops `FCA_ACK` 0.0331-0.0449 s after the FIRST pair frame that
++reaches it (median 0.035, 13/13 bursts) and the drop lasts 2-3 samples. The panda refuses ANY frame carrying the pair
++while its own (fresher) TCS13 ack is 0 (`safety/modes/hyundai.h` l.1165-1182). The car layer's view of that ack is 1-2
++samples old, so the 0036 lane kept the pair on for one more send slot: 3 of the drive's 8 refused 0x38D echoes carried
++the pair (seg 3 t=22962.07, seg 4 t=23048.70, seg 8 t=23274.21), and a refused actuating echo drops the law's rate
++reference to 0 (fca11_long.py l.2284-2291, 0035), so the hold fell 30 -> 4 and re-ramped while the car was stopped.
++
++THE FIX under test: `_stop_hold_step` confines the pair to a WINDOW at the start of the standstill
++(FCA11_STOP_HOLD_PAIR_MAX_FRAMES frames, the 2nd at most one send slot after the 1st). Pair #2 is inside the window in
++which pair #1 cannot yet have caused the drop; a 3rd frame is never sent, so no frame can be refused.
++
++Every verdict below comes from the REAL compiled panda TX hook (libsafety through the safety-test harness), never from a
++Python re-implementation of the rule.
++"""
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _real_camera_frame, _stop_and_hold_scenario
++
++CAM = _real_camera_frame(alive=3)
++# the measured ESC response, in 100 Hz controller frames: the drop starts 0.0331-0.0449 s after the first pair frame and
++# lasts 2-3 samples. 0.04 s = 4 frames is inside the measured band; 3 samples of ack = 0 is its shortest measured length.
++ESC_ACK_LATENCY_FRAMES = 4
++ESC_ACK_DROP_FRAMES = 3
++
++
++def _pair(d):
++  return (fl._get_bits(d, 1, 2), fl._get_bits(d, 21, 1)) == (1, 1)
++
++
++def _level(d):
++  return fl._get_bits(d, 8, 8)
++
++
++def _fixture():
++  """The FCA11-long panda fixture the 0036/0039 safety tests use (LONG on the pedal car, remapped 0x700 dialect)."""
++  import opendbc.safety.tests.test_hyundai as th
++  tc = getattr(th, "TestHyundaiFca11LongSafety_0")("test_needs_controls_and_heartbeat")
++  tc.setUp()
++  return tc
++
++
++class TestLoggedAckDropSequence(unittest.TestCase):
++  """The route-197 sequence: stop, hold, the ESC answers the first pair frame by dropping FCA_ACK 0.04 s later."""
++
++  def _run(self, cp_sp, n=1100, skip_send_at=None):
++    """Drive the REAL `Fca11LongBrake` over the stop-and-hold scenario with the logged ack timeline, judging every
++    0x38D it emits through the REAL panda TX hook and feeding the panda's verdict back as the pandad echo.
++
++    The ack the LAW reads is the one 2 samples old (`fca11_esc_ack` is published from the CAN tick), the ack the PANDA
++    reads is the current sample - the 0.02 s disagreement that produced the refusal on the car.
++    """
++    from opendbc.safety.tests.libsafety import libsafety_py
++    tc = _fixture()
++    tc._rearm()
++    b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++    first_pair = {"f": None, "t": None}
++
++    def ack_panda(f):
++      if first_pair["f"] is None:
++        return True
++      return not (first_pair["f"] + ESC_ACK_LATENCY_FRAMES <= f <
++                  first_pair["f"] + ESC_ACK_LATENCY_FRAMES + ESC_ACK_DROP_FRAMES)
++
++    out = []          # (frame, dat, refused)
++    pending = []      # the pandad echo of the previous send, ingested at the start of the next frame
++    for f in range(n):
++      ask, v, ss = _stop_and_hold_scenario(f)
++      cam = None if f == skip_send_at else (float(f) * 1e7, CAM)
++      cs = _CS(v_ego=v, cam=cam, now=int(f * 1e7), standstill=ss, a_ego=-1.5 if ask < 0 else 0.3)
++      cs.fca11_wheel_max_kph = v * 3.6
++      cs.fca11_esc_ack, cs.fca11_esc_standstill = (ack_panda(f - 2), ss)
++      b.observe_echo(pending)          # create_gas_command does this every controller frame, BEFORE update()
++      pending = []
++      sends = b.update(_cc(ask), cs, f)
++      if not sends:
++        continue
++      for snd in sends:
++        if snd.address != fl.FCA11_ADDR:
++          continue
++        dat = bytes(snd.dat)
++        tc.safety.set_timer(1_000_000 + f * 10_000)
++        tc.esc_hold = (1, 1) if ack_panda(f) else (0, 1)
++        tc._open_window(speed_raw=0 if ss else 640)   # WHL_SPD11 raw: 0 km/h at the stop, 20 km/h before
++        tc._rx(tc._cam_fca11())
++        ok = bool(tc._tx(libsafety_py.make_CANPacket(fl.FCA11_ADDR, 0, dat)))
++        out.append((f, dat, not ok))
++        pending.append((128 if ok else 192, dat))
++        if _pair(dat) and first_pair["f"] is None:
++          first_pair["f"], first_pair["t"] = f, f
++    return b, out
++
++  def test_every_frame_the_new_gate_sends_is_accepted(self):
++    """FAIL-BEFORE (0039 tree): 3 pair frames go out, the 3rd is REFUSED. After: the pair is a 2-frame window, all
++    accepted, and no frame anywhere in the stream is refused."""
++    b, out = self._run(_cp_sp(stop_hold=True))
++    pairs = [(f, d) for f, d, _ in out if _pair(d)]
++    refused = [(f, _level(d)) for f, d, r in out if r]
++    self.assertEqual([], refused, "the panda refused a frame the law sent (route 197's defect)")
++    self.assertEqual(2, len(pairs), "the standstill carries the pair window only (2 == the pinned constant)")
++    self.assertEqual(0, b._refused_streak)
++    self.assertFalse(b._refused_cut)
++
++  def test_the_hold_level_does_not_dip_through_the_ack_drop(self):
++    """FAIL-BEFORE: the refused 3rd pair frame resets the law's rate reference (l.2284-2291) and the hold drops 30 -> 4
++    and re-ramps at a standstill - the owner's "car rolls at a stop". After: the level never falls below the level that
++    was already on the wire when the pair window closed."""
++    _, out = self._run(_cp_sp(stop_hold=True))
++    pairs = [(f, d) for f, d, _ in out if _pair(d)]
++    self.assertTrue(pairs, "the window opened")
++    hold = _level(pairs[-1][1])
++    after = [(f, _level(d)) for f, d, _ in out if f > pairs[-1][0] and _stop_and_hold_scenario(f)[2]]
++    self.assertTrue(after, "the standstill continues after the window")
++    lv = [x for _, x in after]
++    self.assertGreaterEqual(min(lv), hold, "the hold level fell at a standstill (the 30 -> 4 re-ramp)")
++    self.assertFalse([(a, b) for a, b in zip(lv, lv[1:]) if b < a - 2], "a mid-hold down-step at a standstill")
++
++  def test_the_pair_does_not_come_back_at_that_stop(self):
++    """The ESC's drop is its answer to the pair. When the ack returns, the pair must NOT return with it (no on/off
++    flapping at the light) - the window stays closed and 0036's spent latch is set."""
++    _, out = self._run(_cp_sp(stop_hold=True))
++    pair_frames = [f for f, d, _ in out if _pair(d)]
++    drop_end = pair_frames[0] + ESC_ACK_LATENCY_FRAMES + ESC_ACK_DROP_FRAMES
++    self.assertFalse([f for f in pair_frames if f >= drop_end], "the pair returned after the ack came back")
++
++  def test_a_skipped_send_slot_blocks_the_second_pair_frame(self):
++    """The window is a TIMING window, not a counter: if the camera stalls for the slot pair #2 would have used, the
++    next send slot is already outside it, so the pair does not go out at all (a counter would have sent it, 40 ms after
++    pair #1, straight onto the drop)."""
++    _, out = self._run(_cp_sp(stop_hold=True), skip_send_at=None)
++    first = next(f for f, d, _ in out if _pair(d))
++    _, skipped = self._run(_cp_sp(stop_hold=True), skip_send_at=first + fl.FCA11_SEND_EVERY)
++    pairs = [f for f, d, _ in skipped if _pair(d)]
++    self.assertEqual([first], pairs, "the pair went out after its window had already closed")
++
++
++class TestOffPathAndBytes(unittest.TestCase):
++  """The window is a gate on the PAIR ONLY: no level, no slot, and no OFF byte moves."""
++
++  def test_off_path_is_byte_identical_and_uninformed(self):
++    from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import stop_and_hold_frames
++    for dyn in (False, True):
++      with self.subTest(dyn=dyn):
++        b, out = TestLoggedAckDropSequence()._run(_cp_sp(stop_hold=False, dyn=dyn))
++        self.assertEqual(0, b.stop_hold_frames)
++        self.assertEqual({"lane_off"}, set(b.stop_hold_blockers), "the lane is off, and it is the only reason")
++        self.assertGreater(b.stop_hold_blockers["lane_off"], 400, "one census entry per actuating frame")
++        self.assertEqual(stop_and_hold_frames(dyn, CAM), [(f, d) for f, d, _ in out], "the OFF stream moved")
++
++  def test_pair_less_frames_are_the_plain_frame(self):
++    """A frame the window withholds the pair from is byte-identical to the same frame built with the pair cleared."""
++    _, on = TestLoggedAckDropSequence()._run(_cp_sp(stop_hold=True))
++    _, off = TestLoggedAckDropSequence()._run(_cp_sp(stop_hold=False))
++    self.assertEqual([f for f, _, _ in off], [f for f, _, _ in on], "same frames, same slots")
++    held = [f for f, d, _ in on if _pair(d)]
++    self.assertTrue(held)
++    for (f, a, _), (_, d, _) in zip(off, on):
++      if f in held:
++        self.assertNotEqual(a, d)
++      else:
++        self.assertEqual(a, d, f"frame {f} differs from the OFF law although it carries no pair")
++    # and the hold frames after the window still carry the level the law asked for, bit for bit
++    for f, d, _ in on:
++      if f > held[-1] and _stop_and_hold_scenario(f)[2]:
++        self.assertEqual(_level(off[[x for x, _, _ in off].index(f)][1]), _level(d), f)
++
++
++class TestWindow(unittest.TestCase):
++
++  def test_constants_pin_the_measured_esc_latency(self):
++    self.assertEqual(2, fl.FCA11_STOP_HOLD_PAIR_MAX_FRAMES)
++    self.assertEqual(fl.FCA11_SEND_EVERY, fl.FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES)
++    # the window must stay inside the SHORTEST measured ESC response (0.0331 s), or pair #2 lands on the drop
++    self.assertLess(fl.FCA11_STOP_HOLD_PAIR_MAX_GAP_FRAMES * 0.01, 0.0331)
++    self.assertGreaterEqual(fl.FCA11_STOP_HOLD_PAIR_MAX_FRAMES * fl.FCA11_SEND_EVERY * 0.01, 0.02)
++
++  def test_direct_call_without_a_frame_counter_sends_one_pair(self):
++    """`frame=None` (a caller with no controller counter) can only afford pair #1: the spacing guarantee is unavailable,
++    so the window closes after one frame."""
++    from opendbc.sunnypilot.car.hyundai.tests.test_fca11_stop_hold_diag import _logged_cs, _m
++    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True))
++    self.assertTrue(b._stop_hold_step(_logged_cs(), _m(), False))
++    self.assertFalse(b._stop_hold_step(_logged_cs(), _m(), False), "a second pair frame without a frame counter")
++    self.assertEqual(1, b.stop_hold_blockers.get("pair_window"))
++
++
++def _cp_sp(stop_hold=None, dyn=None, fca11=True):
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = fca11
++  cp_sp.enableGasInterceptor = True
++  if dyn is not None:
++    cp_sp.fca11DynamicBrakes = dyn
++  if stop_hold is not None:
++    cp_sp.fca11StopHoldClutch = stop_hold
++  return cp_sp
++
++
++if __name__ == "__main__":
++  unittest.main()
