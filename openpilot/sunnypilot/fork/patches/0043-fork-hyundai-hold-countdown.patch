@@ -1,10 +1,11 @@
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -978,7 +978,95 @@
+@@ -977,8 +977,96 @@
+ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
  FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
  FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
- 
++
 +# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
 +# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
 +# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
@@ -55,7 +56,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD_FRAMES = 4500    # 90.0 s: audible and continuous
 +FCA11_HOLD_NAG_FINAL_FRAMES = 5500   # 110.0 s: warningImmediate
 +FCA11_HOLD_NAG_EXPIRE_FRAMES = 6000  # 120.0 s: latch + LONGITUDINAL disengage + brake release (lateral stays)
- 
++
 +# The five published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud/Final and
 +# fca11HoldExpired). 4 is a LATCH, not a tier: it is not derived from the counter (the counter resets on the frame
 +# openpilot disengages) and it clears on the driver's brake press OR on a car DRIVEN AWAY ON THE GAS (below).
@@ -64,7 +65,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD = 2
 +FCA11_HOLD_NAG_FINAL = 3
 +FCA11_HOLD_NAG_EXPIRED = 4
-+
+ 
 +# CD6: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off ON THE GAS. The red alert
 +# asks for the brake pedal, and the brake is still the only thing that clears a LATCHED, STOPPED car; but a driver who
 +# instead accelerates must not carry a PERMANENT full-screen red alert (and the engage strip that goes with it) for
@@ -75,7 +76,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +# gas pedal can never clear it. Strict `>` and a FINITE value only (fail closed: a missing or NaN vEgo, or a missing
 +# gasPressed, is not evidence that the driver has taken over).
 +FCA11_HOLD_NAG_CLEAR_V_MS = 3.0
-+
+ 
 +
 +def hold_nag_level(frames: int) -> int:
 +  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
@@ -132,7 +133,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
      """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
-@@ -2530,6 +2632,107 @@
+@@ -2530,7 +2632,118 @@
      if why:
        self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
      return want
@@ -151,7 +152,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    if wheel_max is None:
 +      return False
 +    return float(wheel_max) <= FCA11_HOLD_NAG_STILL_KPH
-+
+ 
 +  def _hold_nag_driven_away(self, CS) -> bool:
 +    """CD6: the latch's second clear - the DRIVER has driven the car away, on the gas, above 3 m/s.
 +
@@ -174,10 +175,18 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    The threshold is 420 raw counts against a measured foot-off rest of 353 +/- 12, i.e. ~4 % of travel - a foot
 +    actually on the pedal.
 +
-+    On the recorded drives (2026-11-06, `cd6_launches.py`): 24 manual dead-stop launches cross 3.0 m/s, and NONE of
-+    them has neither pedal down - 14 with the gas, 10 with the brake (the brake is the first clear and needs no
-+    help from this one). Every gas launch held the gas for at least 98 consecutive frames past the crossing, so
-+    requiring the pedal costs 0 of the 24.
++    On the recorded drives (2026-11-06, re-run by CD7 with the CORRECT per-extract column layout): 38 manual
++    dead-stop launches cross 3.0 m/s on 195, 196, 197, 198, 199, 19b and 19c, and 38/38 have the gas pedal down at
++    the crossing - 0 brake-only, 0 with neither pedal - so requiring the pedal costs 0 of the 38. Every gas launch
++    held the gas for at least 98 consecutive frames past the crossing (min 98, max 2533). This was checked against
++    the raw pedal signal itself (GAS_SENSOR 0x201/0x701, `(A+B)//2 > 420`): the gas column agrees with the raw ADC on
++    99.9-100 % of carState frames on all six drives tested.
++    (The earlier "24 launches - 14 with the gas, 10 with the brake" was a COLUMN SWAP, not a measurement: the two
++    extractors store carState in opposite orders - `extract_seg.py` writes t, vEgo, aEgo, gasPressed, brakePressed,
++    standstill (gas col 3) while `lane-R/extract197.py` writes t, vEgo, standstill, brakePressed, gasPressed, brake,
++    gas (gas col 4) - and the first census read gas/brake from columns 3/4 on BOTH, i.e. brakePressed as the gas on
++    the 197/198/199/19b/19c sets. With the right columns those 10 are gas launches too, and the count is 38 because
++    the 197 set was never loaded.)
 +
 +    FAIL CLOSED: a missing gasPressed, or a missing/non-numeric/non-finite vEgo, returns False. A signal we cannot
 +    read is not evidence that the driver has taken over, and this latch must never be released on a guess.
@@ -222,7 +231,9 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +      self.hold_nag = FCA11_HOLD_NAG_NONE
 +      return FCA11_HOLD_NAG_NONE
 +    if bool(CS.out.brakePressed) or self._hold_nag_driven_away(CS):
-+      # the two clears: the driver's brake (what the red alert asks for) and a car that is really MOVING (CD5).
++      # the two clears: the driver's brake (what the red alert asks for), and a DRIVER who has driven away on the gas
++      # above 3.0 m/s (`_hold_nag_driven_away`: gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS - speed alone is not
++      # a driver, a roll-away and a single wheel glitch reach 3 m/s too).
 +      self._hold_expired = False
 +    holding = bool(self._actuating and self._hold_nag_still(CS) and
 +                   not bool(CS.out.brakePressed) and not bool(CS.out.gasPressed) and
@@ -237,10 +248,11 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +        self._hold_expired = True
 +    self.hold_nag = FCA11_HOLD_NAG_EXPIRED if self._hold_expired else hold_nag_level(self._nag_frames)
 +    return self.hold_nag
- 
++
    def _passive_frame(self, CS, frame: int) -> list[CanData]:
      """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
-@@ -3629,6 +3832,9 @@
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+@@ -3629,6 +3842,9 @@
        # 0041: and the gating timers, so a disable is a clean start.
        self._noresp_cmd_since = None
        self._brake_now_clear_since = None
