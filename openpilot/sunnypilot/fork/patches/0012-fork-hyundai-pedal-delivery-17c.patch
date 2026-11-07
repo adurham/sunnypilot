@@ -1,5 +1,5 @@
 diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
-index 9010110..22c2081 100644
+index bbfc0f4a..f131840f 100644
 --- a/opendbc/car/hyundai/carstate.py
 +++ b/opendbc/car/hyundai/carstate.py
 @@ -361,8 +361,13 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
@@ -18,7 +18,7 @@ index 9010110..22c2081 100644
      }
      if CP_SP.enableGasInterceptor:
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index cfd7d48..2ba53e5 100644
+index cfd7d484..2ba53e58 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
 @@ -71,6 +71,15 @@ class CarParamsSP:
@@ -38,10 +38,10 @@ index cfd7d48..2ba53e5 100644
    neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
  
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index df7c000..5ea39ba 100644
+index 360eb69b..a176ad3f 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-@@ -52,6 +52,9 @@ class CarStateExt:
+@@ -57,6 +57,9 @@ class CarStateExt:
      self.fca11_cam_frames: list[tuple[int, bytes]] = []   # 0053: every camera 0x38D of this tick (hand-back counter)
      self.fca11_now_nanos: int = 0
      self.fca11_lead_closing = False
@@ -51,7 +51,7 @@ index df7c000..5ea39ba 100644
      # 0029 CAL command mode: the lead's distance (the cal sequencer skips a rep when a lead is within
      # plan.conditions.min_lead_m), and the cal-hold flag the controller publishes so the gas
      # neutralization below reads it. Both are inert (False / None) unless cal mode is running.
-@@ -213,6 +216,14 @@ class CarStateExt:
+@@ -218,6 +221,14 @@ class CarStateExt:
            self.fca11_cam_frame = (cap[0], bytes(cap[1]))
          # 0053: EVERY camera 0x38D of this tick, in order (the hand-back counts camera frames, like the panda)
          self.fca11_cam_frames = list(can_parsers[Bus.cam].captured_all.get(FCA11_ADDR, ()))
@@ -67,7 +67,7 @@ index df7c000..5ea39ba 100644
        # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
        # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index 664ded9..c307475 100644
+index 664ded93..c307475d 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -789,6 +789,116 @@ def fca11_standstill_hold_lsb() -> int:
@@ -773,7 +773,7 @@ index 664ded9..c307475 100644
      # 0040: alert state (over this frame's braking) and the per-episode log (one line on the true -> false edge).
      self._alerts(CS, frame, v_kph_now, dec_cmd_now)
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index d68e34a..99e14b3 100644
+index d68e34ae..99e14b34 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -6,13 +6,16 @@ See the LICENSE.md file in the root directory for more details.
@@ -1047,7 +1047,7 @@ index d68e34a..99e14b3 100644
      send_slot = frame % 2 == 0
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_clutch.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_clutch.py
 new file mode 100644
-index 0000000..ee29c36
+index 00000000..ee29c363
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_clutch.py
 @@ -0,0 +1,85 @@
@@ -1137,7 +1137,7 @@ index 0000000..ee29c36
 +    assert CI.CS.fca11_clutch_tq_nm == -20.0, "the frame under test really was decoded"
 +    assert with_frame.to_bytes() == without.to_bytes()
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
-index 374a4c3..cf6b607 100644
+index 374a4c3b..cf6b6071 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
 @@ -27,7 +27,7 @@ def _first_open(b, asks, v_fn, start=0, gas_fn=None):
@@ -1188,7 +1188,7 @@ index 374a4c3..cf6b607 100644
  
    def test_feature_disable_clears_the_counter(self):
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
-index 6422f15..2992335 100644
+index 6422f158..29923357 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
 @@ -174,7 +174,7 @@ class TestCoastFirst(unittest.TestCase):
@@ -1297,7 +1297,7 @@ index 6422f15..2992335 100644
      self.assertEqual(STEP, [d for _, d, _ in sent if d > 0][0])
  
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
-index e87e88f..7d2b68a 100644
+index e87e88f7..7d2b68a1 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
 @@ -292,14 +292,14 @@ class TestLeadLossHold(unittest.TestCase):
@@ -1327,7 +1327,7 @@ index e87e88f..7d2b68a 100644
      self.assertEqual(STEP, [d for _, d in got if d > 0][0], "a re-open is a fresh soft onset")
      self.assertIsNone(b._feel_ll_frame)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
-index 9b7fde6..a1320cd 100644
+index 9b7fde65..a1320cd4 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
 @@ -169,7 +169,7 @@ class _CS:
@@ -2634,7 +2634,7 @@ index 9b7fde6..a1320cd 100644
 +      import shutil
 +      shutil.rmtree(d, ignore_errors=True)
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index cee31f5..d539834 100644
+index cee31f58..d5398344 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 @@ -1786,3 +1786,450 @@ class TestBlipSmoothing17c:
@@ -3089,7 +3089,7 @@ index cee31f5..d539834 100644
 +    assert gi.get_pedal_command(-0.45, 20.) == 0.
 +    assert abs(gi.get_delivery_pedal_command(-0.45, 20.) - gi.DELIVERY_PEDAL_FLOOR) < 1e-12
 diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
-index f752d3f..a92360f 100644
+index f752d3f3..a92360ff 100644
 --- a/opendbc/sunnypilot/car/interfaces.py
 +++ b/opendbc/sunnypilot/car/interfaces.py
 @@ -181,6 +181,23 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca

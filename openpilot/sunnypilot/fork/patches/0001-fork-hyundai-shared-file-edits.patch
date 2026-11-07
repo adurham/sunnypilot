@@ -24,27 +24,29 @@ index f55d12c4..89f842ce 100644
          if state is None or len(dat) > 64:
            continue
 diff --git a/opendbc/car/hyundai/carcontroller.py b/opendbc/car/hyundai/carcontroller.py
-index a8ade36c..54741ec6 100644
+index 3b6e8909..c099477a 100644
 --- a/opendbc/car/hyundai/carcontroller.py
 +++ b/opendbc/car/hyundai/carcontroller.py
-@@ -9,6 +9,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParam
- from opendbc.car.interfaces import CarControllerBase
+@@ -10,6 +10,7 @@ from opendbc.car.interfaces import CarControllerBase
  
+ from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
  from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
 +from opendbc.sunnypilot.car.hyundai.gas_interceptor import GasInterceptorCarController
  from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
  from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
  from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
-@@ -55,7 +56,7 @@ def process_hud_alert(enabled, fingerprint, hud_control):
+@@ -55,8 +56,8 @@ def process_hud_alert(enabled, fingerprint, hud_control):
+   return sys_warning, sys_state, left_lane_warning, right_lane_warning
  
  
- class CarController(CarControllerBase, EsccCarController, LeadDataCarController, LongitudinalController, MadsCarController,
+-class CarController(CarControllerBase, CcncCarController, EsccCarController, LeadDataCarController, LongitudinalController, MadsCarController,
 -                    IntelligentCruiseButtonManagementInterface):
-+                    IntelligentCruiseButtonManagementInterface, GasInterceptorCarController):
++class CarController(CarControllerBase, CcncCarController, EsccCarController, LeadDataCarController, LongitudinalController,
++                    MadsCarController, IntelligentCruiseButtonManagementInterface, GasInterceptorCarController):
    def __init__(self, dbc_names, CP, CP_SP):
      CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
-     EsccCarController.__init__(self, CP, CP_SP)
-@@ -63,7 +64,10 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+     CcncCarController.__init__(self, CP, CP_SP)
+@@ -65,7 +66,10 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
      LeadDataCarController.__init__(self, CP)
      LongitudinalController.__init__(self, CP, CP_SP)
      IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
@@ -55,7 +57,7 @@ index a8ade36c..54741ec6 100644
      self.params = CarControllerParams(CP)
      self.packer = CANPacker(dbc_names[Bus.pt])
      self.angle_limit_counter = 0
-@@ -103,13 +107,24 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+@@ -105,13 +109,24 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
      stopping = actuators.longControlState == LongCtrlState.stopping
      set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
  
@@ -81,7 +83,7 @@ index a8ade36c..54741ec6 100644
        # for longitudinal control, either radar or ADAS driving ECU
        addr, bus = 0x7d0, self.CAN.ECAN if self.CP.flags & HyundaiFlags.CANFD else 0
        if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
-@@ -136,6 +151,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+@@ -139,6 +154,11 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
        can_sends.extend(self.create_can_msgs(apply_steer_req, apply_torque, torque_fault, set_speed_in_units, accel,
                                              stopping, hud_control, actuators, CS, CC))
  
@@ -93,7 +95,7 @@ index a8ade36c..54741ec6 100644
      # Intelligent Cruise Button Management
      can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CS, CC_SP, self.packer, self.frame, self.last_button_frame, self.CAN))
  
-@@ -161,6 +181,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+@@ -164,6 +184,9 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
                                                self.lkas_icon))
  
      # Button messages
@@ -103,7 +105,7 @@ index a8ade36c..54741ec6 100644
      if not self.CP.openpilotLongitudinalControl:
        if self.cancel_counter > CANCEL_BUTTON_DELAY_FRAMES:
          can_sends.append(hyundaican.create_clu11(self.packer, self.frame, CS.clu11, Buttons.CANCEL, self.CP))
-@@ -172,7 +195,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+@@ -175,7 +198,7 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
            if (self.frame - self.last_button_frame) * DT_CTRL >= 0.15:
              self.last_button_frame = self.frame
  
@@ -112,7 +114,7 @@ index a8ade36c..54741ec6 100644
        # TODO: unclear if this is needed
        jerk = 3.0 if actuators.longControlState == LongCtrlState.pid else 1.0
        use_fca = self.CP.flags & HyundaiFlags.USE_FCA.value
-@@ -186,11 +209,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
+@@ -189,11 +212,11 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
        can_sends.append(hyundaican.create_lfahda_mfc(self.packer, CC.enabled, self.lfa_icon))
  
      # 5 Hz ACC options
@@ -127,7 +129,7 @@ index a8ade36c..54741ec6 100644
  
      return can_sends
 diff --git a/opendbc/car/hyundai/carstate.py b/opendbc/car/hyundai/carstate.py
-index 57c27f89..90101103 100644
+index ed76996c..bbfc0f4a 100644
 --- a/opendbc/car/hyundai/carstate.py
 +++ b/opendbc/car/hyundai/carstate.py
 @@ -10,7 +10,10 @@ from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarContr
@@ -202,7 +204,7 @@ index 57c27f89..90101103 100644
 +      parsers[Bus.cam].capture_addrs.add(FCA11_ADDR)
 +    return parsers
 diff --git a/opendbc/car/hyundai/interface.py b/opendbc/car/hyundai/interface.py
-index dc2acbe2..9310ac03 100644
+index fe06e24c..3ca9a75d 100644
 --- a/opendbc/car/hyundai/interface.py
 +++ b/opendbc/car/hyundai/interface.py
 @@ -2,13 +2,14 @@ from opendbc.car import Bus, get_safety_config, structs, uds
@@ -243,7 +245,7 @@ index dc2acbe2..9310ac03 100644
    @staticmethod
    def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
      ret.brand = "hyundai"
-@@ -194,6 +210,22 @@ class CarInterface(CarInterfaceBase):
+@@ -215,6 +231,22 @@ class CarInterface(CarInterfaceBase):
        stock_cp.pcmCruise = True
        ret.safetyParam |= HyundaiSafetyFlagsSP.NON_SCC
  
@@ -266,7 +268,7 @@ index dc2acbe2..9310ac03 100644
      # untested non-SCC platforms, need user validations
      if stock_cp.carFingerprint in (CAR.HYUNDAI_BAYON_1ST_GEN_NON_SCC, CAR.KIA_FORTE_2021_NON_SCC,
                                     CAR.KIA_SELTOS_2023_NON_SCC, CAR.GENESIS_G70_2021_NON_SCC):
-@@ -231,8 +263,9 @@ class CarInterface(CarInterfaceBase):
+@@ -237,8 +269,9 @@ class CarInterface(CarInterfaceBase):
      if communication_control is None:
        communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.DISABLE_RX_DISABLE_TX, uds.MESSAGE_TYPE.NORMAL])
  
@@ -279,7 +281,7 @@ index dc2acbe2..9310ac03 100644
        if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
          addr, bus = 0x730, CanBus(CP).ECAN
 diff --git a/opendbc/car/hyundai/values.py b/opendbc/car/hyundai/values.py
-index 3c2ffdf4..1c0752ca 100644
+index 4afdb88a..a5588c86 100644
 --- a/opendbc/car/hyundai/values.py
 +++ b/opendbc/car/hyundai/values.py
 @@ -56,6 +56,13 @@ class CarControllerParams:
@@ -2028,7 +2030,7 @@ index 51a21abe..cbff8c96 100644
    .get_checksum = hyundai_get_checksum,
    .compute_checksum = hyundai_compute_checksum,
 diff --git a/opendbc/safety/modes/hyundai_canfd.h b/opendbc/safety/modes/hyundai_canfd.h
-index 8f86b66e..a9e90dbc 100644
+index 1d3864c8..adc4c100 100644
 --- a/opendbc/safety/modes/hyundai_canfd.h
 +++ b/opendbc/safety/modes/hyundai_canfd.h
 @@ -268,6 +268,12 @@ static safety_config hyundai_canfd_init(uint16_t param) {
@@ -2045,13 +2047,14 @@ index 8f86b66e..a9e90dbc 100644
    gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
    hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
 diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
-index 8eaa2ca9..4d2caf9b 100644
+index 792014e3..c953cbb3 100644
 --- a/opendbc/safety/modes/hyundai_common.h
 +++ b/opendbc/safety/modes/hyundai_common.h
-@@ -22,6 +22,13 @@ enum {
+@@ -22,7 +22,18 @@ enum {
    HYUNDAI_PARAM_SP_LONGITUDINAL_MAIN_CRUISE_TOGGLEABLE = 2,
    HYUNDAI_PARAM_SP_HAS_LDA_BUTTON = 4,
    HYUNDAI_PARAM_SP_NON_SCC = 8,
+-  HYUNDAI_PARAM_SP_CCNC = 16,
 +  HYUNDAI_PARAM_SP_GAS_INTERCEPTOR = 16,  // comma pedal longitudinal (non-SCC ICE only), see hyundai.h
 +  HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED = 32,  // pedal on remapped IDs: cmd 0x700 / sensor 0x701 (needs GAS_INTERCEPTOR)
 +  HYUNDAI_PARAM_SP_FCA11_BRAKE_TEST = 64,  // TEST-ONLY: parked FCA11 (0x38D) brake-injection research, see hyundai.h
@@ -2059,12 +2062,17 @@ index 8eaa2ca9..4d2caf9b 100644
 +  HYUNDAI_PARAM_SP_FCA11_LONG = 256,  // PRODUCTION (toggle-gated): FCA11 decel on top of the gas interceptor, see hyundai.h
 +  HYUNDAI_PARAM_SP_LKAS_PARK_TEST = 512,  // TEST-ONLY: parked LKAS11 (0x340) steering-torque sweep, see hyundai.h
 +  HYUNDAI_PARAM_SP_CN7_STEER_RAMP = 1024,  // Elantra N (CN7 non-SCC): LKAS11 torque rate-up 4/frame instead of 3, see hyundai.h
++  // ccNC (upstream b5e8fe58). Upstream asked for bit 16, which this fork already gave to GAS_INTERCEPTOR: 16..1024 are
++  // the fork's, they are mirrored by HyundaiSafetyFlagsSP in the car layer and pinned there by unit tests, and the
++  // field is uint16_t (current_safety_param_sp) so the block cannot simply move up. Upstream's bit therefore takes the
++  // first free slot above it. Values are symbolic everywhere, so this is invisible to both car layers.
++  HYUNDAI_PARAM_SP_CCNC = 2048,
  };
  
  // common state
-@@ -62,6 +69,280 @@ bool hyundai_has_lda_button = false;
- extern bool hyundai_non_scc;
- bool hyundai_non_scc = false;
+@@ -66,6 +77,280 @@ bool hyundai_non_scc = false;
+ extern bool hyundai_ccnc;
+ bool hyundai_ccnc = false;
  
 +// CN7 (Elantra N, non-SCC) faster steering-torque ramp: max_rate_up 4 (default HKG 3). Same 384 max, same rate-down 7,
 +// same max_rt_delta 112 / 250 ms (4 x 25 frames = 100 < 112, so 4 is the largest rate the real-time check permits).
@@ -2343,7 +2351,7 @@ index 8eaa2ca9..4d2caf9b 100644
  static uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
  
  static bool main_button_prev;
-@@ -69,6 +350,15 @@ static bool acc_main_on_prev;
+@@ -73,6 +358,15 @@ static bool acc_main_on_prev;
  static bool acc_main_on_tx;
  static uint32_t acc_main_on_mismatches;
  
@@ -2359,11 +2367,12 @@ index 8eaa2ca9..4d2caf9b 100644
  void hyundai_common_init(uint16_t param) {
    const uint16_t HYUNDAI_PARAM_EV_GAS = 1;
    const uint16_t HYUNDAI_PARAM_HYBRID_GAS = 2;
-@@ -90,10 +380,16 @@ void hyundai_common_init(uint16_t param) {
+@@ -94,11 +388,17 @@ void hyundai_common_init(uint16_t param) {
    hyundai_longitudinal_main_cruise_toggleable = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_LONGITUDINAL_MAIN_CRUISE_TOGGLEABLE);
    hyundai_has_lda_button = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_HAS_LDA_BUTTON);
    hyundai_non_scc = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_NON_SCC);
 +  hyundai_cn7_steer_ramp = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CN7_STEER_RAMP);
+   hyundai_ccnc = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CCNC);
  
    hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
  
@@ -2376,7 +2385,7 @@ index 8eaa2ca9..4d2caf9b 100644
    acc_main_on_prev = false;
    acc_main_on_tx = false;
    acc_main_on_mismatches = 0U;
-@@ -104,6 +400,43 @@ void hyundai_common_init(uint16_t param) {
+@@ -109,6 +409,43 @@ void hyundai_common_init(uint16_t param) {
  #else
    hyundai_longitudinal = false;
  #endif
@@ -2420,7 +2429,7 @@ index 8eaa2ca9..4d2caf9b 100644
  }
  
  void hyundai_common_cruise_state_check(const bool cruise_engaged) {
-@@ -111,7 +444,8 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+@@ -116,7 +453,8 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
    // so keep track of user button presses to deny engagement if no interaction
  
    // enter controls on rising edge of ACC and recent user button press, exit controls when ACC off
@@ -2430,7 +2439,7 @@ index 8eaa2ca9..4d2caf9b 100644
      if (cruise_engaged && !cruise_engaged_prev && (hyundai_last_button_interaction < HYUNDAI_PREV_BUTTON_SAMPLES)) {
        controls_allowed = true;
      }
-@@ -120,6 +454,48 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
+@@ -125,6 +463,48 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
        controls_allowed = false;
      }
      cruise_engaged_prev = cruise_engaged;
@@ -2479,7 +2488,7 @@ index 8eaa2ca9..4d2caf9b 100644
    }
  }
  
-@@ -130,12 +506,17 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
+@@ -135,12 +515,17 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
      hyundai_last_button_interaction = SAFETY_MIN(hyundai_last_button_interaction + 1U, HYUNDAI_PREV_BUTTON_SAMPLES);
    }
  
@@ -2503,7 +2512,7 @@ index 8eaa2ca9..4d2caf9b 100644
      }
  
      // exit controls on cancel press
-@@ -144,7 +525,9 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
+@@ -149,7 +534,9 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
      }
  
      // toggle main cruise state on rising edge of main cruise button
@@ -2515,10 +2524,10 @@ index 8eaa2ca9..4d2caf9b 100644
      }
  
 diff --git a/opendbc/safety/tests/common.py b/opendbc/safety/tests/common.py
-index d94bdf26..b931cd15 100644
+index 37b855b7..67e241d2 100644
 --- a/opendbc/safety/tests/common.py
 +++ b/opendbc/safety/tests/common.py
-@@ -992,8 +992,10 @@ class SafetyTest(SafetyTestBase):
+@@ -995,8 +995,10 @@ class SafetyTest(SafetyTestBase):
                continue
              if {attr, current_test}.issubset({'TestHyundaiLongitudinalSafety', 'TestHyundaiLongitudinalSafetyCameraSCC', 'TestHyundaiSafetyFCEVLong'}):
                continue
@@ -2530,180 +2539,8 @@ index d94bdf26..b931cd15 100644
              if any(attr.startswith(test) for test in base_tests) and any(current_test.startswith(test) for test in base_tests):
                continue
              volkswagen_shared = ('TestVolkswagenMqb', 'TestVolkswagenMlb', 'TestVolkswagenMeb')
-diff --git a/opendbc/safety/tests/libsafety/libsafety_py.py b/opendbc/safety/tests/libsafety/libsafety_py.py
-index 6146acbc..fd61c517 100644
---- a/opendbc/safety/tests/libsafety/libsafety_py.py
-+++ b/opendbc/safety/tests/libsafety/libsafety_py.py
-@@ -1,5 +1,4 @@
- import os
--import re
- import subprocess
- import tempfile
- from pathlib import Path
-@@ -21,14 +20,12 @@ def _build_libsafety(release: bool = False) -> str:
-     '-std=gnu11', '-Wfatal-errors', '-Wno-pointer-to-int-cast',
-     '-g', '-O0', '-fno-omit-frame-pointer',
-   ]
--  # Coverage must exclude the branches inserted by UBSan.
--  if os.environ.get("SAFETY_COVERAGE") == "1":
--    ldflags = ['-fprofile-arcs', '-ftest-coverage'] if not release else []
--  else:
--    ldflags = ['-fsanitize=undefined', '-fno-sanitize-recover=undefined']
--  cflags += ldflags
-+  ldflags = [
-+    '-fsanitize=undefined', '-fno-sanitize-recover=undefined',
-+  ]
-   if not release:
--    cflags += ['-DALLOW_DEBUG']
-+    cflags += ['-DALLOW_DEBUG', '-fprofile-arcs', '-ftest-coverage']
-+    ldflags += ['-fprofile-arcs', '-ftest-coverage']
- 
-   fd, safety_os = tempfile.mkstemp(suffix='.os', dir=libsafety_dir)
-   os.close(fd)
-@@ -40,38 +37,120 @@ def _build_libsafety(release: bool = False) -> str:
-   return libsafety_so
- 
- 
--def cdef_from_file(path: Path) -> str:
--  source = path.read_text()
--  source = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
--  source = re.sub(r"__attribute__\(\(.*\)\)", "", source)
--
--  # Keep integer constants, type declarations, and function signatures, including definitions.
--  constants = re.findall(r"^#define \w+ \d+[UuLl]*[ \t]*$", source, re.MULTILINE)
--  types = re.findall(r"^(?:typedef|struct|enum)\b(?:[^;{]|\{[^}]*\})+;", source, re.MULTILINE)
--  functions = re.findall(r"^((?!typedef\b)\w[\w *]*\b\w+\([^;{}]*\))\s*[;{]", source, re.MULTILINE)
--  return "\n".join([*constants, *types, *(f"{signature};" for signature in dict.fromkeys(functions))])
--
--
- ffi = FFI()
--safety_dir = Path(libsafety_dir).parents[1]
--ffi.cdef(cdef_from_file(safety_dir / "can.h"), packed=True)
--for path in (safety_dir / "declarations.h", safety_dir / "ignition.h", safety_dir / "sunnypilot" / "mads_declarations.h", Path(libsafety_dir) / "safety.c"):
--  ffi.cdef(cdef_from_file(path))
- 
-+ffi.cdef("""
-+typedef struct {
-+  unsigned char fd : 1;
-+  unsigned char bus : 3;
-+  unsigned char data_len_code : 4;
-+  unsigned char rejected : 1;
-+  unsigned char returned : 1;
-+  unsigned char extended : 1;
-+  unsigned int addr : 29;
-+  unsigned char checksum;
-+  unsigned char data[64];
-+} CANPacket_t;
-+""", packed=True)
- class CANPacket:
-   pass
- 
--# Functions not captured by cdef_from_file (macros, non-standard formatting, or generated)
- ffi.cdef("""
-+bool safety_rx_hook(CANPacket_t *msg);
-+bool safety_tx_hook(CANPacket_t *msg);
-+int safety_fwd_hook(int bus_num, int addr);
-+int set_safety_hooks(uint16_t mode, uint16_t param);
-+
-+void set_controls_allowed(bool c);
-+bool get_controls_allowed(void);
-+bool get_longitudinal_allowed(void);
-+void set_alternative_experience(int mode);
- int get_alternative_experience(void);
--int get_desired_angle_last(void);
-+void set_relay_malfunction(bool c);
-+bool get_relay_malfunction(void);
-+bool get_gas_pressed_prev(void);
-+void set_gas_pressed_prev(bool);
-+bool get_brake_pressed_prev(void);
-+bool get_regen_braking_prev(void);
-+bool get_steering_disengage_prev(void);
-+bool get_acc_main_on(void);
-+float get_vehicle_speed_min(void);
-+float get_vehicle_speed_max(void);
-+int get_current_safety_mode(void);
-+int get_current_safety_param(void);
-+
-+void set_torque_meas(int min, int max);
-+int get_torque_meas_min(void);
-+int get_torque_meas_max(void);
-+void set_torque_driver(int min, int max);
-+int get_torque_driver_min(void);
-+int get_torque_driver_max(void);
-+void set_desired_torque_last(int t);
-+void set_rt_torque_last(int t);
-+void set_desired_angle_last(int t);
-+int get_desired_angle_last();
-+void set_angle_meas(int min, int max);
-+int get_angle_meas_min(void);
-+int get_angle_meas_max(void);
-+void set_desired_curvature_last(int t);
-+int get_desired_curvature_last();
-+void set_curvature_meas(int min, int max);
-+int get_curvature_meas_min(void);
-+int get_curvature_meas_max(void);
-+
-+bool get_cruise_engaged_prev(void);
-+void set_cruise_engaged_prev(bool engaged);
-+bool get_vehicle_moving(void);
-+void set_timer(uint32_t t);
-+
-+void safety_tick(void);
-+void safety_tick_current_safety_config();
-+bool safety_config_valid();
-+
-+void init_tests(void);
-+
-+void set_honda_fwd_brake(bool c);
-+bool get_honda_fwd_brake(void);
-+void set_honda_alt_brake_msg(bool c);
- void set_honda_bosch_long(bool c);
- int get_honda_hw(void);
--void set_ignition_can(bool c);
--uint32_t get_acc_main_on_mismatches(void);
--int get_temp_debug(void);
-+
- void mutation_set_active_mutant(int id);
- int mutation_get_active_mutant(void);
-+
-+void ignition_can_hook(const CANPacket_t *msg);
-+bool get_ignition_can(void);
-+void set_ignition_can(bool c);
-+
-+bool get_controls_allowed_lateral(void);
-+bool get_controls_requested_lateral(void);
-+void set_current_safety_param_sp(uint16_t param);
-+uint16_t get_current_safety_param_sp(void);
-+bool get_enable_mads(void);
-+bool get_disengage_lateral_on_brake(void);
-+bool get_pause_lateral_on_brake(void);
-+void set_mads_button_press(int mads_button_press);
-+void set_controls_allowed_lateral(bool c);
-+void set_controls_requested_lateral(bool c);
-+bool get_mads_acc_main(void);
-+void set_acc_main_on(bool c);
-+int get_mads_button_press(void);
-+void mads_set_current_disengage_reason(int reason);
-+int mads_get_current_disengage_reason(void);
-+int get_temp_debug(void);
-+uint32_t get_acc_main_on_mismatches(void);
-+void set_mads_params(bool enable_mads, bool disengage_lateral_on_brake, bool pause_lateral_on_brake);
-+void mads_apply_alternative_experience(int mode);
-+void tick_mads_state(bool vm, bool acc_main, bool op_allowed, bool braking, bool steering_disengage);
-+void set_heartbeat_engaged_mads(bool c);
-+void mads_heartbeat_engaged_check(void);
-+void set_steering_disengage(bool c);
-+int get_gas_interceptor_prev(void);
-+
-+int get_self_tx_count(void);
-+void clear_self_tx(void);
-+uint32_t get_self_tx(int i, CANPacket_t *out, int *bus, bool *skip_tx_hook);
-+void set_heartbeat_engaged(bool c);
- """)
- 
- class LibSafety:
 diff --git a/opendbc/safety/tests/libsafety/safety.c b/opendbc/safety/tests/libsafety/safety.c
-index 0cfbc3ab..b2cc5421 100644
+index 4266125b..458ccee0 100644
 --- a/opendbc/safety/tests/libsafety/safety.c
 +++ b/opendbc/safety/tests/libsafety/safety.c
 @@ -13,6 +13,57 @@ uint32_t microsecond_timer_get(void) {
@@ -2764,7 +2601,7 @@ index 0cfbc3ab..b2cc5421 100644
  bool safety_config_valid() {
    if (current_safety_config.rx_checks_len <= 0) {
      printf("missing RX checks\n");
-@@ -317,4 +368,7 @@ void init_tests(void){
+@@ -357,4 +408,7 @@ void init_tests(void){
    mads_button_press = MADS_BUTTON_UNAVAILABLE;
    heartbeat_engaged_mads = false;
    heartbeat_engaged_mads_mismatches = 0U;
@@ -6632,12 +6469,12 @@ index 2fbf863f..0b8e6d14 100644
 -  return packer.make_can_msg("GAS_COMMAND", 0, values)
 +  return packer.make_can_msg(msg_name, 0, values)
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index 6b2837c4..e3e2f620 100644
+index 776efb4f..4bf62c64 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-@@ -6,11 +6,25 @@ See the LICENSE.md file in the root directory for more details.
- """
+@@ -7,11 +7,25 @@ See the LICENSE.md file in the root directory for more details.
  
+ import copy
  from enum import StrEnum
 +import time
  
@@ -6662,10 +6499,10 @@ index 6b2837c4..e3e2f620 100644
  
  
  class CarStateExt:
-@@ -19,6 +33,94 @@ class CarStateExt:
-     self.CP_SP = CP_SP
- 
-     self.aBasis = 0.0
+@@ -24,6 +38,94 @@ class CarStateExt:
+     self.msg_162 = {}
+     self.mdps = {}
+     self.cruise_buttons_msg = {}
 +    # GAS_SENSOR STATE, 0 = NO_FAULT. Read by GasInterceptorCarController.create_gas_command (this CarState instance is
 +    # the CS it receives) to send the fault-clearing zero frame; escalation comes back through pedal_fault_monitor.
 +    self.interceptor_state = 0
@@ -6757,7 +6594,7 @@ index 6b2837c4..e3e2f620 100644
  
    def update_speed_limit(self, cp, cp_cam) -> float:
      speed_limit = 0
-@@ -74,7 +176,136 @@ class CarStateExt:
+@@ -81,7 +183,136 @@ class CarStateExt:
          ret.stockFcw = aeb_warning and not aeb_braking
          ret.stockAeb = aeb_warning and aeb_braking
  
@@ -6895,13 +6732,14 @@ index 6b2837c4..e3e2f620 100644
    def update_canfd_ext(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser],
                         speed_factor: float) -> None:
 diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
-index 0ec40068..18eab03d 100644
+index 45a38e86..c764ef78 100644
 --- a/opendbc/sunnypilot/car/hyundai/values.py
 +++ b/opendbc/sunnypilot/car/hyundai/values.py
-@@ -14,6 +14,78 @@ class HyundaiSafetyFlagsSP:
+@@ -14,7 +14,83 @@ class HyundaiSafetyFlagsSP:
    LONG_MAIN_CRUISE_TOGGLEABLE = 2
    HAS_LDA_BUTTON = 4
    NON_SCC = 8
+-  CCNC = 16
 +  GAS_INTERCEPTOR = 16  # comma pedal longitudinal; C mirror: HYUNDAI_PARAM_SP_GAS_INTERCEPTOR (safety/modes/hyundai_common.h)
 +  # pedal uses the REMAPPED IDs (cmd 0x700 / sensor 0x701) instead of 0x200/0x201. Only meaningful with GAS_INTERCEPTOR.
 +  # C mirror: HYUNDAI_PARAM_SP_GAS_INTERCEPTOR_REMAPPED. Also the single source of truth for the dialect in the car layer.
@@ -6933,6 +6771,11 @@ index 0ec40068..18eab03d 100644
 +  # 384. C mirror: HYUNDAI_PARAM_SP_CN7_STEER_RAMP. Must match CarControllerParams.STEER_DELTA_UP for that platform.
 +  # Both are test/car-layer SP bits on distinct flags: 512 LKAS_PARK_TEST (unshipped, this file) and 1024 CN7_STEER_RAMP.
 +  CN7_STEER_RAMP = 1024
++  # ccNC (upstream b5e8fe58). Upstream asked for 16 / 2**11, which this fork's gas-interceptor bits already own; those
++  # values are mirrored in safety/modes/hyundai_common.h and pinned by fork tests, and current_safety_param_sp is
++  # uint16_t, so the fork block cannot move up. Upstream's bit takes the first free slot above it instead. Every use
++  # of it is symbolic (HyundaiSafetyFlagsSP.CCNC / HYUNDAI_PARAM_SP_CCNC), so nothing else has to change.
++  CCNC = 2048
 +
 +
 +# Raw CR_VSM_DecCmd cap (0.01 g/LSB) for FCA11_BRAKE_TEST; must equal HYUNDAI_FCA11_TEST_MAX_DEC in safety/modes/hyundai.h
@@ -6977,16 +6820,19 @@ index 0ec40068..18eab03d 100644
  
  
  class HyundaiFlagsSP(IntFlag):
-@@ -31,3 +103,7 @@ class HyundaiFlagsSP(IntFlag):
+@@ -32,4 +108,9 @@ class HyundaiFlagsSP(IntFlag):
    NON_SCC_NO_FCA = 2 ** 8  # not all have FCA
    SPEED_LIMIT_AVAILABLE = 2 ** 9  # platforms with speed limit data available
    HAS_LKAS12 = 2 ** 10
+-  CCNC = 2 ** 11
 +  GAS_INTERCEPTOR_DETECTED = 2 ** 11  # capability only: comma pedal GAS_SENSOR (0x201) seen on bus 0 of a non-SCC ICE car
 +  # capability only: remapped-ID pedal (custom firmware) GAS_SENSOR_R (0x701) seen on bus 0 of a non-SCC ICE car.
 +  # Independent of GAS_INTERCEPTOR_DETECTED (which stays 'standard 0x201 seen'), so 'both seen' is representable.
 +  GAS_INTERCEPTOR_REMAPPED_DETECTED = 2 ** 12
++  # ccNC (upstream b5e8fe58) sits above the fork's two capability bits for the same reason as HyundaiSafetyFlagsSP.CCNC.
++  CCNC = 2 ** 13
 diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
-index d828a760..a909b29e 100644
+index 0ed15d08..f752d3f3 100644
 --- a/opendbc/sunnypilot/car/interfaces.py
 +++ b/opendbc/sunnypilot/car/interfaces.py
 @@ -23,7 +23,7 @@ from opendbc.car.volkswagen.values import VolkswagenFlags

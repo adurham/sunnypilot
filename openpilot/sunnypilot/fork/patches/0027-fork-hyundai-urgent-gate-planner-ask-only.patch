@@ -1,14 +1,16 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index f58285b8..7979e968 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -900,6 +900,7 @@
- # (Fable review: a bridge or a parked car at 36 m reads as a 3.5 m/s^2 demand, and with the raised gate that would be a
- # 0.35 g phantom brake at highway speed. The urgent authority stays reserved for the planner's own ask.)
+@@ -895,6 +895,7 @@ FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the
  FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
+ 
+ 
 +
- 
- 
  FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
-@@ -2143,7 +2144,10 @@
+ FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+ 
+@@ -2126,7 +2127,10 @@ class Fca11LongBrake:
        # 2026-11-03 (Fable review): this passed the raised gate unconditionally, so EVERY level on this path - a gentle ask,
        # a lead-loss hold, a standstill level - could spend 46 LSB. The gate is now keyed on the ask itself, which is the only
        # thing the owner's ruling covers: an ask at/below FCA11_URGENT_ASK_MSS2, i.e. a genuine hard stop.
@@ -20,7 +22,7 @@
        return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
      if not self.feel_fix:
        return feel_target_lsb(a_tgt, personality)
-@@ -2900,7 +2904,8 @@
+@@ -2869,7 +2873,8 @@ class Fca11LongBrake:
        self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
        return sends
  

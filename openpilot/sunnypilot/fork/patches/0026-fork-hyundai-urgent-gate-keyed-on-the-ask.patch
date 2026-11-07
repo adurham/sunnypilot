@@ -1,6 +1,8 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 0cf73847..f58285b8 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -896,7 +896,9 @@
+@@ -889,7 +889,9 @@ FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguous
  # only when the car is genuinely closing (c >= 1.0 m/s), only with a lead inside 40 m, and it is capped by the wire gate.
  FCA11_AEB_MIN_CLOSING_MPS = 1.0      # m/s: below this the car is following, not closing - never add braking
  FCA11_AEB_GAP_M = 4.0                # m: the standstill gap it defends (lead distance minus this is the room it has)
@@ -11,7 +13,7 @@
  FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
  
  
-@@ -1380,7 +1382,11 @@
+@@ -1363,7 +1365,11 @@ class Fca11LongBrake:
      _refuse_shadow_env()
      self._core = bool(core)
      # 2026-11-03 (owner: guard 0.5 g): only the V3 shaping instance may spend the raised gate on a hard-stop ask.
@@ -24,7 +26,7 @@
      self.shadow = (not self._core) and shadow_enabled(CP_SP)
      self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
      # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
-@@ -2134,7 +2140,10 @@
+@@ -2117,7 +2123,10 @@ class Fca11LongBrake:
      stop band as the car slows instead of stepping at band entry. None = at speed = the moving floor.
      """
      if self.meas_inverse:
@@ -36,9 +38,11 @@
        return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
      if not self.feel_fix:
        return feel_target_lsb(a_tgt, personality)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
+index 29923357..a3243351 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel.py
-@@ -355,9 +355,16 @@
+@@ -355,9 +355,16 @@ class TestAuthorityInvariant(unittest.TestCase):
          if d <= 0:
            continue
          total += 1
@@ -57,9 +61,11 @@
            misaligned += 1
      self.assertLess(misaligned, 0.01 * total, f"misaligned slots must be rare: {misaligned}/{total}")
  
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
+index 7d2b68a1..21840de6 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_feel_fix.py
-@@ -266,8 +266,16 @@
+@@ -266,8 +266,16 @@ class TestLeadLossHold(unittest.TestCase):
        last = 0
        for f, d in _run(b, asks, leads=leads, personality=p):
          if d > 0:

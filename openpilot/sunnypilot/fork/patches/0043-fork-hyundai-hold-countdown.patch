@@ -1,11 +1,43 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 5b5f66b4..2ba833aa 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -222,6 +222,12 @@ class CarStateSP:
+   superviseStop: bool = auto_field()
+   stopComplete: bool = auto_field()
+   brakeNow: bool = auto_field()
++  # 0043-CD: the standstill hold countdown, 0 none / 1 soft (>= 3000 sent frames = 60 s) / 2 loud (4500 = 90 s) /
++  # 3 final (5500 = 110 s) / 4 EXPIRED (6000 = 120 s, a STICKY latch that survives the counter reset and clears only on
++  # the driver's brake press; it is what makes the superproject disengage and release the brakes). Written by the
++  # controller from Fca11LongBrake.hold_nag (a pure observer of the SENT level - the wire is untouched) and read by
++  # car_specific.py -> events.py. Coupled with custom.capnp CarStateSP.holdNag (@21).
++  holdNag: int = auto_field()
+   # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
+   # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
+   # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 85026c2c..f54f4716 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -298,6 +298,10 @@ class CarStateExt:
+     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
+     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
+     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
++    # 0043 (four tiers, replaces 0041-N's two): the standstill hold countdown, 0 none / 1 soft (60 s) / 2 loud (90 s) /
++    # 3 final (110 s) / 4 EXPIRED (120 s, a sticky latch). Same 1-frame pattern and same `armed` gate, so the field is
++    # exactly "this state is up right now"; car_specific.py raises the three tier alerts and the expiry.
++    ret_sp.holdNag = int(getattr(self, "fca11_hold_nag", 0)) if armed else 0
+     # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
+     # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
+     # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 3740cee1..2b412e11 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -977,8 +977,96 @@
- FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
+@@ -978,6 +978,94 @@ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin u
  FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
  FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
-+
+ 
 +# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
 +# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
 +# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
@@ -65,7 +97,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +FCA11_HOLD_NAG_LOUD = 2
 +FCA11_HOLD_NAG_FINAL = 3
 +FCA11_HOLD_NAG_EXPIRED = 4
- 
++
 +# CD6: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off ON THE GAS. The red alert
 +# asks for the brake pedal, and the brake is still the only thing that clears a LATCHED, STOPPED car; but a driver who
 +# instead accelerates must not carry a PERMANENT full-screen red alert (and the engage strip that goes with it) for
@@ -76,7 +108,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +# gas pedal can never clear it. Strict `>` and a FINITE value only (fail closed: a missing or NaN vEgo, or a missing
 +# gasPressed, is not evidence that the driver has taken over).
 +FCA11_HOLD_NAG_CLEAR_V_MS = 3.0
- 
++
 +
 +def hold_nag_level(frames: int) -> int:
 +  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
@@ -94,11 +126,10 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +  return FCA11_HOLD_NAG_LOUD if n < FCA11_HOLD_NAG_FINAL_FRAMES else FCA11_HOLD_NAG_FINAL
 +
 +
-+
+ 
  def stop_hold_enabled(CP_SP) -> bool:
    """0034: the stop-hold clutch lane switch, read from CP_SP only (getattr: an un-wired CP_SP is OFF)."""
-   return bool(getattr(CP_SP, "fca11StopHoldClutch", False))
-@@ -1897,6 +1985,15 @@
+@@ -1897,6 +1985,15 @@ class Fca11LongBrake:
      self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
      # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
      self.stop_hold_blockers: dict[str, int] = {}
@@ -114,7 +145,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
      self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
      # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
      # throttle (see sub_bite_gate). A counter only - it never feeds the law.
-@@ -2153,6 +2250,7 @@
+@@ -2153,6 +2250,7 @@ class Fca11LongBrake:
        self._noresp_cmd_since = None
        self._hold_lost_armed = False
        self._brake_now_clear_since = None
@@ -122,7 +153,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
        return
      now_us = time.monotonic() * 1e6
      gas = bool(CS.out.gasPressed)
-@@ -2242,6 +2340,10 @@
+@@ -2242,6 +2340,10 @@ class Fca11LongBrake:
        self.brake_now = False
        self.brake_now_reason = ""
        self.low_speed_alert = False
@@ -133,11 +164,10 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
  
    def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
      """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
-@@ -2530,7 +2632,118 @@
-     if why:
+@@ -2531,6 +2633,117 @@ class Fca11LongBrake:
        self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
      return want
-+
+ 
 +  def _hold_nag_still(self, CS) -> bool:
 +    """CD3: a DEAD STOP - openpilot's standstill bit AND every one of the four wheels at rest.
 +
@@ -152,7 +182,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
 +    if wheel_max is None:
 +      return False
 +    return float(wheel_max) <= FCA11_HOLD_NAG_STILL_KPH
- 
++
 +  def _hold_nag_driven_away(self, CS) -> bool:
 +    """CD6: the latch's second clear - the DRIVER has driven the car away, on the gas, above 3 m/s.
 +
@@ -252,7 +282,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
    def _passive_frame(self, CS, frame: int) -> list[CanData]:
      """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
      DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
-@@ -3629,6 +3842,9 @@
+@@ -3629,6 +3842,9 @@ class Fca11LongBrake:
        # 0041: and the gating timers, so a disable is a clean start.
        self._noresp_cmd_since = None
        self._brake_now_clear_since = None
@@ -263,9 +293,10 @@ diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/c
                       self.stop_hold_frames, self.stop_hold_blockers)
        self.stop_hold_blockers = {}
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 36290701..734909d9 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-@@ -791,6 +791,12 @@
+@@ -791,6 +791,12 @@ class GasInterceptorCarController:
      CS.fca11_supervise_stop = bool(self.fca11_brake.supervise_stop)
      CS.fca11_stop_complete = bool(self.fca11_brake.stop_complete)
      CS.fca11_brake_now = bool(self.fca11_brake.brake_now)
@@ -278,38 +309,9 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
      # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
      # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
      # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
-diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
---- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-+++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-@@ -293,6 +293,10 @@
-     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
-     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
-     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
-+    # 0043 (four tiers, replaces 0041-N's two): the standstill hold countdown, 0 none / 1 soft (60 s) / 2 loud (90 s) /
-+    # 3 final (110 s) / 4 EXPIRED (120 s, a sticky latch). Same 1-frame pattern and same `armed` gate, so the field is
-+    # exactly "this state is up right now"; car_specific.py raises the three tier alerts and the expiry.
-+    ret_sp.holdNag = int(getattr(self, "fca11_hold_nag", 0)) if armed else 0
-     # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
-     # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
-     # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
-diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
---- a/opendbc/car/structs.py
-+++ b/opendbc/car/structs.py
-@@ -222,6 +222,12 @@
-   superviseStop: bool = auto_field()
-   stopComplete: bool = auto_field()
-   brakeNow: bool = auto_field()
-+  # 0043-CD: the standstill hold countdown, 0 none / 1 soft (>= 3000 sent frames = 60 s) / 2 loud (4500 = 90 s) /
-+  # 3 final (5500 = 110 s) / 4 EXPIRED (6000 = 120 s, a STICKY latch that survives the counter reset and clears only on
-+  # the driver's brake press; it is what makes the superproject disengage and release the brakes). Written by the
-+  # controller from Fca11LongBrake.hold_nag (a pure observer of the SENT level - the wire is untouched) and read by
-+  # car_specific.py -> events.py. Coupled with custom.capnp CarStateSP.holdNag (@21).
-+  holdNag: int = auto_field()
-   # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
-   # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
-   # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
 new file mode 100644
+index 00000000..fd8efc32
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
 @@ -0,0 +1,1014 @@

@@ -199,24 +199,11 @@ index cbff8c96..4902bcfe 100644
    }
  
    // BUTTONS: used for resume spamming and cruise cancellation
-diff --git a/opendbc/safety/tests/libsafety/libsafety_py.py b/opendbc/safety/tests/libsafety/libsafety_py.py
-index fd61c517..b7372392 100644
---- a/opendbc/safety/tests/libsafety/libsafety_py.py
-+++ b/opendbc/safety/tests/libsafety/libsafety_py.py
-@@ -146,6 +146,8 @@ void set_heartbeat_engaged_mads(bool c);
- void mads_heartbeat_engaged_check(void);
- void set_steering_disengage(bool c);
- int get_gas_interceptor_prev(void);
-+bool get_hyundai_fca11_cam_brake(void);
-+uint32_t get_hyundai_fca11_cam_quiet(void);
- 
- int get_self_tx_count(void);
- void clear_self_tx(void);
 diff --git a/opendbc/safety/tests/libsafety/safety.c b/opendbc/safety/tests/libsafety/safety.c
-index b2cc5421..a5f62f4b 100644
+index 458ccee0..a313f721 100644
 --- a/opendbc/safety/tests/libsafety/safety.c
 +++ b/opendbc/safety/tests/libsafety/safety.c
-@@ -348,6 +348,15 @@ int get_gas_interceptor_prev(void){
+@@ -388,6 +388,15 @@ int get_gas_interceptor_prev(void){
    return gas_interceptor_prev;
  }
  
@@ -644,10 +631,10 @@ index 73dfe243..27013a86 100755
  @parameterized_class(LDA_BUTTON)
  class TestHyundaiNonSCCCN7SteerRampSafety(TestHyundaiNonSCCSafety):
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index e3e2f620..f77b0063 100644
+index 4bf62c64..360eb69b 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-@@ -49,6 +49,7 @@ class CarStateExt:
+@@ -54,6 +54,7 @@ class CarStateExt:
      # (written by the controller each frame, same pattern as pedal_long_engaged). fca11_lead_closing = a lead is
      # closing (the low-speed hand-over alert gate), also written by the controller from CarControlSP.
      self.fca11_cam_frame: tuple[int, bytes] | None = None
@@ -655,7 +642,7 @@ index e3e2f620..f77b0063 100644
      self.fca11_now_nanos: int = 0
      self.fca11_lead_closing = False
      # 0029 CAL command mode: the lead's distance (the cal sequencer skips a rep when a lead is within
-@@ -62,6 +63,8 @@ class CarStateExt:
+@@ -67,6 +68,8 @@ class CarStateExt:
      # 0030 (D1-b): the FCA11-long hand-back flag (camera owns / pedal fault), written by the controller each frame
      # (same pattern as fca11_cal_active) and mirrored onto CarStateSP.fca11Unavailable for the superproject alert.
      self.fca11_unavailable = False
@@ -664,7 +651,7 @@ index e3e2f620..f77b0063 100644
      # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
      # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
      # ESC do below 12 km/h / at standstill". None = not published this frame.
-@@ -206,6 +209,8 @@ class CarStateExt:
+@@ -213,6 +216,8 @@ class CarStateExt:
          cap = can_parsers[Bus.cam].captured.get(FCA11_ADDR)
          if cap is not None:
            self.fca11_cam_frame = (cap[0], bytes(cap[1]))
@@ -673,7 +660,7 @@ index e3e2f620..f77b0063 100644
  
        # Factory cruise lockout: openpilot sends no CLU11 in this mode (no CANCEL), so it must never have to fight the
        # factory cruise. The factory cruise can only engage while its MAIN is armed (EMS16 CRUISE_LAMP_M; off at every
-@@ -259,6 +264,9 @@ class CarStateExt:
+@@ -266,6 +271,9 @@ class CarStateExt:
      # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
      # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
      ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
@@ -1966,10 +1953,10 @@ index 4aedf7c7..068a8b17 100644
    def test_mirror_frame_bytes(self):
      CI, CP_SP = self._ccr()
 diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
-index 18eab03d..364e4c63 100644
+index c764ef78..7071d1c0 100644
 --- a/opendbc/sunnypilot/car/hyundai/values.py
 +++ b/opendbc/sunnypilot/car/hyundai/values.py
-@@ -64,6 +64,16 @@ HYUNDAI_FCA11_LONG_MAX_DEC = 30
+@@ -69,6 +69,16 @@ HYUNDAI_FCA11_LONG_MAX_DEC = 30
  # HYUNDAI_FCA11_LONG_MIN_SPEED and the planner's FCA11_BRAKE_MIN_KPH. Actuation is legal at any speed, through zero.
  # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.
  HYUNDAI_FCA11_LONG_RATE_STEP = 4

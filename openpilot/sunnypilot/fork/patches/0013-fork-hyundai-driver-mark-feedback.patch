@@ -1,5 +1,5 @@
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index 2ba53e5..aed26d0 100644
+index 2ba53e58..aed26d06 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
 @@ -210,6 +210,11 @@ class CarStateSP:
@@ -15,10 +15,10 @@ index 2ba53e5..aed26d0 100644
    # decode; see sunnypilot/car/hyundai/fuel_level.py); 0.0 = not decoded / no valid frame yet.
    # Coupled with custom.capnp CarStateSP.
 diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-index 5ea39ba..f9eedf5 100644
+index a176ad3f..9f86c27e 100644
 --- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
 +++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
-@@ -68,6 +68,9 @@ class CarStateExt:
+@@ -73,6 +73,9 @@ class CarStateExt:
      self.fca11_unavailable = False
      self.fca11_camera_braking = False   # 0053: transient camera hand-back (written by the controller each frame)
      self.fca11_divergence = False       # 0053: Python <-> panda disagreement on the camera hand-back
@@ -28,7 +28,7 @@ index 5ea39ba..f9eedf5 100644
      # 0040: the slowest WHEEL speed (km/h) of the current frame, written by the base CarState (carstate.py) when the
      # feature is armed. The FCA11 episode logger (fca11_log.py) stores it so the post-drive log answers "what did the
      # ESC do below 12 km/h / at standstill". None = not published this frame.
-@@ -286,6 +289,10 @@ class CarStateExt:
+@@ -291,6 +294,10 @@ class CarStateExt:
      ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
      ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
      ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
@@ -41,7 +41,7 @@ index 5ea39ba..f9eedf5 100644
    def register_wheel_brake(self, brake) -> None:
 diff --git a/opendbc/sunnypilot/car/hyundai/driver_mark.py b/opendbc/sunnypilot/car/hyundai/driver_mark.py
 new file mode 100644
-index 0000000..25b05ef
+index 00000000..25b05ef5
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/driver_mark.py
 @@ -0,0 +1,125 @@
@@ -171,7 +171,7 @@ index 0000000..25b05ef
 +  """The record's ``source``: the mechanism + the burst shape the press count produced."""
 +  return "bookmark_single" if n_presses <= 1 else "bookmark_double"
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index c307475..de586d3 100644
+index c307475d..de586d3d 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
 @@ -54,12 +54,13 @@ Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
@@ -323,7 +323,7 @@ index c307475..de586d3 100644
          self._in_rel_ramp = True
          self._sent_this_episode = True
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 99e14b3..1e20ac5 100644
+index 99e14b34..1e20ac5f 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -629,6 +629,11 @@ class GasInterceptorCarController:
@@ -340,7 +340,7 @@ index 99e14b3..1e20ac5 100644
      # frame below does not reset it: the pedal resumes the command right after a ~20 ms fault blip.
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
 new file mode 100644
-index 0000000..d77fa0c
+index 00000000..d77fa0cd
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
 @@ -0,0 +1,314 @@
