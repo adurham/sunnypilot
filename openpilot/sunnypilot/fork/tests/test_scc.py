@@ -3,6 +3,7 @@ Fork SCC fixes + throttle-only guard (fork/scc.py). Scenarios are taken from rou
 (car-features/drive-12e-12f-report.md §B; an12ef/scc_episodes.py, scc_uncorr.py).
 """
 import json
+import platform
 from types import SimpleNamespace
 from unittest import mock
 
@@ -309,6 +310,10 @@ class TestVisionMergeExclusion(OpenpilotTestCase):
 class TestMap(OpenpilotTestCase):
   def setup_method(self):
     self.params = Params()
+    # the controller reads MapTargetVelocities from the SHM store on Linux (map_controller.py:77); mapd writes it
+    # there. Upstream's own test uses this same handle (test_map_controller.py:27) - writing the disk store is why
+    # these 8 used to fail on Linux only (the Darwin branch collapses the two handles).
+    self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
     self.params.put_bool("SmartCruiseControlMap", True, block=True)
 
   def _run(self, cls, n, v=20.7, live_map=None, v_cruise=30., sm=None):
@@ -323,14 +328,14 @@ class TestMap(OpenpilotTestCase):
     return c, states
 
   def test_positive_control_near_matched_path_turns(self):
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     c, st = self._run(fscc.ForkSCCMap, 5, live_map=matched_map())
     self.assertEqual(c.state, MapState.turning)
     self.assertAlmostEqual(st[-1][1], 14.93, places=2)
     self.assertLess(c.nearest_dist, 5.)
 
   def test_far_path_ignored(self):
-    put_path(self.params, 60., RAMP_PATH)
+    put_path(self.mem_params, 60., RAMP_PATH)
     _, st_up = self._run(SmartCruiseControlMap, 5)  # upstream: binds on a path 60 m away (min_dist never checked)
     self.assertEqual(st_up[-1][0], MapState.turning)
     c, st = self._run(fscc.ForkSCCMap, 5, live_map=matched_map())
@@ -340,13 +345,13 @@ class TestMap(OpenpilotTestCase):
 
   def test_gate_boundary(self):
     for off, turning in ((20., True), (30., False)):
-      put_path(self.params, off, RAMP_PATH)
+      put_path(self.mem_params, off, RAMP_PATH)
       c, _ = self._run(fscc.ForkSCCMap, 5, live_map=matched_map())
       self.assertEqual(c.state == MapState.turning, turning, off)
 
   def test_unmatched_ignored(self):
     # 12f 682.5-705.5: roadType unknown, no name, no valid speed limit
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     unmatched = messaging.new_message('liveMapDataSP').liveMapDataSP
     c, st = self._run(fscc.ForkSCCMap, 5, live_map=unmatched)
     self.assertTrue(all(s == MapState.enabled for s, _ in st[1:]))
@@ -360,7 +365,7 @@ class TestMap(OpenpilotTestCase):
 
   def test_active_rejection_needs_hold(self):
     # mid-curve, a 1-sample match/GPS blip must not snap the target back to cruise; 1 s of rejection does
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     c, _ = self._run(fscc.ForkSCCMap, 5, live_map=matched_map())
     self.assertEqual(c.state, MapState.turning)
     unmatched = messaging.new_message('liveMapDataSP').liveMapDataSP
@@ -380,7 +385,7 @@ class TestMap(OpenpilotTestCase):
       self.assertEqual(c2.state, MapState.turning)
 
   def test_diagnostics_logged(self):
-    put_path(self.params, 60., RAMP_PATH)
+    put_path(self.mem_params, 60., RAMP_PATH)
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       self._run(fscc.ForkSCCMap, int(3. / DT_MDL), live_map=matched_map())
     diags = [c.kwargs for c in ev.call_args_list if c.args and c.args[0] == "scc_map_diag"]
@@ -403,7 +408,7 @@ class TestMap(OpenpilotTestCase):
   def test_map_path_logged_when_it_changes(self):
     """Route data: MapTargetVelocities is only in /dev/shm params; scc_map_path puts it in the rlog (engaged or not),
     only when its content changes, rate-capped."""
-    put_path(self.params, 0., RAMP_PATH)
+    put_path(self.mem_params, 0., RAMP_PATH)
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       c = fscc.ForkSCCMap()
       for _ in range(int(5. / DT_MDL)):
@@ -416,7 +421,7 @@ class TestMap(OpenpilotTestCase):
     # a new path is logged again, but not faster than MAP_PATH_MIN_GAP_S
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       for i in range(int(4. / DT_MDL)):
-        put_path(self.params, float(i % 7), RAMP_PATH)  # content changes every cycle
+        put_path(self.mem_params, float(i % 7), RAMP_PATH)  # content changes every cycle
         c.update(gps_sm(), False, False, 20., 0., 30.)
     paths = [x for x in ev.call_args_list if x.args and x.args[0] == "scc_map_path"]
     self.assertGreaterEqual(len(paths), 1)
@@ -424,7 +429,7 @@ class TestMap(OpenpilotTestCase):
 
   def test_map_path_capped(self):
     big = [{"latitude": LAT0 + i * 1e-5, "longitude": LON0, "velocity": 20.} for i in range(fscc.MAP_PATH_MAX_POINTS + 50)]
-    self.params.put("MapTargetVelocities", json.dumps(big), block=True)
+    self.mem_params.put("MapTargetVelocities", json.dumps(big), block=True)
     with mock.patch.object(fscc.cloudlog, "event") as ev:
       c = fscc.ForkSCCMap()
       c.update(gps_sm(), False, False, 20., 0., 30.)
@@ -489,6 +494,7 @@ class TestEndToEndPlanner(OpenpilotTestCase):
 
   def setup_method(self):
     self.params = Params()
+    self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
     self.params.put_bool("SmartCruiseControlMap", True, block=True)
     self.params.put_bool("SmartCruiseControlVision", True, block=True)
 
@@ -537,18 +543,18 @@ class TestEndToEndPlanner(OpenpilotTestCase):
 
   def _baseline(self, seconds):
     # control: same scenario with no map path at all (what the planner does without SCC)
-    self.params.put("MapTargetVelocities", "[]", block=True)
+    self.mem_params.put("MapTargetVelocities", "[]", block=True)
     return self._drive(True, matched_map(), seconds=seconds)
 
   def test_phantom_without_guard_coasts_whole_time(self):
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     out = self._drive(False, matched_map())
     late = out[int(3. / DT_MDL):]
     self.assertTrue(all(src == 'sccMap' for _, src, _, _ in late))
     self.assertLess(max(a for a, *_ in late), -0.3)  # the 12f @698 failure: held coast on the merge
 
   def test_phantom_with_guard_released_after_2s(self):
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     out = self._drive(True, matched_map())
     i_rel = next(i for i, o in enumerate(out) if o[3])
     t_rel = i_rel * DT_MDL
@@ -565,14 +571,14 @@ class TestEndToEndPlanner(OpenpilotTestCase):
 
   def test_real_curve_not_released(self):
     # same map target, but the model sees the curve (12f @1349: predicted lat >= 1.3 throughout): keep slowing
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     out = self._drive(True, matched_map(), pred_lat=1.8)
     self.assertFalse(any(o[3] for o in out))
     self.assertLess(max(a for a, *_ in out[int(3. / DT_MDL):]), -0.3)
 
   def test_unmatched_ramp_never_binds(self):
     # 12f @698 as logged: mapd unmatched -> SCC-M ignored outright, no coast at all, guard not needed
-    put_path(self.params, 3., RAMP_PATH)
+    put_path(self.mem_params, 3., RAMP_PATH)
     out = self._drive(True, messaging.new_message('liveMapDataSP').liveMapDataSP, seconds=4.)
     self.assertTrue(all(src != 'sccMap' for _, src, _, _ in out))
     self.assertFalse(any(o[3] for o in out))
