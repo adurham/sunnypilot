@@ -68,8 +68,57 @@ class CarSpecificEventsSP:
         # already know. The CarStateSP.superviseStop flag stays in the log for analysis; nothing raises an event.
         # The old hand-over alert ("FCA11: Take Over Below 12 km/h") is DELETED with the floors it warned about.
         if self.CP_SP.fca11Brake:
-          if CS_SP.brakeNow:
+          # fork (0043): the standstill HOLD COUNTDOWN v2. brakeNow still outranks every nag TIER (a real brake fault
+          # outranks a nag), the nag replaces stopComplete while it is up (it says the same thing with the countdown
+          # attached), and stopComplete still covers every hold shorter than 60 s - so the screen never shows two
+          # overlapping hold banners.
+          #
+          # nag == 4 IS NOT A TIER: it is the expiry latch, and it is the one state that ACTS. The hold has ended at
+          # 2:00, so this frame both tells the driver and takes openpilot's LONGITUDINAL control out: at 2:00
+          # longitudinal control disengages and the brakes release; lateral (MADS) stays engaged by design. That is
+          # measured, not assumed (Opus review D1): selfdrived calls `mads.update(CS)` one line after
+          # `state_machine.update` (selfdrived.py l.660/l.662) and `mads.update_events` REMOVES `pcmDisable`
+          # (mads.py l.205) before the MADS state machine looks at anything, so lateral never sees this write.
+          #   * `pcmDisable` (ET.USER_DISABLE) on the STANDARD events object this function is handed. selfdrived.py
+          #     l.284 passes `self.events` in and l.660 feeds exactly that object to `state_machine.update` in the SAME
+          #     update, so the disengage lands on this frame with no selfdrived.py change, no new cereal enum and no
+          #     compiled code. The release is then the DEPLOYED driver-disengage release, MEASURED under the car's
+          #     own configuration (continuous law ON) through the COMPILED libsafety TX hook
+          #     (lane-X3/proof_release_compiled.py): the law puts NOTHING on 0x38D after the disengage (0 frames),
+          #     every one of the 6 046 hold frames is ACCEPTED and none refused, and the panda's own fwd rule stops
+          #     blocking the camera's 0x38D at +90 ms - inside its 100 ms TX_STALE - so the ESC is back on the
+          #     camera's idle level 0. There is NO host ramp on this car: `dynamic_brakes` is False on the shaped
+          #     instance (the release ramp is a feel-path feature), so the disengage release is the camera
+          #     hand-back. A DRIVER-BRAKE release is different and is also measured: exactly ONE host passive frame
+          #     at level 0 (30 -> 0 in one frame, accepted - passive frames carry no rate gate). The law's own
+          #     bytes are untouched (P1).
+          #   * while the latch is set, `buttonEnable`/`pcmEnable` are removed - the idiom MADS itself uses
+          #     (mads.py l.163-164) - so a RES press cannot re-engage while the latch is set. The latch ends on the
+          #     driver's brake press or, since CD6, once the car is DRIVEN AWAY ON THE GAS above 3.0 m/s (fca11_long
+          #     FCA11_HOLD_NAG_CLEAR_V_MS) - the car layer only ever reads the value, `nag == 4` vs not, so both clears
+          #     drop the strip on the frame they happen. This is how the main
+          #     state machine is blocked WITHOUT inventing a standard ET.NO_ENTRY: every USER_DISABLE+NO_ENTRY standard
+          #     event is already bound to a real signal on this car (buttonCancel is genuinely raised by its CANCEL
+          #     button, car_events l.162 since pcmCruise is False), and a new standard EventName would be an
+          #     upstream-owned cereal change. The SP event below carries NO_ENTRY for MADS (it reads events_sp), which
+          #     is what refuses LATERAL RE-ENTRY once the driver has turned lateral off (LKAS) - not the lateral that is
+          #     already running: the expiry does not touch it. Cost, stated plainly: `engageable` stays True while latched (it is
+          #     `not events.contains(ET.NO_ENTRY)`), so the engage is offered and refused - the red PERMANENT banner is
+          #     the feedback. Reported to the owner, not hidden.
+          nag = int(getattr(CS_SP, "holdNag", 0))
+          if nag == 4:
+            events_sp.add(EventNameSP.fca11HoldExpired)
+            events.add(EventName.pcmDisable)
+            events.remove(EventName.buttonEnable)
+            events.remove(EventName.pcmEnable)
+          elif CS_SP.brakeNow:
             events_sp.add(EventNameSP.fca11BrakeNow)
+          elif nag == 3:
+            events_sp.add(EventNameSP.fca11HoldNagFinal)
+          elif nag == 2:
+            events_sp.add(EventNameSP.fca11HoldNagLoud)
+          elif nag == 1:
+            events_sp.add(EventNameSP.fca11HoldNagSoft)
           elif CS_SP.stopComplete:
             events_sp.add(EventNameSP.fca11StopComplete)
 

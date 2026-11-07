@@ -12,7 +12,8 @@ import pytest
 
 from opendbc.car import structs
 from openpilot.cereal import log, custom
-from openpilot.selfdrive.selfdrived.events import Events
+from openpilot.selfdrive.selfdrived.events import ET, Events
+from openpilot.sunnypilot.selfdrive.selfdrived.events_base import Priority
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 
 EventName = log.OnroadEvent.EventName
@@ -163,3 +164,115 @@ class TestFca11SuperviseStopRemoved:
     # the enum ordinal stays reserved in custom.capnp (the log keeps the flag); only the alert dict entry is gone
     from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
     assert EventNameSP.fca11SuperviseStop not in EVENTS_SP
+
+
+class TestFca11HoldNagEvents:
+  """fork (0043): the standstill HOLD COUNTDOWN v2. CarStateSP.holdNag (0 none / 1 soft 60 s / 2 loud 90 s / 3 final
+  110 s / 4 EXPIRED 120 s) sits BETWEEN the existing alerts: brakeNow outranks every TIER, the nag replaces
+  stopComplete while it is up, and stopComplete still covers every hold shorter than 60 s - so the screen never shows
+  two hold banners at once. 4 is not a tier: it is the latch, and it is the only state that acts - at 2:00 longitudinal
+  control disengages and the brakes release; lateral (MADS) stays engaged by design - and it refuses a longitudinal
+  re-engage until the driver brakes. The state-machine proof is in tests/test_fca11_hold_countdown.py."""
+
+  def _run(self, hold_nag=0, brake_now=False, stop_complete=False, armed=True, button_enable=False):
+    CP = SimpleNamespace(brand='hyundai', carFingerprint='HYUNDAI_ELANTRA_2021', minEnableSpeed=-1.,
+                         openpilotLongitudinalControl=True)
+    CP_SP = SimpleNamespace(enableGasInterceptor=True, fca11Brake=armed)
+    CS_SP = SimpleNamespace(brakeNow=brake_now, stopComplete=stop_complete, superviseStop=False, holdNag=hold_nag,
+                            fca11Unavailable=False, fca11CameraBraking=False, fca11Divergence=False)
+    CS = SimpleNamespace(vEgo=0., buttonEvents=[], cruiseState=SimpleNamespace(nonAdaptive=False))
+    events = Events()
+    if button_enable:
+      events.add(EventName.buttonEnable)
+    return events, CarSpecificEventsSP(CP, CP_SP).update(CS, CS_SP, events, False)
+
+  @pytest.mark.parametrize("nag,event", [(1, EventNameSP.fca11HoldNagSoft), (2, EventNameSP.fca11HoldNagLoud),
+                                           (3, EventNameSP.fca11HoldNagFinal)])
+  def test_each_tier_raises_exactly_its_own_alert_and_never_disengages(self, nag, event):
+    events, ev_sp = self._run(hold_nag=nag, stop_complete=True)
+    assert ev_sp.has(event)
+    others = {EventNameSP.fca11HoldNagSoft, EventNameSP.fca11HoldNagLoud, EventNameSP.fca11HoldNagFinal,
+              EventNameSP.fca11HoldExpired} - {event}
+    assert not any(ev_sp.has(o) for o in others), "one tier at a time"
+    assert not ev_sp.has(EventNameSP.fca11StopComplete), "the nag replaces the plain hand-off banner"
+    # a TIER never disengages: no standard event is written and nothing is stripped
+    assert events.names == [], "a nag tier must not touch the standard events"
+    assert not ev_sp.has(EventNameSP.fca11HoldExpired)
+
+  def test_brake_now_outranks_every_tier(self):
+    for nag in (1, 2, 3):
+      _events, ev_sp = self._run(hold_nag=nag, stop_complete=True, brake_now=True)
+      assert ev_sp.has(EventNameSP.fca11BrakeNow)
+      assert not any(ev_sp.has(e) for e in (EventNameSP.fca11HoldNagSoft, EventNameSP.fca11HoldNagLoud,
+                                            EventNameSP.fca11HoldNagFinal, EventNameSP.fca11HoldExpired))
+
+  def test_expiry_acts_disengage_and_refuse_a_new_engage(self):
+    events, ev_sp = self._run(hold_nag=4, stop_complete=True, button_enable=True)
+    assert ev_sp.has(EventNameSP.fca11HoldExpired)
+    assert not ev_sp.has(EventNameSP.fca11StopComplete)
+    # the disengage: USER_DISABLE on the STANDARD object the state machine reads
+    assert events.has(EventName.pcmDisable)
+    assert events.contains(ET.USER_DISABLE)
+    # and no ENABLE survives the latched frame, so the disabled branch cannot re-engage on the same frame
+    assert not events.has(EventName.buttonEnable)
+    assert not events.has(EventName.pcmEnable)
+
+  def test_expiry_is_not_suppressed_by_brake_now(self):
+    # the brakes are coming off whatever else is true - brakeNow must not be able to hide the release
+    events, ev_sp = self._run(hold_nag=4, brake_now=True, button_enable=True)
+    assert ev_sp.has(EventNameSP.fca11HoldExpired)
+    assert events.has(EventName.pcmDisable)
+
+  def test_the_brake_press_clears_everything(self):
+    events, ev_sp = self._run(hold_nag=0, button_enable=True)
+    assert not ev_sp.has(EventNameSP.fca11HoldExpired)
+    assert not events.has(EventName.pcmDisable)
+    assert events.has(EventName.buttonEnable), "with the latch clear the engage is allowed again"
+    # below the soft threshold nothing changes: the existing hand-off banner is still the one that shows
+    assert self._run(hold_nag=0, stop_complete=True)[1].has(EventNameSP.fca11StopComplete)
+
+  def test_nothing_when_the_feature_is_off(self):
+    for nag in (0, 1, 2, 3, 4):
+      events, ev_sp = self._run(hold_nag=nag, armed=False, button_enable=True)
+      assert ev_sp.names == [], "OFF must be inert (the deployed path)"
+      assert events.names == [EventName.buttonEnable], "OFF must not add or strip anything"
+
+  def test_alert_definitions(self):
+    """The four alerts, by VALUE: who is loud, who outranks whom, and what the words must say now that the hold ends."""
+    from openpilot.sunnypilot.selfdrive.selfdrived.events import EVENTS_SP
+    soft = EVENTS_SP[EventNameSP.fca11HoldNagSoft][ET.WARNING]
+    loud = EVENTS_SP[EventNameSP.fca11HoldNagLoud][ET.WARNING]
+    final = EVENTS_SP[EventNameSP.fca11HoldNagFinal][ET.WARNING]
+    expired_perm = EVENTS_SP[EventNameSP.fca11HoldExpired][ET.PERMANENT]
+    expired_ne = EVENTS_SP[EventNameSP.fca11HoldExpired][ET.NO_ENTRY]
+    brake_now = EVENTS_SP[EventNameSP.fca11BrakeNow][ET.PERMANENT]
+
+    # escalation, by value
+    assert soft.priority == Priority.LOW
+    assert loud.priority == Priority.HIGH
+    assert final.priority == Priority.HIGHEST
+    assert expired_perm.priority == Priority.HIGHEST
+    assert soft.audible_alert == log.SelfdriveState.AudibleAlert.none, "60 s is the SILENT banner"
+    assert loud.audible_alert == log.SelfdriveState.AudibleAlert.warningSoft
+    assert final.audible_alert == log.SelfdriveState.AudibleAlert.warningImmediate
+    assert expired_perm.audible_alert == log.SelfdriveState.AudibleAlert.warningImmediate
+    # a real brake fault still outranks the loudest TIER (expiry is a different thing - it is not a nag)
+    assert loud.priority < brake_now.priority and final.priority <= brake_now.priority
+
+    # the words: PRESS the brake, and WHEN the brakes go. The old 0041 claims are now lies and must be gone.
+    for a in (soft, loud, final, expired_perm):
+      text = (a.alert_text_1 + " " + a.alert_text_2).lower()
+      assert "press" in text and "brake" in text, text
+      for dead in ("2 minutes", "over 2 min", "so long", "keep holding"):
+        assert dead not in text, f"{dead!r} is the OLD (never-release) wording: {text}"
+    assert "2:00" in (soft.alert_text_2 + loud.alert_text_2).lower(), "the release time is stated where the driver reads it"
+    # CD3 (owner): the 2:00 is measured from the DEAD STOP, and the driver is told so
+    for a in (soft, loud):
+      assert "stop" in a.alert_text_2.lower(), \
+             f"the countdown starts at a dead stop - the alert must say so: {a.alert_text_2!r}"
+    assert "released" in expired_perm.alert_text_1.lower(), "at 2:00 the banner must say the brakes ARE released"
+    # NoEntryAlert puts the reason in the second line and "openpilot Unavailable" first (swapped on mici)
+    assert "press the brake pedal first" in (expired_ne.alert_text_1 + " " + expired_ne.alert_text_2).lower(), \
+           "and what to do about it"
+    # D4: a MID alert's second line is drawn (upstream rule: small => text_2 empty, mid => non-empty)
+    assert soft.alert_size == log.SelfdriveState.AlertSize.mid and soft.alert_text_2

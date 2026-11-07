@@ -277,6 +277,65 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
                         AudibleAlert.warningImmediate, 3.),
   },
 
+  # fork (0043): the standstill HOLD COUNTDOWN v2 (owner, 2026-11-06: "silent banner after 1 min / an audio alert after
+  # 1:30 / release the brakes after 2 mins"). The car is held stopped by ESC pressure + a live clutch torque; the hold is
+  # NOT a parking brake, so it is BOUNDED now: 2:00 FROM THE MOMENT THE CAR IS FULLY STOPPED BY OPENPILOT (the clock
+  # starts at a dead stop - all four wheels at rest - not when the braking began and not while the car still creeps).
+  # At 2:00 LONGITUDINAL control disengages - not "openpilot": lateral (MADS) stays engaged by design, see tier 4 below -
+  # and the deployed driver-disengage release takes the brakes off. MEASURED under the
+  # car's configuration (continuous law ON) through the COMPILED libsafety TX hook
+  # (lane-X3/proof_release_compiled.py): the law sends NOTHING on 0x38D after the disengage (6 046/6 046 hold frames
+  # accepted, 0 refused) and the panda stops blocking the camera's 0x38D at +90 ms, inside its 100 ms TX_STALE, so the
+  # ESC is on the camera's idle level 0. There is no host release ramp on this car (`dynamic_brakes` is False on the
+  # shaped instance). Raised from CarStateSP.holdNag (opendbc half: Fca11LongBrake.hold_nag, a pure observer of the
+  # SENT level - the law's wire is untouched, proved byte-identical on both configurations).
+  #   1 soft     60 s  LOW, silent, MID - a notice that the bound exists. `mid`, not `small` (review D4 of 0041): the
+  #                    renderer never draws a `small` alert's text_2, and the second line is the part that says when the
+  #                    brakes go. The time is stated ONCE, here, in the same words as the release.
+  #   2 loud     90 s  HIGH, AudibleAlert.warningSoft, asserted EVERY frame: soundd loops warningSoft for as long as the
+  #                    alert is up (sound_list[warningSoft] has num_loops None), so there is no repeat/pulse logic here
+  #                    and no 30 s re-chime any more. HIGH is below BRAKE NOW's HIGHEST, so a real brake fault wins.
+  #   3 final   110 s  HIGHEST + warningImmediate: "ten seconds to release" - the same authority as an urgent alert,
+  #                    because this one is a hand-off, not a notice.
+  #   4 expired 120 s  PERMANENT + NO_ENTRY. The hold HAS ended: at 2:00 longitudinal control disengages and the brakes
+  #                    release; lateral (MADS) stays engaged by design (mads.py l.205 strips `pcmDisable` inside
+  #                    update_events, so the MADS state machine never sees it). The banner says exactly that - BRAKES
+  #                    RELEASED, PRESS BRAKE PEDAL - and never implies steering is off. NO_ENTRY is what refuses a
+  #                    longitudinal re-engage until the driver brakes (MADS reads events_sp too -
+  #                    sunnypilot/mads/state.py check_contains - so it also refuses lateral RE-entry), and it is cleared
+  #                    only by the clear that ends the opendbc latch: the driver's brake press, or (CD6) the car being
+  #                    DRIVEN AWAY ON THE GAS above 3.0 m/s - a driver who pulls away on the GAS must not keep a permanent
+  #                    red banner and the engage strip for the rest of the drive, and speed alone is not evidence that a
+  #                    driver is there (an unattended car can roll to 3 m/s, and wheel speeds carry no direction).
+  # The old 0041 wording ("FCA11 has held this stop for over 2 minutes", "can only hold for so long") was about a hold
+  # that never ended and is gone with it: not one string here may imply the hold is still being held at 2:00.
+  EventNameSP.fca11HoldNagSoft: {
+    ET.WARNING: Alert("Stopped - press the brake",
+                      "Brakes release 2:00 after openpilot stops the car",
+                      AlertStatus.normal, AlertSize.mid, Priority.LOW, VisualAlert.none, AudibleAlert.none, 2.),
+  },
+
+  EventNameSP.fca11HoldNagLoud: {
+    ET.WARNING: Alert("Press the brake now",
+                      "Brakes release 2:00 after the car stopped",
+                      AlertStatus.critical, AlertSize.mid, Priority.HIGH, VisualAlert.none,
+                      AudibleAlert.warningSoft, 2.),
+  },
+
+  EventNameSP.fca11HoldNagFinal: {
+    ET.WARNING: Alert("Brakes release in 10 seconds",
+                      "Press the brake now to stay stopped",
+                      AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                      AudibleAlert.warningImmediate, 2.),
+  },
+
+  EventNameSP.fca11HoldExpired: {
+    ET.PERMANENT: Alert("BRAKES RELEASED", "PRESS BRAKE PEDAL",
+                        AlertStatus.critical, AlertSize.full, Priority.HIGHEST, VisualAlert.none,
+                        AudibleAlert.warningImmediate, 3.),
+    ET.NO_ENTRY: NoEntryAlert("Press the brake pedal first"),
+  },
+
   EventNameSP.bigModelReady: {
     ET.PERMANENT: Alert(
       "Big Model Ready",
