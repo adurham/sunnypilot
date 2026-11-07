@@ -1,0 +1,123 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -178,6 +178,16 @@
+ # disagreement is "we withheld a frame the panda would have accepted". A silent camera does not advance the counter.
+ FCA11_CAM_QUIET_MARGIN = 2
+ FCA11_CAM_RESUME_FRAMES = HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN
++# *** 16a: the RELEASE TAIL - the camera keeps ownership of refusals for a moment after WE let go ***
++# This layer counts its quiet tail in CAMERA frames; the panda counts its own in 50 Hz TICKS. The +MARGIN above only makes
++# us stricter when the camera's 0x38D rate is at or below the tick rate - above it the two clocks diverge the other way
++# and we release FIRST, into a hand-back that is still live on the panda's side. Route 16a (camera braking frames through
++# 130.64-136.11 s): we let go, the panda refused the frames we resumed with at 136.07, 136.09 and 136.11, the streak
++# latched at 136.13 and "FCA11 Braking Unavailable" stayed up 170 s - while the car had braking again ~1.5 s after the
++# camera went quiet. Those refusals were the camera's hand-back, not a wall. So a release arms this tail (controller
++# frames = the panda's own quiet window) during which refusals stay camera-owned and cannot count: see
++# _camera_owns_refusal. A camera that is still quiet after the tail owns nothing, so a real wall still latches.
++FCA11_CAM_RELEASE_TAIL_FRAMES = HYUNDAI_FCA11_CAM_QUIET_FRAMES
+ 
+ # *** 0053: refusal-cut PROBATION after a resume ***
+ # The echo refusal cut (FCA11_REFUSED_STREAK_CUT, consecutive) is what actually protects against the 14d failure
+@@ -1024,6 +1034,9 @@
+     # (saturating). Starts released, like the panda's hyundai_init.
+     self.cam_brake = False
+     self._cam_quiet = FCA11_CAM_RESUME_FRAMES
++    # 16a: controller frames left in which the camera STILL OWNS our refusals after we released (see
++    # FCA11_CAM_RELEASE_TAIL_FRAMES). 0 = the panda's hand-back cannot outlive ours any more.
++    self._cam_tail = 0
+     self.camera_braking_alert = False  # transient "camera braking - openpilot braking paused" (CarStateSP)
+     # 0053: refusal-cut probation (FCA11_PROBATION_*): actuating echoes left in the window, refused ones counted in it,
+     # and whether the window tripped the cut (held until the window closes).
+@@ -1302,6 +1315,26 @@
+       reason = self._last_why if self._last_why not in ("", "disabled") else "release"
+       self.log.flush(frame, reason, FCA11_STOP_KPH)
+ 
++  def _camera_owns_refusal(self) -> bool:
++    """0053/route 16a: True when a REFUSED actuating echo this tick is the camera hand-back's doing, not a wall.
++
++    Route 16a: the stock camera's bus-2 0x38D carried BRAKING-class frames through 130.64-136.11 s, so the panda's
++    cam_brake held and it refused our actuating frames at 136.07, 136.09 and 136.11 - the panda doing exactly what the
++    camera hand-back requires, and the mirror of our own withhold. The car layer counted those three as evidence of a
++    wall, _refused_cut latched at 136.13 and the driver got "FCA11 Braking Unavailable", which then outlived the
++    condition by 170 s: the wall could only heal on an ACCEPTED actuating echo and the next brake request was at
++    306.63 s, while the car had braking available again ~1.5 s after the camera went quiet. A refusal the hand-back
++    explains is therefore not evidence and must never advance (or leave standing) the streak.
++
++    Ownership holds for every tick in which this layer is withheld from 0x38D on the camera's behalf: while
++    ``cam_brake`` is set, through the quiet tail it keeps after the last braking camera frame (``_cam_quiet``
++    below FCA11_CAM_RESUME_FRAMES), and through FCA11_CAM_RELEASE_TAIL_FRAMES controller frames after its release
++    (``_cam_tail``) - the panda counts its quiet window in ticks, we count ours in camera frames, so our release can
++    come first and its hand-back still refuse our resumption frames. Both tails decay: a camera that never braked,
++    or one that released long ago and stayed quiet, owns nothing and a real wall still latches.
++    """
++    return bool(self.cam_brake or self._cam_quiet < FCA11_CAM_RESUME_FRAMES or self._cam_tail > 0)
++
+   def observe_echo(self, echoes) -> None:
+     """0030 (D2-iii): the car layer's half of the echo-confirmed close.
+ 
+@@ -1315,6 +1348,8 @@
+     behaviour) until the first call, which is what sets ``_echo_wired``.
+     """
+     self._echo_wired = True
++    if self._cam_tail > 0:
++      self._cam_tail -= 1              # 16a: one controller frame of the camera's post-release ownership
+     if not echoes:
+       return
+     # 0035: a REFUSED ACTUATING frame while we are still braking restarts the ramp. The panda's onset rule resets its
+@@ -1337,12 +1372,17 @@
+     # zero deadlock. (A refused PASSIVE close frame is the separate re-owe path below, not counted here.)
+     refused = sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0)
+     accepted = sum(1 for src, dat in echoes if int(src) == 128 and len(dat) == 8 and dat[1] != 0)
+-    # 0053: refusals that land while the camera is braking are the in-flight race of the hand-back itself (the panda
+-    # saw the camera's braking frame before our already-queued frame reached its TX hook). They are EXPECTED and say
+-    # nothing about a wall or a divergence, so they feed neither the refusal streak, the probation, nor the guard.
+-    # (ingest_camera runs BEFORE observe_echo on the real path, so cam_brake already reflects this tick's camera.)
+-    if self.cam_brake:
++    # 0053: refusals that land while the camera hand-back is active are the hand-back doing its job, not a wall - see
++    # _camera_owns_refusal. They are EXPECTED and say nothing about a wall or a divergence, so they feed neither the
++    # refusal streak, the probation, nor the guard. (`_refused_streak` is zeroed too: a wall cannot be "in progress"
++    # across a hand-back, so a mixed sequence - a couple of unexplained refusals, then hand-back refusals, then more -
++    # must not add up to FCA11_REFUSED_STREAK_CUT. ingest_camera runs BEFORE observe_echo on the real path, so the
++    # hand-back state already reflects this tick's camera.)
++    owned = self._camera_owns_refusal()
++    if owned:
+       refused = 0
++      if self.braking:
++        self._refused_streak = 0
+     # 0053 divergence guard: an ACCEPTED 0x38D of any shape arms it (the panda is in FCA11-long and taking frames) and
+     # breaks a refused-passive streak; a REFUSED PASSIVE echo while we believe the camera is NOT braking extends it.
+     if any(int(src) == 128 and len(dat) == 8 for src, dat in echoes):
+@@ -1384,6 +1424,8 @@
+       self._refused_cut = False
+       self._pedal_cut = False
+     elif refused and self.braking:
++      # 16a: `refused` is zero here whenever the camera owns the tick's refusals (see _camera_owns_refusal, which also
++      # zeroes the streak), so this increment can only ever count refusals the hand-back does NOT explain.
+       was = self._refused_streak
+       self._refused_streak += refused
+       if self._refused_streak >= FCA11_REFUSED_STREAK_CUT:
+@@ -1421,12 +1463,16 @@
+         self._refused_streak = 0         # refusals around the hand-back edge are the hand-back, not a wall
+       self.cam_brake = True
+       self._cam_quiet = 0
++      self._cam_tail = 0                 # the hand-back itself owns them now; no tail is owed
+     elif self._cam_quiet < FCA11_CAM_RESUME_FRAMES:
+       self._cam_quiet += 1
+       if self._cam_quiet >= FCA11_CAM_RESUME_FRAMES and self.cam_brake:
+         self.cam_brake = False
+         self._div_active = False         # a resync hold ends with the hand-back it adopted
+         self._start_probation()
++        # 16a: we released on OUR clock (camera frames), which can run ahead of the panda's (its ticks), so the panda may
++        # still be handing back for up to its own quiet window: the camera keeps ownership of refusals until then.
++        self._cam_tail = FCA11_CAM_RELEASE_TAIL_FRAMES
+         # the FIRST host 0x38D after every release is a PASSIVE frame (the camera's idle shape, zero decel - not a
+         # probe): it re-opens our stream cleanly at the panda AND is the divergence guard's evidence - the panda
+         # refuses a well-formed passive frame ONLY while its own cam_brake still holds.
+@@ -1848,6 +1894,7 @@
+       # 0053: the camera hand-back, the probation and the divergence guard start clean too (the panda's hyundai_init).
+       self.cam_brake = False
+       self._cam_quiet = FCA11_CAM_RESUME_FRAMES
++      self._cam_tail = 0
+       self.camera_braking_alert = False
+       self._probation_left = self._probation_refused = 0
+       self._probation_cut = False

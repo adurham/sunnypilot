@@ -360,6 +360,22 @@ struct OnroadEventSP @0xda96579883444c35 {
     e2eChime @23;
     laneChangeRoadEdge @24;
     bigModelReady @25;
+    pedalFactoryCruiseLockout @26;  # fork: Hyundai gas interceptor, factory cruise MAIN armed (alert only)
+    pedalBelowEngageSpeed @27;  # fork: Hyundai gas interceptor, SET/RES below minEnableSpeed refused (alert only)
+    fca11BrakeLowSpeedDEPRECATED @28;  # fork (0040): RETIRED ordinal, was "FCA11: Take Over Below 12 km/h" (that floor is gone); kept so old logs decode, no alert defined
+    driveModePersonalityLockout @29;  # fork: drive mode N/N-Custom blocks openpilot longitudinal (alert only)
+    fca11Unavailable @30;  # fork (0030): FCA11-long is handed back to the camera for the rest of this ignition
+    fca11SuperviseStop @31;  # fork (0040): steady YELLOW "supervise stop" while braking below 15 km/h (warning only)
+    fca11StopComplete @32;  # fork (0040): steady YELLOW "stop complete - hold brake pedal" while holding at a stop (hand-off, NOT a cap)
+    fca11BrakeNow @33;  # fork (0040): persistent RED "BRAKE NOW" - ESC non-response or hold lost; clears only on driver brake
+    fca11CameraBraking @34;  # fork (0053): TRANSIENT - the stock camera is braking, openpilot braking paused (resumes on its own)
+    fca11Divergence @35;  # fork (0053): panda refused FCA11 while the car layer saw no camera braking (Python <-> panda disagreement)
+    driverMarkGood @36;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked GOOD" - one bookmark press (verdict landed)
+    driverMarkBad @37;  # fork (17c FEEDBACK): TRANSIENT 2 s "Marked BAD" - two bookmark presses within 2 s
+    fca11HoldNagSoft @38;  # fork (0043): hold countdown 1/4 - SILENT banner at 60 s ("Stopped - press the brake")
+    fca11HoldNagLoud @39;  # fork (0043): hold countdown 2/4 - audible and CONTINUOUS from 90 s (soundd loops warningSoft)
+    fca11HoldExpired @40;  # fork (0043): hold countdown 4/4 - 120 s: the brakes ARE released (PERMANENT + NO_ENTRY until brake)
+    fca11HoldNagFinal @41;  # fork (0043): hold countdown 3/4 - warningImmediate at 110 s ("brakes release in 10 s")
   }
 }
 
@@ -369,6 +385,13 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pcmCruiseSpeed @3 :Bool;
   intelligentCruiseButtonManagementAvailable @4 :Bool;
   enableGasInterceptor @5 :Bool;
+  fca11Brake @6 :Bool;  # fork: production FCA11 longitudinal braking toggle (HyundaiFca11Brake), default OFF
+  fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
+  fca11Shadow @8 :Bool;  # fork (0045): FCA11 SHADOW log-only mode (HyundaiFca11Shadow, default OFF); never sends; mirrors opendbc CarParamsSP
+  fca11DynamicBrakes @10 :Bool;  # fork (18x): dynamic brakes - every episode ramps in from 1 LSB (jerk-limited rise), rate-limited decrease, soft release ramp, k="b" trace (HyundaiFca11DynamicBrakes, default OFF); mirrors opendbc CarParamsSP
+  fca11StopHoldClutch @11 :Bool;  # fork (0034): at a standstill hold the FCA11 frame also carries CF_VSM_HBACmd=1 + FCA_StopReq=1 so the ESC holds the car and the DCT releases the clutch (HyundaiFca11StopHoldClutch, default OFF); mirrors opendbc CarParamsSP
+  pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
+  gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 
@@ -389,6 +412,15 @@ struct CarControlSP @0xa5cd762cd951a455 {
   leadOne @2 :LeadData;
   leadTwo @3 :LeadData;
   intelligentCruiseButtonManagement @4 :IntelligentCruiseButtonManagement;
+  # fork: raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed; cereal
+  # log.LongitudinalPersonality) so car-brand controllers can scale driver-felt actuation by the feel dial (Hyundai
+  # pedal law: launch ceiling / pull gain / interceptor cap). 0 in capnp is aggressive, so the opendbc mirror defaults
+  # to standard and the producer always writes it; consumers clamp anything unknown to standard.
+  personality @5 :UInt8;
+  # fork (adurham): raw CLU13 drive mode (1 normal / 2 eco / 3 sport / 6 N-custom / 7 N; 0 = unknown), mirrored from
+  # CarStateSP.driveMode. The Hyundai pedal DELIVERY law is only valid in the mode it was measured in (NORMAL), so the
+  # car layer gates the measured inverse on this value instead of applying it blindly in ECO/SPORT.
+  driveMode @6 :UInt8;
 
   struct Param {
     key @0 :Text;
@@ -453,6 +485,42 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  driveMode @1 :UInt8;  # fork: raw CLU13 CF_Clu_DriveMode (1 normal/2 eco/3 sport/6 N custom/7 N), 0 unknown
+  fca11Unavailable @2 :Bool;  # fork (0030): FCA11-long braking is unavailable for the rest of this ignition
+  # fork (0040): the three FCA11 braking alerts (see onroad EventNameSP fca11SuperviseStop/StopComplete/BrakeNow).
+  superviseStop @3 :Bool;  # steady YELLOW: braking below 15 km/h ("supervise stop")
+  stopComplete @4 :Bool;  # steady YELLOW: at/near a stop while holding ("stop complete - hold brake pedal")
+  brakeNow @5 :Bool;  # persistent RED: ESC non-response or hold lost ("BRAKE NOW"); clears only on driver brake
+  fuelLevel @6 :Float32;  # fork (0047): CLU13 CF_Clu_FuelLevel - tank % (KDMLink-validated sender decode;
+                           # see opendbc/sunnypilot/car/hyundai/fuel_level.py); 0 = no valid level accepted yet
+  # fork (0048): KDMLink-derived telemetry (see opendbc/sunnypilot/car/hyundai/carstate_ext.py
+  # update_telemetry); 0 = not decoded / no frame yet unless stated.
+  intakeTemp @7 :Float32;       # EMS_453 degC (x0.75 - 48)
+  lateralAccel @8 :Float32;    # ESP_49D g (16-bit centered; 0 is a real value)
+  longAccel @9 :Float32;       # ESP_49D g (12-bit)
+  batteryVoltage @10 :Float32; # BATT_568 V (x0.1)
+  # N_MODE_4A0 N-Custom settings: 0/1/2 per setting, 3 = unset/default (all 0 while NORMAL)
+  nModeEngine @11 :UInt8;       # 0 Normal / 1 Sport / 2 Sport+
+  nModeSuspension @12 :UInt8;   # 0 Comfort / 1 Normal / 2 Sport
+  nModeEsc @13 :UInt8;          # 0 On / 1 Sport / 2 Off
+  nModeExhaust @14 :UInt8;      # 0 Quiet / 1 Normal / 2 Sport+
+  nModeRevMatch @15 :UInt8;     # 0 off / 1 on
+  nModeELSD @16 :UInt8;         # 0 Normal / 1 Sport / 2 Sport+
+  nModeSteering @17 :UInt8;     # 0 Comfort / 1 Normal / 2 Sport
+  fca11CameraBraking @18 :Bool;  # fork (0053): TRANSIENT - stock camera braking, openpilot braking paused (self-releasing)
+  fca11Divergence @19 :Bool;     # fork (0053): panda refused FCA11 while the car layer saw no camera braking
+  driverMark @20 :UInt8;         # fork (17c FEEDBACK): TRANSIENT driver-mark confirmation, 0 none / 1 "marked GOOD" /
+                                 # 2 "marked BAD" (see fca11_long.on_driver_mark + driver_mark.py)
+  holdNag @21 :UInt8;            # fork (0043): standstill hold countdown MEASURED FROM THE DEAD STOP (all four wheels at
+                                 # rest, not just FL/RR), 0 none / 1 soft (60 s) / 2 loud (90 s) / 3 final (110 s) /
+                                 # 4 EXPIRED (120 s, a STICKY latch). Raised as EventNameSP.fca11HoldNagSoft /
+                                 # fca11HoldNagLoud / fca11HoldNagFinal / fca11HoldExpired. At 4 LONGITUDINAL control
+                                 # disengages and the brakes ARE released; lateral (MADS) stays engaged by design
+                                 # (mads.py l.205 strips pcmDisable before the MADS state machine). The latch survives
+                                 # the counter reset and clears on the driver's brake press OR once the car is DRIVEN
+                                 # AWAY (vEgo > FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s, CD5 - so a driver who pulls away
+                                 # on the gas is not left under a permanent red alert); the counter itself is a pure
+                                 # observer of the SENT level
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
@@ -462,6 +530,14 @@ struct LiveMapDataSP @0xf416ec09499d9d19 {
   speedLimitAhead @3 :Float32;
   speedLimitAheadDistance @4 :Float32;
   roadName @5 :Text;
+  roadType @6 :RoadType;
+
+  enum RoadType {
+    unknown @0;
+    interstate @1;
+    highway @2;
+    urban @3;
+  }
 }
 
 struct ModelDataV2SP @0xa1680744031fdb2d {

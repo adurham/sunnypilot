@@ -1,0 +1,64 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -2223,15 +2223,22 @@
+     the car layer hold on this frame. Lead fields follow the k="f" trace convention (vRel = vLead - vEgo, negative =
+     closing; absent lead => lead_present False and every lead value null, never 0)."""
+     f = self.frame_now if frame is None else int(frame)
++    # CARD CALLS THIS WITH carState (capnp), NOT ONLY WITH THE opendbc CarState: capnp has no `.out` member, so the old
++    # `CS.out.aEgo` killed card on the first mark press - card exit 1, no carState, no engagement for the rest of the
++    # drive (route 18e 2026-11-03, 17:49). Accept either object: an opendbc CarState exposes `.out`, a capnp carState
++    # IS the out struct. Fields the capnp struct does not carry read as their neutral default instead of raising.
++    out = CS
++    if hasattr(CS, "out"):
++      out = CS.out
+     lead = getattr(CS, "fca11_lead_one", None)
+     rec = dict(
+       t_wall=time.time(), t_mono_ns=int(now_nanos), frame=f, ep=int(self._sh_episode_id),
+       # our commanded level: the last level that went ON THE WIRE (the panda's reference), and whether we are actuating
+       lsb_cmd=int(self._dec_last_sent), braking=bool(self._actuating),
+       ask_mps2=round(float(self._ask_last), 4),
+-      a_ego_mps2=float(getattr(CS.out, "aEgo", 0.0) or 0.0), v_ego_mps=float(CS.out.vEgo),
+-      standstill=bool(getattr(CS.out, "standstill", False)),
+-      gas_pressed=bool(CS.out.gasPressed), brake_pressed=bool(CS.out.brakePressed),
++      a_ego_mps2=float(getattr(out, "aEgo", 0.0) or 0.0), v_ego_mps=float(getattr(out, "vEgo", 0.0) or 0.0),
++      standstill=bool(getattr(out, "standstill", False)),
++      gas_pressed=bool(getattr(out, "gasPressed", False)), brake_pressed=bool(getattr(out, "brakePressed", False)),
+       personality=int(self._personality_last),
+       clutch_tq_nm=getattr(CS, "fca11_clutch_tq_nm", None),
+       lead_present=lead is not None,
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_driver_mark.py
+@@ -536,3 +536,33 @@
+     self.assertIn("swipe", note.lower(), "and the GOOD one")
+     self.assertEqual(dm.MARK_GAP_S, hdr[0]["mark_gap_s"])
+     self.assertEqual(dm.MARK_PAIR_DEDUP_S, hdr[0]["mark_pair_dedup_s"])
++
++
++class TestMarkSnapshotAcceptsCapnpCarState(TestMarkRecord):
++  """REGRESSION, route 18e 2026-11-03 17:49: card calls mark_snapshot with carState (capnp), which has no `.out`
++  member, and `CS.out.aEgo` raised AttributeError -> card exit 1 -> no carState, no engagement for the rest of the
++  drive. The snapshot must accept EITHER object: the opendbc CarState (has `.out`) or a capnp carState (IS the out)."""
++
++  def _capnp_cs(self):
++    cs = structs.CarState.new_message()
++    cs.vEgo = 13.7
++    cs.aEgo = -0.31
++    cs.gasPressed = True
++    cs.brakePressed = False
++    cs.standstill = False
++    return cs
++
++  def test_capnp_carstate_does_not_raise_and_reports_its_own_numbers(self):
++    snap = self.brake.mark_snapshot(self._capnp_cs(), now_nanos=1_000_000_000, frame=7)
++    self.assertAlmostEqual(13.7, snap["v_ego_mps"], places=3)
++    self.assertAlmostEqual(-0.31, snap["a_ego_mps2"], places=3)
++    self.assertTrue(snap["gas_pressed"])
++    self.assertFalse(snap["brake_pressed"])
++    self.assertFalse(snap["lead_present"], "a capnp carState carries no fork lead fields -> absent, never 0")
++
++  def test_the_opendbc_carstate_path_is_unchanged(self):
++    cs = _CS(v_ego=12.5, a_ego=-0.42, gas=False, brake=True)
++    snap = self.brake.mark_snapshot(cs, now_nanos=1, frame=1)
++    self.assertAlmostEqual(12.5, snap["v_ego_mps"], places=3)
++    self.assertAlmostEqual(-0.42, snap["a_ego_mps2"], places=3)
++    self.assertTrue(snap["brake_pressed"])

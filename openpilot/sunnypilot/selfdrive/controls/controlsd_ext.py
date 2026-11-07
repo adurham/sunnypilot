@@ -31,7 +31,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'carStateSP']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -103,6 +103,16 @@ class ControlsExt(ModelStateBase):
     CC_SP.intelligentCruiseButtonManagement.state = icbm_src.state
     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
+
+    # fork (adurham): carry the driver's longitudinal personality to the car controller so car-brand actuation can be
+    # scaled by the feel dial (Hyundai pedal law: launch ceiling / pull gain / interceptor cap). Personality is
+    # live (distance button mid-drive). selfdriveState.personality is a capnp _DynamicEnum; .raw is the enum int. A
+    # missing / not-yet-seen selfdriveState must NOT silently read as 0 (aggressive) -> fall back to standard.
+    CC_SP.personality = int(sm['selfdriveState'].personality.raw) if sm.seen.get('selfdriveState') else int(log.LongitudinalPersonality.standard)
+    # fork (adurham): carry the RAW drive mode to the car layer. The Hyundai pedal delivery law was measured in NORMAL;
+    # the pedal map (and so the delivered decel for a given lift) changes with the drive mode, so the law must know
+    # which mode it is in. 0 = unknown (no carStateSP yet), which the car layer treats as "keep the deployed law".
+    CC_SP.driveMode = int(sm['carStateSP'].driveMode) if sm.seen.get('carStateSP') else 0
 
     return CC_SP
 

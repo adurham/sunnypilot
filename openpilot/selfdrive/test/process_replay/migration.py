@@ -6,6 +6,8 @@ import functools
 import traceback
 import sys
 import argparse
+import sys
+import argparse
 
 from openpilot.cereal import messaging, log
 from opendbc.car.structs import car
@@ -19,7 +21,7 @@ from openpilot.selfdrive.modeld.fill_model_msg import fill_xyz_poly, fill_lane_l
 from openpilot.selfdrive.test.process_replay.vision_meta import meta_from_encode_index
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.system.manager.process_config import managed_processes
-from openpilot.tools.lib.logreader import LogIterable, LogReader, save_log
+from openpilot.tools.lib.logreader import LogIterable, LogReader, save_log, LogReader, save_log
 
 MessageWithIndex = tuple[int, capnp.lib.capnp._DynamicStructReader]
 MigrationOps = tuple[list[tuple[int, capnp.lib.capnp._DynamicStructReader]], list[capnp.lib.capnp._DynamicStructReader], list[int]]
