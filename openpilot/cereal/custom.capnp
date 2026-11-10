@@ -486,7 +486,10 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
   driveMode @1 :UInt8;  # fork: raw CLU13 CF_Clu_DriveMode (1 normal/2 eco/3 sport/6 N custom/7 N), 0 unknown
-  fca11Unavailable @2 :Bool;  # fork (0030): FCA11-long braking is unavailable for the rest of this ignition
+  fca11Unavailable @2 :Bool;  # fork (0030): FCA11-long braking is unavailable for the rest of this ignition. The panda's
+                              # cut clears ONLY on hyundai_init; it can be latched by a SINGLE pedal SCE frame at the instant
+                              # the Hyundai safety is applied (1a0 2026-11-09: 7.191973 s, 14 ms before the car-layer mirror,
+                              # then 187/187 actuating frames refused for the whole drive). fca11CutSource says WHICH latch.
   # fork (0040): the three FCA11 braking alerts (see onroad EventNameSP fca11SuperviseStop/StopComplete/BrakeNow).
   superviseStop @3 :Bool;  # steady YELLOW: braking below 15 km/h ("supervise stop")
   stopComplete @4 :Bool;  # steady YELLOW: at/near a stop while holding ("stop complete - hold brake pedal")
@@ -521,6 +524,10 @@ struct CarStateSP @0xb86e6369214c01c8 {
                                  # AWAY (vEgo > FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s, CD5 - so a driver who pulls away
                                  # on the gas is not left under a permanent red alert); the counter itself is a pure
                                  # observer of the SENT level
+  fca11CutSource @22 :UInt8;     # fork (0044): WHY fca11Unavailable is up, so a qlog alone answers it - bitfield
+                                 # 1 = pedal-fault latch, 2 = echo-confirmed refusal wall, 3 = both; 0 = not unavailable.
+                                 # Written at the SAME site as fca11Unavailable; observability only, it changes no
+                                 # byte on the wire.
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {
