@@ -392,6 +392,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   fca11StopHoldClutch @11 :Bool;  # fork (0034): at a standstill hold the FCA11 frame also carries CF_VSM_HBACmd=1 + FCA_StopReq=1 so the ESC holds the car and the DCT releases the clutch (HyundaiFca11StopHoldClutch, default OFF); mirrors opendbc CarParamsSP
   pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
   gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
+  fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 

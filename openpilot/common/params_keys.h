@@ -259,6 +259,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // crawl floor, 100 ms gas window) are NOT behind this key and run on every build.
     {"HyundaiFca11DynamicBrakes", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"HyundaiFca11StopHoldClutch", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork 0034: FCA11 frame carries the ESC stop-hold pair at a standstill (experimental)
+    // PROPOSAL (0045, OWNER DECISION): pedal-fault guard mode for FCA11-long. Bitfield, default "0" = the deployed
+    // fail-closed rule (ANY pedal fault frame latches the cut for the ignition). 1 = a pedal fault observed within
+    // HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US (0.5 s) of hyundai_init does not latch; 2 = latch only after
+    // HYUNDAI_FCA11_PEDAL_FAULT_FRAMES (3) consecutive fault frames; 3 = both. Targets the power-transition SCE race
+    // that cost route 1a0's whole drive (2026-11-09). Inert unless HyundaiFca11Brake is ON. Read at CarParams build
+    // time => takes effect at the NEXT ignition; it changes a FAIL-CLOSED path, so it must stay 0 until the owner
+    // signs off on a first-drive test.
+    {"HyundaiFca11PedalGuard", {PERSISTENT | BACKUP, INT, "0"}},
     // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
     // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
     // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
