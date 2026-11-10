@@ -5,6 +5,7 @@
 
 #include "openpilot/cereal/gen/cpp/log.capnp.h"
 
+// Fork-owned settings inventory (one table for every key): see SETTINGS.md at the repo root.
 inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AccessToken", {CLEAR_ON_MANAGER_START | DONT_LOG, STRING}},
     {"AdbEnabled", {PERSISTENT | BACKUP, BOOL}},
@@ -240,11 +241,27 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BackupManager_RestoreVersion", {PERSISTENT, STRING}},
 
     // sunnypilot car specific params
+    // fork (0046): ONE longitudinal model for the Hyundai page. 0 = Stock, 1 = Comma pedal,
+    // 2 = Pedal + FCA11. It owns the pair below; the old pair is kept registered/readable and is
+    // migrated into this key once (openpilot/sunnypilot/fork/hyundai_settings.py). Read at CarParams
+    // build time => takes effect at the NEXT ignition. Default 0 = the old default pair (0, 0).
+    {"HyundaiLongitudinalMode", {PERSISTENT | BACKUP, INT, "0"}},
+    // fork (0046): user-facing brake-shaping key; replaces the historical misnomer
+    // HyundaiFca11AffineGain. The shim reads the old key while this one is absent and writes this
+    // one once; the car layer still receives the value under the old name (opendbc
+    // setup_interfaces). Inert unless mode 2 (Pedal + FCA11). Default 0 = the old default.
+    {"HyundaiFca11Shaping", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork: comma pedal longitudinal (non-SCC), opt-in. LEGACY (0046): no UI row; still the key the
+    // car layer receives, resolved from HyundaiLongitudinalMode. Kept registered/readable for at
+    // least one release; PERSISTENT | BACKUP so an old backup restore cannot break libparams.
     {"HyundaiGasInterceptor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: comma pedal longitudinal (non-SCC), opt-in
     {"HyundaiGasInterceptorIDSet", {PERSISTENT | BACKUP, STRING, "auto"}},  // fork: pedal CAN IDs: auto/standard/remapped
+    // fork: FCA11 longitudinal braking on the comma pedal (default OFF). LEGACY (0046): no UI row;
+    // resolved from HyundaiLongitudinalMode (mode 2). Kept registered/readable.
     {"HyundaiFca11Brake", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: FCA11 longitudinal braking on the comma pedal (default OFF)
-    // fork (0044): FCA11 brake-SHAPING law, default OFF. The key name is a historical misnomer (it first gated the 0041
-    // affine gain); since 0043 it selects the shaping law (UI: "FCA11 Brake Shaping (Beta)"). Inert unless
+    // fork (0044): FCA11 brake-SHAPING law, default OFF. LEGACY NAME (0046): the user-facing key is
+    // HyundaiFca11Shaping; this one is read as the fallback until the shim has written the new key,
+    // and stays registered/readable for at least one release. Inert unless
     // HyundaiFca11Brake is also ON (enforced in opendbc setup_interfaces). Read at CarParams build time => a toggle takes
     // effect at the NEXT ignition; the UI only enables it offroad.
     {"HyundaiFca11AffineGain", {PERSISTENT | BACKUP, BOOL, "0"}},
