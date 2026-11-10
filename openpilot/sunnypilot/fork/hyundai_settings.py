@@ -103,7 +103,7 @@ def resolve_mode(params) -> tuple[int, str]:
   pair, which is exactly the pre-0046 behaviour.  An invalid value falls back to the legacy pair
   rather than silently selecting Stock."""
   try:
-    raw = params.get(MODE_KEY)
+    raw = params.get(MODE_KEY, return_default=False)
   except Exception:
     raw = None
   if raw is not None:
@@ -111,11 +111,11 @@ def resolve_mode(params) -> tuple[int, str]:
     if mode in MODES:
       return mode, SOURCE_NEW
   try:
-    pedal = params.get(LEGACY_PEDAL_KEY)
+    pedal = params.get(LEGACY_PEDAL_KEY, return_default=False)
   except Exception:
     pedal = None
   try:
-    brake = params.get(LEGACY_BRAKE_KEY)
+    brake = params.get(LEGACY_BRAKE_KEY, return_default=False)
   except Exception:
     brake = None
   if pedal is None and brake is None:
@@ -127,13 +127,13 @@ def resolve_shaping(params) -> bool:
   """The new shaping key wins; the historical key is the fallback until the shim has written the new
   one.  Both default OFF, so a fresh device is unchanged."""
   try:
-    raw = params.get(SHAPING_KEY)
+    raw = params.get(SHAPING_KEY, return_default=False)
   except Exception:
     raw = None
   if raw is not None:
     return _truthy(raw)
   try:
-    old = params.get(LEGACY_SHAPING_KEY)
+    old = params.get(LEGACY_SHAPING_KEY, return_default=False)
   except Exception:
     old = None
   return _truthy(old)
@@ -159,16 +159,16 @@ def migrate_mode(params) -> bool:
   Returns True only when a write happened.  Never overwrites an existing new key and never writes on
   a device where neither legacy key exists (that device is on the old defaults, which equal mode 0)."""
   try:
-    if params.get(MODE_KEY) is not None:
+    if params.get(MODE_KEY, return_default=False) is not None:
       return False
   except Exception:
     return False
   try:
-    pedal = params.get(LEGACY_PEDAL_KEY)
+    pedal = params.get(LEGACY_PEDAL_KEY, return_default=False)
   except Exception:
     pedal = None
   try:
-    brake = params.get(LEGACY_BRAKE_KEY)
+    brake = params.get(LEGACY_BRAKE_KEY, return_default=False)
   except Exception:
     brake = None
   if pedal is None and brake is None:
@@ -182,12 +182,12 @@ def migrate_shaping(params) -> bool:
   The old key stays registered and readable for at least one release, so a rollback to a pre-0046
   build still finds the value it wrote."""
   try:
-    if params.get(SHAPING_KEY) is not None:
+    if params.get(SHAPING_KEY, return_default=False) is not None:
       return False
   except Exception:
     return False
   try:
-    old = params.get(LEGACY_SHAPING_KEY)
+    old = params.get(LEGACY_SHAPING_KEY, return_default=False)
   except Exception:
     old = None
   if old is None:
