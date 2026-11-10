@@ -181,17 +181,6 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11DynamicBrakes param unknown to libparams (not rebuilt?); the dynamic release stays OFF")
 
-  # fork (0034): the FCA11 STOP-HOLD CLUTCH lane. THIS LIST IS THE ONLY FEED for opendbc's setup_interfaces: 0034 taught
-  # opendbc to read HyundaiFca11StopHoldClutch, but nothing ever PUT it here, so params_dict.get() returned None,
-  # _param_truthy(None) left CP_SP.fca11StopHoldClutch False for the whole ignition and Fca11LongBrake._stop_hold_ok
-  # returned False on its first clause - 0 of 399 level-30 frames carried the pair on route 195 while every input the
-  # gate reads (vEgo, standstill, fastest wheel, TCS13 FCA_ACK/StandStill) was satisfied in the log. Same
-  # stale-libparams guard as the siblings: a missing key leaves the lane off.
-  try:
-    params_list.append({"HyundaiFca11StopHoldClutch": params.get("HyundaiFca11StopHoldClutch", return_default=True)})
-  except UnknownKeyName:
-    cloudlog.warning("HyundaiFca11StopHoldClutch param unknown to libparams (not rebuilt?); the stop-hold clutch lane stays OFF")
-
   # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0" = the deployed
   # fail-closed rule). Same stale-libparams guard as the siblings: a missing/junk value leaves the guard OFF, i.e. the
   # deployed behaviour, never raises. It only ever WEAKENS a fail-closed latch for a bounded window / frame count, so it

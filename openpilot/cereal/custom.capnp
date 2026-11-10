@@ -389,7 +389,10 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   fca11AffineGain @7 :Bool;  # fork (0041): affine-gain law opt-in (HyundaiFca11AffineGain, default OFF); mirrors opendbc CarParamsSP
   fca11Shadow @8 :Bool;  # fork (0045): FCA11 SHADOW log-only mode (HyundaiFca11Shadow, default OFF); never sends; mirrors opendbc CarParamsSP
   fca11DynamicBrakes @10 :Bool;  # fork (18x): dynamic brakes - every episode ramps in from 1 LSB (jerk-limited rise), rate-limited decrease, soft release ramp, k="b" trace (HyundaiFca11DynamicBrakes, default OFF); mirrors opendbc CarParamsSP
-  fca11StopHoldClutch @11 :Bool;  # fork (0034): at a standstill hold the FCA11 frame also carries CF_VSM_HBACmd=1 + FCA_StopReq=1 so the ESC holds the car and the DCT releases the clutch (HyundaiFca11StopHoldClutch, default OFF); mirrors opendbc CarParamsSP
+  fca11StopHoldClutch @11 :Bool;  # RETIRED 2026-11-10 (patch 0044): the stop-hold PAIR lane is gone from the host (no param, no
+                                  # reader, no writer, no field in the opendbc CarParamsSP dataclass). The slot is kept because a capnp
+                                  # schema is append-only - old logs still decode, new logs carry False. DO NOT REUSE @11 or the name.
+                                  # FORK.md row 143 says why the lane cannot work on this car.
   pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
   gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
   fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192

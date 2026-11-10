@@ -275,7 +275,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // (enforced in opendbc setup_interfaces). Default OFF; the three UNCONDITIONAL 18x rules (low-speed release hold,
     // crawl floor, 100 ms gas window) are NOT behind this key and run on every build.
     {"HyundaiFca11DynamicBrakes", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"HyundaiFca11StopHoldClutch", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork 0034: FCA11 frame carries the ESC stop-hold pair at a standstill (experimental)
     // PROPOSAL (0045, OWNER DECISION): pedal-fault guard mode for FCA11-long. Bitfield, default "0" = the deployed
     // fail-closed rule (ANY pedal fault frame latches the cut for the ignition). 1 = a pedal fault observed within
     // HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US (0.5 s) of hyundai_init does not latch; 2 = latch only after

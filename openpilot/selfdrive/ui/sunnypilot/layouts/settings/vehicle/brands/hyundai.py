@@ -88,13 +88,10 @@ class HyundaiSettings(BrandSettings):
 
     # ---- Experimental -------------------------------------------------------------------------
     self.experimental_header = _section(tr("Experimental"))
-    self._hold_desc = tr("Experimental: asks the car's ESC to hold the brakes at a stop.")
     self._shadow_desc = tr("Records what the newer brake shaping would have done, without sending it to the car.")
     self.show_experimental_toggle = toggle_item_sp(
       tr("Show experimental"), tr("Show the experimental and diagnostic rows below."),
       initial_state=False, callback=self._on_show_experimental_changed)
-    self.fca11_stop_hold_toggle = toggle_item_sp(tr("ESC Hold At A Stop"), self._hold_desc,
-                                                 param="HyundaiFca11StopHoldClutch", callback=self._on_toggle_changed)
     self.fca11_shadow_toggle = toggle_item_sp(tr("Log What Shaping Would Do"), self._shadow_desc,
                                               param="HyundaiFca11Shadow", callback=self._on_toggle_changed)
 
@@ -103,7 +100,6 @@ class HyundaiSettings(BrandSettings):
       self.follow_header, self.elastic_follow_toggle, self.no_close_toggle, self.stop_approach_toggle,
       self.fca11_header, self.fca11_shaping_toggle, self.fca11_dynamic_release_toggle,
       self.pedal_header, self.pedal_delivery_toggle, self.gas_rise_lag_toggle,
-      self.experimental_header, self.show_experimental_toggle, self.fca11_stop_hold_toggle, self.fca11_shadow_toggle,
     ]
 
   @staticmethod
@@ -213,21 +209,14 @@ class HyundaiSettings(BrandSettings):
       item.set_visible(True)
 
     # ---- Experimental -----------------------------------------------------------------------
-    hold_on = _on(ui_state.params.get("HyundaiFca11StopHoldClutch"))
     shadow_on = _on(ui_state.params.get("HyundaiFca11Shadow"))
     header_state = experimental_header_state(pedal)
     reveal_state = show_experimental_toggle_state(pedal)
-    hold_state = experimental_row_state(pedal, brake, self.show_experimental, hold_on, offroad)
     shadow_state = experimental_row_state(pedal, True, self.show_experimental, shadow_on, offroad)
     self.experimental_header.set_visible(header_state.visible)
     self.show_experimental_toggle.set_visible(reveal_state.visible)
     self.show_experimental_toggle.action_item.set_enabled(reveal_state.enabled)
     self.show_experimental_toggle.show_description(True)
-
-    self.fca11_stop_hold_toggle.action_item.set_enabled(hold_state.enabled)
-    self.fca11_stop_hold_toggle.set_description(self._offroad_hint(self._hold_desc, offroad))
-    self.fca11_stop_hold_toggle.show_description(True)
-    self.fca11_stop_hold_toggle.set_visible(hold_state.visible)
 
     self.fca11_shadow_toggle.action_item.set_enabled(shadow_state.enabled)
     self.fca11_shadow_toggle.set_description(self._offroad_hint(self._shadow_desc, offroad))
