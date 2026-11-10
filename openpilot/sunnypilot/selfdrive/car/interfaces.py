@@ -11,6 +11,8 @@ from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
+from openpilot.sunnypilot.fork.hyundai_settings import (LEGACY_BRAKE_KEY, LEGACY_PEDAL_KEY, LEGACY_SHAPING_KEY,
+                                                       car_layer_overrides, migrate_hyundai_settings, resolve_state)
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -106,6 +108,12 @@ def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None
 
 
 def initialize_params(params) -> list[dict[str, Any]]:
+  # fork (0046): one-time migration of the legacy pair / misnamed shaping key into the new keys.
+  # It writes only when the new key is absent; a fresh device (neither legacy key present) keeps the
+  # defaults.  Failure is never fatal: the resolver below falls back to the legacy values either way.
+  migrate_hyundai_settings(params)
+  hyundai = car_layer_overrides(resolve_state(params))
+
   keys: list = []
 
   # hyundai
@@ -134,13 +142,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
 
   params_list = [{k: params.get(k, return_default=True)} for k in keys]
 
-  # fork: comma pedal opt-in. The key lives in params_keys.h, i.e. inside the compiled libparams; an overlay deploy that
-  # ships this Python without rebuilding libparams would raise UnknownKeyName here and take down card (and lateral) with
-  # it. Read defensively so a stale libparams just leaves the feature off.
-  try:
-    params_list.append({"HyundaiGasInterceptor": params.get("HyundaiGasInterceptor", return_default=True)})
-  except UnknownKeyName:
-    cloudlog.warning("HyundaiGasInterceptor param unknown to libparams (not rebuilt?); gas interceptor stays disabled")
+  # fork (0046): the pedal master is owned by HyundaiLongitudinalMode (Stock / Comma pedal /
+  # Pedal + FCA11).  initialize_params() is still the ONLY feed into opendbc setup_interfaces, so
+  # the resolved boolean is handed over under the legacy key name the car layer reads.  The resolver
+  # is defensive: a stale libparams (new key unknown) derives the same value from the legacy pair.
+  params_list.append({"HyundaiGasInterceptor": hyundai[LEGACY_PEDAL_KEY]})
 
   # fork: optional pedal CAN ID dialect override (auto/standard/remapped). Same stale-libparams hazard; missing -> "auto"
   # (opendbc treats an absent key as auto, i.e. whichever pedal dialect the fingerprint saw, standard preferred).
@@ -149,20 +155,16 @@ def initialize_params(params) -> list[dict[str, Any]]:
   except UnknownKeyName:
     cloudlog.warning("HyundaiGasInterceptorIDSet param unknown to libparams (not rebuilt?); using auto pedal ID detection")
 
-  # fork: FCA11 longitudinal braking opt-in. Same stale-libparams hazard as the pedal keys; a missing key just leaves the
-  # feature off (opendbc treats anything but a clean "1" as OFF and never defaults it ON).
-  try:
-    params_list.append({"HyundaiFca11Brake": params.get("HyundaiFca11Brake", return_default=True)})
-  except UnknownKeyName:
-    cloudlog.warning("HyundaiFca11Brake param unknown to libparams (not rebuilt?); FCA11 braking stays disabled")
+  # fork (0046): FCA11 braking is mode 2 (Pedal + FCA11) of HyundaiLongitudinalMode.  Same single
+  # feed, same defensive resolver: the car layer receives the legacy key name it already reads.
+  params_list.append({"HyundaiFca11Brake": hyundai[LEGACY_BRAKE_KEY]})
 
-  # fork (0044): FCA11 brake-SHAPING law opt-in. Before 0044 this key was read by NOTHING here (and not registered in
-  # params_keys.h), so CP_SP.fca11AffineGain could never be set on the car. Same stale-libparams guard as the sibling: a
-  # missing key leaves the law off (opendbc also requires HyundaiFca11Brake). Takes effect at the next ignition.
-  try:
-    params_list.append({"HyundaiFca11AffineGain": params.get("HyundaiFca11AffineGain", return_default=True)})
-  except UnknownKeyName:
-    cloudlog.warning("HyundaiFca11AffineGain param unknown to libparams (not rebuilt?); FCA11 brake shaping stays disabled")
+  # fork (0044/0046): FCA11 brake-SHAPING law.  The user-facing key is now HyundaiFca11Shaping; the
+  # historical HyundaiFca11AffineGain is the fallback until the one-time shim writes the new key.
+  # The car layer still receives the value under the old name because its dataclass field and capnp
+  # ordinal @7 are a wire contract.  Same defensive resolver as the sibling keys: a missing value is
+  # OFF, never a raise.  Takes effect at the next ignition.
+  params_list.append({"HyundaiFca11AffineGain": hyundai[LEGACY_SHAPING_KEY]})
 
   # fork (0045): FCA11 SHADOW mode. Same stale-libparams guard: a missing key leaves Shadow off. When ON, opendbc
   # setup_interfaces keeps the wire OLD-LAW (HyundaiFca11Brake as today, shaping forced off) and the FCA11 module computes +
