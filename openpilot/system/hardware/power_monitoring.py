@@ -9,7 +9,13 @@ from openpilot.sunnypilot.system.statsd import statlog
 CAR_VOLTAGE_LOW_PASS_K = 0.011 # LPF gain for 45s tau (dt/tau / (dt/tau + 1))
 
 # While driving, a battery charges completely in about 30-60 minutes
-CAR_BATTERY_CAPACITY_uWh = 30e6
+# Virtual offroad power budget (uWh), refilled while driving. Raised 30e6 -> 55e6 (fork):
+# the 30 Wh default ended the offroad session well short of the owner's MaxTimeOffroad
+# (1800 min = 30 h) at the ~1.74 W offroad draw, and the comma Prime offroad route
+# uploads (logs + video over LTE) add draw on top of that, so the session has to last
+# long enough for them to finish while parked. VBATT_PAUSE_CHARGING below is unchanged
+# and remains the real battery protection (a low car battery still cuts the device off).
+CAR_BATTERY_CAPACITY_uWh = 55e6
 CAR_CHARGING_RATE_W = 45
 
 VBATT_PAUSE_CHARGING = 11.8           # Lower limit on the LPF car battery voltage
@@ -19,8 +25,10 @@ DELAY_SHUTDOWN_TIME_S = 300 # Wait at least DELAY_SHUTDOWN_TIME_S seconds after 
 VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S = 60
 
 class PowerMonitoring:
-  def __init__(self):
-    self.params = Params()
+  def __init__(self, params=None):
+    # hardwared passes its ParamsWorker so the CarBatteryCapacity write and the shutdown reads stay off the 2 Hz
+    # deviceState thread (they are /data file ops; see params_worker.py)
+    self.params = params if params is not None else Params()
     self.last_measurement_time = None           # Used for integration delta
     self.last_save_time = 0                     # Used for saving current value in a param
     self.power_used_uWh = 0                     # Integrated power usage in uWh since going into offroad

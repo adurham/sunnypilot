@@ -1,0 +1,106 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 2ba833aa..ef73ee24 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -203,10 +203,19 @@ class CarStateSP:
+   # 3 sport / 6 N-custom / 7 N), debounced one frame. 0 = not decoded / unknown. See drive_mode.py.
+   driveMode: int = auto_field()
+   # 0030 (D1-b): FCA11-long braking is unavailable for the REST of this ignition — the panda's fail-closed
+-  # hyundai_fca11_long_cut (camera owns FCA11 / pedal fault) is set and only hyundai_init can clear it. The
+-  # superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
++  # hyundai_fca11_long_cut (pedal fault; the camera hand-back is instead the self-releasing cam_brake) is set and
++  # only hyundai_init can clear it. It can be latched by a SINGLE pedal SCE frame at the instant the Hyundai safety
++  # is applied: on route 1a0 (2026-11-09) the first 0x701 frame after the mode switch was a STATE=3 (SCE) frame at
++  # 7.191973 s, inside hyundai_init's own interval (7.173, 7.192], so the cut was set 14 ms before this mirror and
++  # held for the rest of the drive (187/187 actuating frames refused at 666.33-670.07 s; FCA11 braking off 20.7 min).
++  # The superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
+   # fails silently while openpilot keeps planning stops it cannot execute). Coupled with custom.capnp CarStateSP.
+   fca11Unavailable: bool = auto_field()
++  # 0044: WHY it is unavailable, so a qlog alone answers it: bitfield 1 = pedal-fault latch (_pedal_cut),
++  # 2 = echo-confirmed refusal wall (_refused_cut), 3 = both; 0 = not unavailable. Written at the SAME site as
++  # fca11Unavailable (fca11_long.update). Observability ONLY — it gates no send and changes no byte on the wire.
++  # Coupled with custom.capnp CarStateSP.fca11CutSource (@22).
++  fca11CutSource: int = auto_field()
+   # 0053: TRANSIENT - the stock camera is BRAKING (braking-class FCA11 frame within the last ~1.5 s of camera frames):
+   # openpilot braking is paused and resumes on its own when the camera stops. Coupled with custom.capnp CarStateSP.
+   fca11CameraBraking: bool = auto_field()
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index f54f4716..18daf68b 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -289,6 +289,9 @@ class CarStateExt:
+     # 0030 (D1-b): surface the FCA11-long hand-back (set by the controller on the previous frame, same 1-frame pattern
+     # as fca11_cal_active). Only when the feature is armed, so the field is exactly "FCA11-long is unavailable now".
+     ret_sp.fca11Unavailable = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_unavailable", False))
++    # 0044: WHY it is unavailable (bitfield 1 pedal / 2 refusal wall / 3 both), same armed gate and same 1-frame
++    # pattern. Observability only - read from a qlog; nothing consumes it.
++    ret_sp.fca11CutSource = int(getattr(self, "fca11_cut_source", 0)) if bool(self.CP_SP.fca11Brake) else 0
+     # 0053: the transient camera hand-back and the Python <-> panda divergence fault (same 1-frame pattern).
+     ret_sp.fca11CameraBraking = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_camera_braking", False))
+     ret_sp.fca11Divergence = bool(self.CP_SP.fca11Brake and getattr(self, "fca11_divergence", False))
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 2b412e11..4e46d9fb 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -165,6 +165,16 @@ FCA11_BRAKE_NOW_CLEAR_S = 2.0
+ # refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with zero deadlock.
+ FCA11_REFUSED_STREAK_CUT = 3
+ 
++# *** 0044: the SURFACED cut SOURCE ***
++# fca11Unavailable answers "is FCA11-long dead for this ignition"; it does NOT answer "why". On route 1a0
++# (2026-11-09) the whole 20.7 min drive sat behind that flag with no qlog-only way to tell the panda's PEDAL-fault
++# latch from the echo-confirmed REFUSAL wall - the answer needed the rlog and a safety replay. This bitfield is
++# published as CarStateSP.fca11CutSource at the SAME write site as fca11Unavailable (see update()), so the next
++# occurrence is answerable from a qlog alone. Observability ONLY: it gates no send and changes no byte on the wire.
++FCA11_CUT_SOURCE_NONE = 0      # not unavailable
++FCA11_CUT_SOURCE_PEDAL = 1     # the pedal-fault latch (_pedal_cut): pedal STATE not in {0,4,5}
++FCA11_CUT_SOURCE_REFUSED = 2   # the echo-confirmed refusal wall (_refused_cut)
++
+ # *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
+ # "A camera WARNING must not stop openpilot braking. A warning just means we got close to something. If the camera
+ # starts sending actual BRAKE messages, hand back - but do not latch until the next ignition: when the camera stops
+@@ -1884,6 +1894,9 @@ class Fca11LongBrake:
+     # set, the three 0040/0041 braking alerts are SUPPRESSED in _alerts() (they all assume we are actually braking):
+     # the dedicated unavailability alert supersedes them.
+     self.fca11_unavailable = False
++    # 0044: WHY it is unavailable (FCA11_CUT_SOURCE_*). Written at the same site as fca11_unavailable so the two can
++    # never disagree; CarStateExt publishes it as CarStateSP.fca11CutSource for the qlog. Observability only.
++    self.fca11_cut_source = FCA11_CUT_SOURCE_NONE
+     # 0030 (D2-iii): echo-confirmation of the passive close frame. The panda only CLOSES its FCA11-long episode on an
+     # ACCEPTED passive 0x38D (hyundai.h:1027-1030); if the close frame was REFUSED (engage/disengage edge), the
+     # episode never closes. The car layer sees the pandad echo of every 0x38D it sends (src 128 = sent, 192 = REJECTED)
+@@ -3861,6 +3874,7 @@ class Fca11LongBrake:
+       self.blocked_until_resume = False
+       # 0042: and nothing is UNAVAILABLE while the feature is off (the surfaced flag is the OR of the cut sources).
+       self.fca11_unavailable = False
++      self.fca11_cut_source = FCA11_CUT_SOURCE_NONE   # 0044: same write site as the flag
+       # 0042 (B): clear the echo-confirmed refusal wall too.
+       self._refused_streak = 0
+       self._refused_cut = False
+@@ -3963,6 +3977,14 @@ class Fca11LongBrake:
+     # _refused_cut (B) is the echo-confirmed refusal wall. 0053: these two - and ONLY these two - own the PERMANENT
+     # "unavailable until restart" alert; the camera owns the transient camera_braking_alert instead.
+     self.fca11_unavailable = bool(self.enabled and (self._pedal_cut or self._refused_cut))
++    # 0044: the SOURCE bitfield, at the same write site so the two can never disagree. 1 = pedal-fault latch,
++    # 2 = echo-confirmed refusal wall, 3 = both (0 = not unavailable). Published as CarStateSP.fca11CutSource so the
++    # NEXT occurrence is answerable from a qlog alone - route 1a0 needed the rlog + a safety replay to tell these
++    # apart, because both surface through the same boolean. Observability only: no send reads it.
++    self.fca11_cut_source = FCA11_CUT_SOURCE_NONE
++    if self.fca11_unavailable:
++      self.fca11_cut_source = ((FCA11_CUT_SOURCE_PEDAL if self._pedal_cut else 0) |
++                               (FCA11_CUT_SOURCE_REFUSED if self._refused_cut else 0))
+ 
+     # 0040: this frame's speed (km/h); the alert state machine + logger both read it.
+     v_kph_now = float(CS.out.vEgo) * 3.6
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 734909d9..1fb2e2e8 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -785,6 +785,7 @@ class GasInterceptorCarController:
+     # 0053: that PERMANENT alert is the pedal-fault latch / refusal wall only. The camera hand-back is the TRANSIENT
+     # fca11CameraBraking, and a Python<->panda disagreement is fca11Divergence.
+     CS.fca11_unavailable = bool(self.fca11_brake.fca11_unavailable)
++    CS.fca11_cut_source = int(self.fca11_brake.fca11_cut_source)   # 0044: the SOURCE bitfield behind it (qlog only)
+     CS.fca11_camera_braking = bool(self.fca11_brake.camera_braking_alert)
+     CS.fca11_divergence = bool(self.fca11_brake.fca11_divergence)
+     # 0040: publish the three FCA11 braking alerts (read by CarStateExt -> CarStateSP, then car_specific.py -> events.py).

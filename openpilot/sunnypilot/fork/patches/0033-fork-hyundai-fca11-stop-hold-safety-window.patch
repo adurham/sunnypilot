@@ -1,0 +1,287 @@
+0033 fork/hyundai: panda safety - allow the FCA11 ESC stop-hold pair (FCA_StopReq + CF_VSM_HBACmd=1), narrowly
+
+WHY. Route 190, 3,994 standstill frames: under our FCA11 hold the DCT clutch keeps +26 Nm (creeping); under the
+driver's foot it is 0.0 Nm. CR_VSM_DecCmd pressure is injected downstream of the master-cylinder sensor, so the
+car never learns it is braked. The camera's own stop-hold lane in the same frame (FCA_StopReq bit 21 +
+CF_VSM_HBACmd bits 1-2) asks the ESC for ITS OWN hold. Our production FCA11 TX hook refused both bits
+unconditionally, so the lane never reached the wire. We own this code; this patch allows the lane deliberately,
+inside a window that can be proven from the hook alone.
+
+ACCEPTED only when ALL hold (safety/modes/hyundai.h, HYUNDAI_FCA11_LONG_STOP_HOLD_*):
+  1. exact pair: CF_VSM_HBACmd == 1 AND FCA_StopReq == 1
+  2. valid variant-B actuating frame: Warn == 3, FCA_CmdAct == 1, CF_VSM_DecCmdAct == 0
+  3. a real hold: CR_VSM_DecCmd >= 7 LSB (== FCA11_CRAWL_MIN_LSB, the measured clutch-open level)
+  4. walking pace or less on the FASTEST wheel: max(WHL_SPD11) <= HYUNDAI_FCA11_ROLL_MIN_SPEED (160 raw = 5 km/h),
+     speed seen this arm and fresh <= 100 ms (new hyundai_fca11_long_speed_max, fail-closed 0xFFFF at init).
+     Fastest, not slowest: one stuck wheel must never make a moving car look stopped.
+  5. the camera is not braking (hyundai_fca11_long_cam_brake keeps absolute priority)
+  ...and the frame then still passes EVERY unchanged rule: 46 LSB cap, +RATE_STEP rise gate / onset rule,
+  controls_allowed + heartbeat, window (seen/fresh inputs, cuts, latches, gear D, no pedal, gas hold-off),
+  host-liveness watchdog, TX-stale hand-back.
+REFUSED: HBA 2/3; either bit alone; either bit on a passive frame; Warn != 3; DecCmdAct set; CmdAct clear;
+  DecCmd < 7; any wheel > 5 km/h; stale/unseen speed; camera braking; every pre-existing refusal.
+UNCHANGED: cap, rise gate, window/clock/cut/freshness, camera hand-back and forwarding, liveness watchdog, the
+  TEST-ONLY brake/rolling branches (still refuse HBA/StopReq unconditionally). No openpilot-side law change here.
+
+Tests (safety/tests/test_hyundai.py, TestHyundaiFca11LongSafety): test_hba_stopreq_dec_cmd_act_blocked now pins the
+refusal OUTSIDE the window (20 km/h, dec 1, incl. the full pair); new test_stop_hold_* cover accept at standstill,
+cap/rise gate, below hold level, above walking pace (incl. single fast wheel), stale speed, HBA 2/3 + partial
+pairs, frame shape (Warn/DecCmdAct/CmdAct/passive), camera braking (incl. camera's own StopReq/HBA), and every
+other gate. Hyundai safety suite: 80 failed / 3071 passed before -> 80 failed / 3091 passed after; the 80 are the
+identical pre-existing set (78 x test_ignore_frequency_check, F3/F5 FCA11-long). Old header + new tests: 28 fail.
+Touches safety/ -> firmware bytes change -> REFLASH required.
+
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index ed954e6..10872e4 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -164,6 +164,29 @@ static bool hyundai_legacy = false;
+ #define HYUNDAI_FCA11_LONG_TX_STALE_US 100000U
+ #define HYUNDAI_FCA11_LONG_GEAR_D 5U  // LVR12 CF_Lvr_Gear: 5 = D (same decode as the rolling window)
+ 
++// *** 0033: the ESC STOP-HOLD request (FCA_StopReq + CF_VSM_HBACmd), allowed NARROWLY ***
++// MEASURED (route 190, 3,994 standstill frames): under our FCA11 hold the DCT clutch keeps +26 Nm (creeping); under the
++// driver's foot it is 0.0 Nm. The CR_VSM_DecCmd pressure is injected downstream of the master-cylinder sensor, so the car
++// never learns it is braked. FCA11 has the camera's own stop-hold lane - FCA_StopReq (bit 21) + CF_VSM_HBACmd (bits 1-2) -
++// which asks the ESC for ITS OWN hold. Until 0033 the production hook refused both bits unconditionally. They are now
++// accepted ONLY as the exact pair (HBACmd == 1 AND StopReq == 1) on a frame that satisfies every one of:
++//   (1) it is already a legal ACTUATING variant-B frame: Warn == 3, FCA_CmdAct == 1, CF_VSM_DecCmdAct == 0, and it passes
++//       the unchanged cap (46), rise gate, window/clock/cut/freshness, controls+heartbeat and host-liveness rules;
++//   (2) it is a REAL hold: CR_VSM_DecCmd >= HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC (7 LSB = the measured clutch-open level,
++//       FCA11_CRAWL_MIN_LSB in the law). A stop request with no pressure behind it is refused;
++//   (3) EVERY wheel is at or below walking pace: the FASTEST wheel (hyundai_fca11_long_speed_max, fresh <= 100 ms via the
++//       window) <= HYUNDAI_FCA11_ROLL_MIN_SPEED (160 raw = 5 km/h). The fastest wheel, not the slowest: one stuck/zero
++//       wheel must never make a road-speed frame look stopped. A stop hold is never legal at road speed;
++//   (4) the camera does not own FCA11 (hyundai_fca11_long_cam_brake keeps absolute priority: while the camera is braking
++//       every host 0x38D is refused, so this lane can never mask or race a real camera AEB/stop).
++// Everything else stays a violation: HBA 2/3, HBA or StopReq alone, either bit on a passive frame, Warn != 3,
++// DecCmdAct set, a decel under the hold level, any wheel above 5 km/h, a stale/unseen speed, the camera braking, a stale
++// host. The bits add NO authority over CR_VSM_DecCmd (cap and +RATE_STEP rise gate are unchanged); what they add is the
++// ESC's own standstill hold, which the panda can only cut by the same means as any of our frames (refuse -> stale ->
++// camera's own idle FCA11 forwarded within TX_STALE).
++#define HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC 7
++#define HYUNDAI_FCA11_LONG_STOP_HOLD_HBA 1
++
+ // *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
+ // "A camera WARNING must not stop openpilot braking. If the camera starts sending actual BRAKE messages, hand back -
+ // but do not latch until the next ignition: when the camera stops braking, openpilot resumes."
+@@ -194,6 +217,7 @@ static bool hyundai_fca11_long_cut;         // LATCHED (pedal fault only since 0
+ static uint32_t hyundai_fca11_long_seen;    // HYUNDAI_LONG_SEEN_* bits
+ static bool hyundai_fca11_long_gear_d;
+ static uint32_t hyundai_fca11_long_speed_min;  // raw, slowest wheel
++static uint32_t hyundai_fca11_long_speed_max;  // 0033: raw, FASTEST wheel (the stop-hold lane's walking-pace bound)
+ static uint32_t hyundai_fca11_long_ts_speed;
+ static uint32_t hyundai_fca11_long_ts_gear;
+ static uint32_t hyundai_fca11_long_ts_brake;
+@@ -290,6 +314,7 @@ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_seen = 0U;
+   hyundai_fca11_long_gear_d = false;
+   hyundai_fca11_long_speed_min = 0U;
++  hyundai_fca11_long_speed_max = 0xFFFFU;  // fail-closed until a real WHL_SPD11 lands (above any raw wheel value)
+   hyundai_fca11_long_ts_speed = 0U;
+   hyundai_fca11_long_ts_gear = 0U;
+   hyundai_fca11_long_ts_brake = 0U;
+@@ -333,6 +358,7 @@ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+       uint32_t rl = GET_BYTES_LE(msg, 4, 2) & 0x3FFFU;
+       uint32_t rr = GET_BYTES_LE(msg, 6, 2) & 0x3FFFU;
+       hyundai_fca11_long_speed_min = SAFETY_MIN(SAFETY_MIN(fl, fr), SAFETY_MIN(rl, rr));
++      hyundai_fca11_long_speed_max = SAFETY_MAX(SAFETY_MAX(fl, fr), SAFETY_MAX(rl, rr));
+       hyundai_fca11_long_ts_speed = ts;
+       hyundai_fca11_long_seen |= HYUNDAI_LONG_SEEN_SPEED;
+     }
+@@ -1095,7 +1121,8 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       //     CF_VSM_Prefill (bit 0), CF_VSM_Warn = 3 (bits 3-4), FCA_CmdAct (bit 20), CF_VSM_DecCmdAct = 0;
+       //   * PASSIVE: the camera's own idle shape (all brake fields 0, Warn = 0) - the clean release/hand-back frame,
+       //     byte-identical to what the ESC sees from the camera every idle frame.
+-      // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2), FCA_StopReq (bit 21), CF_VSM_DecCmdAct,
++      // Always blocked: decel above the cap, CF_VSM_HBACmd (bits 1-2) / FCA_StopReq (bit 21) OUTSIDE the 0033 stop-hold
++      // window (see HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC), CF_VSM_DecCmdAct,
+       // Warn 1/2 (never a shape this car answered), Warn 3 on a passive frame (a warning we have no reason to send),
+       // any ACTUATION outside the window / after a cut / while the camera owns FCA11 / from a host
+       // that has gone silent past HOST_HB_TIMEOUT_US (0038 liveness watchdog). 0040: there is NO speed floor any more
+@@ -1113,8 +1140,23 @@ static bool hyundai_tx_hook(const CANPacket_t *msg) {
+       }
+ 
+       bool violation = (CR_VSM_DecCmd > HYUNDAI_FCA11_LONG_MAX_DEC);
+-      violation |= (CF_VSM_HBACmd != 0);
+-      violation |= FCA_StopReq;
++      // 0033: the stop-hold pair is legal ONLY in the narrow standstill window (block comment at
++      // HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC). This only decides whether the two bits are acceptable; the frame must
++      // STILL pass every rule below (cap, DecCmdAct, Warn shape, camera-owns, controls/heartbeat, window, liveness, rise
++      // gate) - none of those is relaxed here.
++      if ((CF_VSM_HBACmd != 0) || FCA_StopReq) {
++        bool stop_hold_ok = (CF_VSM_HBACmd == HYUNDAI_FCA11_LONG_STOP_HOLD_HBA) && FCA_StopReq;
++        stop_hold_ok = stop_hold_ok && FCA_CmdAct && !CF_VSM_DecCmdAct && (CF_VSM_Warn == 3);
++        stop_hold_ok = stop_hold_ok && (CR_VSM_DecCmd >= HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC);
++        stop_hold_ok = stop_hold_ok && ((hyundai_fca11_long_seen & HYUNDAI_LONG_SEEN_SPEED) != 0U) &&
++                       hyundai_fca11_long_fresh(microsecond_timer_get(), hyundai_fca11_long_ts_speed) &&
++                       (hyundai_fca11_long_speed_max <= HYUNDAI_FCA11_ROLL_MIN_SPEED);
++        // defence in depth: cam_brake, the Warn shape and speed freshness are ALSO enforced by the outer rules below
++        // (cam_brake on every frame, Warn 3 on actuation, the window's 100 ms freshness); repeated here so this
++        // predicate alone is a complete statement of the stop-hold window.
++        stop_hold_ok = stop_hold_ok && !hyundai_fca11_long_cam_brake;
++        violation |= !stop_hold_ok;
++      }
+       violation |= CF_VSM_DecCmdAct;           // variant B: FCA_CmdAct carries the command, not DecCmdAct
+       violation |= actuation ? (CF_VSM_Warn != 3) : (CF_VSM_Warn != 0);
+       // 0053: while the camera is BRAKING (braking-class frame within the last HYUNDAI_FCA11_CAM_QUIET_FRAMES camera
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 27013a8..0133a45 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -2797,12 +2797,155 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self.assertEqual(self.DEC_CAP, HYUNDAI_FCA11_LONG_MAX_DEC)
+ 
+   def test_hba_stopreq_dec_cmd_act_blocked(self):
++    # 0033: OUTSIDE the stop-hold window (here: 20 km/h, dec 1) every HBA / StopReq combination is still refused, and
++    # DecCmdAct stays refused everywhere (variant B).
+     self._open_window()
+     for hba in (1, 2, 3):
+       self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, hba=hba, cmd_act=1)))
+     self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, cmd_act=1, stop_req=1)))
++    self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, cmd_act=1, hba=1, stop_req=1)))
+     self.assertFalse(self._tx(self._fca11(dec=1, prefill=1, warn=3, cmd_act=1, dec_cmd_act=1)))  # variant B: DecCmdAct stays 0
+ 
++  # *** 0033: the narrow ESC stop-hold window (FCA_StopReq + CF_VSM_HBACmd == 1) ***
++
++  STOP_HOLD_MIN_DEC = 7     # == HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC (the law's FCA11_CRAWL_MIN_LSB)
++  WALK_RAW = 5 * 32         # == HYUNDAI_FCA11_ROLL_MIN_SPEED (160 raw = 5 km/h), the fastest-wheel bound
++
++  def _hold_cmd(self, dec, hba=1, stop_req=1, warn=3, cmd_act=1, dec_cmd_act=0, prefill=1):
++    return self._fca11(dec=dec, prefill=prefill, warn=warn, cmd_act=cmd_act, dec_cmd_act=dec_cmd_act, hba=hba,
++                       stop_req=stop_req)
++
++  def _hold_ready(self, speed_raw=0, dec=8):
++    """Fresh arm, window open at `speed_raw`, a legal plain variant-B ramp up to `dec` (so the rise gate allows `dec`)."""
++    self._rearm()
++    self._open_window(speed_raw)
++    self.assertTrue(self._tx_brake(dec), "precondition: the plain ramp is accepted")
++
++  def test_stop_hold_constants_pinned(self):
++    from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++    self.assertEqual(self.STOP_HOLD_MIN_DEC, fl.FCA11_CRAWL_MIN_LSB)
++    self.assertEqual(self.WALK_RAW, HYUNDAI_FCA11_ROLL_MIN_SPEED_KPH * self.RAW_PER_KPH)
++    h = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modes", "hyundai.h")
++    with open(h) as f:
++      src = f.read()
++    self.assertRegex(src, r"#define HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC %d\b" % self.STOP_HOLD_MIN_DEC)
++    self.assertRegex(src, r"#define HYUNDAI_FCA11_ROLL_MIN_SPEED %dU\b" % self.WALK_RAW)
++
++  def test_stop_hold_accepted_at_standstill(self):
++    """(a) the narrow window ACCEPTS: standstill, a valid actuating variant-B frame, a hold level >= 7 LSB. FALSIFIABLE
++    CONTRAST: refused on the 32-patch tree (HBA/StopReq were unconditionally a violation)."""
++    for raw in (0, 1, self.WALK_RAW):
++      with self.subTest(raw=raw):
++        self._hold_ready(raw, dec=8)
++        self.assertTrue(self._tx(self._hold_cmd(8)), f"raw {raw}: stop-hold frame must be accepted")
++    # exactly the hold level, and a long hold at the cap, all accepted
++    self._hold_ready(0, dec=self.STOP_HOLD_MIN_DEC)
++    self.assertTrue(self._tx(self._hold_cmd(self.STOP_HOLD_MIN_DEC)))
++    self._hold_ready(0, dec=self.DEC_CAP)
++    for i in range(250):
++      self.safety.set_timer(1000000 + (i + 1) * self.PERIOD_MS * 1000)
++      self._feed_inputs(speed_raw=0)
++      self.assertTrue(self._tx(self._hold_cmd(self.DEC_CAP)), f"hold frame {i}")
++    # releasing the bits again (plain frame) and then a passive close are accepted: the lane never wedges
++    self.assertTrue(self._tx(self._brake_cmd(self.DEC_CAP)))
++    self.assertTrue(self._tx(self._fca11()))
++
++  def test_stop_hold_keeps_cap_and_rise_gate(self):
++    # the bits add NO decel authority: the 46 LSB cap and the +RATE_STEP rise gate apply unchanged
++    self._hold_ready(0, dec=self.DEC_CAP)
++    self.assertFalse(self._tx(self._hold_cmd(self.DEC_CAP + 1)), "cap")
++    self._rearm()
++    self._open_window(0)
++    self.assertFalse(self._tx(self._hold_cmd(8)), "onset: 0 -> 8 exceeds RATE_STEP even with the hold bits")
++    self._hold_ready(0, dec=8)
++    self.assertFalse(self._tx(self._hold_cmd(8 + HYUNDAI_FCA11_LONG_RATE_STEP + 1)), "rise gate")
++    self.assertTrue(self._tx(self._hold_cmd(8 + HYUNDAI_FCA11_LONG_RATE_STEP)))
++
++  def test_stop_hold_refused_below_hold_level(self):
++    # StopReq without a real hold behind it is refused (the plain frame at the same level is fine)
++    for dec in (1, 4, self.STOP_HOLD_MIN_DEC - 1):
++      with self.subTest(dec=dec):
++        self._hold_ready(0, dec=dec)
++        self.assertFalse(self._tx(self._hold_cmd(dec)))
++        self.assertTrue(self._tx(self._brake_cmd(dec)))
++
++  def test_stop_hold_refused_above_walking_pace(self):
++    """(b) the same bits are refused above walking pace, judged on the FASTEST wheel (one slow/stuck wheel can never
++    make a moving car look stopped). The plain frame at the same speed and level stays accepted."""
++    for wheels in ([self.WALK_RAW + 1] * 4, [self.IN_WINDOW_RAW] * 4, [100 * self.RAW_PER_KPH] * 4,
++                   [0, 0, 0, self.WALK_RAW + 1], [self.IN_WINDOW_RAW, 0, 0, 0], [0, self.IN_WINDOW_RAW, 0, 0]):
++      with self.subTest(wheels=wheels):
++        self._hold_ready(0, dec=8)
++        self._rx(self._wheel_msg(*wheels))
++        self.assertFalse(self._tx(self._hold_cmd(8)), f"{wheels}: stop hold at road speed must be refused")
++        self.assertTrue(self._tx(self._brake_cmd(8)), f"{wheels}: the plain frame is unaffected")
++
++  def test_stop_hold_refused_on_stale_speed(self):
++    self._hold_ready(0, dec=8)
++    self.safety.set_timer(1000000 + 100001)   # every input stale, speed included
++    self.assertFalse(self._tx(self._hold_cmd(8)))
++    self._feed_inputs(speed_raw=0)
++    # our stream also went stale (> TX_STALE), so the 0035 onset rule restarts the ramp from 0: hold bits or not
++    self.assertFalse(self._tx(self._hold_cmd(8)), "onset after a stale stream is still capped at RATE_STEP")
++    self.assertTrue(self._tx(self._brake_cmd(4)))
++    self.assertTrue(self._tx(self._hold_cmd(8)))
++
++  def test_stop_hold_refused_hba_2_3_and_partial_pairs(self):
++    """(c) refused at HBA 2/3, and either bit alone is refused (only the exact HBA 1 + StopReq pair is a hold)."""
++    for hba, stop_req in ((2, 1), (3, 1), (2, 0), (3, 0), (1, 0), (0, 1)):
++      with self.subTest(hba=hba, stop_req=stop_req):
++        self._hold_ready(0, dec=8)
++        self.assertFalse(self._tx(self._hold_cmd(8, hba=hba, stop_req=stop_req)))
++        self.assertTrue(self._tx(self._hold_cmd(8)))
++
++  def test_stop_hold_refused_on_bad_frame_shape(self):
++    """(d) refused when Warn is passive / not 3, when DecCmdAct is set, when FCA_CmdAct is clear, and on a passive frame."""
++    for kw in ({"warn": 0}, {"warn": 1}, {"warn": 2}, {"dec_cmd_act": 1}, {"cmd_act": 0}, {"cmd_act": 0, "dec_cmd_act": 1}):
++      with self.subTest(**kw):
++        self._hold_ready(0, dec=8)
++        self.assertFalse(self._tx(self._hold_cmd(8, **kw)))
++    self._hold_ready(0, dec=8)
++    self.assertFalse(self._tx(self._hold_cmd(0, prefill=0, cmd_act=0, warn=0)), "bits on a passive frame")
++    self.assertFalse(self._tx(self._hold_cmd(0, prefill=0, cmd_act=0, warn=3)))
++
++  def test_stop_hold_refused_while_camera_brakes(self):
++    """(e) refused while the camera is braking (camera-owns keeps priority), including the camera's OWN stop hold."""
++    for cam in ({"CR_VSM_DecCmd": 0.10}, {"FCA_StopReq": 1}, {"CF_VSM_HBACmd": 1}, {"FCA_CmdAct": 1}):
++      with self.subTest(cam=cam):
++        self._hold_ready(0, dec=8)
++        self._rx(self._cam_fca11(**cam))
++        self.assertFalse(self._tx(self._hold_cmd(8)))
++        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x38D), "the camera's frame is forwarded")
++    # ...and a camera WARNING (non-braking class) does not take FCA11 away (0053 policy unchanged)
++    self._hold_ready(0, dec=8)
++    self._rx(self._cam_fca11(CF_VSM_Warn=2, CF_VSM_Prefill=1))
++    self.assertTrue(self._tx(self._hold_cmd(8)))
++
++  def test_stop_hold_refused_outside_window(self):
++    # every other actuation gate still refuses the hold frame: disengaged, stale heartbeat, driver brake, gear != D,
++    # gas pressed, pedal fault, stale host
++    def disengaged():
++      self._engage(False, True)
++    def hb_stale():
++      self._engage(True, False)
++    def brake():
++      self._rx(self._user_brake_msg(True))
++    def gear():
++      self._rx(self._gear_msg(4))
++    def gas():
++      self._rx(self._interceptor_user_gas(self.INTERCEPTOR_THRESHOLD + 1))
++    def fault():
++      self._rx(self._interceptor_user_gas(0, state=1))
++    def host_stale():
++      self.safety.set_timer(1000000 + HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US + 100000)
++      self._feed_inputs(speed_raw=0)
++    for name, fault_fn in (("disengaged", disengaged), ("hb_stale", hb_stale), ("brake", brake), ("gear", gear),
++                           ("gas", gas), ("fault", fault), ("host_stale", host_stale)):
++      with self.subTest(name):
++        self._hold_ready(0, dec=8)
++        fault_fn()
++        self.assertFalse(self._tx(self._hold_cmd(8)), name)
++
+   def test_warn_shape_policed(self):
+     self._open_window()
+     # actuating frames must carry Warn 3; passive frames must carry Warn 0
