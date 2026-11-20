@@ -222,6 +222,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ModelManager_ModelsCache", {PERSISTENT | BACKUP, JSON}},
     {"ModelManager_ModelsCache_Chestnut", {PERSISTENT | BACKUP, JSON}},
 
+    // Jetlink (runs the large driving model on an iPhone/Mac/Jetson over USB; see sunnypilot/jetlink_adapter).
+    // JetlinkLink is the setting: 0 off (the default: every Jetlink hook answers as if absent), 1 USB host
+    // (Jetson/PC/Mac), 2 iOS (iPhone/iPad). JetlinkSpec must survive a reboot or every drive rebuilds the model.
+    {"JetlinkLink", {PERSISTENT | BACKUP, INT, "0"}},
+    {"JetlinkProgress", {CLEAR_ON_MANAGER_START, JSON}},
+    {"JetlinkSpec", {PERSISTENT, JSON}},
+    {"JetlinkChargePhone", {PERSISTENT, BOOL, "0"}},
+    {"Offroad_JetlinkUnavailable", {CLEAR_ON_MANAGER_START, JSON}},
+
     // Neural Network Lateral Control
     {"NeuralNetworkLateralControl", {PERSISTENT | BACKUP, BOOL, "0"}},
 

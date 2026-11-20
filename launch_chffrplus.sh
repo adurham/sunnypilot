@@ -81,9 +81,15 @@ function launch {
   ln -sfn rednose_repo/rednose rednose
   ln -sfn teleoprtc_repo/teleoprtc teleoprtc
   ln -sfn tinygrad_repo/tinygrad tinygrad
+  ln -sfn jetlink_repo/jetlink jetlink
 
   # hardware specific init
   if [ -f /AGNOS ]; then
+    # Jetlink: with the link on (JetlinkLink param not 0), draw nothing from the USB-C port from boot. A no-op with the
+    # param absent or 0 (the default), or with no jetlink checkout (docs/porting.md in jetlink)
+    if [ -f jetlink/comma/jetlink-root.sh ] && [ "$(cat /data/params/d/JetlinkLink 2>/dev/null || echo 0)" != "0" ]; then
+      sudo -n bash jetlink/comma/jetlink-root.sh boot /data/params/d/JetlinkLink &
+    fi
     agnos_init
   fi
 
