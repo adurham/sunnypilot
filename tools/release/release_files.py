@@ -21,6 +21,10 @@ blacklist = [
   ".gitmodules",
   ".run/",
   ".idea/",
+
+  # jetlink_repo: the comma needs only jetlink/, LICENSE, pyproject.toml and README.md
+  r"^jetlink_repo/(ios|android|macos|JetlinkKit|catalog|docs|scripts|tests|\.github)/",
+  r"^jetlink_repo/(install\.sh|CHANGELOG\.md)$",
 ]
 
 # gets you through the blacklist

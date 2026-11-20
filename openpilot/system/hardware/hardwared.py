@@ -23,6 +23,7 @@ from openpilot.common.hardware.usb import CHESTNUT_FW_VERSION, CHESTNUT_USB_PROD
 from openpilot.common.linux import LinuxSystemStats
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot import jetlink_adapter
 from openpilot.sunnypilot.system.statsd import statlog
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.params_worker import ParamsWorker
@@ -40,6 +41,10 @@ DISCONNECT_TIMEOUT = 5.  # wait 5 seconds before going offroad after disconnect 
 PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)  # 1.5x the expected pandaState frequency
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
 SLOW_ITERATION_S = 0.3  # a deviceState iteration slower than this is cloudlogged with its slowest step
+# the longest a shutdown waits on a Jetlink accelerator that is on its own supply: jetlink's SHUTDOWN_TIMEOUT (25 s) and 5 s,
+# written out so it holds without jetlink, so a jetlink regression can never keep a comma on
+JETLINK_SHUTDOWN_CAP_S = 30.
+JETLINK_REASON_PERIOD_S = 5.
 
 # Every param the publish loop (and PowerMonitoring) reads. They are read by ParamsWorker off-thread; the loop only sees
 # the cached values. A key missing here raises KeyError on first use, so a new read can't silently go back to /data.
@@ -294,6 +299,8 @@ def hardware_thread(end_event, hw_queue) -> None:
   off_ts: float | None = None
   started_ts: float | None = None
   started_seen = False
+  shutdown_since: float | None = None
+  jetlink_reason_next = 0.
   startup_blocked_ts: float | None = None
   thermal_status = ThermalStatus.ok
 
@@ -456,6 +463,16 @@ def hardware_thread(end_event, hw_queue) -> None:
     startup_conditions["device_temp_engageable"] = thermal_status < ThermalStatus.overheated
 
     startup_conditions["not_flashing_chestnut"] = not chestnut.flashing
+    # no drive may start under the power-off a Jetlink shutdown wait leads to (once should_shutdown has been true the
+    # power-off is committed, as it was when DoShutdown went out at once)
+    startup_conditions["not_powering_off"] = shutdown_since is None
+
+    # why the Jetlink link a user turned on cannot run (None with the link off): otherwise silently absent
+    # (every JETLINK_REASON_PERIOD_S, not every loop: it reads the setting's file, and this loop keeps disk reads off its thread)
+    if time.monotonic() >= jetlink_reason_next:
+      jetlink_reason_next = time.monotonic() + JETLINK_REASON_PERIOD_S
+      jetlink_reason = jetlink_adapter.reason()
+      params.set_alert("Offroad_JetlinkUnavailable", jetlink_reason is not None, extra_text=jetlink_reason)
 
     # ensure device is fully booted
     startup_conditions["device_booted"] = startup_conditions.get("device_booted", False) or HARDWARE.booted()
@@ -555,7 +572,14 @@ def hardware_thread(end_event, hw_queue) -> None:
     timer.mark("som_power_draw")
 
     # Check if we need to shut down
-    if power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen):
+    # A Jetlink accelerator on its own supply outlives the comma, so a shutdown asks it to power off first and
+    # DoShutdown waits until it says it may, or JETLINK_SHUTDOWN_CAP_S has passed. Link off: shutdown_step() answers
+    # `should_shutdown` unchanged, so this is the original two lines.
+    should_shutdown = power_monitor.should_shutdown(onroad_conditions["ignition"], in_car, off_ts, started_seen)
+    if should_shutdown and shutdown_since is None:
+      shutdown_since = time.monotonic()
+    capped = shutdown_since is not None and time.monotonic() - shutdown_since > JETLINK_SHUTDOWN_CAP_S
+    if jetlink_adapter.shutdown_step(should_shutdown, f"offroad since {off_ts}") or capped:
       cloudlog.warning(f"shutting device down, offroad since {off_ts}")
       params.put_bool("DoShutdown", True, block=True)
 
