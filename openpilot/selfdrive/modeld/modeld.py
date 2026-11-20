@@ -41,6 +41,7 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, wait_for_chestnut
+from openpilot.sunnypilot import jetlink_adapter
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
@@ -236,13 +237,15 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  CHESTNUT = chestnut_compiled() and (chestnut_present() or cable_connected())
+  # a Jetson or an iPhone on the USB-C port looks like a chestnut to cable_connected(): the cable counts only while Jetlink is off
+  CHESTNUT = chestnut_compiled() and (chestnut_present() or jetlink_adapter.chestnut_cable(cable_connected()))
   if CHESTNUT:
     from tinygrad.runtime.ops_amd import AMDDevice
     AMDDevice.wait_timeout_ms = 3000
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
+  jetlink_adapter.prepare(CHESTNUT)  # before going realtime: the GPU thread it starts would inherit SCHED_FIFO 54 on core 7
 
   gc.disable()
 
@@ -298,6 +301,8 @@ def main(demo=False):
   small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
   if model is None:
     model = small_model
+  # the joining Jetlink model drives as small_model until the big model is ready (default off: returns model unchanged)
+  model = jetlink_adapter.attach(model, small_model, vipc_client_main.width, vipc_client_main.height)
   assert model is not None
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
@@ -407,6 +412,8 @@ def main(demo=False):
     run_count = run_count + 1
 
     frame_drop_ratio = frames_dropped / (1 + frames_dropped)
+    # Jetlink's joining model reads the drop ratio to hand a lagging big model back; stock modeld never wrote it on the model
+    model.frame_drop_ratio = frame_drop_ratio
 
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
@@ -439,6 +446,8 @@ def main(demo=False):
       model_output = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
+    if jetlink_adapter.handed_over(model):  # a swap or a hand-back stalls a frame or two: restart the filter's warmup
+      run_count = 0
 
     if model_output is not None:
       modelv2_send = messaging.new_message('modelV2')
