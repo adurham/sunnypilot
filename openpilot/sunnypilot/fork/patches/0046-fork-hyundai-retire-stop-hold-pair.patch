@@ -1,0 +1,950 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index c91a0bb3..d5bec360 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -76,11 +76,6 @@ class CarParamsSP:
+   # onset, a decrease limit, a soft release ramp and the k="b" level trace, all on the FEEL path only. OFF = the deployed
+   # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicBrakes @10.
+   fca11DynamicBrakes: bool = auto_field()
+-  # 0034: STOP-HOLD CLUTCH lane (HyundaiFca11StopHoldClutch, default OFF). Written ONLY by setup_interfaces from that param
+-  # (requires fca11Brake, never in Shadow); read ONCE by the car layer via getattr. ON = an actuating FCA11 frame held at a
+-  # standstill (>= 7 LSB, vEgo <= 1.2 m/s, fastest wheel <= 4 km/h) also carries CF_VSM_HBACmd = 1 + FCA_StopReq = 1 (the
+-  # ESC's own stop hold, so the DCT releases the clutch). OFF = byte-for-byte. Coupled with custom.capnp @11.
+-  fca11StopHoldClutch: bool = auto_field()
+   # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+   # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+   # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index d237859f..90d23487 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -3007,8 +3007,16 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     logged = bytes.fromhex("191e1800d87ffed7")
+     base = fl.Fca11MirrorFrame(dec_cmd=30, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+     self.assertEqual(logged, fl.build_fca11_frame(cam, 11, base), "the builder must reproduce the logged host frame")
+-    held = fl.build_fca11_frame(cam, 11, fl.Fca11MirrorFrame(dec_cmd=30, prefill=True, warn=3, cmd_act=True,
+-                                                            dec_cmd_act=False, stop_hold=True))
++    # The host no longer builds this frame - the pair is retired (patch 0044) - so the pair bits are written here
++    # directly, and this test now pins the PANDA's still-open window rather than the retired builder path.
++    held = bytearray(logged)
++    for start, length, val in ((1, 2, 1), (21, 1, 1)):
++      for i in range(length):
++        pos = start + i
++        held[pos // 8] &= (~(1 << (pos % 8))) & 0xFF
++        held[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
++    held[7] = fl.hyundai_checksum(bytes(held[:7]))
++    held = bytes(held)
+     self.assertEqual((1, 1), (fl._get_bits(held, 1, 2), fl._get_bits(held, 21, 1)))
+     # only the two pair fields (and the checksum that covers them) move
+     self.assertEqual(logged[0] & ~0x06, held[0] & ~0x06)     # byte 0 bits 1-2 = CF_VSM_HBACmd
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_log.py b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+index 6ef0e852..16eff704 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_log.py
+@@ -220,8 +220,7 @@ class EpisodeLogger:
+       self._panda_refused += n
+ 
+   # ------------------------------------------------------------------ record + write
+-  def episode_record(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0,
+-                     stop_hold_frames: int = 0, stop_hold_blockers: dict | None = None) -> dict | None:
++  def episode_record(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0) -> dict | None:
+     if not self._open or self._frames == 0:
+       return None
+     return {
+@@ -249,11 +248,6 @@ class EpisodeLogger:
+       "aego_min_mss2": _r(self._aego_final),
+       "refused": dict(sorted(self._refused.items())),
+       "refused_panda": self._panda_refused,
+-      # 0039: the stop-hold clutch lane's own census. `stop_hold_frames` = SENT frames that carried the HBA/StopReq pair;
+-      # `stop_hold_blockers` = {first failing clause: count} for the SENT frames that did not, so the next drive answers
+-      # "why was the pair never sent" from the log instead of a source read (route 195: 0 pairs, `lane_off` on 399).
+-      "stop_hold_frames": int(stop_hold_frames),
+-      "stop_hold_blockers": dict(sorted((stop_hold_blockers or {}).items())),
+       "plateaus": self._plateau_record(),
+       "plateaus_dropped": self.plateau.dropped,
+       "stop_kph": stop_kph,
+@@ -266,9 +260,8 @@ class EpisodeLogger:
+     except Exception:  # noqa: BLE001 - a malformed sample must not cost the whole episode line
+       return []
+ 
+-  def flush(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0,
+-            stop_hold_frames: int = 0, stop_hold_blockers: dict | None = None) -> None:
+-    rec = self.episode_record(frame, reason, stop_kph, cont_low_lsb_frames, stop_hold_frames, stop_hold_blockers)
++  def flush(self, frame: int, reason: str, stop_kph: float, cont_low_lsb_frames: int = 0) -> None:
++    rec = self.episode_record(frame, reason, stop_kph, cont_low_lsb_frames)
+     self.reset()
+     if rec is not None:
+       self._append(rec)
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index eaf91723..9fef2b9b 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -977,30 +977,18 @@ FCA11_CRAWL_RELEASE_ACCEL = -0.10         # m/s^2: an open episode is not releas
+ # gone. 6 is the boundary, not yet open; one more LSB costs ~+0.1 m/s^2 of commanded brake at crawl.
+ FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguously OPEN clutch (-20 Nm, creep torque gone)
+ 
+-# *** 0034: STOP-HOLD CLUTCH LANE (param HyundaiFca11StopHoldClutch -> CP_SP.fca11StopHoldClutch, DEFAULT OFF) ***
+-# MEASURED (route 190): at a standstill the driver's pedal puts Clutch_Driving_Tq (0x162) at 0.0 Nm while our FCA11 hold
+-# leaves it at +26 Nm over 3,994 frames (creep torque live): the pressure the ESC builds from CR_VSM_DecCmd is injected
+-# downstream of the master-cylinder sensor, so the transmission never learns the car is held. The stock camera's own
+-# stop-hold lane - CF_VSM_HBACmd (1|2) = 1 together with FCA_StopReq (21|1) = 1 - asks the ESC for ITS OWN hold. Patch
+-# 0024 removed an earlier lane because the panda refused both bits unconditionally; panda patch 0033 now accepts the
+-# pair inside a narrow window (safety/modes/hyundai.h, HYUNDAI_FCA11_LONG_STOP_HOLD_*): exact pair, Warn 3, CmdAct 1,
+-# DecCmdAct 0, DecCmd >= 7, FASTEST wheel <= 5 km/h on a fresh speed, camera not braking.
+-# THIS LANE adds the two bits to an ACTUATING frame the law was ALREADY going to send, and only when every one of the
+-# conditions in Fca11LongBrake._stop_hold_ok holds (toggle on, an ordinary planner hold - not cal, not Shadow's core -
+-# at a confirmed standstill, vEgo <= FCA11_STOP_HOLD_V_MAX_MPS, the fastest wheel <= FCA11_STOP_HOLD_WHEEL_MAX_KPH,
+-# level >= FCA11_STOP_HOLD_MIN_LSB, the frame in the variant-B actuating shape). It NEVER changes the level, the cap, the
+-# rise gate, the hold band, the reference the rate limiter uses or any state: the only difference on the wire is bits
+-# 1-2 and 21 of that frame. Release-ramp frames (18x) and the passive close are never touched, so the bits drop on the
+-# first frame the law stops holding. OFF (the default, and every CP_SP without the field) = byte-for-byte today.
+-# Margins: the panda judges the FASTEST wheel on its own (possibly newer) WHL_SPD11 sample against 5.0 km/h, and a refused
+-# actuating frame feeds the law's refusal streak, so the law's bound sits a full 1 km/h under it and is fail-closed when
+-# the car layer did not publish the fastest wheel this frame.
+-FCA11_STOP_HOLD_MIN_LSB = FCA11_CRAWL_MIN_LSB   # == HYUNDAI_FCA11_LONG_STOP_HOLD_MIN_DEC (7): the measured clutch-open level
+-# 0036: narrowed to a TRUE standstill with the brake held (panda window HYUNDAI_FCA11_LONG_STOP_HOLD_MAX_SPEED = 1.0 km/h
+-# fastest wheel + TCS13 FCA_ACK + StandStill). Measured at every archive hold: fastest wheel <= 0.56 km/h, vEgo 0.000.
+-FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin under the panda's 1.0 km/h wheel gate
+-FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
+-FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
++# *** 0034 STOP-HOLD CLUTCH PAIR: RETIRED 2026-11-10 (patch 0044) ***
++# The lane is gone, not switched off. It existed for ONE purpose - to ask the ESC for its own hold (CF_VSM_HBACmd = 1
++# + FCA_StopReq = 1) so the DCT would open its clutch - and that purpose is measured dead: the TCU releases the clutch
++# on the DRIVER's brake (CYL_PRES 1.3-24 bar / 0x329 BRAKE_ACT), while our ESC braking leaves 0.0 bar at the
++# master-cylinder sensor. 6/6 owner stops open it (Clutch_Driving_Tq 0x162 -20 Nm); 14/14 openpilot-held stops keep it
++# closed (+18..26 Nm). On the wire it could only ever be a 2-3 frame burst (the panda's window closes on the first
++# dropped FCA_ACK, and the ESC drops it ~20 ms after the first pair frame in 13/13 bursts), and the hold it was meant
++# to buy is not needed: the FCA11 decel hold alone holds the car at 30 LSB for 103.1 s (measured, FORK row 142).
++# FORK.md row 143 carries the reasoning and the evidence; do not re-open this without a new measurement that the TCU
++# reads 0x38D at all (it does not: 0x421/0x081/0x490 never appear in 2,690 segments).
++# The PANDA side (safety/modes/hyundai.h HYUNDAI_FCA11_LONG_STOP_HOLD_* window) is deliberately untouched: with no
++# host frame carrying the pair it is unreachable, and removing it would cost a firmware rebuild for no wire change.
+ 
+ # *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
+ # Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
+@@ -1091,10 +1079,6 @@ def hold_nag_level(frames: int) -> int:
+ 
+ 
+ 
+-def stop_hold_enabled(CP_SP) -> bool:
+-  """0034: the stop-hold clutch lane switch, read from CP_SP only (getattr: an un-wired CP_SP is OFF)."""
+-  return bool(getattr(CP_SP, "fca11StopHoldClutch", False))
+-
+ # *** 2026-11-03 (route 191, owner: "braking feels binary; if the initial force isn't enough nothing more happens") ***
+ # THE MEASUREMENT that explains it: over 1,568 engaged plan frames on route 191 the planner's own aTarget went below
+ # -2.0 m/s^2 on EIGHT frames, below -2.4 on ONE, and never below -3.0 - while the driver's pedal hit -2.4..-3.2 in the
+@@ -1723,9 +1707,6 @@ class Fca11MirrorFrame:
+   warn: int
+   cmd_act: bool
+   dec_cmd_act: bool
+-  # 0034: True = write the ESC stop-hold PAIR (CF_VSM_HBACmd = 1, FCA_StopReq = 1). False (the default, every existing
+-  # caller) = leave both fields exactly as the camera sent them, i.e. the builder is byte-for-byte the pre-0034 one.
+-  stop_hold: bool = False
+ 
+ 
+ def _get_bits(dat: bytes, start: int, length: int) -> int:
+@@ -1772,7 +1753,7 @@ def build_fca11_frame(cam_dat: bytes, cam_alive: int, m: Fca11MirrorFrame) -> by
+   """The camera's frame with ONLY the brake fields overridden + alive+1 + a fresh CRC.
+ 
+   ``cam_dat`` is the camera's raw 8-byte FCA11 frame; every other byte (FCA_Status, Failinfo,
+-  DrvSetStatus, BeltCmd, RelativeVelocity, TimetoCollision, PAINT1, StopReq, HBA (0034: unless ``m.stop_hold``), and the
++  DrvSetStatus, BeltCmd, RelativeVelocity, TimetoCollision, PAINT1, StopReq, HBA, and the
+   undefined bits this car always carries, e.g. byte4 bit7 = 1 in 10549/10549 logged frames) is
+   copied byte-for-byte, so the ESC only ever sees a shape it has already accepted - with a
+   different brake command in it.
+@@ -1805,14 +1786,6 @@ def build_fca11_frame(cam_dat: bytes, cam_alive: int, m: Fca11MirrorFrame) -> by
+   setb(20, 1, 1 if m.cmd_act else 0)
+   setb(31, 1, 1 if m.dec_cmd_act else 0)
+   setb(35, 4, int(cam_alive) & 0xF)
+-  if m.stop_hold:
+-    # 0034: the pair is only ever written TOGETHER, and only on a frame the caller has already proven is a variant-B
+-    # actuating frame (Fca11LongBrake._stop_hold_ok). Both fields are overridden (not OR-ed onto the camera's value) so
+-    # the result is exactly HBA 1 + StopReq 1 whatever the camera carried.
+-    clear(1, 2)    # CF_VSM_HBACmd
+-    clear(21, 1)   # FCA_StopReq
+-    setb(1, 2, FCA11_STOP_HOLD_HBA)
+-    setb(21, 1, 1)
+ 
+   out = bytes(b[:7])
+   return out + bytes([hyundai_checksum(out)])
+@@ -2012,12 +1985,6 @@ class Fca11LongBrake:
+     self._cont_q_last = 0                # 0040: the level last SENT on the continuous path (the down-step floor / the
+     self._cont_q_bus = 0                 # non-send frame's answer) and the level the BUS last carried (the hysteresis
+     #                                      reference; sub_bite_gate zeroes it when it withholds a sub-bite frame)
+-    # 0034: the stop-hold clutch lane (FCA11_STOP_HOLD_*). Read ONCE, CP_SP only, DEFAULT OFF; never on a disabled
+-    # instance or the Shadow compute core (whose frames never reach the wire).
+-    self.stop_hold_clutch = self.enabled and (not self._core) and stop_hold_enabled(CP_SP)
+-    self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
+-    # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
+-    self.stop_hold_blockers: dict[str, int] = {}
+     # 0043-CD: the standstill hold countdown. `_nag_frames` counts CONTINUOUS SENT frames that put a level
+     # >= FCA11_HOLD_NAG_MIN_LSB on the wire while the car is held at standstill; `hold_nag` is the published state
+     # (0 none / 1 soft / 2 loud / 3 final / 4 EXPIRED-LATCH) the superproject turns into an alert. Neither is ever
+@@ -2034,11 +2001,6 @@ class Fca11LongBrake:
+     # 0038-excl (lane F): controller frames left in the host's mirror of the panda's 100 ms throttle-exclusion window,
+     # armed by every frame we actually SEND with a level (see FCA11_WIRE_WINDOW_FRAMES / _wire_arm).
+     self._wire_arm_left = 0
+-    # 0036: once the pair has been on the wire during a standstill and then drops while the car is STILL stopped (the ESC
+-    # stopped acknowledging, the level fell under the hold), it stays off until the car moves again - no on/off flapping
+-    # at the light. Reset only by leaving standstill.
+-    self._stop_hold_prev = False
+-    self._stop_hold_spent = False
+     self._rel_acc: float | None = None  # 18x: the release ramp's level accumulator (None = no ramp in progress)
+     self._rel_sent = 0                 # 18x: the last level the ramp put on the wire (1-2 LSB per sent frame, enforced)
+     self._rel_fast = False             # 18x: this ramp is a standstill release (the 0.5 s rate), latched at its start
+@@ -2402,9 +2364,7 @@ class Fca11LongBrake:
+                            bool(CS.out.gasPressed), bool(CS.out.brakePressed), FCA11_SEND_EVERY)
+     elif self.log._open:
+       reason = self._last_why if self._last_why not in ("", "disabled") else "release"
+-      self.log.flush(frame, reason, FCA11_STOP_KPH, self.cont_low_lsb_frames,
+-                     self.stop_hold_frames, self.stop_hold_blockers)
+-      self.stop_hold_blockers = {}
++      self.log.flush(frame, reason, FCA11_STOP_KPH, self.cont_low_lsb_frames)
+ 
+   def _camera_owns_refusal(self) -> bool:
+     """0053/route 16a: True when a REFUSED actuating echo this tick is the camera hand-back's doing, not a wall.
+@@ -2608,64 +2568,6 @@ class Fca11LongBrake:
+     for _t, dat in frames:
+       self._cam_step(bytes(dat))
+ 
+-  def _stop_hold_blocker(self, CS, m: Fca11MirrorFrame, cal_on: bool) -> str:
+-    """0039: the FIRST clause that stops this ACTUATING frame from carrying the ESC stop-hold pair, as a short stable
+-    name; "" when the frame may carry it. Diagnostics only - the decision is `_stop_hold_ok`, which is now exactly
+-    `blocker == ""`, so this cannot drift from the gate it explains.
+-
+-    WHY IT EXISTS: on route 195 the pair was sent on 0 of 399 level-30 frames while every input below was satisfied in the
+-    log, and the log could not say WHICH clause refused - the first clause (`lane_off`) was the answer, and it took a source
+-    read to find it. Every episode line now carries this reason, so the next drive answers it from the log alone."""
+-    if not self.stop_hold_clutch:
+-      return "lane_off"          # CP_SP.fca11StopHoldClutch never reached True (the 0034-0039 parametrisation defect)
+-    if cal_on:
+-      return "cal"
+-    # the frame must ALREADY be the valid variant-B actuating shape, at a real hold level
+-    if not (m.prefill and m.cmd_act and not m.dec_cmd_act and int(m.warn) == 3):
+-      return "shape"
+-    if int(m.dec_cmd) < FCA11_STOP_HOLD_MIN_LSB:
+-      return "level"
+-    # held at a confirmed standstill, on BOTH speed bases (the panda judges the fastest wheel; fail-closed if unpublished)
+-    if not bool(getattr(CS.out, "standstill", False)):
+-      return "standstill"
+-    if not (float(CS.out.vEgo) <= FCA11_STOP_HOLD_V_MAX_MPS):
+-      return "vego"
+-    w_max = getattr(CS, "fca11_wheel_max_kph", None)
+-    if w_max is None:
+-      return "wheel_unpublished"
+-    if not (float(w_max) <= FCA11_STOP_HOLD_WHEEL_MAX_KPH):
+-      return "wheel"
+-    # 0036: the ESC itself must report the hold (TCS13 FCA_ACK = executing our brake, StandStill) - the same two bits the
+-    # panda requires. Unpublished reads False (fail-closed).
+-    if not (getattr(CS, "fca11_esc_ack", False) is True):
+-      return "esc_ack"
+-    if not (getattr(CS, "fca11_esc_standstill", False) is True):
+-      return "esc_standstill"
+-    return ""
+-
+-  def _stop_hold_ok(self, CS, m: Fca11MirrorFrame, cal_on: bool) -> bool:
+-    """0034: True iff this ACTUATING frame may carry the ESC stop-hold pair (FCA11_STOP_HOLD_* block). Pure: reads CS
+-    and the frame, writes nothing. Every term mirrors (with margin) a term of the panda's 0033 window, so a frame this
+-    returns True for is one the panda accepts; anything else keeps today's frame (the pair is never sent alone)."""
+-    return self._stop_hold_blocker(CS, m, cal_on) == ""
+-
+-  def _stop_hold_step(self, CS, m: Fca11MirrorFrame, cal_on: bool) -> bool:
+-    """0036: _stop_hold_ok plus the once-per-standstill latch (see _stop_hold_spent). Called on every SENT actuating frame.
+-    0039: also counts WHY this frame did not carry the pair (diagnostics; the return value is unchanged)."""
+-    standstill = bool(getattr(CS.out, "standstill", False))
+-    if not standstill:
+-      self._stop_hold_spent = False
+-    why = self._stop_hold_blocker(CS, m, cal_on)
+-    want = (why == "") and not self._stop_hold_spent
+-    if why == "" and self._stop_hold_spent:
+-      why = "spent"              # every input held; the lane already used its one shot at this standstill
+-    if self._stop_hold_prev and not want and standstill:
+-      self._stop_hold_spent = True
+-    self._stop_hold_prev = want
+-    if why:
+-      self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
+-    return want
+-
+   def _hold_nag_still(self, CS) -> bool:
+     """CD3: a DEAD STOP - openpilot's standstill bit AND every one of the four wheels at rest.
+ 
+@@ -3878,9 +3780,7 @@ class Fca11LongBrake:
+       # 0043: and the hold countdown - a disabled law holds nothing.
+       self._nag_frames = 0
+       self.hold_nag = FCA11_HOLD_NAG_NONE
+-      self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames,
+-                     self.stop_hold_frames, self.stop_hold_blockers)
+-      self.stop_hold_blockers = {}
++      self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames)
+       # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+       self._ask_frames = 0
+       self._on_frames = 0
+@@ -4300,9 +4200,6 @@ class Fca11LongBrake:
+       if frame % FCA11_SEND_EVERY == 0:
+         cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
+         m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+-        # 0034: the ESC stop-hold pair rides THIS frame only if every lane condition holds; the level is not touched.
+-        m.stop_hold = self._stop_hold_step(CS, m, cal_on)
+-        self.stop_hold_frames += int(m.stop_hold)
+         out = build_fca11_frame(dat, (cam_alive + 1) & 0xF, m)
+         sends.append(CanData(FCA11_ADDR, out, 0))
+         # R7-A: the panda allows +RATE_STEP over the last ACCEPTED frame, and we only SEND on the 50 Hz
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+index fd8efc32..7a8f002a 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+@@ -70,12 +70,12 @@ def _cp_sp(fca11=True):
+ #   HyundaiGasRiseLag=1          -> gasRiseLag
+ #   HyundaiGasInterceptor=1      -> enableGasInterceptor
+ #   HyundaiFca11Shadow=0         -> fca11Shadow          (OFF)
+-#   HyundaiFca11StopHoldClutch=0 -> fca11StopHoldClutch  (OFF)
++# (the 0034 stop-hold clutch pair is retired - patch 0044 - so its key is no longer read or set here)
+ # The countdown proofs used to be built with `_cp_sp()` (Brake + interceptor only), which leaves the CONTINUOUS brake
+ # law OFF - so they measured a configuration the car does not run. Everything that says "deployed" below uses this.
+ DEPLOYED_ON = ("fca11Brake", "fca11AffineGain", "fca11DynamicBrakes", "pedalDeliveryLaw", "gasRiseLag",
+                "enableGasInterceptor")
+-DEPLOYED_OFF = ("fca11Shadow", "fca11StopHoldClutch")
++DEPLOYED_OFF = ("fca11Shadow",)
+ 
+ 
+ def _cp_sp_deployed():
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 653255e5..9fcbb81b 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -4485,20 +4485,16 @@ def stop_and_hold_frames(dynamic, cam_dat):
+ 
+ 
+ class TestNoStopHoldBits(unittest.TestCase):
+-  """With the 0034 stop-hold clutch lane OFF (HyundaiFca11StopHoldClutch, the default - and every CP_SP that does not
+-  carry the field) FCA_StopReq 21|1 and CF_VSM_HBACmd 1|2 are never ours: every frame the law sends carries exactly the
+-  camera's value (the camera is idle -> 0), across a full stop-and-hold, with Dynamic Brakes OFF and ON. (2026-11-03 the
+-  0024 lane was removed because the panda refused the pair unconditionally; panda 0033 opened a narrow window and 0034
+-  re-adds the lane behind a default-OFF switch - see test_fca11_stop_hold_clutch.py for the ON side.)"""
++  """The 0034 stop-hold PAIR is RETIRED (patch 0044, 2026-11-10): FCA_StopReq 21|1 and CF_VSM_HBACmd 1|2 are never
++  ours any more, because there is no longer a field, a param, a gate or a code path that can write them. Every frame
++  the law sends carries exactly the camera's value (the camera is idle -> 0), across a full stop-and-hold, with
++  Dynamic Brakes OFF and ON. FORK.md row 143 is the reasoning (the TCU releases the clutch on the driver's pedal
++  brake, not on 0x38D, and the FCA11 decel hold alone holds the car for 103.1 s). The PANDA window is untouched and
++  is still pinned in opendbc/safety/tests/test_hyundai.py - a frame carrying the pair is accepted there even though
++  this host can no longer build one."""
+ 
+   CAM = _real_camera_frame(alive=3)
+ 
+-  def test_lane_is_off_by_default(self):
+-    self.assertFalse(structs.CarParamsSP().fca11StopHoldClutch)
+-    for dyn in (None, False, True):
+-      self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn)).stop_hold_clutch, dyn)
+-    self.assertFalse(fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False).stop_hold)
+-
+   def test_full_stop_and_hold_never_sets_stopreq_or_hba(self):
+     cam_stop, cam_hba = fl._get_bits(self.CAM, 21, 1), fl._get_bits(self.CAM, 1, 2)
+     for dynamic in (False, True):
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py
+deleted file mode 100644
+index 388959eb..00000000
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_clutch.py
++++ /dev/null
+@@ -1,386 +0,0 @@
+-"""0034: the FCA11 STOP-HOLD CLUTCH lane (HyundaiFca11StopHoldClutch -> CP_SP.fca11StopHoldClutch, DEFAULT OFF).
+-
+-At a standstill hold the law's actuating 0x38D also carries CF_VSM_HBACmd (1|2) = 1 + FCA_StopReq (21|1) = 1, asking
+-the ESC for its own stop hold so the DCT releases the clutch (route 190: +26 Nm under our hold vs 0.0 Nm under the foot).
+-
+-Every stream test drives the REAL controller update path (Fca11LongBrake.update with a CarState double). The panda
+-acceptance test runs the emitted frames through the REAL production TX hook (libsafety, safety/modes/hyundai.h with the
+-0033 window), not a Python re-implementation of it.
+-"""
+-import unittest
+-
+-from opendbc.car import structs
+-from opendbc.car.hyundai.hyundaican import hyundai_checksum
+-from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+-from opendbc.sunnypilot.car.interfaces import setup_interfaces
+-from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _get_ci, _real_camera_frame, \
+-  _stop_and_hold_scenario
+-
+-CAM = _real_camera_frame(alive=3)
+-HBA_MASK0 = 0x06     # byte 0 bits 1-2 = CF_VSM_HBACmd
+-STOP_MASK2 = 0x20    # byte 2 bit 5 (= DBC bit 21) = FCA_StopReq
+-
+-
+-def _cp_sp(stop_hold=None, dyn=None, fca11=True):
+-  cp_sp = structs.CarParamsSP()
+-  cp_sp.fca11Brake = fca11
+-  cp_sp.enableGasInterceptor = True
+-  if dyn is not None:
+-    cp_sp.fca11DynamicBrakes = dyn
+-  if stop_hold is not None:
+-    cp_sp.fca11StopHoldClutch = stop_hold
+-  return cp_sp
+-
+-
+-def _bits(d):
+-  return fl._get_bits(d, 1, 2), fl._get_bits(d, 21, 1)
+-
+-
+-def _pair(d):
+-  return _bits(d) == (1, 1)
+-
+-
+-def _run(cp_sp, scenario, n, wheel_max=lambda v: v * 3.6, esc=lambda ss: (ss, ss)):
+-  """[(frame, dat)] for every 0x38D the law sends through `scenario(f) -> (ask, vEgo, standstill)`. The fastest wheel
+-  is published like carstate.py does (km/h), from vEgo by default; 0036: so are TCS13 FCA_ACK / StandStill, which the ESC
+-  reports while it holds our brake at a stop (`esc(standstill) -> (ack, standstill)`, both = standstill by default)."""
+-  b = fl.Fca11LongBrake(structs.CarParams(), cp_sp)
+-  out = []
+-  for f in range(n):
+-    ask, v, ss = scenario(f)
+-    cs = _CS(v_ego=v, cam=(0, CAM), standstill=ss, a_ego=-1.5 if ask < 0 else 0.3)
+-    setattr(cs, "fca11_wheel_max_kph", wheel_max(v))
+-    cs.fca11_esc_ack, cs.fca11_esc_standstill = (bool(x) for x in esc(ss))
+-    for s in b.update(_cc(ask), cs, f):
+-      if s.address == fl.FCA11_ADDR:
+-        out.append((f, bytes(s.dat)))
+-  return b, out
+-
+-
+-def _release_at_standstill(f):
+-  """Stop, hold, then the ask RELEASES while the car is still at a standstill (the dynamic release ramp runs at 0 km/h)."""
+-  if f < 950:
+-    return _stop_and_hold_scenario(f)
+-  return 0.5, 0.0, True
+-
+-
+-class TestWiring(unittest.TestCase):
+-
+-  def test_default_off_everywhere(self):
+-    self.assertFalse(structs.CarParamsSP().fca11StopHoldClutch)
+-    self.assertFalse(fl.stop_hold_enabled(structs.CarParamsSP()))
+-    self.assertFalse(fl.stop_hold_enabled(object()))     # an un-wired CP_SP (no field at all) is OFF
+-    for dyn in (None, False, True):
+-      self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn)).stop_hold_clutch)
+-
+-  def test_requires_fca11_braking_and_is_never_on_the_shadow_core(self):
+-    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True, fca11=False)).stop_hold_clutch)
+-    self.assertTrue(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True)).stop_hold_clutch)
+-    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True), core=True).stop_hold_clutch)
+-
+-  def test_setup_interfaces_param(self):
+-    """The param reaches CP_SP only with HyundaiFca11Brake on and Shadow off; missing/junk = OFF."""
+-    def build(extra):
+-      CI, CP, CP_SP = _get_ci(True, None)      # fresh CP_SP: no FCA11 param applied yet
+-      setup_interfaces(CI, CP, CP_SP, [{"HyundaiGasInterceptor": True}] + extra)
+-      return CP_SP
+-    self.assertFalse(build([{"HyundaiFca11Brake": True}]).fca11StopHoldClutch)
+-    for raw in (True, "1", b"1"):
+-      self.assertTrue(build([{"HyundaiFca11Brake": True}, {"HyundaiFca11StopHoldClutch": raw}]).fca11StopHoldClutch, raw)
+-    for raw in (False, "0", None, "junk"):
+-      self.assertFalse(build([{"HyundaiFca11Brake": True}, {"HyundaiFca11StopHoldClutch": raw}]).fca11StopHoldClutch)
+-    self.assertFalse(build([{"HyundaiFca11Brake": False}, {"HyundaiFca11StopHoldClutch": True}]).fca11StopHoldClutch)
+-    self.assertFalse(build([{"HyundaiFca11Brake": True}, {"HyundaiFca11Shadow": True},
+-                            {"HyundaiFca11StopHoldClutch": True}]).fca11StopHoldClutch)
+-
+-  def test_constants_match_the_panda_window(self):
+-    self.assertEqual(7, fl.FCA11_STOP_HOLD_MIN_LSB)
+-    self.assertEqual(fl.FCA11_CRAWL_MIN_LSB, fl.FCA11_STOP_HOLD_MIN_LSB)
+-    self.assertEqual(1, fl.FCA11_STOP_HOLD_HBA)
+-    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_LONG_STOP_HOLD_MAX_SPEED_KPH as PANDA_KPH
+-    self.assertEqual(1.0, PANDA_KPH)                            # 0036: the panda's fastest-wheel bound
+-    self.assertLessEqual(fl.FCA11_STOP_HOLD_V_MAX_MPS, 0.2)
+-    self.assertLess(fl.FCA11_STOP_HOLD_V_MAX_MPS * 3.6, PANDA_KPH)   # margin under the panda's wheel gate
+-    self.assertLess(fl.FCA11_STOP_HOLD_WHEEL_MAX_KPH, PANDA_KPH)
+-
+-
+-class TestBuilder(unittest.TestCase):
+-
+-  def test_default_builder_is_unchanged(self):
+-    m = fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+-    self.assertFalse(m.stop_hold)
+-    for hba, stop in ((0, 0), (2, 1), (3, 0)):
+-      cam = _real_camera_frame(alive=3, hba=hba, stop_req=stop)
+-      self.assertEqual((hba, stop), _bits(fl.build_fca11_frame(cam, 4, m)))
+-
+-  def test_stop_hold_sets_exactly_the_pair_at_20_lsb(self):
+-    base = fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+-    held = fl.Fca11MirrorFrame(dec_cmd=20, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False, stop_hold=True)
+-    for cam in (CAM, _real_camera_frame(alive=3, hba=3), _real_camera_frame(alive=3, hba=2, stop_req=1)):
+-      a, b = fl.build_fca11_frame(cam, 4, base), fl.build_fca11_frame(cam, 4, held)
+-      self.assertEqual((1, 1), _bits(b))                       # the exact pair, whatever the camera carried
+-      self.assertEqual(20, fl._get_bits(b, 8, 8))
+-      self.assertEqual(b[7], hyundai_checksum(b[:7]))
+-    a, b = fl.build_fca11_frame(CAM, 4, base), fl.build_fca11_frame(CAM, 4, held)
+-    self.assertEqual(bytes([HBA_MASK0 & 0x02, 0, STOP_MASK2, 0, 0, 0, 0]), bytes(x ^ y for x, y in zip(a[:7], b[:7])))
+-
+-
+-class TestGate(unittest.TestCase):
+-  """Fca11LongBrake._stop_hold_ok, term by term (the predicate the single call site uses)."""
+-
+-  def setUp(self):
+-    self.b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True))
+-
+-  def _cs(self, v=0.0, standstill=True, wheel_max: float | None = 0.0, esc=(True, True)):
+-    cs = _CS(v_ego=v, cam=(0, CAM), standstill=standstill)
+-    if wheel_max is not None:
+-      setattr(cs, "fca11_wheel_max_kph", wheel_max)
+-    if esc is not None:
+-      cs.fca11_esc_ack, cs.fca11_esc_standstill = esc
+-    return cs
+-
+-  @staticmethod
+-  def _m(dec=20, **kw):
+-    a = dict(dec_cmd=dec, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+-    a.update(kw)
+-    return fl.Fca11MirrorFrame(**a)
+-
+-  def test_standstill_20_lsb_hold(self):
+-    self.assertTrue(self.b._stop_hold_ok(self._cs(), self._m(20), False))
+-    # the boundary (vEgo is float32 in CarState: 0.2 reads as 0.2000000030 and is refused - the fail-safe direction)
+-    self.assertTrue(self.b._stop_hold_ok(self._cs(v=0.19, wheel_max=0.75), self._m(7), False))
+-
+-  def test_never_above_0_2_mps(self):
+-    for v in (0.21, 0.5, 1.2, 1.5, 3.0, 20.0):     # 0036: 0.21-1.2 m/s were legal under 0034
+-      self.assertFalse(self.b._stop_hold_ok(self._cs(v=v), self._m(), False), v)
+-
+-  def test_never_without_the_esc_reporting_the_hold(self):
+-    """0036: TCS13 FCA_ACK (the ESC executes our brake) AND StandStill, both required; unpublished = refused."""
+-    for esc in ((False, False), (False, True), (True, False), None):
+-      self.assertFalse(self.b._stop_hold_ok(self._cs(esc=esc), self._m(), False), esc)
+-
+-  def test_never_on_a_fast_or_unknown_wheel(self):
+-    for w in (0.76, 1.0, 4.0, 5.0, 30.0, None, float("nan")):
+-      self.assertFalse(self.b._stop_hold_ok(self._cs(wheel_max=w), self._m(), False), w)
+-
+-  def test_never_without_confirmed_standstill(self):
+-    self.assertFalse(self.b._stop_hold_ok(self._cs(standstill=False), self._m(), False))
+-
+-  def test_never_below_level_7(self):
+-    for dec in range(0, 7):
+-      self.assertFalse(self.b._stop_hold_ok(self._cs(), self._m(dec), False), dec)
+-
+-  def test_never_with_dec_cmd_act_or_a_bad_shape(self):
+-    for kw in ({"dec_cmd_act": True}, {"warn": 0}, {"warn": 2}, {"cmd_act": False}, {"prefill": False},
+-               {"dec_cmd": 0, "prefill": False, "warn": 0, "cmd_act": False}):
+-      self.assertFalse(self.b._stop_hold_ok(self._cs(), self._m(**kw), False), kw)
+-
+-  def test_never_under_cal_or_toggle_off(self):
+-    self.assertFalse(self.b._stop_hold_ok(self._cs(), self._m(), True))
+-    off = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=False))
+-    self.assertFalse(off._stop_hold_ok(self._cs(), self._m(), False))
+-
+-
+-class TestStream(unittest.TestCase):
+-  """The real controller over a full stop-and-hold: OFF is byte-identical, ON differs ONLY in the pair."""
+-
+-  def _streams(self, dyn, scenario=_stop_and_hold_scenario, n=1100, **kw):
+-    off = _run(_cp_sp(stop_hold=False, dyn=dyn), scenario, n, **kw)[1]
+-    absent = _run(_cp_sp(dyn=dyn), scenario, n, **kw)[1]
+-    b_on, on = _run(_cp_sp(stop_hold=True, dyn=dyn), scenario, n, **kw)
+-    return off, absent, on, b_on
+-
+-  def test_toggle_off_is_byte_identical(self):
+-    """OFF (explicit False) == field absent (today's CP_SP) == the stream the 0024 tests were written against."""
+-    from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import stop_and_hold_frames
+-    for dyn in (False, True):
+-      with self.subTest(dyn=dyn):
+-        off, absent, _, _ = self._streams(dyn)
+-        self.assertEqual(absent, off)
+-        self.assertEqual(stop_and_hold_frames(dyn, CAM), off)
+-        self.assertFalse(any(_bits(d) != (0, 0) for _, d in off))
+-
+-  def test_toggle_on_differs_only_in_the_pair(self):
+-    for dyn in (False, True):
+-      with self.subTest(dyn=dyn):
+-        off, _, on, b_on = self._streams(dyn)
+-        self.assertEqual([f for f, _ in off], [f for f, _ in on], "same frames, same slots")
+-        n_pair = 0
+-        for (f, a), (_, b) in zip(off, on):
+-          x = bytes(p ^ q for p, q in zip(a[:7], b[:7]))
+-          self.assertEqual(0, x[0] & ~HBA_MASK0 & 0xFF, f)
+-          self.assertEqual(b"\x00", x[1:2], f"DecCmd changed @{f}")
+-          self.assertEqual(0, x[2] & ~STOP_MASK2 & 0xFF, f)
+-          self.assertEqual(b"\x00" * 4, x[3:7], f)
+-          self.assertEqual(b[7], hyundai_checksum(b[:7]))
+-          if a != b:
+-            self.assertTrue(_pair(b), f"never one bit alone @{f}")
+-            self.assertEqual((0, 0), _bits(a))
+-            n_pair += 1
+-        self.assertGreater(n_pair, 200, "the hold at the light must actually carry the pair")
+-        self.assertEqual(n_pair, b_on.stop_hold_frames)
+-
+-  def test_on_bits_only_on_standstill_hold_frames(self):
+-    for dyn in (False, True):
+-      with self.subTest(dyn=dyn):
+-        _, _, on, _ = self._streams(dyn)
+-        for f, d in on:
+-          ask, v, ss = _stop_and_hold_scenario(f)
+-          lvl = fl._get_bits(d, 8, 8)
+-          if _pair(d):
+-            self.assertTrue(ss and v <= 1.2 and lvl >= 7, f"pair @{f}: v={v} ss={ss} lvl={lvl}")
+-            self.assertEqual((1, 1, 3, 0), (fl._get_bits(d, 0, 1), fl._get_bits(d, 20, 1), fl._get_bits(d, 3, 2),
+-                                            fl._get_bits(d, 31, 1)))
+-          else:
+-            self.assertEqual((0, 0), _bits(d), f)
+-        # every moving frame and every frame of the launch is clean, and the launch closes with a clean passive frame
+-        self.assertFalse(any(_pair(d) for f, d in on if _stop_and_hold_scenario(f)[1] > 0.0))
+-        self.assertFalse(any(_pair(d) for f, d in on if f >= 950))
+-        self.assertTrue(any(fl._get_bits(d, 8, 8) == 0 for f, d in on if f >= 950))
+-
+-  def test_never_above_0_2_mps_even_if_standstill_says_so(self):
+-    """A CarState that (wrongly) claims standstill at 1.5 m/s with slow wheels still never gets the pair."""
+-    def sc(f):
+-      a, v, ss = _stop_and_hold_scenario(f)
+-      return (a, 1.5, True) if 350 <= f < 950 else (a, v, ss)
+-    _, _, on, b = self._streams(False, scenario=sc, wheel_max=lambda v: 0.0)
+-    self.assertEqual(0, b.stop_hold_frames)
+-    self.assertFalse(any(_pair(d) for _, d in on))
+-
+-  def test_never_on_a_fast_wheel(self):
+-    _, _, on, b = self._streams(False, wheel_max=lambda v: 0.9)
+-    self.assertEqual(0, b.stop_hold_frames)
+-    _, _, on, b = self._streams(False, wheel_max=lambda v: None)
+-    self.assertEqual(0, b.stop_hold_frames)
+-
+-  def test_never_without_the_esc_ack_in_the_stream(self):
+-    """0036: the whole stop-and-hold with the ESC NOT acknowledging (or not at its own standstill) never carries the pair."""
+-    for esc in (lambda ss: (False, ss), lambda ss: (ss, False), lambda ss: (False, False)):
+-      _, _, on, b = self._streams(False, esc=esc)
+-      self.assertEqual(0, b.stop_hold_frames)
+-      self.assertFalse(any(_pair(d) for _, d in on))
+-
+-  def test_pair_drops_once_and_stays_off_for_that_stop(self):
+-    """0036: the ESC ack falls mid-hold -> the pair drops on that frame and does NOT come back at the same stop, even
+-    when the ack returns (no on/off flapping at the light). A new stop (after moving) may carry it again."""
+-    def esc_flap(f):
+-      return (False, True) if 600 <= f < 650 else (True, True)
+-    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold=True))
+-    pair_frames = []
+-    for f in range(1100):
+-      ask, v, ss = _stop_and_hold_scenario(f)
+-      cs = _CS(v_ego=v, cam=(0, CAM), standstill=ss, a_ego=-1.5 if ask < 0 else 0.3)
+-      cs.fca11_wheel_max_kph = v * 3.6
+-      cs.fca11_esc_ack, cs.fca11_esc_standstill = esc_flap(f) if ss else (False, False)
+-      for snd in b.update(_cc(ask), cs, f):
+-        if snd.address == fl.FCA11_ADDR and _pair(bytes(snd.dat)):
+-          pair_frames.append(f)
+-    self.assertTrue(pair_frames and min(pair_frames) < 600)
+-    self.assertFalse(any(f >= 600 for f in pair_frames), "came back at the same stop after the ack fell")
+-
+-  def test_never_on_the_release_ramp_or_passive_frame(self):
+-    """Dynamic Brakes ON, ask released while STILL at a standstill: the ramp-down and the close frame carry no pair -
+-    the pair drops on the first frame the law stops holding."""
+-    off, _, on, _ = self._streams(True, scenario=_release_at_standstill, n=1100)
+-    self.assertEqual([f for f, _ in off], [f for f, _ in on])
+-    after = [(f, d) for f, d in on if f >= 950]
+-    lv = [fl._get_bits(d, 8, 8) for _, d in after]
+-    self.assertGreater(len(after), 3)
+-    self.assertTrue(any(0 < x < lv[0] for x in lv), "a release ramp actually ran at standstill")
+-    self.assertIn(0, lv, "and closed with a passive frame")
+-    for f, d in after:
+-      self.assertEqual((0, 0), _bits(d), f"frame {f} lvl {fl._get_bits(d, 8, 8)}")
+-    self.assertTrue(any(_pair(d) for f, d in on if f < 950))
+-    # the passive frame in every stream is clean
+-    for f, d in on:
+-      if fl._get_bits(d, 8, 8) == 0:
+-        self.assertEqual((0, 0), _bits(d))
+-
+-  def test_never_below_level_7(self):
+-    """Frames below 7 LSB at a standstill (the onset ramp 4 -> 8 at a stop) never carry the pair."""
+-    def sc(f):
+-      return (-2.0, 0.0, True)
+-    _, _, on, _ = self._streams(False, scenario=sc, n=200)
+-    for f, d in on:
+-      if fl._get_bits(d, 8, 8) < 7:
+-        self.assertEqual((0, 0), _bits(d), f)
+-    self.assertTrue(any(fl._get_bits(d, 8, 8) < 7 for _, d in on), "the onset frames below 7 exist")
+-    self.assertTrue(any(_pair(d) for _, d in on))
+-
+-
+-class TestPandaAcceptance(unittest.TestCase):
+-  """The ON stream through the REAL production TX hook (libsafety, FCA11_LONG on the pedal car, window open, engaged).
+-  The C hook IS callable from Python through the existing libsafety cffi harness (opendbc/safety/tests)."""
+-
+-  def _fixture(self):
+-    import opendbc.safety.tests.test_hyundai as th
+-    # the same parameterized fixture TestNoStopHoldBitsPandaTx (test_fca11_long.py) uses
+-    tc = getattr(th, "TestHyundaiFca11LongSafety_0")("test_needs_controls_and_heartbeat")
+-    tc.setUp()
+-    return tc
+-
+-  def _verdicts(self, tc, sent, speed_raw, esc=lambda f: (1, 1) if f >= 350 else (0, 0)):
+-    from opendbc.safety.tests.libsafety import libsafety_py
+-    tc._rearm()
+-    out = []
+-    for f, d in sent:
+-      tc.safety.set_timer(1_000_000 + f * 10_000)
+-      tc.esc_hold = esc(f)      # 0036: TCS13 FCA_ACK / StandStill, as the ESC reports them while it holds our brake
+-      tc._open_window(speed_raw=speed_raw(f))
+-      tc._rx(tc._cam_fca11())
+-      out.append(tc._tx(libsafety_py.make_CANPacket(fl.FCA11_ADDR, 0, d)))
+-    return out
+-
+-  def test_on_stream_accepted_like_the_off_stream(self):
+-    tc = self._fixture()
+-    spd = lambda f: 0 if f >= 350 else 640     # noqa: E731 - WHL_SPD11 raw (1/32 km/h): 0 at the stop, 20 km/h before
+-    for dyn in (False, True):
+-      with self.subTest(dyn=dyn):
+-        off = _run(_cp_sp(stop_hold=False, dyn=dyn), _stop_and_hold_scenario, 1100)[1]
+-        on = _run(_cp_sp(stop_hold=True, dyn=dyn), _stop_and_hold_scenario, 1100)[1]
+-        v_off, v_on = self._verdicts(tc, off, spd), self._verdicts(tc, on, spd)
+-        self.assertEqual(v_off, v_on, "the pair never costs the law a frame")
+-        pair = [i for i, (_, d) in enumerate(on) if _pair(d)]
+-        self.assertGreater(len(pair), 200)
+-        self.assertTrue(all(v_on[i] for i in pair), "every frame carrying the pair is ACCEPTED by the panda")
+-
+-  def test_contrast_same_frames_refused_above_walking_pace(self):
+-    """Falsifiable: the panda refuses the very same pair frames once the fastest wheel is above 1 km/h (0036; 5 km/h
+-    under 0033), and whenever the ESC does not report the hold. The WHOLE stream is replayed (the ramp to the hold level
+-    must pass the panda's rise gate first); only the verdicts of the frames carrying the pair are judged."""
+-    tc = self._fixture()
+-    on = _run(_cp_sp(stop_hold=True), _stop_and_hold_scenario, 1100)[1]
+-    pair = [i for i, (_, d) in enumerate(on) if _pair(d)]
+-    self.assertGreater(len(pair), 200)
+-    stop = lambda f: f >= 350    # noqa: E731 - the scenario's standstill
+-    ok = self._verdicts(tc, on, lambda f: 0 if stop(f) else 640)
+-    self.assertTrue(all(ok[i] for i in pair), "control: accepted at 0 km/h with the ESC reporting the hold")
+-    for raw in (33, 5 * 32 + 1):
+-      v = self._verdicts(tc, on, lambda f, r=raw: r if stop(f) else 640)
+-      self.assertFalse(any(v[i] for i in pair), f"raw {raw}: a pair frame was accepted above 1 km/h")
+-    for esc in ((0, 1), (1, 0), (0, 0)):
+-      v = self._verdicts(tc, on, lambda f: 0 if stop(f) else 640, esc=lambda f, e=esc: e if stop(f) else (0, 0))
+-      self.assertFalse(any(v[i] for i in pair), f"esc {esc}: a pair frame was accepted without the ESC hold")
+-
+-
+-class TestCarStatePublishes(unittest.TestCase):
+-  """0036: the lane's inputs through the REAL CarInterface.update -> carstate.py path. FAIL-BEFORE: nothing published
+-  fca11_wheel_max_kph (or the ESC flags), so _stop_hold_ok's fail-closed read refused every frame on the car and the
+-  0034 toggle could never put a single pair frame on the wire."""
+-
+-  def test_fastest_wheel_and_esc_flags_reach_the_carstate(self):
+-    from opendbc.can import CANPacker
+-    from opendbc.sunnypilot.car.hyundai.tests.test_fca11_clutch import _ci
+-    pk = CANPacker("hyundai_can_generated")
+-    CI, _ = _ci()
+-    whl = pk.make_can_msg("WHL_SPD11", 0, {"WHL_SPD_FL": 0.0, "WHL_SPD_FR": 0.5, "WHL_SPD_RL": 0.25, "WHL_SPD_RR": 0.0})
+-    for ack, ss in ((1, 1), (0, 1), (1, 0)):
+-      tcs = pk.make_can_msg("TCS13", 0, {"FCA_ACK": ack, "StandStill": ss})
+-      for i in range(3):
+-        CI.update([((i + 1) * int(0.02e9), [(whl[0], whl[1], 0), (tcs[0], tcs[1], 0)])])
+-      self.assertAlmostEqual(0.5, CI.CS.fca11_wheel_max_kph, places=3)
+-      self.assertEqual((bool(ack), bool(ss)), (CI.CS.fca11_esc_ack, CI.CS.fca11_esc_standstill))
+-
+-
+-if __name__ == "__main__":
+-  unittest.main()
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_diag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_diag.py
+deleted file mode 100644
+index b27af6d3..00000000
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_hold_diag.py
++++ /dev/null
+@@ -1,193 +0,0 @@
+-"""0039: the stop-hold clutch lane answers "why was the pair never sent" from the LOG, and the frame the car produces at
+-the route-195 hold inputs is the frame that was on the wire (byte for byte).
+-
+-WHAT HAPPENED (route 195, 2026-11-05). 4,234 SENT 0x38D frames that drive, 399 of them at level 30 (CR_VSM_DecCmd), and
+-ZERO carrying the pair: `Fca11LongBrake._stop_hold_ok` returned False on its FIRST clause, `not self.stop_hold_clutch`,
+-because `CP_SP.fca11StopHoldClutch` was never set - the param key was missing from the feed that builds the params list
+-(fixed in the superproject's initialize_params, patch-independent). Every input the gate reads was satisfied in the log:
+-vEgo 0.015-0.066 m/s, carState.standstill True, fastest wheel 0.00-0.31 km/h, TCS13 FCA_ACK = 1 (100 %/93 %), StandStill =
+-1 (100 %), level 30. Nothing in the log said WHICH clause refused.
+-
+-These tests pin (a) the per-frame reason code, (b) that the reason reaches the episode line, (c) the exact wire bytes of
+-one of those held frames, rebuilt from its own camera frame, and (d) that only the pair bits differ once the lane is on.
+-"""
+-import os
+-import tempfile
+-import unittest
+-
+-from opendbc.car import structs
+-from opendbc.sunnypilot.car.hyundai import fca11_long as fl
+-from opendbc.sunnypilot.car.hyundai import fca11_log
+-from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _get_ci, _real_camera_frame
+-from opendbc.sunnypilot.car.interfaces import setup_interfaces
+-
+-# Route 195, segment 195-2, t = 9851.314 / 9851.322 (logMonoTime): the camera's own 0x38D on bus 2 and the mirror frame the
+-# host sent 8 ms later, at vEgo 0.02 m/s, standstill, fastest wheel 0.00 km/h, TCS13 FCA_ACK = 1, StandStill = 1.
+-LOGGED_CAM = bytes.fromhex("00000800d07ffe94")     # CR_FCA_Alive = 10, DecCmd 0, Prefill 0, Warn 0
+-LOGGED_SENT = bytes.fromhex("191e1800d87ffed7")    # Prefill 1, DecCmd 30, Warn 3, CmdAct 1, DecCmdAct 0, HBA 0, StopReq 0
+-
+-
+-def _cp_sp(stop_hold):
+-  cp_sp = structs.CarParamsSP()
+-  cp_sp.fca11Brake = True
+-  cp_sp.enableGasInterceptor = True
+-  cp_sp.fca11StopHoldClutch = stop_hold
+-  return cp_sp
+-
+-
+-def _logged_cs(**over):
+-  """The CS the car layer published at those frames: every gate input satisfied (route-195 values)."""
+-  cs = _CS(v_ego=over.pop("v_ego", 0.02), standstill=over.pop("standstill", True), a_ego=-1.5)
+-  cs.fca11_wheel_max_kph = over.pop("wheel_max", 0.0)
+-  cs.fca11_esc_ack = over.pop("ack", True)
+-  cs.fca11_esc_standstill = over.pop("esc_standstill", True)
+-  assert not over, over
+-  return cs
+-
+-
+-def _m(level=30, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False, stop_hold=False):
+-  return fl.Fca11MirrorFrame(dec_cmd=level, prefill=prefill, warn=warn, cmd_act=cmd_act, dec_cmd_act=dec_cmd_act,
+-                              stop_hold=stop_hold)
+-
+-
+-class TestBlocker(unittest.TestCase):
+-  """The reason code is the gate itself: `_stop_hold_ok` is `blocker == ""`, so it cannot drift."""
+-
+-  def _b(self, stop_hold=True):
+-    return fl.Fca11LongBrake(structs.CarParams(), _cp_sp(stop_hold))
+-
+-  def test_the_route_195_first_clause_is_named(self):
+-    """THE FIELD FAILURE: the lane off (CP_SP field never set) + every logged input satisfied + the exact held frame."""
+-    b = self._b(False)
+-    self.assertFalse(b.stop_hold_clutch)
+-    self.assertEqual("lane_off", b._stop_hold_blocker(_logged_cs(), _m(), False))
+-    self.assertFalse(b._stop_hold_ok(_logged_cs(), _m(), False))
+-    self.assertFalse(b._stop_hold_step(_logged_cs(), _m(), False))
+-    self.assertEqual({"lane_off": 1}, b.stop_hold_blockers)
+-
+-  def test_all_inputs_satisfied_is_no_blocker(self):
+-    b = self._b()
+-    self.assertEqual("", b._stop_hold_blocker(_logged_cs(), _m(), False))
+-    self.assertTrue(b._stop_hold_ok(_logged_cs(), _m(), False))
+-
+-  def test_each_clause_names_itself(self):
+-    """One mutation per term: the reason must name the term that failed (a name that never fires is not a diagnostic)."""
+-    b = self._b()
+-    cases = {
+-      "cal": (_logged_cs(), _m(), True),
+-      "shape": (_logged_cs(), _m(warn=2), False),
+-      "level": (_logged_cs(), _m(level=fl.FCA11_STOP_HOLD_MIN_LSB - 1), False),
+-      "standstill": (_logged_cs(standstill=False), _m(), False),
+-      "vego": (_logged_cs(v_ego=fl.FCA11_STOP_HOLD_V_MAX_MPS + 0.1), _m(), False),
+-      "wheel": (_logged_cs(wheel_max=fl.FCA11_STOP_HOLD_WHEEL_MAX_KPH + 0.1), _m(), False),
+-      "esc_ack": (_logged_cs(ack=False), _m(), False),
+-      "esc_standstill": (_logged_cs(esc_standstill=False), _m(), False),
+-    }
+-    for want, (cs, m, cal) in cases.items():
+-      with self.subTest(clause=want):
+-        self.assertEqual(want, b._stop_hold_blocker(cs, m, cal))
+-        self.assertFalse(b._stop_hold_ok(cs, m, cal))
+-    cs = _logged_cs()
+-    del cs.fca11_wheel_max_kph
+-    self.assertEqual("wheel_unpublished", b._stop_hold_blocker(cs, _m(), False))
+-
+-  def test_spent_is_named_only_after_a_pair_was_sent(self):
+-    """The once-per-standstill latch: the reason is `spent` (not a data clause) once the lane used its shot and the ESC
+-    then stopped acknowledging at the same light."""
+-    b = self._b()
+-    self.assertTrue(b._stop_hold_step(_logged_cs(), _m(), False))          # pair rides this frame
+-    self.assertFalse(b._stop_hold_step(_logged_cs(ack=False), _m(), False))  # ESC stops acknowledging, still stopped
+-    self.assertEqual("", b._stop_hold_blocker(_logged_cs(), _m(), False), "every DATA clause holds again...")
+-    self.assertFalse(b._stop_hold_step(_logged_cs(), _m(), False))           # ...but the shot is spent
+-    self.assertEqual(1, b.stop_hold_blockers.get("spent"), "and the reason says so")
+-    b._stop_hold_step(_logged_cs(standstill=False), _m(), False)            # leaving standstill re-arms
+-    self.assertFalse(b._stop_hold_spent)
+-
+-
+-class TestWireBytes(unittest.TestCase):
+-  """Byte-level: the frame the car produced at that instant, rebuilt from its own camera frame."""
+-
+-  def test_unpaired_reconstruction_reproduces_the_logged_frame(self):
+-    out = fl.build_fca11_frame(LOGGED_CAM, 11, _m())
+-    self.assertEqual(LOGGED_SENT, out)
+-    self.assertEqual((0, 0), (fl._get_bits(out, 1, 2), fl._get_bits(out, 21, 1)))
+-
+-  def test_pair_changes_only_the_two_fields(self):
+-    base = fl.build_fca11_frame(LOGGED_CAM, 11, _m())
+-    held = fl.build_fca11_frame(LOGGED_CAM, 11, _m(stop_hold=True))
+-    self.assertEqual((1, 1), (fl._get_bits(held, 1, 2), fl._get_bits(held, 21, 1)))
+-    # every field the mirror owns is identical; only HBA / StopReq / the checksum byte differ
+-    for start, n in ((0, 1), (3, 2), (8, 8), (20, 1), (31, 1), (35, 4)):
+-      self.assertEqual(fl._get_bits(base, start, n), fl._get_bits(held, start, n), (start, n))
+-    self.assertNotEqual(base[7], held[7], "the checksum must follow the pair")
+-
+-
+-class TestEpisodeLine(unittest.TestCase):
+-
+-  def _open_log(self):
+-    log = fca11_log.EpisodeLogger(tempfile.mkdtemp(prefix="fca11-0039-"))
+-    log.begin(0, 0.0, 0.0)
+-    log.note_frame(0, 30, 0.0, 0.0, -1.5, True, fl.FCA11_STOP_KPH)
+-    return log
+-
+-  def test_census_is_on_the_episode_line(self):
+-    log = self._open_log()
+-    rec = log.episode_record(1, "release", fl.FCA11_STOP_KPH, 0, 12, {"lane_off": 7, "esc_ack": 3})
+-    self.assertEqual(12, rec["stop_hold_frames"])
+-    self.assertEqual({"esc_ack": 3, "lane_off": 7}, rec["stop_hold_blockers"])
+-
+-  def test_additive_only(self):
+-    """The 0039 keys are additive: an older caller (no kwargs) still gets the full line, with zeros."""
+-    log = self._open_log()
+-    rec = log.episode_record(1, "release", fl.FCA11_STOP_KPH)
+-    self.assertEqual(0, rec["stop_hold_frames"])
+-    self.assertEqual({}, rec["stop_hold_blockers"])
+-    for k in ("frames", "dec_cmd_max", "hold_frames", "refused", "refused_panda", "plateaus", "stop_kph"):
+-      self.assertIn(k, rec)
+-
+-
+-class TestTheFieldStateFailsThroughTheRealPlumbing(unittest.TestCase):
+-  """The end-to-end signature, using the opendbc writer with the list the FIXED superproject now feeds: with the key the
+-  pair appears; with the key stripped (what card.py fed before the fix) it never does."""
+-
+-  def _plist(self, with_key):
+-    pl = [{"HyundaiGasInterceptor": True}, {"HyundaiFca11Brake": True}]
+-    if with_key:
+-      pl.append({"HyundaiFca11StopHoldClutch": True})
+-    return pl
+-
+-  def _law(self, with_key):
+-    CI, CP, CP_SP = _get_ci(None, None)
+-    setup_interfaces(CI, CP, CP_SP, self._plist(with_key))
+-    CS = _logged_cs()
+-    CS.fca11_cam_frame = (0, LOGGED_CAM)
+-    b = fl.Fca11LongBrake(CP, CP_SP)
+-    return b, CS
+-
+-  def test_on_sends_the_pair_off_sends_none(self):
+-    b, CS = self._law(True)
+-    self.assertTrue(b.stop_hold_clutch)
+-    out = []
+-    for f in range(20):
+-      CS.fca11_cam_frame = (f * 10_000_000, LOGGED_CAM)
+-      CS.fca11_now_nanos = f * 10_000_000
+-      out += [bytes(s.dat) for s in b.update(_cc(-2.0), CS, f) if s.address == fl.FCA11_ADDR]
+-    self.assertTrue(out, "precondition: the law is holding")
+-    self.assertTrue(any((fl._get_bits(d, 1, 2), fl._get_bits(d, 21, 1)) == (1, 1) for d in out))
+-    self.assertGreater(b.stop_hold_frames, 0)
+-
+-    b2, CS2 = self._law(False)
+-    self.assertFalse(b2.stop_hold_clutch)
+-    out2 = []
+-    for f in range(20):
+-      CS2.fca11_cam_frame = (f * 10_000_000, LOGGED_CAM)
+-      CS2.fca11_now_nanos = f * 10_000_000
+-      out2 += [bytes(s.dat) for s in b2.update(_cc(-2.0), CS2, f) if s.address == fl.FCA11_ADDR]
+-    self.assertTrue(out2, "precondition: the law is holding here too")
+-    self.assertFalse([d for d in out2 if (fl._get_bits(d, 1, 2), fl._get_bits(d, 21, 1)) == (1, 1)])
+-    self.assertEqual(0, b2.stop_hold_frames)
+-    self.assertEqual({"lane_off": len(out2)}, b2.stop_hold_blockers)
+-
+-
+-if __name__ == "__main__":
+-  unittest.main()
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index d98f7d70..d35896de 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -190,12 +190,6 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # libparams) = the deployed law plus only the three UNCONDITIONAL 18x rules. Next ignition to take effect.
+   if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicBrakes")) and not shadow:
+     CP_SP.fca11DynamicBrakes = True
+-  # 0034: the STOP-HOLD CLUTCH lane (HyundaiFca11StopHoldClutch, PERSISTENT BOOL, default "0" = OFF): at a standstill
+-  # hold the FCA11 frame also asks for the ESC's own stop hold (CF_VSM_HBACmd = 1 + FCA_StopReq = 1) so the transmission
+-  # releases the clutch. Same truthy parser; inert without HyundaiFca11Brake and in Shadow (Shadow's wire = OLD-LAW).
+-  # Read at CarParams build time => next ignition. The panda's 0033 window is the hard bound on where it can act.
+-  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StopHoldClutch")) and not shadow:
+-    CP_SP.fca11StopHoldClutch = True
+   # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0"). A bitfield:
+   # 1 = grace window after hyundai_init, 2 = N consecutive fault frames, 3 = both; 0 = the deployed fail-closed rule.
+   # Written HERE because the car layer only READS CP_SP.fca11PedalGuard - without this writer the key would be a no-op

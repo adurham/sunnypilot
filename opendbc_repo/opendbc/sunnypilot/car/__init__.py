@@ -20,8 +20,8 @@ def crc8_pedal(data):
   return crc
 
 
-def create_gas_interceptor_command(packer, gas_amount, idx):
-  # Common gas pedal msg generator
+def create_gas_interceptor_command(packer, gas_amount, idx, msg_name="GAS_COMMAND"):
+  # Common gas pedal msg generator. msg_name selects the DBC message (same signals) for pedals on non-standard CAN IDs
   enable = gas_amount > 0.001
 
   values = {
@@ -33,9 +33,9 @@ def create_gas_interceptor_command(packer, gas_amount, idx):
     values["GAS_COMMAND"] = gas_amount * 255.
     values["GAS_COMMAND2"] = gas_amount * 255.
 
-  dat = packer.make_can_msg("GAS_COMMAND", 0, values)[1]
+  dat = packer.make_can_msg(msg_name, 0, values)[1]
 
   checksum = crc8_pedal(dat[:-1])
   values["PEDAL_CHECKSUM"] = checksum
 
-  return packer.make_can_msg("GAS_COMMAND", 0, values)
+  return packer.make_can_msg(msg_name, 0, values)

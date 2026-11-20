@@ -91,7 +91,10 @@ class TogglesLayoutMici(NavScroller):
     self._initial_cruise_speed.refresh()
 
     if ui_state.CP is not None:
-      self._personality_toggle.set_visible(ui_state.has_longitudinal_control)
+      # fork #30: grey the personality toggle (not hide it) while longitudinal is unavailable, matching the Qt path
+      # (which only disables it), so the owner can still see the stored value.
+      self._personality_toggle.set_visible(True)
+      self._personality_toggle.set_enabled(ui_state.has_longitudinal_control)
 
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:

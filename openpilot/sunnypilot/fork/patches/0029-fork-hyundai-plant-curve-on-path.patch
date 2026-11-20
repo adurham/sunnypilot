@@ -1,0 +1,218 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -591,8 +591,42 @@
+   moving, stop = float(FCA11_MEAS_FLOOR_LSB), float(FCA11_NORESPONSE_MIN_LSB)
+   frac = (v_ego_mps - bot) / (top - bot)
+   return int(round(stop + (moving - stop) * frac))
++
++
++# *** 2026-11-03 (routes 190/191, measured on THIS car): the real LSB -> decel curve ***
++# Sustained plateaus decoded from the rlogs on disk, coast baseline ~0.0 m/s^2 at 10-35 m/s with no pedals (so these are
++# brake, not coast): 4 LSB -> 1.14, 8 -> 1.27, 13 -> 1.49, 20 -> 1.57 m/s^2. The analytic fit (lsb = 100*(|a|-0.4)/9.9)
++# predicts 0.80 at 4 and 2.38 at 20 - it OVER-brakes at low asks and UNDER-brakes at high ones, which is the owner's
++# "brakes feel binary". This table is the level that MEASURABLY delivers the ask.
++FCA11_PLANT_DECEL_MSS2 = (1.14, 1.27, 1.49, 1.57)
++FCA11_PLANT_LSB = (4, 8, 13, 20)
++
++
++def dec_cmd_from_plant_curve(want_extra: float) -> int:
++  """The level that measurably delivers ``want_extra`` m/s^2, interpolated from FCA11_PLANT_* (monotone, <= 20 LSB)."""
++  pts_a, pts_l = FCA11_PLANT_DECEL_MSS2, FCA11_PLANT_LSB
++  if want_extra <= pts_a[0]:
++    return pts_l[0]
++  for i in range(1, len(pts_a)):
++    if want_extra <= pts_a[i]:
++      f = (want_extra - pts_a[i-1]) / (pts_a[i] - pts_a[i-1])
++      return int(round(pts_l[i-1] + f * (pts_l[i] - pts_l[i-1])))
++  return pts_l[-1]
++
++
++def dec_cmd_from_accel_plant(accel: float, v_ego_mps=None) -> int:
++  """The DYNAMIC-BRAKES (ON) ask -> raw CR_VSM_DecCmd: the inverse of the MEASURED plant curve (FCA11_PLANT_*).
+ 
++  Same contract as dec_cmd_from_accel_measured (an ask above the onset threshold is coast -> 0; otherwise never below the
++  speed-indexed floor fca11_floor_lsb(v_ego_mps)), but the level is the one that MEASURABLY delivers the ask, so it
++  saturates at the top measured point (FCA11_PLANT_LSB[-1] = 20 LSB -> 1.57 m/s^2) instead of extrapolating the
++  analytic fit. Monotone non-decreasing in the ask. Only the ON path uses it; OFF stays on the deployed map.
++  """
++  if accel > FCA11_BRAKE_ONSET_ACCEL:
++    return 0
++  return max(fca11_floor_lsb(v_ego_mps), dec_cmd_from_plant_curve(-accel))
+ 
++
+ def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None, ceil_lsb: int = 0) -> int:
+   """0054: the MEASURED ask -> raw CR_VSM_DecCmd inverse (0.01 g/LSB), for a MOVING episode above the stop band.
+ 
+@@ -2131,6 +2165,16 @@
+       # law-internal demand must never reach the 31-46 LSB region.
+       _gate_ask = float(getattr(self, '_planner_ask', a_tgt))
+       _ceil = getattr(self, '_urgent_ceiling_lsb', 0) if _gate_ask <= FCA11_URGENT_ASK_MSS2 else 0
++      if getattr(self, 'dynamic_brakes', False):
++        # 2026-11-03 (routes 190/191): ON, the level IS the inverse of the measured plant curve, so the target - and with
++        # it every level the ramp/anticipation/deadband/floors downstream can reach - is bounded by what the ask is
++        # measurably worth (<= 20 LSB / 1.57 m/s^2). The ONE deliberate override is the existing urgent lane (the owner's
++        # 0.5 g ruling): a genuine hard-stop PLANNER ask (<= FCA11_URGENT_ASK_MSS2) may still spend the analytic map up to
++        # the raised gate, and only ever ADDS to the curve level (max), so the urgent lane can never brake less.
++        lsb = dec_cmd_from_accel_plant(a_tgt, v_mps)
++        if _ceil:
++          lsb = max(lsb, dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
++        return min(effective_max_dec(personality, a_tgt, _ceil), lsb)
+       return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+     if not self.feel_fix:
+       return feel_target_lsb(a_tgt, personality)
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -4103,7 +4103,11 @@
+     hard_off = [d for _, d in first_frames(False, -2.0)]
+     self.assertEqual(4, hard_off[0])
+     self.assertEqual(1, hard_on[0], "ON: a hard ask ramps in from 1 LSB")
+-    self.assertEqual(max(hard_off), max(hard_on), "it still reaches exactly the deployed level")
++    # 2026-11-03: ON, the level is the inverse of the MEASURED plant curve: a -2.0 ask is past the top measured point
++    # (1.57 m/s^2), so it saturates at 20 LSB (the deployed analytic map asks 16 and under-delivers). OFF is unchanged.
++    self.assertEqual(16, max(hard_off))
++    self.assertEqual(min(fl.personality_max_dec(fl.PERSONALITY_STANDARD), fl.dec_cmd_from_plant_curve(2.0)), max(hard_on),
++                     "ON reaches the measured-curve level for the ask")
+     drops = [b - a for a, b in zip(hard_on, hard_on[1:]) if b < a]
+     self.assertEqual([], drops, "the rise never goes backwards")
+     steps = [b - a for a, b in zip(hard_on, hard_on[1:]) if b > a]
+@@ -4173,7 +4177,7 @@
+     off = levels(False)
+     on = levels(True)
+     self.assertEqual(16, max(off))
+-    self.assertEqual(16, max(on))
++    self.assertEqual(fl.dec_cmd_from_plant_curve(2.0), max(on), "ON holds the measured-curve level (20) for a -2.0 ask")
+     off_drops = [a - c for a, c in zip(off, off[1:]) if c < a]
+     on_drops = [a - c for a, c in zip(on, on[1:]) if c < a]
+     self.assertEqual([16], off_drops, "the deployed law drops the whole level in one frame")
+@@ -4351,11 +4355,15 @@
+       for s in b.update(_cc(ask), _CS(v_ego=15.0, cam=_cam()), f):
+         sent.append((f, fl._get_bits(s.dat, 8, 8)))
+     held = dict(sent)
+-    self.assertEqual(16, held[100], "the scenario's held level (standard tier, a -2.0 ask)")
++  # 2026-11-03: the ON path now solves its level from the MEASURED plant curve (4/8/13/20 LSB -> 1.14/1.27/1.49/1.57
++  # m/s^2), so a -2.0 ask asks 20 LSB where the deployed analytic map asked 16 - the deployed law UNDER-asked, which is
++  # the shortfall the driver reported. ON is therefore no longer bounded by the deployed level; the OFF path still is.
++    self.assertEqual(fl.dec_cmd_from_plant_curve(2.0), held[100], "the scenario's held level (the curve level, a -2.0 ask)")
+     self.assertEqual([], [d for f, d in sent if f == 101], "101 is a NON-send ramp frame (the trap)")
+     self.assertTrue(b.episode_open, "the ramp keeps the episode open, so the re-ask is not a new episode")
+     # THE DEFECT: the first sent frame after the re-ask fell 16 -> 4. Now it continues from the wire.
+-    self.assertGreaterEqual(held[102], 15, f"the re-ask frame fell to {held[102]} LSB")
++    self.assertGreaterEqual(held[102], held[100] - fl.FCA11_DYN_DECREASE_MAX_DROP_LSB,
++                            f"the re-ask frame fell to {held[102]} LSB")
+     drops = [(a, c) for (fa, a), (fc, c) in zip(sent, sent[1:]) if c < a]
+     self.assertLessEqual(max(a - c for a, c in drops), fl.FCA11_DYN_DECREASE_MAX_DROP_LSB,
+                          f"no single sent frame may fall by more than the release limit: {drops}")
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_plant_curve.py
+@@ -0,0 +1,111 @@
++"""2026-11-03 (routes 190/191): the MEASURED FCA11 plant curve is the level the dynamic-brakes (ON) path requests.
++
++Sustained DecCmd plateaus on this car: 4 LSB -> 1.14, 8 -> 1.27, 13 -> 1.49, 20 -> 1.57 m/s^2. ON, the law's target is the
++inverse of that curve (saturating at 20 LSB), so the level it RAMPS TO is bounded by what the ask measurably buys - not a
++post-hoc clamp at the send site. The one deliberate override is the existing urgent lane (planner ask <=
++FCA11_URGENT_ASK_MSS2, the owner's 0.5 g ruling, route 190): it may spend the analytic map up to the raised gate and only
++ever ADDS to the curve level. OFF is the deployed law byte-for-byte (pinned in test_fca11_long.py).
++"""
++import unittest
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam, _cc, _cp_sp, _decs
++
++
++def _run(dyn, ask, v=15.0, frames=400):
++  """Drive the REAL controller (Fca11LongBrake.update -> the FCA11 send path) with a constant ask; return sent levels."""
++  b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=dyn))
++  out = []
++  for f in range(frames):
++    out += _decs(b.update(_cc(ask), _CS(v_ego=v, cam=_cam()), f))
++  return b, out
++
++
++class TestPlantCurveInverse(unittest.TestCase):
++  def test_measured_points(self):
++    self.assertEqual({1.14: 4, 1.27: 8, 1.49: 13, 1.57: 20},
++                     {a: fl.dec_cmd_from_plant_curve(a) for a in (1.14, 1.27, 1.49, 1.57)})
++
++  def test_monotone_and_saturated(self):
++    xs = [i * 0.01 for i in range(0, 501)]
++    ys = [fl.dec_cmd_from_plant_curve(x) for x in xs]
++    self.assertTrue(all(b >= a for a, b in zip(ys, ys[1:])), "non-decreasing in the ask")
++    self.assertEqual(fl.FCA11_PLANT_LSB[0], ys[0])
++    self.assertEqual(20, max(ys), "saturates at the top measured point")
++    # the accel-domain wrapper the ON law uses: coast above onset, speed floor, monotone, saturated
++    self.assertEqual(0, fl.dec_cmd_from_accel_plant(-0.3))
++    asks = [-0.5 - i * 0.01 for i in range(400)]
++    lv = [fl.dec_cmd_from_accel_plant(a) for a in asks]
++    self.assertTrue(all(b >= a for a, b in zip(lv, lv[1:])))
++    self.assertEqual(20, max(lv))
++    self.assertEqual(fl.FCA11_NORESPONSE_MIN_LSB, fl.dec_cmd_from_accel_plant(-0.6, 0.2), "stop-band floor kept")
++
++
++class TestOnPathRequestsTheCurve(unittest.TestCase):
++  """Through Fca11LongBrake.update: the level the ON path converges to IS the curve level for the ask."""
++
++  def test_mid_ask_converges_to_the_curve_level(self):
++    want = fl.dec_cmd_from_plant_curve(1.3)
++    self.assertIn(want, (8, 9))
++    for v in (15.0, 5.0):
++      _, out = _run(True, -1.3, v)
++      self.assertEqual(want, out[-1], f"v={v}: steady state is the curve level")
++      self.assertLessEqual(max(out), want, f"v={v}: the ramp never overshoots the curve level")
++
++  def test_hard_ask_below_the_urgent_lane_saturates_at_20(self):
++    for ask in (-1.6, -2.0, -2.3):
++      for v in (15.0, 5.0):
++        b, out = _run(True, ask, v)
++        self.assertFalse(b._feel_in_hold_band)
++        self.assertEqual(20, out[-1], f"ask={ask} v={v}: saturates at the curve top")
++        self.assertLessEqual(max(out), 20, f"ask={ask} v={v}: never above the curve-saturated level")
++
++  def test_target_itself_is_curve_bounded(self):
++    """Root cause, not a clamp: the law's own target (what the ramp climbs toward) is the curve level."""
++    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=True))
++    b._planner_ask = -2.0
++    for ask in (-0.7, -1.0, -1.3, -1.5, -2.0):
++      self.assertEqual(min(fl.personality_max_dec(fl.PERSONALITY_STANDARD), fl.dec_cmd_from_accel_plant(ask, 15.0)),
++                       b._feel_target(ask, ask, fl.PERSONALITY_STANDARD, 1.0, 15.0), ask)
++
++  def test_urgent_lane_is_the_deliberate_override(self):
++    """-3.0 is at/below FCA11_URGENT_ASK_MSS2 (-2.4): the owner-ruled brake-authority lane keeps the deployed level (26),
++    so ON never brakes LESS than OFF on a genuine hard stop (route 190: 20 LSB let a lead close to 2.9 m)."""
++    self.assertLessEqual(-3.0, fl.FCA11_URGENT_ASK_MSS2)
++    for v in (15.0, 5.0):
++      _, on = _run(True, -3.0, v)
++      _, off = _run(False, -3.0, v)
++      self.assertEqual(off[-1], on[-1])
++      self.assertGreaterEqual(on[-1], 20)
++      self.assertLessEqual(max(on), fl.HYUNDAI_FCA11_LONG_MAX_DEC)
++
++  def test_relaxed_tier_still_caps(self):
++    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(dyn=True))
++    out = []
++    for f in range(400):
++      out += _decs(b.update(_cc(-2.0), _CS(v_ego=15.0, cam=_cam()), f, fl.PERSONALITY_RELAXED))
++    self.assertEqual(fl.personality_max_dec(fl.PERSONALITY_RELAXED), out[-1])
++
++  def test_sweep_on_is_monotone_and_never_below_the_curve_or_above_the_gate(self):
++    prev = 0
++    for i in range(0, 36):
++      ask = -0.7 - i * 0.1
++      _, on = _run(True, ask, frames=300)
++      lvl = on[-1]
++      self.assertGreaterEqual(lvl, prev, f"steady level monotone in the ask at {ask:.2f}")
++      prev = lvl
++      if ask > fl.FCA11_URGENT_ASK_MSS2:
++        self.assertEqual(fl.dec_cmd_from_accel_plant(ask), lvl, f"{ask:.2f}: the curve level")
++      else:
++        self.assertGreaterEqual(lvl, 20)
++      self.assertLessEqual(max(on), fl.HYUNDAI_FCA11_LONG_MAX_DEC)
++
++  def test_off_path_untouched(self):
++    for ask, want in ((-1.3, 9), (-2.0, 16), (-3.0, 26)):
++      _, off = _run(False, ask)
++      self.assertEqual(want, off[-1], f"OFF {ask}: the deployed level")
++
++
++if __name__ == "__main__":
++  unittest.main()

@@ -1,0 +1,4338 @@
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+
+Fork: FCA11 longitudinal BRAKING for Hyundai non-SCC ICE cars on the gas interceptor
+(param ``HyundaiFca11Brake``, default OFF, ``CP_SP.fca11Brake``). NOT A TEST MODE: this is the
+production feature built on the on-car-proven FCA11 path (roll-20261005T232357Z).
+
+Actuator facts this is built on (measured on the car, ~31 km/h, 0.6 s pulses):
+  - variant B frames (CF_VSM_Warn=3, FCA_CmdAct=1, CF_VSM_DecCmdAct=0, CR_VSM_DecCmd=g*100,
+    CF_VSM_Prefill=1) make the ESC brake: 0.74 / 1.28 / 2.03 m/s^2 extra decel for 0.10 / 0.20 /
+    0.30 g, ~2/3 of the command, linear.
+  - no response below ~8-10 km/h and at standstill; FCA_ACK rises during braking; the dash shows a
+    collision-braking notification with no chime.
+
+Design (see car-features/fca11-long-integration.md for the full picture):
+  - the PLANNER asks for accel as usual; when ``accel <= FCA11_BRAKE_ONSET_ACCEL`` and the window
+    is open the pedal command is hard-zeroed for that frame (gas and brake are never commanded
+    together) and one FCA11 mirror frame goes out at the camera's own rate;
+  - the frame MIRRORS the freshest bus-2 camera 0x38D (zero-gap takeover) and overrides ONLY the
+    brake fields: CR_VSM_DecCmd, CF_VSM_Prefill, CF_VSM_Warn (3), FCA_CmdAct, CF_VSM_DecCmdAct
+    (0), the alive counter (+1, continuing the camera's sequence) and the CRC8-J1850 checksum;
+  - panda (bit 256, patch 0014) independently polices every frame: controls_allowed AND
+    heartbeat_engaged, gear D, no pedal, fresh inputs, every wheel above 9 km/h, DecCmd <= 0.30 g,
+    rate-limited growth (every (re)opened episode restarts at +RATE_STEP), and an immediate camera
+    hand-back. There is NO actuation-duration budget and NO cooldown (0035): a brake runs until the
+    planner releases it or a gate (floor, driver, camera, stale) ends it. Nothing here can make the
+    car brake if the panda rules say no;
+  - the COMMANDED decel cap is personality-indexed (relaxed 0.12 g / standard 0.20 g / aggressive 0.30 g, the
+    max) so the driver's feel dial owns the braking strength too. Every tier is <= the panda's 0.30 g gate
+    (which is personality-agnostic), so this is a python-only change;
+  - no auto-resume after a CUT (driver brake/gas, gear != D, pedal fault, camera request): braking
+    stays off until the next deliberate pause/resume engagement, per the owner's model.
+  - G7 (N1): on every braking true -> false transition ONE passive mirror frame goes out - all brake
+    fields 0, Warn 0, the camera's own idle shape: the clean hand-back that ends the episode at the
+    panda (an accepted passive frame drops the panda's rate-limit reference to 0, so the next episode
+    restarts its onset ramp). 0035 deleted the 2.5 s budget / 3 s cooldown mirror that used to live
+    here, together with the budget-edge stop-commanding it drove.
+  - G8 (R7 frame contract): the mirror is made a strict subset of what the panda accepts, frame by frame.
+    (R7-A) the rate-limit reference (``_dec_last_sent``) advances only on frames actually SENT: the panda
+    allows +RATE_STEP over the last ACCEPTED frame, and we only send on the 50 Hz slot, so advancing the
+    reference on every 100 Hz frame stepped the sent ramp +8 (twice the allowed rate) and the panda refused
+    every actuating frame after the first. (R7-D) the longActive-off exit owes the passive frame too, so a
+    mid-episode longActive drop still hands back cleanly.
+
+Byte layout (hyundai_can.dbc BO_ 909 FCA11, Intel/LSB-first start bits):
+  CF_VSM_Prefill (0,1), CF_VSM_HBACmd (1,2), CF_VSM_Warn (3,2), CF_VSM_BeltCmd (5,3),
+  CR_VSM_DecCmd (8,8), PAINT1_Status (16,2), FCA_Status (18,2), FCA_CmdAct (20,1),
+  FCA_StopReq (21,1), FCA_DrvSetStatus (22,3), CF_VSM_DecCmdAct (31,1), FCA_Failinfo (32,3),
+  CR_FCA_Alive (35,4), FCA_RelativeVelocity (39,9), FCA_TimetoCollision (48,8),
+  CR_FCA_ChkSum (56,8).
+"""
+import os
+import math
+import time
+from collections import deque
+from dataclasses import dataclass
+
+from opendbc.car import structs
+from opendbc.car.hyundai.hyundaican import hyundai_checksum
+from opendbc.car.can_definitions import CanData
+from opendbc.sunnypilot.car.hyundai import cal_mode, driver_mark
+from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP,
+                                                   HYUNDAI_FCA11_PEDAL_STATE_OK, HYUNDAI_FCA11_CAM_BRAKE_MASK,
+                                                   HYUNDAI_FCA11_CAM_WARN_MASK, HYUNDAI_FCA11_CAM_QUIET_FRAMES,
+                                                   HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US, HYUNDAI_FCA11_PEDAL_FAULT_FRAMES,
+                                                   HYUNDAI_FCA11_PEDAL_GUARD_GRACE, HYUNDAI_FCA11_PEDAL_GUARD_FRAMES,
+                                                   HYUNDAI_FCA11_PEDAL_GUARD_MASK)
+from opendbc.sunnypilot.car.hyundai import fca11_log
+
+FCA11_ADDR = 0x38D
+FCA11_CAM_BUS = 2
+
+# accel request (m/s^2) at/below which the FCA11 brake engages. Coast (engine braking, ~0.3-0.5
+# m/s^2) covers everything above this; the first meaningful "slow down" ask is about -0.5 (which
+# delivers ~0.34 m/s^2 through the measured 2/3 gain). Between this and 0 the car coasts exactly
+# as it does today.
+FCA11_BRAKE_ONSET_ACCEL = -0.5
+
+# *** G5: onset debounce + release hysteresis + minimum on-time (anti-flap) ***
+# A planner ask that crosses -0.5 for a single frame used to open an FCA11 episode (Warn=3 = a dash
+# "collision braking" notification) and immediately release the moment the ask rose back above -0.5.
+# On the owner's route this produced ~1.5 notifications/min with sub-0.3 s blips and 2 s re-asks (M7).
+#
+# Release hysteresis (m/s^2): while braking, STAY engaged until the ask rises above this (release only
+# when accel > -0.30). The band [-0.30, -0.50] is the hysteresis window; inside it the commanded decel
+# is floored at the onset value so the ESC never sees a 0 mid-episode (that would be a release).
+FCA11_BRAKE_RELEASE_ACCEL = -0.30
+# Onset debounce (controller frames, 100 Hz): a NEW episode needs this many consecutive frames of
+# (window-open AND accel <= ONSET) before the first frame goes out. 20 frames = 0.2 s. This kills the
+# single-frame asks without adding latency to a sustained one.
+FCA11_ONSET_HOLD_FRAMES = 20
+# Minimum on-time (controller frames, 100 Hz): once engaged, stay engaged at least this long even if
+# the ask goes away, so an isolated sub-0.3 s blip becomes one continuous episode. 60 frames = 0.6 s.
+FCA11_MIN_ON_FRAMES = 60
+# Hard-ask bypass: an ask at/below this skips the onset debounce entirely, so a genuine hard demand is
+# never delayed by 0.2 s (safety + coverage). Suggested in the G5 plan; keeps acceptance (c) honest.
+FCA11_ONSET_BYPASS_ACCEL = -1.2
+# Above the bypass threshold this is the minimum on-time, in seconds, exposed for the report/tests.
+FCA11_MIN_ON_S = FCA11_MIN_ON_FRAMES / 100.0
+FCA11_ONSET_HOLD_S = FCA11_ONSET_HOLD_FRAMES / 100.0
+
+# *** G7 (N1): passive release frame ***
+# On every braking true -> false edge ONE passive 0x38D goes out (the camera's idle shape). It is the clean
+# hand-back, and an ACCEPTED passive frame drops the panda's rate-limit reference to 0 (safety/modes/hyundai.h,
+# the 0035 onset rule), so the next episode restarts at +RATE_STEP - exactly what this layer does too
+# (`_dec_last_sent` resets on release). 0035: there is NO actuation-duration budget / cooldown any more, in the
+# panda or here, so nothing in this module may end a brake or hold one off on a clock.
+
+# *** 0038: driver GAS = per-frame suppression + a short hold-off, NOT a latch ***
+# Owner requirement: hitting the gas to escape an over-brake must override the CURRENT frame (human wins) but must
+# NEVER lock out FUTURE braking events. Before 0038 a gas press latched the driver cut, cleared only by a deliberate
+# disengage+re-engage, so the next stop after a gas escape was unbraked. Gas is now removed from the driver latch
+# (which keeps brake / gear != D only) and enforced per-frame, exactly like the panda (safety/modes/hyundai.h):
+#   * while gasPressed -> fca11_ok is False, so the episode releases and the passive (all-zero) frame goes out;
+#   * for GAS_HOLDOFF_FRAMES after the pedal releases, fca11_ok stays False (a plain elapsed-frame hold-off, no edge
+#     needed to clear it), so a 1-2 Hz brake/gas fight cannot start. A NEW, distinct brake request after the hold-off
+#     is served normally, first frame at the onset floor then ramping.
+# Frames are the car layer's clock (controller frames are 100 Hz): 50 frames = 0.5 s, matching the panda's
+# HYUNDAI_FCA11_LONG_GAS_HOLDOFF_US. Must stay equal (a unit test pins both).
+GAS_HOLDOFF_FRAMES = 50
+GAS_HOLDOFF_S = GAS_HOLDOFF_FRAMES / 100.0
+
+# 0040: the planner-side speed floor is DELETED. It was 12 km/h, chosen to stay 3 km/h above the panda's (now also
+# deleted) 9 km/h backstop. Both floors were OUR assumption that the ESC is inert below ~8-10 km/h - a belief never
+# tested, because OUR floor stopped us from ever asking below 12.7 km/h. The owner's directive: treat FCA11 as a real
+# brake system, command through zero, and LOG what the ESC does. There is therefore NO speed gate here any more, and no
+# hold cap: below STOP_KPH the planner's standstill request keeps being commanded.
+#
+# The old "FCA11: Take Over Below 12 km/h" alert is now FALSE and is DELETED (see the superproject events.py /
+# car_specific.py for its removal). It is replaced by the three owner-approved alerts below.
+#
+# steady YELLOW "supervise stop": a stop is requested (we are braking) and the car is slow. Warning only.
+FCA11_SUPERVISE_KPH = 15.
+# steady YELLOW "stop complete - hold brake pedal": at/near a full stop while we keep holding. An explicit HAND-OFF,
+# NOT a cap - the command keeps flowing. "standstill" is CarState.standstill (all wheels <= 0.375 km/h).
+# RED persistent "BRAKE NOW": the ESC is not doing what we asked, or the hold was lost. Two triggers, both measured:
+#   * ESC non-response: delivered aEgo < FCA11_NORESPONSE_FACTOR x expected for FCA11_NORESPONSE_MS while commanding
+#     >= FCA11_NORESPONSE_MIN_LSB. aEgo is CS.out.aEgo (m/s^2, measured). expected = dec_cmd * 0.01 g * FCA11_BRAKE_GAIN.
+#   * hold lost: v > FCA11_HOLD_LOST_KPH with no gas while we were commanding a stop.
+# Clears ONLY on driver brake. There is deliberately NO hold-duration alert.
+FCA11_NORESPONSE_FACTOR = 0.4
+FCA11_NORESPONSE_MS = 500.
+FCA11_NORESPONSE_MIN_LSB = 8
+FCA11_HOLD_LOST_KPH = 2.
+FCA11_STOP_KPH = 0.5  # the "at/near a full stop" band (log + stop-complete alert), matching the planner's stop semantics
+# 0041 (SHIP-BLOCKER gating fix): no_response is only meaningful on a REAL, SUSTAINED, MOVING brake. A car
+# HELD AT STANDSTILL has aEgo ~ 0, so the raw aEgo test tripped at every red light; a standstill hold is
+# hold_lost's job, not no_response's. So no_response runs ONLY while the car is moving above this, with a
+# real command (>= MIN_LSB) that has been held for the ESC lag (dead 0.14 + 2*tau 0.24 = 0.62 s) before the
+# 500 ms measurement timer may start. The command-stable gate resets whenever the command drops below 8 LSB.
+FCA11_NORESPONSE_MIN_KPH = 5.0
+FCA11_NORESPONSE_CMD_STABLE_S = 0.62
+# 0041 (latching): brake_now is still PERSISTENT (it survives frame-to-frame), but it SELF-HEALS once both
+# trigger conditions have been continuously false for this long, so a transient can never latch the red
+# alert on for a whole drive. (It also clears immediately on driver brake / disengage / gear != D / gas.)
+FCA11_BRAKE_NOW_CLEAR_S = 2.0
+
+# *** 0042 (B): echo-based refusal surfacing ***
+# The panda's fail-closed cut latches (hyundai_fca11_long_cut / driver_cut) can refuse a SUSTAINED wall of our
+# actuating frames for the rest of an ignition, and that failure was otherwise SILENT (route 156: 3143/3143 actuating
+# frames refused, no driver alert). The car layer sees the pandad echo of every 0x38D it sends (src 128 = accepted by
+# the TX hook, src 192 = REJECTED). Count CONSECUTIVE refused ACTUATING echoes while braking; a streak this long
+# (~3 x the 20 ms 50 Hz send slot = ~60 ms) is a wall, not a transient, and sets the surfaced _refused_cut. An
+# ACCEPTED actuating echo (src 128) means the wall is gone: reset + self-heal. No send suppression rides on this -
+# refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with zero deadlock.
+FCA11_REFUSED_STREAK_CUT = 3
+
+# *** 0044: the SURFACED cut SOURCE ***
+# fca11Unavailable answers "is FCA11-long dead for this ignition"; it does NOT answer "why". On route 1a0
+# (2026-11-09) the whole 20.7 min drive sat behind that flag with no qlog-only way to tell the panda's PEDAL-fault
+# latch from the echo-confirmed REFUSAL wall - the answer needed the rlog and a safety replay. This bitfield is
+# published as CarStateSP.fca11CutSource at the SAME write site as fca11Unavailable (see update()), so the next
+# occurrence is answerable from a qlog alone. Observability ONLY: it gates no send and changes no byte on the wire.
+FCA11_CUT_SOURCE_NONE = 0      # not unavailable
+FCA11_CUT_SOURCE_PEDAL = 1     # the pedal-fault latch (_pedal_cut): pedal STATE not in {0,4,5}
+FCA11_CUT_SOURCE_REFUSED = 2   # the echo-confirmed refusal wall (_refused_cut)
+
+# *** 0045 (PROPOSAL, OWNER DECISION): the car-layer half of the pedal-fault guards ***
+# Mirrors safety/modes/hyundai.h exactly (the 0042 design rule: the two layers must not drift). Off unless the owner sets
+# HyundaiFca11PedalGuard (bit 1 = grace, bit 2 = consecutive frames; 0 = the deployed rule, which is what ships). The
+# grace window is anchored to the FIRST ENABLED FRAME of this instance - on the real path the controller is created at
+# ignition, so that frame is within one 100 Hz tick of the panda's hyundai_init (route 1a0: the panda's init was at
+# 7.19 s and the mirror's latch 14 ms later), which is the edge the guard protects.
+# MUST equal HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US / _FAULT_FRAMES in values.py (unit-tested; the panda counts microseconds,
+# this layer counts 100 Hz controller frames).
+FCA11_PEDAL_GUARD_GRACE_FRAMES = HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US // 10000   # 0.5 s @ 100 Hz = 50 frames
+FCA11_PEDAL_GUARD_FRAMES = HYUNDAI_FCA11_PEDAL_FAULT_FRAMES
+
+# *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
+# "A camera WARNING must not stop openpilot braking. A warning just means we got close to something. If the camera
+# starts sending actual BRAKE messages, hand back - but do not latch until the next ignition: when the camera stops
+# braking, openpilot resumes." Both incidents that shaped the old latch were WARNING-only (route 14d: 93,170 camera
+# frames, 0 braking-class; route 15b: 23,834 frames, 0 braking-class, a 1 s warn/prefill burst that cost the last 99 s
+# of the drive). The classes are the shared masks in values.py (one definition, also the panda's):
+#   BRAKING (hand back): HBACmd, BeltCmd, DecCmd, CmdAct, StopReq, DecCmdAct.   WARNING (keep braking): Prefill, Warn.
+# State machine (cam_brake + a saturating quiet counter, counted in CAMERA FRAMES - never wall time - and NEVER gated on
+# engagement): a braking-class frame sets cam_brake and zeroes the counter, a non-braking frame advances it, and the
+# hand-back is released at HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN. The panda releases at
+# HYUNDAI_FCA11_CAM_QUIET_FRAMES, so this layer is STRICTER on both edges: it stops on the same frame it sees a braking
+# message (before any send decision) and resumes 2 camera frames after the panda would allow it - the only possible
+# disagreement is "we withheld a frame the panda would have accepted". A silent camera does not advance the counter.
+FCA11_CAM_QUIET_MARGIN = 2
+FCA11_CAM_RESUME_FRAMES = HYUNDAI_FCA11_CAM_QUIET_FRAMES + FCA11_CAM_QUIET_MARGIN
+# *** 16a: the RELEASE TAIL - the camera keeps ownership of refusals for a moment after WE let go ***
+# This layer counts its quiet tail in CAMERA frames; the panda counts its own in 50 Hz TICKS. The +MARGIN above only makes
+# us stricter when the camera's 0x38D rate is at or below the tick rate - above it the two clocks diverge the other way
+# and we release FIRST, into a hand-back that is still live on the panda's side. Route 16a (camera braking frames through
+# 130.64-136.11 s): we let go, the panda refused the frames we resumed with at 136.07, 136.09 and 136.11, the streak
+# latched at 136.13 and "FCA11 Braking Unavailable" stayed up 170 s - while the car had braking again ~1.5 s after the
+# camera went quiet. Those refusals were the camera's hand-back, not a wall. So a release arms this tail (controller
+# frames = the panda's own quiet window) during which refusals stay camera-owned and cannot count: see
+# _camera_owns_refusal. A camera that is still quiet after the tail owns nothing, so a real wall still latches.
+FCA11_CAM_RELEASE_TAIL_FRAMES = HYUNDAI_FCA11_CAM_QUIET_FRAMES
+
+# *** 0053: refusal-cut PROBATION after a resume ***
+# The echo refusal cut (FCA11_REFUSED_STREAK_CUT, consecutive) is what actually protects against the 14d failure
+# (commanding into a refused wall) and stays independent of the camera state. For the first FCA11_PROBATION_ECHOES
+# actuating echoes after a hand-back clears and after every (re)engage, a CUMULATIVE count is ALSO kept (an accepted
+# echo does not reset it): FCA11_PROBATION_REFUSED_CUT refused actuating echoes inside the window trip the cut too, so an
+# intermittent wall (accept 1 / refuse many) right after we resume cannot hide behind the consecutive rule. A probation
+# trip holds until the window closes. No probe decel is ever sent to test acceptance: only real braking feeds it.
+FCA11_PROBATION_ECHOES = 50
+FCA11_PROBATION_REFUSED_CUT = 5
+
+# *** 0053: Python <-> panda DIVERGENCE guard ***
+# After 0053 the ONLY panda rule that refuses a well-formed PASSIVE 0x38D is its cam_brake (a passive frame is accepted
+# disengaged, outside the window, with a pedal fault ...). So FCA11_DIVERGENCE_PASSIVE_STREAK consecutive REFUSED passive
+# echoes while this layer believes the camera is NOT braking = the two layers disagree (e.g. a camera frame the host
+# never saw). Reaction: adopt the panda's view (cam_brake = True, counter 0 - the stricter direction) and raise the
+# divergence alert; the FCA11_DIVERGENCE_LATCH_EVENTS-th event in one ignition latches: no 0x38D for the rest of it.
+# Armed only after the first ACCEPTED 0x38D echo (a panda that is not armed refuses everything).
+FCA11_DIVERGENCE_PASSIVE_STREAK = 2
+FCA11_DIVERGENCE_LATCH_EVENTS = 3
+# Attribution of a refusal WALL (FCA11_REFUSED_STREAK_CUT refused actuating echoes while we see no camera brake): the
+# episode is ended for at most this many controller frames (3 send slots) so the owed PASSIVE close frame goes out and
+# its echo says whether the panda is handing back to the camera (refused) or the wall is something else (accepted).
+FCA11_ATTRIB_HOLD_FRAMES = 6
+
+# 0040: per-episode logger. One compact JSON line per braking episode to /data/fca11-log/episodes.jsonl (see fca11_log
+# for the schema, the fields and the reasoning). Inert (no accumulation, no I/O) unless enabled.
+FCA11_LOG_ENABLED = os.environ.get("FCA11_LOG_DIR", "") != "0"
+
+# PID accel bound the interface hands the planner above the floor: 0.30 g cap x the measured
+# delivered/commanded ratio (FCA11_BRAKE_GAIN) + margin. A -2.0 request commands 0.30 g raw
+# (clamped). See the FCA11_BRAKE_GAIN block below for what that ratio is and is NOT.
+FCA11_A_MAX_MSS2 = 5.0
+
+# *** FCA11_BRAKE_GAIN — ONE provenance block (the single source of truth for this constant) ***
+#
+# WHAT IT MEANS (exactly): the delivered-decel / commanded-decel RATIO, fitted THROUGH THE ORIGIN
+# (zero intercept):  delivered_extra[m/s^2] = FCA11_BRAKE_GAIN * (cmd_LSB * 0.01 * 9.81).
+# The request path INVERTS it (dec_cmd_from_accel):  dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81,
+# so an accel ask of -2.0 m/s^2 commands ~0.30 g raw. It is a scalar here, not a slope+offset.
+#
+# THE VALUE THE DEPLOYED CODE USES: FCA11_BRAKE_GAIN = 0.67.
+#
+# THERE ARE THREE HISTORICALLY CITED FIGURES, FROM THREE DIFFERENT ESTIMATORS. They were measured
+# on DIFFERENT FRAME SHAPES AND DURATIONS and are NOT interchangeable. Do not "reconcile" them
+# by picking one; quote each with its origin.
+#   1. "2/3 gain", fit slope 6.46 m/s^2 per g  -- the ROLLING-TEST measurement: ~31 km/h,
+#      0.6 s pulses, 0.10 / 0.20 / 0.30 g commands delivering 0.74 / 1.28 / 2.03 m/s^2 extra.
+#      This is a SLOPE fit over short pulses and it is stated in delivered-decel-per-g-of-command.
+#   2. Ratio 0.67 (== this constant) -- the same rolling run read as a through-origin
+#      delivered/commanded RATIO (2.03 / (0.30 * 9.81) ~= 0.69; ~0.67 across the points).
+#   3. Affine fit of the route-151 PRODUCTION frames: extra = BITE + K * cmd_g, with
+#      K ~ 9.7-10.1 (m/s^2 per g) and BITE ~ 0.63-0.75 (m/s^2). This is a TWO-PARAMETER (slope +
+#      offset) fit on long, real production brake frames at 50-80 km/h -- a different model
+#      shape from (1)/(2).
+#
+# NOTE THE DISAGREEMENT, PLAINLY: 0.67 x 9.81 = 6.57, so figures (1) and (2) -- both "6.4x" --
+# do not even agree with each other (6.46 vs 6.57). Figure (3)'s K ~ 9.7-10.1 is ~1.5x either.
+# These are NOT three measurements of one number; they are three different estimators on
+# different data. This comment exists so the next reader SEES the disagreement and the
+# provenance, not so it is papered over with a single "correct" slope.
+#
+# The live refit is Stage-1 of car-features/normal-braking/PLAN.md (K ~ 9.9, BITE ~ 0.68), which
+# supersedes 0.67. Until that ships, 0.67 is what the car runs -- CHANGE NO VALUE WITHOUT THE REFIT.
+FCA11_BRAKE_GAIN = 0.67
+
+# *** 0041: FCA11_AFFINE_GAIN — the OPT-IN affine command law (DEFAULT OFF), the Stage-1 refit ***
+#
+# The deployed 0.67 law inverts a THROUGH-THE-ORIGIN gain (delivered = 0.67 * commanded). The measured plant is
+# AFFINE: extra[m/s^2] = BITE + K * cmd_g, fitted on 17260 frames / 126 brake events from the owner's routes at
+# K = 9.9 (CI [9.43, 10.38]), BITE = 0.40 (CI [0.33, 0.48]). Two consequences the through-origin law gets wrong
+# at the same time: it UNDER-commands (~0.67 vs the true slope, ~1.5x low once BITE is accounted for), and the
+# 8 LSB episode floor OVER-delivers at the bottom (an 8 LSB command delivers ~1.19 m/s^2 where the planner wanted
+# ~0.06). See normal-braking/PLAN.md Stage 1 and stage3-floors/REPORT.md.
+#
+# When HyundaiFca11AffineGain is ON, the request inverts the AFFINE plant instead:
+#     dec_cmd_from_accel_affine(want, K, BITE): want_extra = -want (m/s^2, positive) -> cmd_LSB = (want_extra - BITE)/K in g.
+# It is clamped to [0, 30] here (the caller re-clamps to the personality tier cap as before) and the release-band
+# floor drops from 8 to 4 LSB ONLY WHILE MOVING: at/below the low-speed stop band the hold keeps the >= 8 LSB floor
+# (FCA11_AFFINE_HOLD_LSB), because a through-zero command that tapers honestly at speed must not weaken a physical
+# standstill hold. This hold/release floor is applied to the REQUEST, BEFORE the +RATE_STEP rate limiter, so the ramp
+# still governs the episode onset and the command can never exceed the panda's +RATE_STEP onset gate (see the fix note
+# on FCA11_AFFINE_STOP_BAND_KPH). The tier cap (20 std / 30 agg) and FCA11_A_MAX_MSS2 are UNCHANGED.
+#
+# THIS IS DEFERRED / OPT-IN. With the param OFF, NOTHING here runs and the module is byte-identical to 0040: the 0.67
+# law inverts exactly as before and the 8 LSB floor is untouched. (0044: the old FCA11_AFFINE env override is removed
+# and refused - CP_SP.fca11AffineGain, written by setup_interfaces from the param, is the only way in.) No value of
+# FCA11_BRAKE_GAIN or its doc block above is changed.
+FCA11_AFFINE_K = 9.9
+FCA11_AFFINE_BITE = 0.40
+FCA11_AFFINE_RELEASE_LSB = 4  # the release-band floor under the affine law (vs FCA11_NORESPONSE_MIN_LSB = 8 today)
+# 0041 hold floor: while the car is stopped or creeping (in the low-speed hold band) the affine ON path keeps the SAME
+# >= 8 LSB hold floor as the deployed 0.67 law. Reason: this is a DCT car that CREEPS at a stop and the sim cannot see
+# the ESC's behaviour at standstill, so a hold weaker than today's 8 LSB is an untested risk, not an improvement. (8 ==
+# FCA11_NORESPONSE_MIN_LSB by construction; pinned in the tests.)
+FCA11_AFFINE_HOLD_LSB = 8
+# The hold-band edge: v at/below which the affine path keeps FCA11_AFFINE_HOLD_LSB. Deliberately GENEROUS (3 km/h, above
+# the 0.5 km/h stop-complete band) and also true whenever CarState.standstill is set.
+FCA11_AFFINE_STOP_BAND_KPH = 3.0
+# THE FLOOR ABOVE IS A *REQUEST* FLOOR, APPLIED BEFORE THE +RATE_STEP RATE LIMITER (not after it). This is
+# load-bearing: the panda's onset rule allows only +RATE_STEP (4 LSB) over the last ACCEPTED frame, and that frame is
+# 0 at an episode open. A floor applied AFTER the limiter lifts the first SENT frame straight to 8 LSB, over the onset
+# gate, so the panda REFUSES every actuating frame (dec=8, last=0) and the brake never engages at low speed. Applied
+# to the REQUEST the limiter still governs the onset: request 8 -> min(8, 0+4)=4 (first frame, ACCEPTED) ->
+# min(8, 4+4)=8 (ACCEPTED) -> reaches the hold floor in ~40 ms. So these values can never exceed the panda gate.
+
+
+# *** 0043: FCA11_SHAPE_* — the OPT-IN BRAKE-SHAPING command law (behind HyundaiFca11AffineGain, DEFAULT OFF) ***
+#
+# WHY (measured 2026-10-10, routes 155/157; wsB-feel). An FCA11 brake ONSET is a near-STEP. The deployed law's
+# request path (0.67 through-origin inverse) plus the +RATE_STEP rate limiter sends 4 LSB and then 8 LSB within
+# 40-60 ms; the ESC's own plant has a CLIFF between 4 and 8 LSB (delivered EXTRA decel ~0.15 m/s^2 at 4 LSB vs
+# ~1.42 at 8), so the 4->8 step is a ~1.3 m/s^2 delivered step -> onset jerk median 7.6 m/s^3 (max 38; comfort
+# <= 2-3). 86% of stops are grabby. The steady plant, though, is AFFINE (delivered = BITE + K*cmd_g, K = 8.23
+# [8.07, 8.39] m/s^2/g, BITE = 0.85 [0.82, 0.87], r^2 = 0.69, n = 2701), and the 0.67 law OVER-delivers by ~0.9
+# m/s^2 (steady moving delivered -1.71 vs ask -0.77).
+#
+# WHAT THIS LAW DOES (ON path, gated by HyundaiFca11AffineGain; OFF = BYTE-IDENTICAL to 0042):
+#   1. demand:      want = max(0.0, -accel_ask); no coast subtraction.
+#   2. level (moving, above FCA11_SHAPE_HOLD_BAND_KPH): a piecewise-MONOTONE inverse of the measured steady
+#      curve, clamped [FCA11_SHAPE_FLOOR_LSB, tier cap]. Anchors (extra -> LSB): (0.15 -> 4) and (1.50 -> 8). For
+#      extra >= 1.50 the affine inverse cmd = round(((extra - BITE)/K)*100), clamped [8, tier cap]; for extra in
+#      (0.15, 1.50) a LINEAR interpolation across the cliff; extra < 0.15 -> the 4 LSB floor (never below 4 while
+#      moving).
+#   3. onset shaping: an episode (re)open starts at the floor and HOLDS FCA11_SHAPE_ONSET_HOLD_S (0.2 s since
+#      0043 v3 / C1, was 0.4 s; in SENT-frame time) before growth; then a JERK-LIMITED slew (target delivered jerk FCA11_SHAPE_JERK_TARGET
+#      = 0.75 m/s^3, band 0.5-1.0) computed through the local d(extra)/d(cmd) slope of the curve (cliff band
+#      ~1 LSB per ~0.5 s; above 8 ~9 LSB/s). Growth never exceeds the panda's +RATE_STEP / sent-frame ceiling.
+#      A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) is an EMERGENCY: it BYPASSES the onset hold AND the comfort jerk
+#      slew - its growth runs at up to the panda ceiling (+RATE_STEP = 4 LSB per SENT frame, the same speed class as
+#      the pre-shaping path's fast ramp) so a hard demand reaches the tier cap in a few sent frames, not seconds.
+#      The shaped LEVEL target is KEPT (an honest inverse level once reached). The comfort slew is for comfort asks,
+#      not emergencies. (0043 v2: v1 bypassed only the hold but still jerk-slewed the growth, which added ~1.7 s to
+#      8 LSB / ~3 s to the cap - up to +44 m of open-loop stopping distance. Fixed.)
+#   4. steady:      cmd tracks the level inverse; the only rate limit is the jerk slew. Decreases are IMMEDIATE
+#      (the safe direction); the release ramp is deliberately NOT in this patch (see the REPORT).
+#   5. stop/hold:   v <= FCA11_SHAPE_HOLD_BAND_KPH (or CarState.standstill) ENTERS the hold band; it is left only at
+#      >= FCA11_SHAPE_HOLD_EXIT_KPH (EXIT hysteresis, 0043 v2). Inside, the command floors at the PERSONALITY TIER CAP
+#      (12/20/30), reached at the panda's +RATE_STEP so a proven hold (which ran at the cap, 8-20 s) is never
+#      weakened. This is the last-meter snub. The hysteresis stops a DCT creeping across the 3 km/h edge from
+#      stepping the command cap<->level (e.g. 20 -> 6 -> 20) on the boundary.
+#   6. release:     unchanged (episode close + passive frame). NO release ramp in this patch (deferred).
+#
+# 0043 v3 (C0, the owner-feel study wsG-feel, 285 accepted episodes over 9 FCA11 routes): K/BITE refit on 8-20 LSB to
+# 9.6/0.74 (the 155+157-only 8.23/0.85 sat outside the pooled CI and over-delivered +0.10 m/s^2 mean at 12-20 LSB; the
+# refit's inverse error is +0.02 mean). CLIFF_HI_EXTRA 1.42 -> 1.50 = the measured 8 LSB median 1.499, so the inverse
+# stays CONTINUOUS at the 8 LSB boundary (affine(1.50) = round(7.92) = 8) and monotone (pinned by a test). Per-route K
+# still spans 8.1-10.6 (day-to-day), so a low-K day under-delivers soft asks slightly; the gate sim covers K = 8.1.
+# These constants are read ONLY by the shaping law (shape_dec_cmd_from_extra / shape_local_slope_extra_per_lsb); the
+# OFF (deployed 0.67) path never reads them.
+# 0043 v3 (C1): the onset hold 0.4 -> 0.2 s. The study measured the 0.4 s floor hold as ~0.4 s of dead time (the 4 LSB
+# floor delivers ~0.15 m/s^2) that made the law 0.35 s later than the owner's own onset. The hold has NO frame-acceptance
+# role: the panda's onset rule (hyundai.h, 0035) caps the FIRST actuating frame at +RATE_STEP over a 0 reference and each
+# later frame at +RATE_STEP over the last ACCEPTED one, with no time term, and Prefill rides every actuating frame from
+# the first; hard asks already skip the hold entirely and are accepted. The hold is comfort-only (wsB-feel (b)2: 300-500
+# ms was a feel proposal, the 0.2 s choice is the study's C1). The G5 onset DEBOUNCE (FCA11_ONSET_HOLD_FRAMES, 0.2 s
+# of ask before an episode opens) is a SEPARATE constant and is unchanged.
+# The anchors + cliff slope ARE PROVISIONAL: the 5-7 LSB band was NEVER emitted by the old law (it jumped 4->8 in
+# one +4 step), so it is UNMEASURED. Refit FCA11_SHAPE_CLIFF_LO/HI_EXTRA (+ FCA11_SHAPE_K/BITE) after the next
+# drive logs the 5/6/7 LSB levels. The whole mapping is behind these few constants so the refit is a constant
+# change, not a code change.
+FCA11_SHAPE_FLOOR_LSB = 4          # the moving floor; the law never commands below this while moving
+FCA11_SHAPE_CLIFF_LO_EXTRA = 0.15  # PROVISIONAL: delivered extra (m/s^2) measured at 4 LSB (0.12-0.17)
+FCA11_SHAPE_CLIFF_HI_EXTRA = 1.50  # 0043 v3 (C0): MEASURED 8 LSB median 1.499 [1.42, 1.57], 106 episodes (== BITE + K*0.08 = 1.508)
+FCA11_SHAPE_CLIFF_LO_LSB = 4
+FCA11_SHAPE_CLIFF_HI_LSB = 8
+FCA11_SHAPE_K = 9.6                # 0043 v3 (C0): 8-20 LSB refit over 285 episodes, K 9.58 [8.98, 10.34] (was 8.23, 155+157 only)
+FCA11_SHAPE_BITE = 0.74            # 0043 v3 (C0): 8-20 LSB refit over 285 episodes, BITE 0.74 [0.64, 0.81] (was 0.85)
+FCA11_SHAPE_ONSET_HOLD_S = 0.2     # 0043 v3 (C1): the onset hold at the floor, seconds of SENT-frame time (was 0.4)
+FCA11_SHAPE_ONSET_HOLD_SENT = 10   # == FCA11_SHAPE_ONSET_HOLD_S / 0.02 (the 50 Hz sent-frame period); pinned by a test
+# 0043 v3: the study's C2 (jerk 0.75 -> 0.9) is NOT folded - the pre-registered rule R1 fired (REPORT-0043 v3).
+FCA11_SHAPE_JERK_TARGET = 0.75     # target delivered jerk (m/s^3); the comfort band is 0.5-1.0
+FCA11_SHAPE_JERK_BAND = (0.5, 1.0)
+FCA11_SHAPE_HOLD_BAND_KPH = 3.0    # ENTER the stop/hold band at/below this (or CarState.standstill): floor at the tier cap
+FCA11_SHAPE_HOLD_EXIT_KPH = 5.0    # 0043 v2: EXIT the band only at/above this (hysteresis) - no cap<->level step chatter at 3 km/h
+FCA11_SHAPE_SENT_DT = 0.02         # seconds per SENT (50 Hz) frame: the jerk slew is per SENT frame
+# *** 2026-11-03 (work item 3, owner + reviewer ruling): the jump to the hold cap waits for CONFIRMED STANDSTILL ***
+# MEASURED (routes 18a/190, every shaped-law stop on disk): band entry at 3 km/h (v = 0.81-0.82 m/s, 0.68-0.78 s before
+# CarState.standstill) stepped the command 5 -> 9 -> 13 -> 17 -> 20 in 60 ms while the car was still rolling; the logged
+# aEgo then dug 1.15 -> 1.55 m/s^2 (jerk -4.1..-4.5 at -0.5 s) and the car arrived at the stop on ~1.5 m/s^2.
+# THE RULE (the 3 km/h edge is NOT moved - the reviewer rejected 1 km/h): the band is kept, but while the car is still
+# ROLLING in it (no CarState.standstill) it only applies the CREEP FLOOR: the shaped moving level, floored at
+# max(the level held at band entry, FCA11_CRAWL_MIN_LSB = 7, the measured clutch-open level), never above the tier cap.
+# The tier cap itself is reached only on:
+#   * CarState.standstill -> the cap at the panda's +RATE_STEP (the deployed take-up). At a standstill the extra LSB are hold
+#     force, not felt decel, and a slower take-up lets the DCT creep the car (the 17c finding);
+#   * a HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) -> the cap at +RATE_STEP, as before (an emergency at walking pace);
+#   * the TIMEOUT: v <= 3 km/h continuously for FCA11_SHAPE_BAND_SS_TIMEOUT_S with no standstill (a car that will not stop -
+#     the creep case the band exists for) -> a LINEAR ramp from the current level to the cap over
+#     FCA11_SHAPE_BAND_TIMEOUT_RAMP_S (no step).
+# All three LATCH until the band EXIT (>= FCA11_SHAPE_HOLD_EXIT_KPH) / an episode (re)open, so a standstill flag that drops
+# False while the car creeps (17c specimen) cannot pull the hold back down.
+# WHAT THIS DOES NOT FIX (replay, wi3): the last-0.2 s stop jerk is the arrival decel unloading at v -> 0, not the cap step
+# (the step was 0.7 s earlier). Gating the cap lowers the arrival decel from the 20 LSB plateau (~1.55) to the creep-floor
+# plateau (~1.25-1.35 m/s^2 at arrival on the measured curve + lag), so the jerk drops only ~15 %; <2 m/s^3 would need an
+# arrival decel of ~0.65 m/s^2, below what any actuating level delivers (4 LSB -> 1.14). See the wi3 report.
+FCA11_SHAPE_BAND_SS_TIMEOUT_S = 1.5        # s at/below 3 km/h without standstill before the cap ramp starts
+FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES = 150   # == FCA11_SHAPE_BAND_SS_TIMEOUT_S at 100 Hz (pinned by a test)
+FCA11_SHAPE_BAND_TIMEOUT_RAMP_S = 0.5      # s for the timeout's linear ramp from the current level to the tier cap
+FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES = 50  # == FCA11_SHAPE_BAND_TIMEOUT_RAMP_S at 100 Hz (pinned by a test)
+
+
+def shape_dec_cmd_from_extra(extra: float, cap: int = 30) -> int:
+  """0043: the piecewise-MONOTONE inverse of the measured steady curve (wanted extra m/s^2 -> raw CR_VSM_DecCmd).
+
+  Clamped to [FCA11_SHAPE_FLOOR_LSB, cap]. extra <= 0.15 -> the 4 LSB floor; extra in (0.15, 1.50) -> a LINEAR
+  interpolation across the CLIFF (PROVISIONAL - the 5/6/7 LSB band is unmeasured); extra >= 1.50 -> the affine
+  inverse round(((extra - BITE)/K)*100), clamped [8, cap] (which keeps the curve continuous at the 8 anchor)."""
+  if extra <= FCA11_SHAPE_CLIFF_LO_EXTRA:
+    return FCA11_SHAPE_FLOOR_LSB
+  if extra < FCA11_SHAPE_CLIFF_HI_EXTRA:
+    frac = (extra - FCA11_SHAPE_CLIFF_LO_EXTRA) / (FCA11_SHAPE_CLIFF_HI_EXTRA - FCA11_SHAPE_CLIFF_LO_EXTRA)
+    cmd = FCA11_SHAPE_CLIFF_LO_LSB + frac * (FCA11_SHAPE_CLIFF_HI_LSB - FCA11_SHAPE_CLIFF_LO_LSB)
+    return int(round(max(FCA11_SHAPE_FLOOR_LSB, min(cap, cmd))))
+  cmd = int(round(((extra - FCA11_SHAPE_BITE) / FCA11_SHAPE_K) * 100))
+  return max(FCA11_SHAPE_CLIFF_HI_LSB, min(cap, cmd))
+
+
+def shape_local_slope_extra_per_lsb(lsb: float) -> float:
+  """d(extra)/d(LSB) of the shaped curve at a command level (m/s^2 per LSB) - the slope the jerk slew rides.
+
+  Cliff band (4-8 LSB): the linear interpolation's slope. At/above 8: the affine slope K/100 (the inverse's
+  d(extra)/d(cmd_g) = K with cmd_g = LSB/100), so the map back to LSB growth is K/100 per LSB."""
+  if lsb < FCA11_SHAPE_CLIFF_HI_LSB:
+    return (FCA11_SHAPE_CLIFF_HI_EXTRA - FCA11_SHAPE_CLIFF_LO_EXTRA) / (FCA11_SHAPE_CLIFF_HI_LSB - FCA11_SHAPE_CLIFF_LO_LSB)
+  return FCA11_SHAPE_K / 100.0
+
+
+def shape_slew_lsb_per_sent(lsb: float) -> float:
+  """The jerk-limited growth allowed in ONE 50 Hz sent frame at command level ``lsb`` (LSB per sent frame).
+
+  dLSB/dt = jerk_target / (d(extra)/dLSB), times the 0.02 s sent-frame period. 0043 v3 (C0 slopes, jerk 0.75):
+  cliff band -> ~0.044 LSB/frame (~1 LSB per ~0.45 s); above 8 -> ~0.16 LSB/frame (~7.8 LSB/s)."""
+  slope = shape_local_slope_extra_per_lsb(lsb)
+  return FCA11_SHAPE_JERK_TARGET / slope * FCA11_SHAPE_SENT_DT
+
+
+def dec_cmd_from_accel_affine(accel: float, K: float = FCA11_AFFINE_K, BITE: float = FCA11_AFFINE_BITE) -> int:
+  """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB) through the AFFINE plant, clamp [0, 30].
+
+  The inverse of ``extra = BITE + K * cmd_g``: a wanted extra decel of ``want_extra = -accel`` needs
+  ``cmd_g = (want_extra - BITE) / K``. Zero for anything above the onset threshold (coast territory) and for a
+  want at/below BITE (the plant's own bite already delivers more than asked). Unlike the 0.67 path this returns
+  0 (not 1) when nothing is asked, so it can taper honestly through zero; the caller applies the personality cap.
+  """
+  if accel > FCA11_BRAKE_ONSET_ACCEL:
+    return 0
+  want_extra = -accel
+  if want_extra <= BITE:
+    return 0
+  cmd_g = (want_extra - BITE) / K
+  return max(0, min(30, int(round(cmd_g * 100))))
+
+
+# 0044: the FCA11_AFFINE env override and the Params() last-resort fallback are DELETED. The env path was the sim's
+# only way to turn the shaping law on, and it HID the defect that the law was unreachable on the car (the key was not
+# in params_keys.h and nothing wrote CP_SP.fca11AffineGain). The ONLY path in is now the production one: the
+# HyundaiFca11AffineGain param -> the superproject's initialize_params() -> opendbc setup_interfaces() (which applies
+# the fca11Brake dependency) -> CP_SP.fca11AffineGain. A SET env var is refused loudly at construction so a stale
+# harness can never silently run the law the car would not run.
+FCA11_AFFINE_ENV_REMOVED = "FCA11_AFFINE"
+
+
+def affine_gain_enabled(CP_SP) -> bool:
+  """The resolved opt-in state for the shaping law: CP_SP.fca11AffineGain AND CP_SP.fca11Brake. Read ONCE at
+  Fca11LongBrake.__init__ (never per frame). setup_interfaces already applies the dependency; it is re-applied here so a
+  hand-built CP_SP can never run the law without FCA11 braking. A missing field (older struct) is False."""
+  return bool(getattr(CP_SP, "fca11AffineGain", False)) and bool(getattr(CP_SP, "fca11Brake", False))
+
+
+def _refuse_affine_env() -> None:
+  """0044: raise if the removed FCA11_AFFINE env override is SET (any value, even empty) - see the note above."""
+  if FCA11_AFFINE_ENV_REMOVED in os.environ:
+    val = os.environ[FCA11_AFFINE_ENV_REMOVED]
+    msg = f"{FCA11_AFFINE_ENV_REMOVED} is set ({val!r}) but the env override was removed in patch 0044: "
+    msg += "the FCA11 brake-shaping law is enabled ONLY through the HyundaiFca11AffineGain param "
+    msg += "(Params -> initialize_params -> setup_interfaces -> CP_SP.fca11AffineGain, requires HyundaiFca11Brake). Unset the variable."
+    raise RuntimeError(msg)
+
+
+# *** 0054: FCA11_MEAS_* — the MEASURED ask -> LSB inverse, and the RELEASE BELOW THE FLOOR rule ***
+#
+# WHAT IT REPLACES (quoted, so the next reader sees the exact thing rather than a paraphrase):
+#   fca11_long.py:843-850   def dec_cmd_from_accel(accel):
+#                             if accel > FCA11_BRAKE_ONSET_ACCEL: return 0
+#                             dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81
+#                             return int(round(dec_g * 100))
+#   fca11_long.py:255       FCA11_BRAKE_GAIN = 0.67        <- through-the-origin gain (delivered = 0.67 * commanded)
+#   fca11_long.py:75        FCA11_BRAKE_ONSET_ACCEL = -0.5 <- with `min(accel, ONSET)` at fca11_long.py:2198 and :1669
+#                             this IS the 8 LSB floor: dec_cmd_from_accel(-0.5) = round(7.60) = 8
+#   fca11_long.py:853-855   clamp_dec_cmd()               <- the per-frame cap: max(1, min(tier cap, dec_cmd))
+#   fca11_long.py:824-828   PERSONALITY_MAX_DEC           <- the ceiling: 12 / 20 / 30 (30 == HYUNDAI_FCA11_LONG_MAX_DEC)
+# So the deployed request was lsb = clamp(round(100 * (-accel / 0.67 / 9.81)), 8, 30): a through-origin inverse whose floor
+# was fixed by the onset clamp. Two errors in one, and they conspire: (i) the plant is AFFINE, so the slope is ~1.5x off
+# and every mid-band ask is commanded nearly twice as hard as asked; (ii) the 8 LSB floor turns ANY ask softer than
+# ~1.25 m/s^2 into ~1.25 m/s^2 of delivered decel -- including the planner's own roll-out asks (0.0 ... 0.6), which the
+# PLAN believes are coasting. Route 16a: 3 of 4 stops came to rest 2.07 / 2.69 / 2.06 m beyond the planner's own 6.0 m
+# standstill target, and the last 2 s before stop t=152 asked 0.0 / 0.0 / 0.62 m/s^2 while the law held 8-9 LSB
+# (1.19-1.29 m/s^2 delivered). The car was not failing to execute the plan; it was braking when the plan said coast.
+#
+# THE MEASUREMENT (91 routes; sustained FCA11 frames >= 0.5 s into an episode, driver not braking, v >= 12 km/h, no lead
+# within 60 m; ~/comma-sim/wsSTOP/drive-169-16c/sub/esc-floor/frames.csv): delivered decel BEYOND COAST by level
+#   4 LSB -> 0.78 m/s^2 (p10 0.65)   5 -> 0.84 (0.71)   6 -> 0.91   8 -> 1.25   10 -> 1.44   20 -> 2.28   30 -> 3.64
+# i.e. affine: extra = BITE + K * cmd_g. Refitted on tonight's per-level medians over 4-20 LSB (the band the law uses):
+# K = 8.94 (CI95 [8.52, 9.36]) m/s^2/g, BITE = 0.49 (CI95 [0.42, 0.55]) m/s^2, max residual 0.11 m/s^2. This block keeps
+# the 0041/0043 POOLED fit (17260 production frames, 126 events) -- BITE 0.40 [0.33, 0.48], K 9.9 [9.43, 10.38] -- which
+# sits inside/next to that CI and is the pair the 0043 shaping law already inverts, so the two laws can never disagree
+# about the ESC. The two fits differ by <= 0.11 m/s^2 anywhere in the band (<= 0.6 LSB of inverse error), i.e. below the
+# command resolution. Do NOT re-tune one without the other.
+#
+# THE LAW (moving, above the stop/hold band):
+#   want_extra = -accel                                          (m/s^2 beyond coast the planner wants)
+#   lsb        = round(100 * (want_extra - BITE) / K)            clamped [FCA11_MEAS_FLOOR_LSB, FCA11_MEAS_CEIL_LSB]
+# An ask softer than FCA11_MEAS_FLOOR_EXTRA is commanded at the FLOOR (4 LSB), never released: see the REJECTED
+# release variant below. FCA11_MEAS_FLOOR_EXTRA is what 4 LSB actually delivers, so the law's output is either 0
+# (an ask above the onset, i.e. coast territory) or an honest level in [0.80, 3.64] m/s^2.
+#
+# THE REJECTED RELEASE VARIANT (measured, do NOT re-add). An earlier revision RELEASED any moving ask below
+# FCA11_MEAS_FLOOR_EXTRA (closed the episode passively) on the theory that flooring it up is "more braking than asked".
+# Replay of the four route-16a stops says otherwise: the last 2 s of ALL FOUR asked 0.00-0.66 m/s^2 (below the floor) while
+# the car was demonstrably delivering 1.19-1.71 m/s^2 -- so a release there sends NOTHING exactly where the car needs
+# brake, and every one of those stops becomes a coast that never reaches standstill, i.e. a BRAKE LOSS. It also broke the
+# cycle-1 crawl-dwell escapes, which open on asks <= -0.5 (below the floor) for the creep-into-a-closing-lead case. The
+# FLOOR change alone recovers the error: replay give-back against observed is +1.91/+1.81/-0.48/+5.55 m vs observed
+# +2.07/+2.69/-0.01/+2.06 m on the four stops (sub/rollout-replay/replay_16a_flooronly.py), i.e. 1.9 of the 2.07 m on the
+# first stop, two stops inside +-0.5 m of the 6.0 m target and three inside +-0.9 m (the 4th stop's residual -3.49 m is the
+# plant model's own domain error: the log shows 1.71 m/s^2 delivered at 3 m/s, i.e. ~2x the fit's 4 LSB value, and the fit
+# was made at >= 12 km/h with no lead). The release arm added nothing but the brake loss.
+#
+# UNTOUCHED (each a deliberate boundary, not an oversight):
+#   * the ONSET rule (:75, :89, :2139-2160) and the +RATE_STEP rate step (:2265) -- this block chooses a LEVEL, never a
+#     timing, and the panda's +RATE_STEP onset gate still governs every ramp;
+#   * the 30 LSB cap and the personality tiers (:824-828, :853-855);
+#   * the driver cut / gas hold-off / camera hand-back / refusal wall (:2009-2062, :2274);
+#   * the STOP/HOLD band (:1667-1674): at/below FCA11_FEEL_HOLD_BAND_KPH the DEPLOYED request still runs, because a
+#     standstill hold on a DCT car that creeps must not be weakened and the measured curve is LOWER there (a -2.0 ask is
+#     16 LSB, not the 20 the deployed request gives). The 2 m this patch recovers is spent between 4 and 12 km/h, ABOVE
+#     the band edge, so excluding the band loses none of the fix. 0055: the band's FLOOR is now fca11_floor_lsb(v), which
+#     is 8 at every band speed; the request above the floor is untouched. See the 0055 block below;
+#   * the 0043 shaping law (shape_dec_cmd_from_extra) and cal -- both take their own paths (:2212, :2250).
+# Kill switch: FCA11_MEAS_INVERSE = False restores the pre-0054 request map byte-for-byte (read once per
+# instance; it also needs the feel layer, which is where the deployed request lives -- see self.meas_inverse).
+FCA11_MEAS_INVERSE = True
+FCA11_MEAS_BITE = 0.40       # m/s^2 delivered beyond coast at 0 LSB (the plant's own bite); CI95 [0.33, 0.48]
+FCA11_MEAS_K = 9.9           # m/s^2 per g of command (per 100 LSB);                     CI95 [9.43, 10.38]
+FCA11_MEAS_FLOOR_LSB = 4     # the weakest actuating level the ESC accepts (was 8, set by the onset clamp at :2198)
+# 2026-11-03 (owner ruling: guard 0.5 g): the WIRE gate is 46 LSB now, but the DEPLOYED mapping ceiling stays 30 so the
+# shipped law is byte-identical for every ask that is not a genuine hard stop. Only an ask at/below
+# FCA11_URGENT_ASK_MSS2 may spend the raised gate (see effective_max_dec / dec_cmd_from_accel_measured(ceil_lsb=)).
+FCA11_MEAS_CEIL_LSB = 30   # deployed mapping ceiling; the personality tier cap is applied on top
+# What the floor actually delivers beyond coast: 0.40 + 9.9 * 0.04 = 0.796 m/s^2 (measured 0.78, p10 0.65). An ask softer
+# than this cannot be served by ANY actuating frame; it is commanded at the FLOOR anyway (see the rejected release
+# variant above: releasing such an ask is a brake loss at exactly the asks where the car needs brake).
+FCA11_MEAS_FLOOR_EXTRA = FCA11_MEAS_BITE + FCA11_MEAS_K * FCA11_MEAS_FLOOR_LSB / 100.0
+
+
+# *** 0055: fca11_floor_lsb — the SPEED-INDEXED band floor (4 LSB moving -> 8 LSB in the stop band) ***
+#
+# WHY THERE IS A RAMP AT ALL (Fable's ruling on the 0054 stop-band step; intent quoted): 0054 dropped the MOVING floor
+# from 8 to 4 LSB but left the STOP band at 8 - the deployed request floors there through the -0.5 onset clamp. That
+# reproduced exactly the jerk 0054 exists to remove, just later and in one frame:
+#   (a) holding 4 LSB *through* the stop band is NOT supportable: there is no stop-hold evidence below ~12 km/h, and
+#       0.31 m/s^2 (what a 4 LSB-class command can leave you with at creeping speed) from 2 m/s is up to ~6 m of
+#       roll-out into a lead. The planner's own standstill plan for that approach is 1.9-2.5 m;
+#   (b) letting the level step 4 -> 8 in ONE frame at band entry is a SECOND jerk event of the same magnitude as the
+#       one we are fixing (+0.4 m/s^2 in 20 ms, at the end of every stop).
+# So the floor is a CONTINUOUS function of v instead of a piecewise step: 4 LSB at v >= 2.0 m/s, rising LINEARLY to 8 LSB
+# at v <= 1.0 m/s, and constant 8 below 1.0 m/s (i.e. through the whole stop band and at standstill).
+#
+# SPEED-INDEXED, NOT TIME-INDEXED, on purpose: the level is a pure function of the CURRENT v, so it is deterministic,
+# reproducible frame-for-frame in a pin test, has no state to arm/reset/migrate, and cannot drift with a different
+# frame cadence or a pause in the frame stream. There is NO time term anywhere in this function.
+#
+# THE MEASURED TABLE IT INTERPOLATES (85-91 routes; sustained FCA11 frames >= 0.5 s into an episode, driver not braking,
+# v >= 12 km/h, no lead within 60 m; delivered decel BEYOND COAST in m/s^2 - full table in the FCA11_MEAS_* block above):
+#   4 LSB -> 0.78 (median, p10 0.65)   6 -> 0.91   8 -> 1.25   10 -> 1.44   20 -> 2.28   30 -> 3.64
+# The ramp's endpoints are two of those medians - the weakest actuating frame the ESC accepts (4) and the deployed
+# stop-hold floor (8) - so every interpolated value between them is a level the plant has been measured at, and the
+# ramp never asks for a level below the floor (which is the rejected release shape) or above the stop hold.
+#
+# JERK AND ROLL-OUT (the arithmetic behind the ruling): at the 1 m/s^2 decel a stop is planned with, 2.0 -> 1.0 m/s takes
+# 1.0 s and the floor climbs 4 LSB, i.e. ~0.40 m/s^3 of jerk (0.39 m/s^2 of extra decel spread over 1 s) - well under the
+# owner's 1.4 m/s^3 limit, and it is the same 0.4 m/s^2 delivered over 50 sent frames instead of 1. DISTANCE: integrating
+# v/a(v) over v = 2.0 -> 0 with a(v) = 0.40 + 9.9 * floor(v)/100 (0.80 m/s^2 at 2.0 m/s rising to 1.19 by 1.0 m/s) gives
+# 1.99 m -- inside the planner's own 1.9-2.5 m standstill plan. Holding 4 LSB all the way instead would need 2.51 m from
+# the same 2 m/s (4 / 2*0.80), and the ~6 m the ruling quotes is that same arithmetic at the ~0.31 m/s^2 the plant can
+# leave you with at creep (4 / 2*0.31 = 6.4 m) -- a stop that undershoots its plan by metres into a lead. A constant 8
+# from 2 m/s would stop in 1.68 m, i.e. it overshoots the plan's SHORT end, which is why 8 belongs to the last metre
+# (the hold) and not to the whole approach.
+#
+# APPLIED EVERYWHERE THE MEASURED FLOOR IS APPLIED: dec_cmd_from_accel_measured, the feel target (_feel_target) and the
+# stop-band path that used to hard-code 8 (it now takes this floor explicitly instead of inheriting 8 from the -0.5
+# onset clamp; at <= 1.0 m/s, i.e. at every band speed, it IS 8, so the band stays byte-identical to 0054 there).
+# The stop HOLD itself is untouched: a deployed request ABOVE the floor still commands what it commanded. ``None`` means
+# "at speed" (>= 2.0 m/s) -> 4, so a caller with no speed gets the moving floor, which is what every pre-0055 pin means.
+# 2026-11-01 (owner: "brakes for holds hits too early, car isn't stopped so causes a big jerk"): the ramp used to reach the
+# 8 LSB stop floor at 1.0 m/s, i.e. BEFORE the 3 km/h band (0.83 m/s) - so the last 3 km/h of every stop entered the band
+# already commanding 7-8 LSB (~1.1-1.25 m/s^2) on a car that was still rolling, which is the bite. The ramp now finishes at
+# 0.4 m/s: at band entry it is 6 LSB, 5 at 1.0 m/s, and 4 (the moving floor) from 1.2 m/s up. The TRUE hold is untouched
+# (30 LSB, panda-max rise, latched at standstill) - this only softens the last metre of the approach.
+FCA11_FLOOR_RAMP_TOP_MPS = 2.0   # at/above: FCA11_MEAS_FLOOR_LSB (4), the moving floor
+FCA11_FLOOR_RAMP_BOT_MPS = 1.0   # at/below: FCA11_NORESPONSE_MIN_LSB (8), the stop-band hold floor
+
+
+FCA11_FLOOR_RAMP_TOP_SOFT_MPS = 1.2   # 2026-11-01: the SOFT ramp (dynamic brakes ON only) - see fca11_floor_lsb(soft=True)
+FCA11_FLOOR_RAMP_BOT_SOFT_MPS = 0.4
+
+
+def fca11_floor_lsb(v_ego_mps=None, soft: bool = False) -> int:
+  """0055: the SPEED-INDEXED floor (LSB) of the measured law at ego speed ``v_ego_mps`` (m/s).
+
+  v >= 1.2 -> 4 LSB; v <= 0.4 -> 8 LSB; in between, linear 4 -> 8 and rounded to the nearest LSB; None -> 4 (at speed).
+  A pure function of v: no state, no time term, same v always gives the same LSB. See the 0055 block above for the
+  ruling it implements, the measured table it interpolates and the jerk/roll-out arithmetic.
+  """
+  top, bot = ((FCA11_FLOOR_RAMP_TOP_SOFT_MPS, FCA11_FLOOR_RAMP_BOT_SOFT_MPS) if soft
+              else (FCA11_FLOOR_RAMP_TOP_MPS, FCA11_FLOOR_RAMP_BOT_MPS))
+  if v_ego_mps is None:
+    return FCA11_MEAS_FLOOR_LSB
+  if v_ego_mps >= top:
+    return FCA11_MEAS_FLOOR_LSB
+  if v_ego_mps <= bot:
+    return FCA11_NORESPONSE_MIN_LSB
+  moving, stop = float(FCA11_MEAS_FLOOR_LSB), float(FCA11_NORESPONSE_MIN_LSB)
+  frac = (v_ego_mps - bot) / (top - bot)
+  return int(round(stop + (moving - stop) * frac))
+
+
+# *** 2026-11-03 (routes 190/191, measured on THIS car): the real LSB -> decel curve ***
+# Sustained plateaus decoded from the rlogs on disk, coast baseline ~0.0 m/s^2 at 10-35 m/s with no pedals (so these are
+# brake, not coast): 4 LSB -> 1.14, 8 -> 1.27, 13 -> 1.49, 20 -> 1.57 m/s^2. The analytic fit (lsb = 100*(|a|-0.4)/9.9)
+# predicts 0.80 at 4 and 2.38 at 20 - it OVER-brakes at low asks and UNDER-brakes at high ones, which is the owner's
+# "brakes feel binary". This table is the level that MEASURABLY delivers the ask.
+FCA11_PLANT_DECEL_MSS2 = (1.14, 1.27, 1.49, 1.57)
+FCA11_PLANT_LSB = (4, 8, 13, 20)
+
+
+def dec_cmd_from_plant_curve(want_extra: float) -> int:
+  """The level that measurably delivers ``want_extra`` m/s^2, interpolated from FCA11_PLANT_* (monotone, <= 20 LSB)."""
+  pts_a, pts_l = FCA11_PLANT_DECEL_MSS2, FCA11_PLANT_LSB
+  if want_extra <= pts_a[0]:
+    return pts_l[0]
+  for i in range(1, len(pts_a)):
+    if want_extra <= pts_a[i]:
+      f = (want_extra - pts_a[i-1]) / (pts_a[i] - pts_a[i-1])
+      return int(round(pts_l[i-1] + f * (pts_l[i] - pts_l[i-1])))
+  return pts_l[-1]
+
+
+# 2026-11-03 (Fable review of the plant curve): the inverse is ILL-CONDITIONED on the flat segment. 13 -> 20 LSB buys only
+# 1.49 -> 1.57 m/s^2 (0.011 m/s^2 per LSB), so an ask hovering at -1.5 +/- 0.05 maps to 13..18 and can walk the level
+# several LSB with every planner wiggle while the car feels nothing different (measured: a +/-0.05 ask flips 17/18 EVERY
+# sent frame, a 0.1 m/s^2 1 Hz wobble sweeps 12..20). Fix = a BACKLASH (play) operator in the ASK domain: the level only
+# moves when the ask leaves +/- FCA11_PLANT_HYST_MSS2 of what the current level delivers, and then only to the edge of that
+# window. Why the ask domain, not a fixed LSB band: the play in LSB is automatically wide where the plant is flat (~+/-5 LSB
+# on 13-20, where those LSB buy nothing) and narrow where it is steep (~+/-2 LSB on 4-8), and the DELIVERED error it allows
+# is bounded by the same 0.06 m/s^2 everywhere - below the plant table's own ~0.08 m/s^2 uncertainty. A reversal smaller
+# than 2*HYST never moves the level; a genuine trend is followed with that fixed lag. Real hover asks (rlogs 188-190,
+# 0.5 s windows with mean in [-1.7, -1.3]): frame-to-frame |d ask| p90 0.012, p99 0.075 m/s^2.
+FCA11_PLANT_HYST_MSS2 = 0.06
+
+
+def dec_cmd_from_plant_curve_hyst(want_extra: float, ref_lsb=None) -> int:
+  """dec_cmd_from_plant_curve with backlash: ``ref_lsb`` (the previous curve level) is kept while it lies inside the levels
+  for want_extra -/+ FCA11_PLANT_HYST_MSS2, otherwise clamped to the nearer edge. ref None = no history = the plain inverse.
+  Pure function; monotone non-decreasing in want_extra for a fixed ref; never outside the plain curve's [4, 20] range."""
+  if ref_lsb is None:
+    return dec_cmd_from_plant_curve(want_extra)
+  lo = dec_cmd_from_plant_curve(want_extra - FCA11_PLANT_HYST_MSS2)
+  hi = dec_cmd_from_plant_curve(want_extra + FCA11_PLANT_HYST_MSS2)
+  return min(hi, max(lo, int(ref_lsb)))
+
+
+def dec_cmd_from_accel_plant(accel: float, v_ego_mps=None) -> int:
+  """The DYNAMIC-BRAKES (ON) ask -> raw CR_VSM_DecCmd: the inverse of the MEASURED plant curve (FCA11_PLANT_*).
+
+  Same contract as dec_cmd_from_accel_measured (an ask above the onset threshold is coast -> 0; otherwise never below the
+  speed-indexed floor fca11_floor_lsb(v_ego_mps)), but the level is the one that MEASURABLY delivers the ask, so it
+  saturates at the top measured point (FCA11_PLANT_LSB[-1] = 20 LSB -> 1.57 m/s^2) instead of extrapolating the
+  analytic fit. Monotone non-decreasing in the ask. Only the ON path uses it; OFF stays on the deployed map.
+  """
+  if accel > FCA11_BRAKE_ONSET_ACCEL:
+    return 0
+  return max(fca11_floor_lsb(v_ego_mps), dec_cmd_from_plant_curve(-accel))
+
+
+def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None, ceil_lsb: int = 0) -> int:
+  """0054: the MEASURED ask -> raw CR_VSM_DecCmd inverse (0.01 g/LSB), for a MOVING episode above the stop band.
+
+  want_extra = -accel (m/s^2 beyond coast); lsb = round(100 * (want_extra - BITE) / K), clamped to
+  [fca11_floor_lsb(v_ego_mps), FCA11_MEAS_CEIL_LSB]. Above the onset threshold the ask is coast territory, not a brake
+  request -> 0. An ask softer than what the floor delivers returns the FLOOR: that is the weakest level that can be
+  sent, and this law SENDS it rather than releasing (the release variant was measured and rejected -- brake loss).
+  0055: the floor is speed-indexed (4 LSB at/above 2.0 m/s, ramping to 8 LSB by 1.0 m/s); ``v_ego_mps`` None = at speed.
+  Monotone non-decreasing in the ask, monotone non-decreasing in 1/v (slower -> never a weaker floor), and never above
+  the deployed 0.67 inverse for the same ask.
+  """
+  if accel > FCA11_BRAKE_ONSET_ACCEL:
+    return 0
+  want_extra = -accel
+  lsb = int(round((want_extra - FCA11_MEAS_BITE) / FCA11_MEAS_K * 100.0))
+  return max(fca11_floor_lsb(v_ego_mps), min(int(ceil_lsb) or FCA11_MEAS_CEIL_LSB, lsb))
+
+
+# *** 0049: FCA11_FEEL_* — brake FEEL on the DEPLOYED (OLD-LAW) path: coast-first open, lag-aware onset ramp through the
+# intermediate LSBs, and an anticipatory release (DEFAULT ON; the shaping/V3 path and cal are untouched) ***
+#
+# WHY (drive-feedback-159, routes 158/159/15a, 46.5k shadow frames; plant ID in plant-notes.md): the deployed law only
+# ever emitted {0, 4, 8..20} LSB. That is NOT a wire limit - CR_VSM_DecCmd is an 8-bit integer at 0.01 g and the panda
+# accepts ANY level 1..30 within +RATE_STEP over the last accepted frame. It is the law: (a) the -0.5 onset maps through
+# the 0.67 inverse to 7.6 -> round = 8, so 8 is the mapping's floor; (b) inside the release band (-0.50, -0.30] and the
+# min-on window the ask is clamped to the onset value (`min(accel, ONSET)`), so the command is floored at 8; (c) the
+# +RATE_STEP limiter takes 0 -> 4 -> 8 in two sent frames (40 ms). The plant over-delivers exactly there (L=8: ~1.20 m/s^2
+# incremental for a ~0.5 ask, 1.5-2x nominal), lags ~0.28 s and has a ~0.53 s release tail, so a small ask became a
+# grabby 1.2 m/s^2 hit and the owner cancelled 85/89 gas-ended episodes with the throttle.
+#
+# WHAT 0049 DOES (OLD-LAW instance only: not the V3/shaping law, not cal, not the low-speed hold band):
+#   1. COAST-FIRST OPEN: a NEW episode (and the 0.2 s onset debounce) needs the RESIDUAL demand beyond zero-throttle coast,
+#      -ask - FCA11_FEEL_COAST_DECEL, to reach FCA11_FEEL_OPEN_MARGIN (defaults 0.15 + 0.45 -> the ask must reach -0.60, was
+#      -0.50). Hysteresis: once open, the deployed release rule (-0.30 + 0.6 s min-on) is unchanged. A HARD ask
+#      (<= FCA11_ONSET_BYPASS_ACCEL) still opens on its first frame, and an ask SUSTAINED at/below the deployed -0.5 for
+#      FCA11_FEEL_DWELL_FRAMES (1.0 s) opens anyway (dwell escape: suppress transients, never a sustained demand).
+#   2. ONSET RAMP (lag-aware): the first sent frame is FCA11_FEEL_FIRST_LSB (4, the panda's onset step); growth is then
+#      jerk-limited per SENT frame: FCA11_FEEL_JERK_TARGET / (delivered m/s^2 per LSB at the current level) x 0.02 s, i.e.
+#      ~0.19 LSB/frame across the 4-8 band (PROVISIONAL steep low-band slope) and ~0.51 LSB/frame above 8, for asks at/above
+#      FCA11_FEEL_RATE_SOFT_ACCEL, blending linearly to the panda's +RATE_STEP at FCA11_ONSET_BYPASS_ACCEL (a HARD ask is
+#      never slowed; nor is an ask DEEPENING faster than FCA11_FEEL_DEEPEN_SLOPE). DISCLOSED TRADE: a soft ramp that then
+#      turns hard climbs at +RATE_STEP from a lower level, so it can reach the cap up to ~3 sent frames (60 ms) after the
+#      deployed law; a jump to the old trajectory would violate the panda's +RATE_STEP rule, so this is inherent. Over the 0.28 s plant lag the planner sees no response and deepens its ask; the old law followed it
+#      instantly and the delayed plant then over-shot. The ramp walks through 5/6/7 (never emitted before).
+#   3. ANTICIPATORY RELEASE: while the ask is EASING, the target is computed from the ask predicted FCA11_FEEL_ANTICIPATE_S
+#      (the plant lag) ahead (slope = an EMA over sent frames, lead capped at FCA11_FEEL_ANTICIPATE_MAX); and inside the
+#      release band / min-on window the command FOLLOWS the ask down through the intermediate LSBs (the same 0.67 inverse,
+#      floored at FCA11_FEEL_FLOOR_LSB = 4) instead of being clamped at 8. Episode exit timing is UNCHANGED (the passive
+#      close frame goes out on the same frame as before); only the level ahead of it is lower.
+#   4. HOLD BAND: at/below FCA11_FEEL_HOLD_BAND_KPH (or CarState.standstill), until >= FCA11_FEEL_HOLD_EXIT_KPH, the
+#      deployed law runs EXACTLY (open at -0.5, +RATE_STEP ramp, 8 LSB floor): a standstill hold is never weakened.
+# AUTHORITY INVARIANT (pinned by tests + replay): the requested level is never above the deployed law's level for the same
+# ask (the target map is the same 0.67 inverse at/below -0.5, the anticipated ask is only ever LESS negative, the ramp only
+# slows growth), a HARD ask from idle produces the deployed law's frames byte-for-byte, and the steady level for any ask
+# <= -0.5 is unchanged. Every panda contract (Warn 3, +RATE_STEP over the last SENT frame, passive close on every exit,
+# R7 latch, camera hand-back, no auto-resume, arming) is untouched - this block only chooses a level <= the old one.
+# 0054 SUPERSEDES the second half of that invariant ON THE MEASURED LAW: the level map is now the measured affine inverse
+# (dec_cmd_from_accel_measured, floor 4 LSB), so the steady level for a given ask is LOWER than the deployed one and a
+# sustained -0.55 still actuates (at the 4 LSB floor, as the dwell escape requires). The "never above the deployed level"
+# half still holds (the measured map is <= the 0.67 map for every ask). The pre-0054 behaviour - and every test that pins
+# it - is restored byte-for-byte by FCA11_MEAS_INVERSE = False.
+# Set FCA11_FEEL_ENABLED False to restore the pre-0049 OLD-LAW byte-for-byte (read once per instance).
+FCA11_FEEL_ENABLED = True
+FCA11_FEEL_COAST_DECEL = 0.15        # m/s^2 zero-throttle coast near the onset asks (measured 0.13-0.19 by speed band)
+FCA11_FEEL_OPEN_MARGIN = 0.45        # m/s^2 residual (beyond coast) a NEW episode needs -> open at ask <= -0.60
+FCA11_FEEL_OPEN_ACCEL = -(FCA11_FEEL_COAST_DECEL + FCA11_FEEL_OPEN_MARGIN)
+FCA11_FEEL_FIRST_LSB = 4             # first sent frame of a soft episode (== the panda's onset RATE_STEP)
+FCA11_FEEL_FLOOR_LSB = 4             # moving floor while an episode is open (never 0 mid-episode; 0 is the release)
+FCA11_FEEL_JERK_TARGET = 2.5         # m/s^3 delivered onset jerk the soft ramp aims at (was ~8 raw p50 measured)
+# Delivered decel per LSB the ramp divides by (m/s^2 per LSB). Above 8 LSB = the MEASURED marginal slope (0.098, plant-notes
+# 3: L 8->19 rises 1.20 -> 2.25). Below 8 = PROVISIONAL: 1-3 / 5-7 were never commanded and 4 only as a 20 ms pulse, so the
+# 0043 cliff interpolation (0.15 m/s^2 at 4 -> 1.20 at 8 = 0.26 / LSB) is assumed - the CONSERVATIVE choice (if the low band
+# is in fact linear, the ramp there is just gentler than needed). Refit once a drive logs the 5/6/7 levels.
+FCA11_FEEL_SLOPE_LOW = 0.26          # m/s^2 per LSB below FCA11_FEEL_SLOPE_KNEE_LSB (PROVISIONAL)
+FCA11_FEEL_SLOPE_HIGH = 0.098        # m/s^2 per LSB at/above the knee (measured)
+FCA11_FEEL_SLOPE_KNEE_LSB = 8
+FCA11_FEEL_RATE_SOFT_ACCEL = -1.0    # asks at/above this ramp at the jerk target; linear to +RATE_STEP at the HARD bypass
+FCA11_FEEL_ANTICIPATE_S = 0.28       # measured total command -> aEgo lag: look this far ahead while the ask eases
+FCA11_FEEL_ANTICIPATE_MAX = 0.25     # m/s^2 cap on the anticipated easing (noise / outlier bound)
+FCA11_FEEL_SLOPE_ALPHA = 0.2         # EMA weight per SENT frame for the ask slope (~0.1 s time constant)
+FCA11_FEEL_HOLD_BAND_KPH = 3.0       # at/below (or standstill): the deployed law runs unchanged (stop/hold)
+# Coast-first DWELL ESCAPE (closed-loop guard): an ask held at/below the deployed onset (-0.5) for this long opens anyway
+# (and then ramps softly). Coast-first must suppress transient small asks, never leave a SUSTAINED one unactuated while
+# a gap closes (the planner would only re-ask later and deeper). 100 frames = 1.0 s.
+FCA11_FEEL_DWELL_FRAMES = 100
+# cycle 1 (route 167 seg 9, 15:50:36-39 CDT): a SLOW-CRAWL dwell escape. At a crawl toward a closing lead the planner's
+# ask hovers at -0.50..-0.62; the 1.0 s dwell then never completes (74 frames at <= -0.5, one shallow lift to -0.46, 68
+# more) and the car crept 1.13 -> 1.49 m/s for 2.65 s with no brake until the driver stepped in. Below
+# FCA11_FEEL_DWELL_SLOW_MPS a SECOND consecutive counter - same qualifying frames (ok AND ask <= -0.5) AND speed below the
+# limit, hard-reset otherwise - opens after FCA11_FEEL_DWELL_SLOW_FRAMES (0.7 s). It is strict (every counted frame was
+# below the limit), so a car slowing through the limit can never open off frames it accumulated at speed; at/above it the
+# 1.0 s dwell runs unchanged. Open-loop replay of routes 167/168 (wsSTOP/feel-167-168/underbrake-fix): seg 9 opens at
+# 15:50:37.99 (1.35 s before the driver's brake); 2 other openings move, both at 1.39 m/s in one shared 167-s25 window;
+# no changed opening above 1.4 m/s; +1.52 s brake-on over both drives. A dwell of 70 at ALL speeds moves 38 openings, 36
+# of them above 2 m/s (up to 26 m/s) - the early-braking-at-speed complaint - and dropout-tolerant counters at 100 cannot
+# open before ~15:50:38.2 on this ask (the lift is a 53-frame shallow dip, not a dropout). Release/gain/min-on untouched.
+FCA11_FEEL_DWELL_SLOW_MPS = 2.0
+FCA11_FEEL_DWELL_SLOW_FRAMES = 70
+# DEEPENING bypass: while the ask is getting more negative faster than this (m/s^3, EMA over sent frames), the onset ramp
+# grows at the panda's full +RATE_STEP - a demand that is building quickly is not throttled by the comfort ramp.
+FCA11_FEEL_DEEPEN_SLOPE = -2.0
+FCA11_FEEL_HOLD_EXIT_KPH = 5.0       # leave the hold band only at/above this (hysteresis, as 0043 v2)
+
+# *** 0051: FEEL fix round (drive-feedback 15b-15f, 130 min on 0049; evidence: wsSTOP/feel-fix/REPORT.md) ***
+# (a) WOBBLE. 0049 lifted the wire-level dip-and-recover count 24 -> 109 (15b/c/e/f). Root cause, isolated by replay: the
+#     ANTICIPATION term. Its slope EMA (alpha 0.2/sent frame, ~0.1 s) tracks the planner's +-0.05 m/s^2 ask ripple, so the
+#     anticipated ask flickers by up to the 0.25 cap and the follow-down target flips 1-3 LSB frame to frame (anticipation
+#     off -> exactly 24 again, but every release is ~1.9 LSB later). Fix = the smallest pair that restores 24 without giving
+#     the lead back: (1) ANTICIPATION reads a slower slope EMA, alpha FCA11_FEEL_SLOPE_ALPHA_0051 (0.10, ~0.2 s: ripple
+#     averages out, a real easing still registers within the 0.28 s plant lag); the 0049 alpha-0.2 EMA is kept, unchanged,
+#     for the DEEPENING bypass (a fast-building demand is detected exactly as fast as before); (2) a RE-RISE DEADBAND: once
+#     the level has come DOWN from the episode peak, a GENTLE ask (above FCA11_FEEL_RATE_SOFT_ACCEL) must call for
+#     >= FCA11_FEEL_RERISE_LSB above the current level before it climbs again. Onsets (level == peak) and harder asks
+#     are untouched; the deadband only ever HOLDS a level, bounded by RERISE_LSB below the 0049 target (2 LSB ~ 0.13
+#     m/s^2 nominal), and releases are never delayed by it.
+FCA11_FEEL_SLOPE_ALPHA_0051 = 0.10
+FCA11_FEEL_RERISE_LSB = 2.0
+# (b) GENTLE GAIN. Delivered/ask on the 15x drives (ask lagged 0.28 s, >15 km/h, no pedals): 2.15x (-0.7,-0.5], 2.03x
+#     (-1.0,-0.7], 1.86x (-1.5,-1.0], 1.39x (-2.1,-1.5]. Steady per-level delivered (constant level >= 0.8 s, no higher level
+#     in the prior 1.5 s) fits brake-only = 0.57 + 8.06 * L/100 m/s^2 on L 6..20 (Oct-9 cal affine: 0.40 + 9.9 * L/100), i.e.
+#     a ~1.0 m/s^2 BITE at L 4-7: below ~1.0 m/s^2 no nonzero level can deliver the ask, so a FULL inverse is impossible
+#     there and the low-band per-level data is thin (L4 n=1, L5 n=4 clean samples). So the correction is PARTIAL and a single
+#     gain, not a per-level table: the feel target is scaled by FCA11_FEEL_GENTLE_GAIN = 0.70 = sqrt(1/2.03), i.e. HALF the
+#     measured over-delivery of the (-1.0,-0.7] band in log terms, for asks at/above FCA11_FEEL_GAIN_FADE_ACCEL, fading
+#     linearly to 1.0 at FCA11_ONSET_BYPASS_ACCEL (a HARD ask keeps the deployed level byte-for-byte). With the measured
+#     p25 per-level delivered, every corrected gentle level still delivers MORE than its ask (never under-brakes by the data).
+FCA11_FEEL_GENTLE_GAIN = 0.70
+FCA11_FEEL_GAIN_FADE_ACCEL = -0.8
+# (b2) LOW-SPEED RESTORE (independent-review must-fix 1). The stop/hold band (<= FCA11_FEEL_HOLD_BAND_KPH, or standstill)
+#     runs the DEPLOYED law, NOT the feel law (the band branch of _feel_level). With the gentle gain in force the level sits
+#     ~2-3 LSB lower just before the band, so band entry re-stepped it up to the deployed request: open-loop replay of the
+#     15x drives gives a +4 LSB step on 18 of the 25 scored stops, in the last ~0.6 s before standstill (0049: 0/25; the
+#     step is caused by (b) alone - with the gain at 1.0 it is 0/25 - and it is exactly the "last metre too firm / jerky"
+#     complaint this round exists to fix). So the gain is RESTORED to 1.0 as the car slows: at band entry the feel level IS
+#     the deployed request for the same ask and the band cannot step it. The strength benefit stays where it was measured
+#     (at speed: the delivered/ask table is computed on frames > 15 km/h).
+#     THRESHOLDS FROM THE DRIVES (provenance): at v <= 3 km/h the band's deployed request is what the car runs to standstill
+#     within ~0.2-0.4 s of band entry (the scored-stop decel is 0.8-1.1 m/s^2 at 3 km/h -> 0.83 m/s to standstill). The
+#     feel ramp grows at <= 0.19 LSB/sent = 9.6 LSB/s below the L8 knee, so restoring a 3 LSB gap needs ~0.3 s. Starting
+#     at 8 km/h leaves 0.5-0.9 s (2-3x the ramp time) at those decelerations and completing at 5 km/h puts the level at the
+#     deployed request ~0.2-0.4 s before the band takes over - no step, and no need to rush the ramp.
+#     NO LATCH, deliberately: the two thresholds are placed in the stop band's own two-threshold idiom (FULL 5.0 just
+#     under the band's EXIT 5.0, FADE 8.0 above its ENTER 3.0), but the fade itself is CONTINUOUS in v, so there is no
+#     state to chatter about - a latch over this curve is provably inert (the curve is already 1.0 at FADE_KPH, so a
+#     latched and an unlatched call return the same value above it), and latching the DEEP end instead would re-introduce
+#     a 3 LSB target step when the latch clears on a re-acceleration. Measured in the zone: <= 1 LSB of target ripple.
+FCA11_FEEL_GAIN_FADE_KPH = 8.0        # at/below: the gentle gain starts being restored (stop-band approach)
+FCA11_FEEL_GAIN_FULL_KPH = 5.0        # at/below: the gain IS 1.0 -> the band entry level is the deployed request (0049)
+# (c) LEAD-LOSS HOLD. 15c seg 45 (47 km/h): radarState.leadOne dropped out for 0.53 s mid-brake, the planner's ask eased
+#     -0.93 -> -0.49 on the same frame, anticipation + follow-down took the level 13 -> 4, the lead came back and the level
+#     rebuilt to 19 (release-and-reapply). A track flicker is not evidence the need ended (34 in-brake drop-outs on 15b-f,
+#     median 0.62 s), and the planner's ask stays eased for ~1 s after the track returns. On a lead present -> absent EDGE
+#     inside an open episode (feel path, moving), the last SENT level becomes a FLOOR: held while the lead stays absent (at
+#     most FCA11_FEEL_LEAD_LOSS_MAX_ABSENT_S) and for FCA11_FEEL_LEAD_LOSS_HOLD_S after that, then tapered linearly to 0 over
+#     FCA11_FEEL_LEAD_LOSS_TAPER_S (no step at the end). A harder ask still climbs normally. BOUNDS: the floor is <= the level
+#     already on the wire AND <= the PRE-0049 deployed law's request for the current ask (so the hold never commands more
+#     than the law the car ran before 0049 would for that ask); every `ok` veto (driver brake/gas, gear, camera, pedal,
+#     stale) and the episode exit rule (-0.30 + min-on) are UNCHANGED; anticipation is suspended while it is active.
+FCA11_FEEL_LEAD_LOSS_MAX_ABSENT_S = 1.0   # the hold follows a drop-out up to this long (median in-brake drop-out 0.62 s)
+FCA11_FEEL_LEAD_LOSS_HOLD_S = 0.6    # then holds this long (the planner re-acquiring the lead)
+FCA11_FEEL_LEAD_LOSS_TAPER_S = 1.0   # then the floor ramps to 0 (~1 LSB per 0.1 s at L 10: a taper, not a release)
+# Kill switch for (a)+(b)+(c): False restores the 0049/0050 feel layer byte-for-byte (read once per instance).
+FCA11_FEEL_FIX_0051 = True
+
+# *** 17c: STANDSTILL HOLD above the personality tier cap (route 17c, owner note "need higher hold to prevent creep") ***
+# WHAT THE CAR DID (route 17c, standard tier, wsSTOP/drive-17c/REPORT.md Note 1): every FCA11-held stop ran the FEEL hold
+# band below, where LongControl's stopping ramp drives the ask to -2.0 (FCA11_A_MAX_MSS2), the deployed request maps that to
+# dec_cmd_from_accel(-2.0) = 30 and the TIER CLAMP cuts it to the personality cap - 20 LSB for standard - held CONSTANT for
+# 18-26 s. The DCT car crept anyway: stop 2 (mono 16662.8-16665.0) went 0 -> 0.165 m/s at 20 LSB (net +0.14 m/s^2, one +0.46
+# sample), CarState.standstill dropping False for ~0.8 s, while CYL_PRES read 0.0 (the injection is downstream of the
+# master-cylinder sensor). FCA11_HOLD_LOST_KPH (2 km/h) is far above that creep, so brakeNow never fired.
+# THE CHANGE: once the car has been at TRUE standstill (CarState.standstill: WHL_SPD_FL and WHL_SPD_RR <= 0.375 km/h —
+# two wheels on this CAN platform, not every wheel; carstate.py:117) inside the hold band
+# of an open episode, the band's CEILING becomes max(tier cap, FCA11_STANDSTILL_HOLD_LSB) instead of the tier cap. Nothing
+# else in the band changes: the request map, the 8 LSB band floor and the +RATE_STEP-over-the-last-SENT-frame limiter are the
+# same lines, so the extra LSB arrive by the planner's own stopping ramp (ask -0.85 -> -2.0 over ~1.1 s after standstill on
+# all 17c stops -> 13 -> 30 at ~15 LSB/s, the last 10 LSB of it after the car is already stationary) and never faster than
+# +RATE_STEP per sent frame. It is a ceiling, not a floor: a weaker ask at standstill commands exactly what it commanded.
+# WHY A LATCH (set on standstill, cleared only by the band's unchanged EXIT >= FCA11_FEEL_HOLD_EXIT_KPH, an episode (re)open,
+# longActive off or a disable): a per-frame standstill gate would drop 30 -> 20 exactly while the car creeps (the 17c
+# specimen flipped standstill False for 0.8 s mid-creep), i.e. it would weaken the hold at the one moment it is needed. A
+# whole-band gate (<= 3 km/h) would add up to ~1 m/s^2 while still ROLLING into the stop - the final-metre grab the owner's
+# "smoothness first" directive forbids. The episode-open clear means a re-brake while rolling in the band after a launch
+# starts at the tier cap again (the latch never carries from one stop into a moving episode).
+# THE NUMBER (30) and its arithmetic — RESTATED AT INTEGRATION (laneB-REVIEW #2): the hold REQUEST is x1.5 (20 -> 30 LSB)
+# IF the ESC maps DecCmd -> pressure linearly at standstill. That map is UNVERIFIED: no LSB -> bar / hold-force calibration
+# exists for this car. The only numbers on disk are MOVING-plant fits and they disagree: (a) the shape K (9.6 m/s^2 per
+# 100 LSB, BITE 0.74) extrapolated to v = 0 gives +10 LSB ~ +0.96 m/s^2; (b) FORK row 91's sustained moving holds measure
+# 20 LSB -> 2.28 and 30 LSB -> 3.64 m/s^2, i.e. +1.36. Neither is a standstill number: at v = 0 decel is not the quantity
+# being commanded, hold FORCE is, and the creep (0.14 m/s^2 net, 0.46 peak) is a force-balance problem, not a decel one.
+# 30 == HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate, CR_VSM_DecCmd > 30 refused) == the aggressive tier
+# cap == the highest level ever exercised on this car (0.30 g rolling scaling pulses, 2.03 m/s^2 delivered). It is NOT yet
+# proven at standstill: no production episode on disk exceeded 20 (891 episodes, 7 pulls), and the LSB -> bar / hold-force
+# calibration the drive report asks for has NOT been done; the moving-plant K is an extrapolation at v = 0. Revisit this one
+# constant when that calibration exists. VALID RANGE [PERSONALITY_MAX_DEC[STANDARD] (20), HYUNDAI_FCA11_LONG_MAX_DEC (30)]:
+# below 20 it is a no-op for standard (the tier the owner drives), above 30 the panda refuses the frame (pinned by tests,
+# and clamped again at use by fca11_standstill_hold_lsb()).
+# PERSONALITY POLICY: ONE level for every tier (relaxed 12 -> 30, standard 20 -> 30, aggressive 30 unchanged). A standstill
+# hold is stop-KEEPING, not a feel dial: the car is stationary, so the level is not felt as decel, and a tier that holds less
+# creeps more (relaxed's 12 is the weakest hold of all). Same ruling as the pedal hold feedforward (G3, FORK.md #47).
+# Exit hysteresis, FCA11_HOLD_LOST_KPH, the alerts and the moving law are untouched. False restores the deployed band
+# byte-for-byte (read once per instance).
+FCA11_STANDSTILL_HOLD_ENABLED = True
+FCA11_STANDSTILL_HOLD_LSB = 30
+
+
+def fca11_standstill_hold_lsb() -> int:
+  """17c: the standstill hold ceiling (raw CR_VSM_DecCmd), clamped to the panda gate so no edit can make it unsendable."""
+  # the deployed hold lives inside the LAW ceiling (30), not the wire gate: raising the gate must never make a parked
+  # car hold harder than the tuned 30 LSB (0.30 g).
+  return int(min(FCA11_MEAS_CEIL_LSB, FCA11_STANDSTILL_HOLD_LSB))
+
+
+# *** 18x: ROLLING-RELEASE HOLD — the "creep" the owner still feels, and the ONE threshold that owns it ***
+# THE MEASUREMENT (routes 181/182, BRAKE-REVIEW-opus.md §1): 18 releases happened while the car was STILL ROLLING at
+# 0.4-3.8 m/s, every single one at the deployed exit threshold (ask > FCA11_BRAKE_RELEASE_ACCEL = -0.30), each with a lead
+# 4-16 m ahead. In 17 of the 18 the car did not stop within 3 s and re-accelerated by +0.20 to +0.46 m/s^2 on the
+# re-enabled pedal (23-30 % of floor releases re-open within 6 s). This is NOT the standstill hold: at 30 LSB the car
+# moved 0-1.6 cm over 12 holds. The law was letting go at the exact moment the planner was easing its ask while a lead
+# was still ahead, and the driver felt the car creep toward it.
+# THE RULE: below FCA11_ROLLING_RELEASE_V_MAX with a lead INSIDE FCA11_ROLLING_RELEASE_LEAD_M, an OPEN episode is held
+# until the ask rises above FCA11_ROLLING_RELEASE_ACCEL (-0.10) instead of -0.30. It is the release threshold and nothing
+# else: the onset rule (-0.5 / the feel open -0.60), the min-on, the speed floor, the level law and every safety veto are
+# untouched, and every `ok == False` (driver brake/gas, gear, pedal fault, stale/no camera, camera braking, divergence,
+# blocked_until_resume) still releases on the SAME frame because `ok` is still ANDed into `holding`. The lead test uses
+# CS.fca11_lead_drel_m (carcontroller.py writes it every controller frame from CC_SP.leadOne; None = no lead) and falls
+# back to the presence of CS.fca11_lead_one, which is written on the same line of the same frame - a missing DISTANCE
+# with a lead present therefore keeps the brake (the conservative direction for this rule).
+# WHY 4 m/s: the planner's own release in a stop approach happens in the last 3.8 m/s of the approach (all 18 measured
+# releases sit below it); above that the deployed threshold is the right one and is untouched.
+# WHY 20 m: every one of the 18 releases had the lead at 4-16 m. Beyond 20 m the lead is not the reason the ask is easing,
+# so the deployed -0.30 stands.
+FCA11_ROLLING_RELEASE_V_MAX = 4.0          # m/s: below this the rolling-release rule is armed
+FCA11_ROLLING_RELEASE_LEAD_M = 20.0        # m: ... while a lead is at or inside this distance
+FCA11_ROLLING_RELEASE_ACCEL = -0.10       # m/s^2: the exit threshold in that regime (deployed: -0.30)
+
+# *** 18x (b): THE CRAWL BAND — the other half of the owner's "creep", and it is NOT about the lead ***
+# THE OWNER'S WORDS (route 182, measured after the first brief): "when I've just barely got the brake pressed and the engine is
+# able to slightly overpower the brakes and it creaks and groans and moves just the tiniest amount forward".
+# THE MEASUREMENT (route 182, TCU_DCT13 0x162 Clutch_Driving_Tq, 1147 frames at 0.05 < v < 1.6 m/s with the law active,
+# foot off the pedals):
+#   our LSB = 0     537 frames (47 %)  clutch torque +26.0 Nm, rpm 935, v ~1.00 m/s   <- the engine's creep torque is live
+#   our LSB = 6-7   161 frames         clutch torque -20.0 Nm, v 1.38 m/s            <- the clutch is OPEN, creep torque gone
+#   (that bin hides the per-level boundary - the owner's decision is therefore 7, not 6, see FCA11_CRAWL_MIN_LSB)
+#   our LSB = 8-10  319 frames         clutch torque -20.0 Nm, v 0.57 m/s
+#   our LSB = 11-20 129 frames         clutch torque -20.0 Nm, v 0.07 m/s
+#   the driver's own light brake at crawl (6078 frames): +13.0 Nm, v 0.64 m/s
+# WHAT IS PROVABLE: the driveline delivers creep torque (+13..+26 Nm) whenever the commanded level is below the level that
+# closes the clutch, and at >= 6 LSB the clutch torque reads -20 Nm (creep torque gone). The hydraulic pressure behind
+# that is NOT observable (CYL_PRES reads 0.0 bar through every held frame), so nothing here claims what the calipers do.
+# THE RULE, three parts, all in the 0 < v < FCA11_CRAWL_V_MAX band:
+#   (0) THE ONSET RULE IS UNTOUCHED: a shallow crawl ask (-0.2 .. -0.6) still does NOT open an episode. Opening one
+#       would command >= 6 LSB (~1 m/s^2) and stop a car that the planner is only coasting, which is the opposite of
+#       "smoothness first". The crawl rule below is about the RELEASE and the LEVEL of an episode that is already open -
+#       i.e. exactly the "brake is on but too light" state the owner described.
+#   (1) A STOP IN PROGRESS IS NEVER RELEASED: while an episode is open below the crawl speed, the exit threshold is
+#       FCA11_CRAWL_RELEASE_ACCEL (-0.10, the same one the rolling rule uses) - the law does not go to the 0 LSB state
+#       while the planner is still asking for a decel and the car is still rolling.
+#   (2) NO HALF-APPLIED LEVEL: an open episode at crawl commands at least FCA11_CRAWL_MIN_LSB (7 LSB - the first level at
+#       which the measured clutch is unambiguously open). The 4 LSB floor of the deployed law sits exactly in the
+#       half-applied band, which is why it never closed the clutch. 1-6 LSB is never commanded at crawl.
+#   (3) A GENUINE ROLL-FREE STAYS FREE: if the ask rises above -0.10 (the planner genuinely wants to move), the episode is
+#       released at 0 and a FCA11_CRAWL_RELEASE_HOLDOFF_S window keeps it released, so the law cannot chatter back into a
+#       7 LSB re-application two frames later. A HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) ignores the hold-off, so a real
+#       stop is never delayed.
+# SAFETY: every `ok` veto still releases on the same frame; the hold-off only gates the ONSET (it can never keep or
+# extend a brake, only decline to start one); the floor only ever RAISES the command inside an episode that is already
+# open. The standstill hold band (<= 3 km/h) is untouched: its floor is already 8 and its 30 LSB ceiling/timing do not
+# change (see the 17c block above).
+FCA11_CRAWL_V_MAX = 2.0                   # m/s: the measured crawl band
+FCA11_CRAWL_RELEASE_ACCEL = -0.10         # m/s^2: an open episode is not released at crawl below this ask
+# WHY 7, NOT 6 (owner decision, 2026-10-29): the route-182 per-LEVEL medians put 6 LSB at Clutch_Driving_Tq = 0.0 Nm - i.e.
+# exactly ON the open/closed boundary, the transition sample - and 5 LSB at -9.0 Nm against a released-state +12..13 Nm;
+# 7 LSB reads -20.0 Nm, the same as every level above it, i.e. the clutch is unambiguously open and the creep torque is
+# gone. 6 is the boundary, not yet open; one more LSB costs ~+0.1 m/s^2 of commanded brake at crawl.
+FCA11_CRAWL_MIN_LSB = 7                   # LSB: first level with an unambiguously OPEN clutch (-20 Nm, creep torque gone)
+
+# *** 0034 STOP-HOLD CLUTCH PAIR: RETIRED 2026-11-10 (patch 0044) ***
+# The lane is gone, not switched off. It existed for ONE purpose - to ask the ESC for its own hold (CF_VSM_HBACmd = 1
+# + FCA_StopReq = 1) so the DCT would open its clutch - and that purpose is measured dead: the TCU releases the clutch
+# on the DRIVER's brake (CYL_PRES 1.3-24 bar / 0x329 BRAKE_ACT), while our ESC braking leaves 0.0 bar at the
+# master-cylinder sensor. 6/6 owner stops open it (Clutch_Driving_Tq 0x162 -20 Nm); 14/14 openpilot-held stops keep it
+# closed (+18..26 Nm). On the wire it could only ever be a 2-3 frame burst (the panda's window closes on the first
+# dropped FCA_ACK, and the ESC drops it ~20 ms after the first pair frame in 13/13 bursts), and the hold it was meant
+# to buy is not needed: the FCA11 decel hold alone holds the car at 30 LSB for 103.1 s (measured, FORK row 142).
+# FORK.md row 143 carries the reasoning and the evidence; do not re-open this without a new measurement that the TCU
+# reads 0x38D at all (it does not: 0x421/0x081/0x490 never appear in 2,690 segments).
+# The PANDA side (safety/modes/hyundai.h HYUNDAI_FCA11_LONG_STOP_HOLD_* window) is deliberately untouched: with no
+# host frame carrying the pair it is unreachable, and removing it would cost a firmware rebuild for no wire change.
+
+# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
+# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
+# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
+# OBSERVER of the sent level that writes one counter and one published state, never the level, the cap, the rate
+# gate, the ramp or any other law state - so the wire bytes are unchanged by construction (proved in the tests).
+# The clutch cannot be opened without the owner's foot, so a standstill hold is openpilot holding the car with ESC
+# pressure + a live clutch torque. That is safe but it is NOT a parking brake: at 2 min the hold is handed back.
+# MEASURED (parent, drives 195-197): the longest real hold is 97.88 s - nothing here fires on the recorded data.
+# FOUR TIERS, in SENT frames (20 ms each: controller 100 Hz / FCA11_SEND_EVERY == 2), NOT wall clock:
+#   1 soft     3000 frames =  60 s  "Stopped - press the brake" banner, LOW, silent;
+#   2 loud     4500 frames =  90 s  HIGH + AudibleAlert.warningSoft, and CONTINUOUS: the alert is asserted every
+#                                   frame, and soundd loops warningSoft for as long as an alert is asserted
+#                                   (sound_list[warningSoft] has num_loops None), so the old 30 s repeat / 3 s
+#                                   pulse logic is GONE - there is nothing left to re-chime;
+#   3 final    5500 frames = 110 s  HIGHEST + AudibleAlert.warningImmediate ("the brakes are about to release");
+#   4 expired  6000 frames = 120 s  STICKY. at 2:00 LONGITUDINAL control disengages and the brakes release; LATERAL
+#                                   (MADS) stays engaged by design (owner decision, Opus review D1 - the MADS state
+#                                   machine never sees the disengage: mads.py l.205 strips `pcmDisable` inside
+#                                   update_events, before its own state machine runs). The DEPLOYED driver-disengage
+#                                   release takes the brakes off: this car sends NOTHING on 0x38D after the disengage
+#                                   and the panda hands 0x38D back to the camera's idle frame at +90 ms (compiled
+#                                   libsafety, lane-X3/proof_release_compiled.py). There is NO host release ramp here
+#                                   (`dynamic_brakes` is False on the shaped instance). A DRIVER-BRAKE release is the
+#                                   one path that emits a host passive frame: exactly one, at level 0.
+# The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition).
+# THE LAW IS NOT TOUCHED BY ANY OF IT. The disengage is raised in the superproject from CarStateSP.holdNag == 4, and
+# the law releases because `longActive` goes False, exactly as on any driver disengage. This block only counts.
+# COUNTING UNIT: SENT frames, not wall clock - the sent stream is exactly what the ESC is holding on, it is
+# reproducible frame-for-frame in a replay (this class's other timers use time.monotonic(), which no replay can age),
+# and a frame that was never sent cannot age the hold.
+FCA11_HOLD_NAG_SENT_HZ = 50.0        # SENT frames per second (controller 100 Hz, one sent frame per FCA11_SEND_EVERY)
+FCA11_HOLD_NAG_MIN_LSB = 20          # LSB: the hold level that arms the countdown (~0.20 g of held pressure)
+# CD3 (owner, 2026-11-06): the countdown starts at a DEAD STOP - no motion at all - not at "the two wheels openpilot
+# reads say stopped". CS.out.standstill is FL and RR only (opendbc/car/hyundai/carstate.py:117), so a car dragging a
+# front-right or rear-left wheel counted as stopped. The strict gate is the FASTEST of all four wheels
+# (`CS.fca11_wheel_max_kph`, carstate.py:127), against the same 12 * 0.03125 km/h threshold carstate.py:24 uses.
+# MEASURED on the recorded drives (lane-X3/census_strict_gate.py): standstill -> all four at rest lags by at most
+# 0.175 s (197, median 0.017) and 0.087 s (198), and 43 frames INSIDE the 13 openpilot holds on 197 had standstill True
+# with the fastest wheel above the threshold (the same count over the whole drive, probe_tcs13_agreement.py, is 55 -
+# two different windows, both real; the hold-window figure is the one that matters here). The strict gate changes no
+# hold length (197 longest 97.88 s either way). TCS13 StandStill is
+# DELIBERATELY NOT part of the gate: it agrees within 0.026 s (so it adds no information) and it is False on 134 frames
+# INSIDE openpilot holds on 198-19c, which would have reset a running countdown to zero mid-hold.
+FCA11_HOLD_NAG_STILL_KPH = 12 * 0.03125   # == carstate.py:24 STANDSTILL_THRESHOLD (pinned equal by test)
+# Thresholds are FRAMES (integers) on purpose: 60 s * 50 Hz is exactly 3000, and an integer comparison cannot be
+# off by one float rounding at the boundary. Edges are pinned by test: 2999/3000, 4499/4500, 5499/5500, 5999/6000.
+FCA11_HOLD_NAG_SOFT_FRAMES = 3000    # 60.0 s: the silent banner
+FCA11_HOLD_NAG_LOUD_FRAMES = 4500    # 90.0 s: audible and continuous
+FCA11_HOLD_NAG_FINAL_FRAMES = 5500   # 110.0 s: warningImmediate
+FCA11_HOLD_NAG_EXPIRE_FRAMES = 6000  # 120.0 s: latch + LONGITUDINAL disengage + brake release (lateral stays)
+
+# The five published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud/Final and
+# fca11HoldExpired). 4 is a LATCH, not a tier: it is not derived from the counter (the counter resets on the frame
+# openpilot disengages) and it clears on the driver's brake press OR on a car DRIVEN AWAY ON THE GAS (below).
+FCA11_HOLD_NAG_NONE = 0
+FCA11_HOLD_NAG_SOFT = 1
+FCA11_HOLD_NAG_LOUD = 2
+FCA11_HOLD_NAG_FINAL = 3
+FCA11_HOLD_NAG_EXPIRED = 4
+
+# CD6: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off ON THE GAS. The red alert
+# asks for the brake pedal, and the brake is still the only thing that clears a LATCHED, STOPPED car; but a driver who
+# instead accelerates must not carry a PERMANENT full-screen red alert (and the engage strip that goes with it) for
+# the rest of the drive. The clear is `gasPressed AND vEgo > this value`, never speed alone: a latched car with nobody
+# in it can ROLL to 3 m/s in about 6 s (down a grade, or BACKWARD - the wheel speeds are unsigned, so a backward roll
+# reads exactly like a forward one), and one bad wheel-speed frame reaches it at a standstill too, so speed is not
+# evidence that a driver is there. 3.0 m/s = 10.8 km/h: creep on this car is estimated at <= 1.5 m/s, so creep with no
+# gas pedal can never clear it. Strict `>` and a FINITE value only (fail closed: a missing or NaN vEgo, or a missing
+# gasPressed, is not evidence that the driver has taken over).
+FCA11_HOLD_NAG_CLEAR_V_MS = 3.0
+
+
+def hold_nag_level(frames: int) -> int:
+  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
+
+  0 below FCA11_HOLD_NAG_SOFT_FRAMES, 1 from there, 2 from FCA11_HOLD_NAG_LOUD_FRAMES, 3 from
+  FCA11_HOLD_NAG_FINAL_FRAMES. It stops at 3: EXPIRED is not a tier of this function but a sticky flag in
+  `_hold_nag_step` (it has to survive the counter reset). Pure: no state, so the escalation is testable on its own
+  and cannot drift from the counter.
+  """
+  n = max(0, int(frames))
+  if n < FCA11_HOLD_NAG_SOFT_FRAMES:
+    return FCA11_HOLD_NAG_NONE
+  if n < FCA11_HOLD_NAG_LOUD_FRAMES:
+    return FCA11_HOLD_NAG_SOFT
+  return FCA11_HOLD_NAG_LOUD if n < FCA11_HOLD_NAG_FINAL_FRAMES else FCA11_HOLD_NAG_FINAL
+
+
+
+# *** 2026-11-03 (route 191, owner: "braking feels binary; if the initial force isn't enough nothing more happens") ***
+# THE MEASUREMENT that explains it: over 1,568 engaged plan frames on route 191 the planner's own aTarget went below
+# -2.0 m/s^2 on EIGHT frames, below -2.4 on ONE, and never below -3.0 - while the driver's pedal hit -2.4..-3.2 in the
+# same drive. openpilot's MPC plans a comfortable decel and does not escalate, so raising the LAW's ceiling (0022/0023)
+# changes nothing: the ask never arrives. Route 190/191's two near-misses are that gap.
+# THE FIX: the law computes its OWN closing demand from the lead it already receives every controller frame
+# (CS.fca11_lead_drel_m / fca11_lead_vrel_mps) and takes the harder of that and the planner's ask. Physics, not tuning:
+# to stop short of a lead at distance d with closing speed c you need c^2 / (2 * (d - gap)). It only ever ADDS braking,
+# only when the car is genuinely closing (c >= 1.0 m/s), only with a lead inside 40 m, and it is capped by the wire gate.
+FCA11_AEB_MIN_CLOSING_MPS = 1.0      # m/s: below this the car is following, not closing - never add braking
+FCA11_AEB_GAP_M = 4.0                # m: the standstill gap it defends (lead distance minus this is the room it has)
+FCA11_AEB_MAX_MSS2 = 3.4             # m/s^2: the DEPLOYED 30 LSB ceiling - the demand may never enter the 31-46 region
+# (Fable review: a bridge or a parked car at 36 m reads as a 3.5 m/s^2 demand, and with the raised gate that would be a
+# 0.35 g phantom brake at highway speed. The urgent authority stays reserved for the planner's own ask.)
+FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
+
+# *** 0035: FCA11_TRACK_* — the SHAPED law keeps TRACKING the need inside an episode (routes 193/194, owner complaint #1) ***
+# OWNER (2026-11-04): "braking does whatever the first request was and never adjusts - gap still closing -> no more brake,
+# easing -> no less". THE MECHANISM, verified on the car's own carParamsSP (fca11AffineGain AND fca11DynamicBrakes True on
+# 18e/190/191/193/194): `feel = enabled and not affine_gain` is False, so `dynamic_brakes` is False too and the car ran the
+# 0043 SHAPED law (_shape_level) - every 18x / 11-03 change on the feel path (the measured plant inverse, its backlash,
+# _closing_demand, the urgent 46 LSB lane, the 1 LSB onset) never ran on the car (wire census: every episode opens at 4,
+# zero 1-3 LSB frames). On the shaped path the level is an OPEN-LOOP map of the planner ask on the OLD analytic anchors
+# (8 LSB == 1.50 m/s^2; the car delivers ~1.2 there), it never sees the lead, and the planner's ask EASES as the gap
+# collapses (193 #4: ask -1.76 -> -1.36 while the gap fell 10 -> 3.4 m), so the level FELL 11 -> 8 into the stop. Nothing
+# ever compares what was delivered with what was wanted.
+# THE LAYER (shaped path, moving, outside the 3 km/h hold band; DynamicBrakes ON only - OFF / feel path byte-identical):
+#   need     = max(-planner ask, closing-lead demand)   (the existing _closing_demand physics, now live on this path)
+#   feed-fwd = the MEASURED plant inverse FCA11_TRACK_PLANT_* (monotone linear interpolation, fractional LSB)
+#   trim     = integral of (need 0.3 s ago - delivered -aEgo), KI LSB per (m/s^2 * s), from 0.5 s into the episode,
+#              clamped [-TRIM_DOWN, +TRIM_UP], frozen against the ceiling/floor it is pushing into (anti-windup)
+#   level    = clip(ff + trim, 4, ceiling), slewed at FCA11_TRACK_JERK through the local MEASURED plant slope, both up AND
+#              down (down at 2x), never above +RATE_STEP over the last sent frame (panda contract)
+#   ceiling  = the personality tier cap; FCA11_TRACK_CEIL_MAX_LSB (30, the deployed law ceiling - never the 31-46 wire
+#              region, which is behind a DEFAULT-OFF constant) only while the need exceeds what the tier cap measurably
+#              delivers + FCA11_TRACK_URGENT_MARGIN, LATCHED (it leaves again below FCA11_TRACK_CEIL_EXIT_FRAC of that)
+#              and only for the standard tier and up. It is a bound on the TARGET, never a post-slew cut.
+# LIGHT ASKS at speed (>= FCA11_TRACK_LIGHT_V_MIN): the weakest level (4 LSB) delivers ~1.0 m/s^2, so an ask softer than
+# FCA11_TRACK_LIGHT_OPEN does not OPEN an episode (left to the pedal's coast/throttle-lift), and an open one releases below
+# FCA11_TRACK_LIGHT_RELEASE after min-on. Below that speed (every stop) the deployed open/release rules are untouched (the
+# measured-and-rejected release-below-the-floor variant was a LOW-SPEED stop failure).
+FCA11_TRACK_ENABLED = True               # code-level kill switch (False = the shaped law byte-for-byte)
+# Measured plant (delivered m/s^2 at a sustained level, coast ~0 at 10-35 m/s): 190/191 rlog plateaus 4/8/13/20 ->
+# 1.14/1.27/1.49/1.57 pooled with the 193/194 per-episode `plateaus` (v >= 4 m/s): 4 -> 0.98 (n 23), 5 -> 1.09 (12),
+# 6 -> 1.14 (12), 7 -> 1.22 (8), 8 -> 1.12 (6), 11 -> 1.59 (1), 16 -> 1.61 (1). Above 20 nothing is measured on this
+# car's current plant: the last point (30) is the analytic slope K = 9.9 m/s^2/g from 20 (EXTRAPOLATED - the feedback trim
+# owns the error there).
+FCA11_TRACK_PLANT_LSB = (4, 6, 8, 13, 20, 30)
+FCA11_TRACK_PLANT_MSS2 = (1.00, 1.14, 1.20, 1.49, 1.57, 2.56)
+FCA11_TRACK_JERK = 2.0                   # m/s^3 slew through the measured slope (comfort ~2.5; was 0.75 analytic)
+FCA11_TRACK_MIN_SLOPE = 0.02             # m/s^2 per LSB floor on the slope the slew divides by
+FCA11_TRACK_KI = 8.0                     # LSB per (m/s^2 * s): 0.5 m/s^2 of shortfall adds 4 LSB per second
+FCA11_TRACK_TRIM_UP = 12.0               # LSB
+FCA11_TRACK_TRIM_DOWN = 6.0              # LSB
+FCA11_TRACK_FB_DELAY_SENT = 25           # sent frames (0.5 s) before the trim integrates (onset transient + ESC lag)
+FCA11_TRACK_LAG_SENT = 15                # sent frames (0.3 s): the need is compared with the decel it produces this late
+FCA11_TRACK_URGENT_MARGIN = 0.10         # m/s^2 beyond what the tier cap delivers before the 30 LSB ceiling opens
+FCA11_TRACK_CEIL_EXIT_FRAC = 0.85        # hysteresis on that switch: leave the raised ceiling only below 0.85x what the
+                                         # tier cap delivers (1.33 m/s^2 for the standard cap; the old rule was a 0.1 band,
+                                         # so a need hovering at the switch recut the level 27 -> 20 every second)
+FCA11_TRACK_CEIL_MAX_LSB = 30            # THE MOST THIS PATH MAY COMMAND (0.30 g): the deployed law ceiling. The 31-46 wire
+                                         # region was never measured on this plant, so it is not reachable here.
+FCA11_TRACK_URGENT46_ENABLED = False     # DEFAULT OFF: the owner's 0.5 g (41-46 LSB) lane on this path. A rebuild-time
+                                         # opt-in (a code constant, not a params key: no libparams rebuild, no new key).
+FCA11_TRACK_BAND_DESCENT_FRAMES = 5      # F4: sent frames the hold band takes to walk an inherited (up to 30 LSB) tracked
+                                         # level down to its own target instead of a one-frame 30 -> 20 lurch at the seam
+FCA11_TRACK_DOWN_STEP_LSB = 3.0          # F2: the most the DOWN slew may take in one sent frame. The panda has no rule for
+                                         # decreases; 2x the jerk rate through the measured slope is 0.4-1.4 LSB/frame except
+                                         # on the flat 13-20 segment, where FCA11_TRACK_MIN_SLOPE floors the slope at 0.02
+                                         # and it reached exactly 4 (a 0.05-0.14 m/s^2 physical step that still READS as a
+                                         # step in LSB). Capped so no sent frame moves by the panda's onset step on the way down.
+FCA11_TRACK_LIGHT_V_MIN = 10.0           # m/s
+FCA11_TRACK_LIGHT_OPEN = -0.80           # m/s^2: at speed a NEW episode needs this (4 LSB delivers ~1.0)
+FCA11_TRACK_LIGHT_RELEASE = -0.50        # m/s^2: at speed an open episode releases above this (after min-on)
+
+
+def fca11_track_plant_decel(lsb: float) -> float:
+  """Delivered decel (m/s^2) of a sustained level on the measured plant, linear between FCA11_TRACK_PLANT_* points."""
+  L, A = FCA11_TRACK_PLANT_LSB, FCA11_TRACK_PLANT_MSS2
+  if lsb <= L[0]:
+    return A[0]
+  for i in range(1, len(L)):
+    if lsb <= L[i]:
+      return A[i - 1] + (lsb - L[i - 1]) / (L[i] - L[i - 1]) * (A[i] - A[i - 1])
+  return A[-1]
+
+
+def fca11_track_lsb(need: float) -> float:
+  """The measured inverse: the (fractional) level that delivers ``need`` m/s^2; monotone, clamped to the table range."""
+  L, A = FCA11_TRACK_PLANT_LSB, FCA11_TRACK_PLANT_MSS2
+  if need <= A[0]:
+    return float(L[0])
+  for i in range(1, len(A)):
+    if need <= A[i]:
+      return L[i - 1] + (need - A[i - 1]) / (A[i] - A[i - 1]) * (L[i] - L[i - 1])
+  return float(L[-1])
+
+
+def fca11_track_slope(lsb: float) -> float:
+  """d(delivered)/d(LSB) of the measured plant at ``lsb`` (m/s^2 per LSB), floored at FCA11_TRACK_MIN_SLOPE."""
+  L, A = FCA11_TRACK_PLANT_LSB, FCA11_TRACK_PLANT_MSS2
+  i = 1
+  while i < len(L) - 1 and lsb >= L[i]:
+    i += 1
+  return max(FCA11_TRACK_MIN_SLOPE, (A[i] - A[i - 1]) / (L[i] - L[i - 1]))
+
+
+# *** 0037: FCA11_CONT_* — ONE continuous brake law, engine braking first (owner, 2026-11-05: "treat braking with the same
+# logic and respect that we do for accelerating; we don't gate accelerating to buckets"). DESIGN.md lane-E §3-§5 is the
+# spec. This layer REPLACES, on the shaped-tracking instance only, every discrete gate of the 0043/0035 brake: onset
+# debounce, hard-ask bypass, open/release/light-ask thresholds, min-on, onset hold at the floor, 4 LSB moving floor,
+# low-speed floor ramp, personality tier caps + the raised-ceiling latch, the separate release ramp and the hold-band law
+# swap. What is left is one demand -> level map, one jerk slew both ways, one ceiling (30 LSB), the physical feedback trim
+# and the physical standstill hold. FCA11_CONT_ENABLED is a code constant (not a params key), default TRUE on this path;
+# False is the pre-0037 law byte-for-byte (pinned by test_fca11_continuous.py's identity test). ***
+FCA11_CONT_ENABLED = True
+# Engine braking first: the coast (foot off, 0x700 ENABLE=0) decel curve, fitted on the disengaged bins of
+# lane-E/coast_fit.json (15 bins, weight ~ n, Huber 0.02) as a saturating exponential. Residuals per bin are in
+# DESIGN.md §3; mean |resid| 0.033 m/s^2, max 0.090 over the bins with n >= 1000 (a 0.30-wide bin of downhill cruising).
+FCA11_CONT_COAST_C = 0.365       # m/s^2 asymptote
+FCA11_CONT_COAST_TAU = 6.4       # m/s
+FCA11_CONT_BLEND_W = 0.04        # m/s^2: half-width of the C1 quadratic blend around need == coast(v) (<= 0.05)
+FCA11_CONT_COAST_REF = 0.3458    # m/s^2: mean coast over the 10-35 m/s range the plateau fit was decoded in - the shift
+                                 # that turns the NET measured table into the brake's OWN (incremental) contribution
+FCA11_CONT_JERK = 2.0            # m/s^3, the one jerk constant - identical to the gas law's PEDAL_JERK_UP
+FCA11_CONT_JERK_DOWN_MULT = 2.0  # a release must not lag the ask (the 0035 convention; a hydraulic release is not free)
+FCA11_CONT_DOWN_STEP_LSB = 3.0   # the most one sent frame may fall (the panda's onset step, never reached on the way down)
+FCA11_CONT_CEIL_LSB = FCA11_TRACK_CEIL_MAX_LSB   # 30: the one ceiling (panda gate 46 untouched)
+FCA11_CONT_HOLD_FLOOR_LSB = FCA11_CRAWL_MIN_LSB  # 7: creep floor in the stop band (an OPEN clutch - measured)
+FCA11_CONT_BAND_ENTER_KPH = FCA11_SHAPE_HOLD_BAND_KPH   # 3 km/h
+FCA11_CONT_BAND_EXIT_KPH = FCA11_SHAPE_HOLD_EXIT_KPH    # 5 km/h: the blend's other end (both ends are blends now)
+# The brake's OWN plant, incremental (decel ABOVE the coast), 0 LSB .. 30 LSB. Same measured anchors as
+# FCA11_TRACK_PLANT_* shifted by FCA11_CONT_COAST_REF; 1-3 LSB are the linear extension through the ESC's 4 LSB cliff
+# (their delivered decel is UNMEASURED on this plant - the law sends them and logs them, nothing else assumes them).
+FCA11_CONT_PLANT_LSB = (0, 4, 6, 8, 13, 20, 30)
+FCA11_CONT_PLANT_MSS2 = (0.0, 0.654, 0.794, 0.854, 1.144, 1.224, 2.214)
+
+# *** 0040 (lane L, brake slice 1a): THE WIRE QUANTISER HAS HYSTERESIS; THE aEgo TRIM STAYS ON ***
+# Fable's review of lane J's 0040 (branch fix/brake-commit @ f66a1070) said split it, because the two halves have
+# different risk. Replayed on the REAL class over the same 23 windows of drive 195/196 (lane-K/replay_k_flags.py,
+# 50 Hz sent frames): trim ON + no hysteresis (what ships) 2.13 reversals/s and 59 isolated zero frames; trim ON + the
+# 1.0 LSB band 0.47/s and 11; trim OFF only 0.95/s and 6; both 0.27/s and 1. The band therefore removes ~78% of the
+# reversals on its own, while removing the trim costs 4.2 m of minimum gap on a 6% downhill (lane-K/grade_k.py) and
+# buys only the remaining sliver. THIS SLICE SHIPS THE BAND AND NOT THE REMOVAL: `True` below is the 0037 feedback
+# trim (KI 8, +12/-6 LSB, 0.5 s delay, 0.3 s lag on `max(0, -aEgo - coast(v))`), byte-identical to what ships, and
+# with FCA11_CONT_QHYST_LSB = 0 the level sequence is EXACTLY the 0037/0038 law's on a recorded episode (pinned in
+# test_fca11_brake_commit.py). `False` remains the flag-off branch (the trim then contributes EXACTLY zero - it never
+# integrates and is never added), and is pinned there too; the trim-removal slice is a separate change set with its
+# own replay and its own grade disclosure.
+FCA11_CONT_TRIM_ENABLED = True
+# The wire quantiser's hysteresis, in LSB. CR_VSM_DecCmd is an INTEGER level and the ESC holds each value until the
+# next frame, so re-rounding a smooth fractional target every 20 ms turns ~0.3 LSB of demand motion into a level
+# reversal (half the measured flicker). The integer level now changes only when the fractional target is at least
+# FCA11_CONT_QHYST_LSB away from the level last SENT, and then it re-rounds. This is a property of the physical
+# quantiser (a Schmitt band one LSB wide, i.e. 0.5 LSB either side of the round boundary), NOT a bucket on the
+# demand: the demand, the slew and `_shape_acc` stay continuous, and the level still reaches round(target) after
+# every change (so the steady-state error at a step is <= 0.5 LSB). A monotone ramp produces a monotone level, and
+# command noise below 0.5 LSB produces no level change at all. 0.0 = plain rounding (the pre-0040 behaviour).
+FCA11_CONT_QHYST_LSB = 1.0
+
+
+def fca11_cont_coast(v_ego_mps: float) -> float:
+  """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
+  return FCA11_CONT_COAST_C * (1.0 - math.exp(-max(0.0, float(v_ego_mps)) / FCA11_CONT_COAST_TAU))
+
+
+def fca11_cont_brake_need(need: float, v_ego_mps: float) -> float:
+  """The demand the FRICTION brake must add: a C1 quadratic blend of max(0, need - coast(v)), width FCA11_CONT_BLEND_W.
+
+  Exactly 0 for need <= coast(v) (so "engine braking is enough" is a true zero, not 0.03 m/s^2 of residual that would
+  keep an episode open), C1 at the join (value AND slope are 0 there), monotone, and equal to need - coast(v) - w above
+  2w. Max deviation from the pure positive part is w/4 = 0.01 m/s^2 (0.06 LSB) at need - coast = w. The brief's
+  "softplus or a small quadratic blend, width <= 0.05" -> this is the quadratic one, because a softplus cannot be
+  exactly zero on the coast side (ln2 * w = 0.028 m/s^2 there), which would leave the gas never truly released and the
+  level at 0.17 LSB whenever the car was coasting.
+  """
+  x = float(need) - fca11_cont_coast(v_ego_mps)
+  w = FCA11_CONT_BLEND_W
+  if x <= 0.0:
+    return 0.0
+  if x < 2.0 * w:
+    return x * x / (4.0 * w)
+  return x - w
+
+
+def fca11_cont_lsb(brake_need: float) -> float:
+  """The fractional LSB that delivers ``brake_need`` m/s^2 ABOVE coast (monotone, clamped to [0, 30])."""
+  L, A = FCA11_CONT_PLANT_LSB, FCA11_CONT_PLANT_MSS2
+  if brake_need <= 0.0:
+    return 0.0
+  for i in range(1, len(A)):
+    if brake_need <= A[i]:
+      return L[i - 1] + (brake_need - A[i - 1]) / (A[i] - A[i - 1]) * (L[i] - L[i - 1])
+  return float(L[-1])
+
+
+def fca11_cont_slope(lsb: float) -> float:
+  """d(brake decel)/d(LSB) at ``lsb`` (m/s^2 per LSB), floored at FCA11_TRACK_MIN_SLOPE - the slew divides by this."""
+  L, A = FCA11_CONT_PLANT_LSB, FCA11_CONT_PLANT_MSS2
+  i = 1
+  while i < len(L) - 1 and lsb >= L[i]:
+    i += 1
+  return max(FCA11_TRACK_MIN_SLOPE, (A[i] - A[i - 1]) / (L[i] - L[i - 1]))
+
+
+def fca11_cont_qhyst(target: float, last_sent: int) -> int:
+  """0040: the WIRE quantiser - the integer level for a fractional ``target`` with a one-LSB hysteresis band.
+
+  The level is held at ``last_sent`` until the target is at least ``FCA11_CONT_QHYST_LSB`` away from it, then it
+  re-rounds to the nearest integer. ``FCA11_CONT_QHYST_LSB = 0`` reduces this to plain ``int(round())`` (pre-0040).
+  Hysteresis here, not on the demand: the caller keeps its continuous accumulator, so the level is still a
+  monotone function of a monotone ramp and a static target still lands on its nearest integer after one change.
+  """
+  band = float(FCA11_CONT_QHYST_LSB)
+  # 0040 v2 (review K2): ZERO-SNAP. Below half an LSB there is nothing for the pads to deliver, so the level is 0
+  # whatever the hysteresis reference says - a demand that has fallen into (0, 0.5) LSB must RELEASE, not hold the
+  # last level for a full band width. This is a property of the physical quantiser (the ESC's weakest actuating level
+  # is 4 LSB, FCA11_FEEL_FIRST_LSB), not a bucket on the demand, and it keeps `FCA11_CONT_QHYST_LSB = 0` exactly equal
+  # to plain rounding: int(round(t)) is already 0 for every t in [0, 0.5).
+  # Lane N: the caller floors the TRIMMED sum at 1 LSB whenever the UNTRIMMED target is >= 0.5 LSB (`_cont_level`), so
+  # this snap only ever fires when the DEMAND - not the feedback trim - has fallen below half an LSB.
+  if float(target) < 0.5:
+    return 0
+  if band <= 0.0 or abs(float(target) - float(last_sent)) >= band:
+    return int(round(float(target)))
+  return int(last_sent)
+
+
+def fca11_cont_gain(personality) -> float:
+  """Personality as a continuous GAIN on the demand - the gas law's exact table and position (PERSONALITY_SCALE_V)."""
+  try:
+    pid = int(getattr(personality, "raw", personality))
+  except (TypeError, ValueError):
+    pid = PERSONALITY_STANDARD
+  vals = (1.20, 1.00, 0.85)
+  return float(vals[pid]) if 0 <= pid < len(vals) else vals[PERSONALITY_STANDARD]
+
+
+def fca11_cont_band_weight(v_kph: float) -> float:
+  """The stop/hold band's blend weight: 1 at/below ENTER_KPH, 0 at/above EXIT_KPH, C1 smoothstep between.
+
+  This replaces the 3 km/h LATCH + law swap: the hold floor (and the standstill hold) fade in over 3->5 km/h, so a DCT
+  creeping across the 3 km/h edge cannot step the command between two different laws.
+  """
+  span = max(1e-3, FCA11_CONT_BAND_EXIT_KPH - FCA11_CONT_BAND_ENTER_KPH)
+  x = (FCA11_CONT_BAND_EXIT_KPH - float(v_kph)) / span
+  x = min(max(x, 0.0), 1.0)
+  return x * x * (3.0 - 2.0 * x)
+
+
+
+
+
+FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
+FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+
+# *** 18x: GAS HOLD-OFF FOR THE PANDA'S OWN BRAKE/THROTTLE WINDOW (BRAKE_THROTTLE_EXCL_US = 100 ms) ***
+# THE DEFECT (routes 181/182): 44/45 (181) and 49/55 (182) releases had a 90-130 ms GAP in the accepted 0x700 gas
+# stream. Mechanism: the panda refuses any non-zero GAS_COMMAND within 100 ms of the last ACTUATING 0x38D, while the car
+# layer resumed non-zero gas on the very next frame after ours went passive, so those frames were stripped. No pedal
+# fault ever resulted (fca11Unavailable = 0 frames on both routes) - it is a hand-over quality defect, and the owner feels
+# it as the launch/hand-over not being smooth ("smoothness first").
+# THE FIX: after the last actuating frame, hold the gas command at EXACTLY 0 for the same 100 ms, so no frame is refused
+# and the 0x700 counter never gaps. Implemented as `braking` (the attribute gas_interceptor.py reads) staying True for
+# the window while `_actuating` - the flag the whole law uses - drops on the release frame as it always did. THE 0x38D
+# STREAM IS NOT TOUCHED AT ALL: same actuating frames, same passive close frame, same frame numbers. Only the pedal is
+# muted for 100 ms instead of being stripped for 90-130 ms.
+FCA11_GAS_WINDOW_HOLD_S = 0.10             # == the panda's BRAKE_THROTTLE_EXCL_US
+FCA11_GAS_WINDOW_HOLD_FRAMES = 10          # controller frames at 100 Hz
+
+# *** 0038-excl (lane F): the WIRE-side window counter ***
+# Same window, but keyed on the level that is ACTUALLY ON THE WIRE instead of on the law's `_actuating` flag, and with
+# one frame of margin. Why both:
+#   * `_actuating` is a LAW flag. With a sub-bite level withheld from the wire (sub_bite_gate: 1-3 LSB never goes out
+#     while the frame commands throttle) the law is actuating but the panda's window was never armed - holding gas on
+#     that flag is exactly the 5.2 % -> 0 -> 5.2 % dip M1 removed. So the hold must follow the WIRE.
+#   * MARGIN: the panda refuses while `elapsed <= BRAKE_THROTTLE_EXCL_US` (100 ms exactly), and it arms the window when
+#     it judges OUR brake frame - which is the frame BEFORE this counter is decremented for the next 100 Hz frame. A
+#     10-frame hold therefore lands one gas frame exactly ON the 100 ms edge, and the harness shows that frame refused
+#     (lane-F/cp1_after.txt, first run). 11 frames = 110 ms is strictly conservative; the cost is 10 ms of throttle
+#     resumption, and it can never be felt because a refused frame resumes nothing.
+FCA11_WIRE_WINDOW_FRAMES = 11
+
+# *** 18x: DYNAMIC BRAKES (param HyundaiFca11DynamicBrakes -> CP_SP.fca11DynamicBrakes, DEFAULT OFF) ***
+# ONE switch for the owner's "brakes need to be dynamic, gradual increase and decrease", minus the calibration drive
+# (the owner's ruling: no scripted calibration drives, the car cannot be forced). ON does five things, all on the FEEL
+# path (the deployed request path), all OFF = byte-for-byte today:
+#   (a) GENTLE ONSET: every episode STARTS at FCA11_DYN_GENTLE_FIRST_LSB and climbs to the target at the rise limiter
+#       below (1 -> 4 in ~0.15 s at 4 LSB). A HARD EMERGENCY ask (<= FCA11_DYN_EMERGENCY_ACCEL) or a target that
+#       outruns the limiter by more than FCA11_DYN_RISE_MAX_GAP_LSB keeps the deployed first frame and the deployed rise.
+#   (a2) RISE LIMIT (18x v2, the owner's "increased braking force as well as decreased"): growth is jerk-limited at
+#       FCA11_DYN_RISE_JERK = 4.5 m/s^3 through the MEASURED map (dLSB = J * 0.02 / slope(LSB)), so the same knob
+#       produces a smooth ramp at every depth instead of a fixed LSB step; above 8 LSB that is ~0.9 LSB per sent frame,
+#       i.e. 0 -> 30 LSB in ~0.65 s. It never exceeds the panda's +RATE_STEP, and it is BYPASSED (panda max) for an
+#       emergency ask (<= -3.0 m/s^2) and for a step the planner is outrunning (target - prev > 12 LSB) - the two cases
+#       where a ramp would cost braking a real stop needs. The old DEEPEN_SLOPE bypass is NOT used on this path: at
+#       -2.0 m/s^3 an ordinary planner ramp would trip it and silently defeat the feature.
+#   (b) DECREASE LIMIT: a level decrease is at most FCA11_DYN_DECREASE_LSB_PER_SENT (0.3) per SENT frame ~ 1.5 m/s^3,
+#       instead of one-frame drops.
+#   (c) SOFT RELEASE RAMP: on a release (the ask eased, or min-on ended - never a safety veto, see _update_law) the level
+#       is ramped to 0 at the same rate (4 -> 0 in 0.27 s); a release from the standstill hold (>= 8 LSB) ramps at
+#       FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT so 30 -> 0 takes FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s, 1.2 LSB per
+#       sent frame). Gas is 0 for the whole ramp (the ramp frames are actuating frames) AND for the 100 ms window after.
+#   (d) LEVEL TRACE: one k="b" record per SENT actuating frame (level + measured aEgo + ask + vEgo) in the FCA11 shadow
+#       log file, so a normal stop on the next drive answers "do 1-3 LSB produce graded braking or nothing" from the
+#       ordinary drives: see _log_dyn_send and BRAKE-BUILD-REPORT.md §"what the next drive must show".
+# WHAT RIDES IT: nothing in this module can be turned on by an env var; the flag is read ONCE from CP_SP (getattr, so an
+# un-wired CP_SP - including every existing test double and the deployed build - is OFF).
+FCA11_DYN_BRAKES_ENABLED = True              # code-level kill switch for the whole (a)-(d) build
+FCA11_DYN_GENTLE_FIRST_LSB = 1               # (a) the first SENT level of a ramped episode (was 4)
+FCA11_DYN_RISE_JERK = 4.5                    # (a2) m/s^3: the growth limit through the measured map (planner ramps ~2-4)
+FCA11_DYN_RISE_MAX_GAP_LSB = 12              # (a2) a single-frame level gap above this means the planner stepped the ask
+FCA11_DYN_EMERGENCY_ACCEL = -3.0             # (a2) asks at/below this (near the 30 LSB cap) go at the panda max
+FCA11_DYN_ASK_STEP_ACCEL = 1.5               # (a2) an ask that jumps this much in ONE sent frame is a step demand
+FCA11_DYN_DECREASE_LSB_PER_SENT = 0.3        # (b)/(c) ~1.5 m/s^3 at the measured low-band slope 0.26 m/s^2 per LSB
+FCA11_DYN_STANDSTILL_HOLD_LSB = 8            # (c) a release from at/above this level is a standstill/stop-band hold
+FCA11_DYN_STANDSTILL_RELEASE_S = 0.5         # (c) 30 -> 0 in exactly this long (30 / 25 sent frames = 1.2 LSB/frame)
+FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT = (FCA11_STANDSTILL_HOLD_LSB /
+                                              (FCA11_DYN_STANDSTILL_RELEASE_S / FCA11_SHAPE_SENT_DT))
+FCA11_DYN_DECREASE_MAX_DROP_LSB = 1           # the largest single-frame step the comfort rate may render as
+FCA11_DYN_STANDSTILL_MAX_DROP_LSB = 2        # ... and the standstill rate, so 30 -> 0 still fits in 0.5 s
+
+
+def feel_gentle_gain(accel: float) -> float:
+  """0051: the gentle-ask strength scale on the feel target: GENTLE_GAIN at/above GAIN_FADE_ACCEL, linear to 1.0 at the HARD
+  bypass, 1.0 at/below it. Always in (0, 1]: the feel target can only get LOWER (authority invariant kept)."""
+  if accel <= FCA11_ONSET_BYPASS_ACCEL:
+    return 1.0
+  if accel >= FCA11_FEEL_GAIN_FADE_ACCEL:
+    return FCA11_FEEL_GENTLE_GAIN
+  frac = (FCA11_FEEL_GAIN_FADE_ACCEL - accel) / (FCA11_FEEL_GAIN_FADE_ACCEL - FCA11_ONSET_BYPASS_ACCEL)
+  return FCA11_FEEL_GENTLE_GAIN + frac * (1.0 - FCA11_FEEL_GENTLE_GAIN)
+
+
+def feel_gentle_gain_speed_frac(v_kph: float) -> float:
+  """0051 (b2): the fraction of the gentle-gain correction still in force at speed ``v_kph`` inside the restore zone: 1.0
+  at/above FCA11_FEEL_GAIN_FADE_KPH, 0.0 at/below FCA11_FEEL_GAIN_FULL_KPH, linear in between (never outside [0, 1])."""
+  if v_kph >= FCA11_FEEL_GAIN_FADE_KPH:
+    return 1.0
+  if v_kph <= FCA11_FEEL_GAIN_FULL_KPH:
+    return 0.0
+  return (v_kph - FCA11_FEEL_GAIN_FULL_KPH) / (FCA11_FEEL_GAIN_FADE_KPH - FCA11_FEEL_GAIN_FULL_KPH)
+
+
+def feel_gentle_target_lsb(accel: float, personality=None, gain_accel: float | None = None, gain_speed: float = 1.0) -> int:
+  """0051 (b): the feel target with the gentle-ask gain: feel_target_lsb(accel * g_eff), where g_eff = 1 - (1 -
+  feel_gentle_gain(gain_accel or accel)) * gain_speed. ``gain_speed`` is the (b2) low-speed restore: 1.0 = the gain in full
+  force (at speed), 0.0 = the deployed 0049 level (inside the stop-band approach). <= feel_target_lsb(accel) always (both
+  factors are in [0, 1]); identical at/below the HARD bypass and at gain_speed 0."""
+  g = feel_gentle_gain(accel if gain_accel is None else gain_accel)
+  g = 1.0 - (1.0 - g) * min(1.0, max(0.0, gain_speed))
+  return feel_target_lsb(accel * g, personality)
+
+
+def feel_target_lsb(accel: float, personality=None) -> int:
+  """0049: the level the feel layer REQUESTS for an ask (before the onset ramp and the panda clamp).
+
+  At/below the onset (-0.5) this is EXACTLY the deployed request, clamp_dec_cmd(dec_cmd_from_accel(accel)); above it (the
+  release band / min-on window, where the deployed law clamps the ask to -0.5 -> 8 LSB) it continues the SAME 0.67 inverse
+  down through 7/6/5, floored at FCA11_FEEL_FLOOR_LSB. Monotone in accel and never above the deployed request."""
+  if personality is None:
+    personality = PERSONALITY_STANDARD
+  if accel <= FCA11_BRAKE_ONSET_ACCEL:
+    return clamp_dec_cmd(dec_cmd_from_accel(accel), personality)
+  lsb = int(round((-accel / FCA11_BRAKE_GAIN) / 9.81 * 100))
+  return max(FCA11_FEEL_FLOOR_LSB, min(personality_max_dec(personality), lsb))
+
+
+def feel_soft_rate_lsb_per_sent(lsb: float) -> float:
+  """0049: the jerk-limited growth per SENT frame at command level ``lsb``: JERK_TARGET / slope(lsb) x 0.02 s, where
+  slope is the delivered m/s^2 per LSB (PROVISIONAL low band below the knee, measured above)."""
+  slope = FCA11_FEEL_SLOPE_LOW if lsb < FCA11_FEEL_SLOPE_KNEE_LSB else FCA11_FEEL_SLOPE_HIGH
+  return FCA11_FEEL_JERK_TARGET / slope * (FCA11_SEND_EVERY * 0.01)
+
+
+def feel_rate_lsb_per_sent(accel: float, lsb: float = float(FCA11_FEEL_SLOPE_KNEE_LSB)) -> float:
+  """0049: the onset growth allowed per SENT frame: the jerk-limited soft rate for asks at/above RATE_SOFT_ACCEL, the
+  panda's +RATE_STEP for a HARD ask (<= FCA11_ONSET_BYPASS_ACCEL, never slowed), linear in between. Never above
+  +RATE_STEP (the panda ceiling is applied again by the caller)."""
+  step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+  if accel <= FCA11_ONSET_BYPASS_ACCEL:
+    return step
+  soft = min(step, feel_soft_rate_lsb_per_sent(lsb))
+  if accel >= FCA11_FEEL_RATE_SOFT_ACCEL:
+    return soft
+  frac = (FCA11_FEEL_RATE_SOFT_ACCEL - accel) / (FCA11_FEEL_RATE_SOFT_ACCEL - FCA11_ONSET_BYPASS_ACCEL)
+  return soft + frac * (step - soft)
+
+
+def dyn_rise_lsb_per_sent(lsb: float) -> float:
+  """18x (a2): the RISE allowed in ONE 50 Hz sent frame at command level ``lsb`` under the dynamic-brakes switch.
+
+  The same jerk limit converted through the MEASURED map (dLSB/dt = J / d(extra)/dLSB), so 4.5 m/s^3 is ~0.9 LSB/frame
+  above 8 LSB (0 -> 30 in ~0.65 s) and ~0.27 LSB/frame across the 4-8 cliff. Clamped to [0.05, +RATE_STEP]: it can never
+  exceed the panda ceiling, and the floor only stops a zero slope from freezing the ramp."""
+  slope = max(shape_local_slope_extra_per_lsb(lsb), 1e-6)
+  return max(0.05, min(float(HYUNDAI_FCA11_LONG_RATE_STEP), FCA11_DYN_RISE_JERK * FCA11_SHAPE_SENT_DT / slope))
+
+
+def feel_anticipated_accel(accel: float, slope: float) -> float:
+  """0049: the ask predicted FCA11_FEEL_ANTICIPATE_S ahead, used ONLY while it is EASING (slope > 0) and never for a HARD
+  ask. Only ever returns an ask that is equal or LESS negative (a lower request) - never more braking."""
+  if accel <= FCA11_ONSET_BYPASS_ACCEL or slope <= 0.0:
+    return accel
+  return accel + min(slope * FCA11_FEEL_ANTICIPATE_S, FCA11_FEEL_ANTICIPATE_MAX)
+
+
+# *** 0045 (v2, settlement Amendment 1): SHADOW mode — param HyundaiFca11Shadow -> CP_SP.fca11Shadow (DEFAULT OFF) ***
+#
+# TERMS (fixed by the settlement; used everywhere in this module, the log and the UI):
+#   OLD-LAW        the currently DEPLOYED FCA11 law: the 0.67 through-origin inverse + the deployed state machine (what
+#                  the car does TODAY with HyundaiFca11Brake ON). In this module = Fca11LongBrake with affine_gain False.
+#   V3             the shaped candidate law (0043 v3, affine_gain True). In Shadow it is COMPUTED + LOGGED, NEVER sent.
+#   FCA11-DISABLED our FCA11 stack fully off (no host 0x38D at all). Exists ONLY as the explicitly named debug transform
+#                  fca11_disabled_debug_params() below - NEVER reachable through the Shadow flag or any param.
+#
+# WHAT SHADOW DOES: the wire stays EXACTLY today's. setup_interfaces (opendbc sunnypilot/car/interfaces.py) writes
+# CP_SP.fca11Shadow and FORCES CP_SP.fca11AffineGain False; HyundaiFca11Brake keeps its deployed meaning (B ON -> OLD-LAW
+# actuates, safetyParam bit 256 set, exactly as today; B OFF -> no FCA11 frames, exactly as today with B OFF). So in Shadow:
+#   * the actuating Fca11LongBrake IS the OLD-LAW instance (affine_gain additionally forced False here, so a hand-built
+#     CP_SP can never put V3 on the wire); its frames are returned by update() untouched -> the sent CAN is byte-identical
+#     to the deployed OLD-LAW build for the same HyundaiFca11Brake value;
+#   * ONE private V3 compute core (Fca11LongBrake(core=True) on a synthetic armed CP_SP with affine_gain True) runs the
+#     full production state machine on the car's CC/CS, open-loop (every V3 would-be frame assumed ACCEPTED: the core gets
+#     synthetic src-128 echoes of its own previous frame). Its frames live on `shadow_out.wouldbe_sends` (non_actuating)
+#     and in the shadow log; they are NEVER returned.
+# THE SEAM (update()): `sends = self._update_law(...)` is the deployed law path, unchanged; in Shadow update() only CAPTURES
+#   the V3 inputs (`self._v3_pending = ...`). One-line revert of the seam: delete the `if self.shadow: self._v3_pending = ...`
+#   statement in update().
+# V3-FAULT ISOLATION: V3 is computed in v3_post_send(), which the superproject card.py calls AFTER sendcan is published
+#   (GasInterceptorCarController.fca11_post_send -> here). So V3 work can never delay or alter the frame already on the
+#   wire. v3_post_send NEVER raises: any V3 exception is caught, written as a k="v3fail" record, and V3 is DISABLED for the
+#   rest of the ignition (its state is untrusted after a fault); a V3 step slower than FCA11_V3_BUDGET_S counts an overrun
+#   (k="v3fail" kind=overrun) and FCA11_V3_OVERRUN_TRIP CONSECUTIVE overruns disable V3 the same way. The OLD-LAW instance never reads
+#   V3 state. (An in-process Python step cannot be pre-empted; the breaker bounds the damage of a pathological V3 step to
+#   FCA11_V3_OVERRUN_TRIP post-send slots, never the current send.)
+# LEAD FIELDS (floor-validation primitives; carcontroller.py forwards them from CarControlSP.leadOne = radarState.leadOne):
+#   CS.fca11_lead_vrel_mps = leadOne.vRel  and  CS.fca11_lead_one = leadOne (dRel, status, modelProb, radar, aLeadK, vLead).
+#   *** 0051: CS.fca11_lead_one is a CONTROL INPUT, not a log-only read: the (c) lead-loss hold arms on a
+#   lead present -> absent edge and needs the PRESENCE (None = no lead). 0045 introduced the field as a log-only read
+#   ("Log-only reads" in carcontroller.py) - that comment is stale for this field and is flagged for the next fork commit;
+#   this patch does not touch carcontroller.py. Absent/None reads as NO lead, which is inert for a CS without the field. ***
+#   SIGN CONVENTION (pinned): vRel = vLead - vEgo in m/s (radard: radar track vRel / vision lead v[0] - model vEgo), so
+#   vRel < 0 means the gap is CLOSING (the existing fca11_lead_closing gate is `status and vRel < -0.5`). TTC, if wanted, is
+#   derived OFFLINE as dRel / -vRel for vRel < 0 - nothing derived is logged.
+#   NO LEAD (leadOne.status False, or the attributes absent): lead_present False and every lead_* value is logged as null
+#   (never 0 - a 0 m/s vRel or 0 m dRel would read as a real lead).
+#   LOW-QUALITY LEAD: NOT filtered here. lead_model_prob (radarState modelProb, 0..1) and lead_radar (radar-fused bool) are
+#   logged raw with every lead record so the offline floor analysis applies its own gate (FLOOR-DESIGN §2 suggests
+#   modelProb >= 0.5 or radar); the log never drops or rewrites a lead for quality.
+# Read ONCE at construction (CarParams build time => next ignition). A SET env FCA11_SHADOW is refused (env-override ban).
+FCA11_SHADOW_ENV_REMOVED = "FCA11_SHADOW"
+FCA11_V3_BUDGET_S = 0.003          # a V3 post-send step slower than this is an overrun (the 100 Hz frame is 10 ms)
+FCA11_V3_OVERRUN_TRIP = 5          # CONSECUTIVE overruns before V3 is disabled for the ignition (each one is logged)
+# 0054: the shadow log's IDLE / availability trace. Route 16a: the per-frame trace only exists inside the shadow WINDOW
+# (V3/OLD-LAW braking, camera request, or a longActive release ask), so the whole 170 s "FCA11 Braking Unavailable"
+# window - raised 14:36:13, cleared 14:39:04 - fell between two file records and every flag a reader could see came
+# from the frames on either side of it. While the feature is ARMED but longitudinal is NOT active (and ALWAYS while
+# fca11_unavailable holds), the writer therefore emits one frame record every FCA11_SHADOW_IDLE_FRAMES controller frames
+# (50 = 0.5 s = 2 Hz) plus ONE immediately on every change of the diagnostic state tuple (see _shadow_diag_state), so an
+# availability loss is diagnosable from fca11-shadow.jsonl alone. Same record builder, same field names; the idle record
+# adds only `idle` + `diag` (see fca11_shadow_log.frame_idle). Pure logging: nothing here is read by a send decision or
+# an alert.
+FCA11_SHADOW_IDLE_FRAMES = 50     # 0.5 s at the 100 Hz controller rate (2 Hz idle record)
+
+
+def shadow_enabled(CP_SP) -> bool:
+  """0045: the resolved Shadow state: CP_SP.fca11Shadow AND the pedal armed (the V3 core reads the pedal state).
+  Independent of fca11Brake (which keeps deciding whether OLD-LAW actuates). Missing field (older struct) = False."""
+  return bool(getattr(CP_SP, "fca11Shadow", False)) and bool(getattr(CP_SP, "enableGasInterceptor", False))
+
+
+def _refuse_shadow_env() -> None:
+  """0045: raise if FCA11_SHADOW is SET (any value): Shadow is reachable ONLY through the HyundaiFca11Shadow param."""
+  if FCA11_SHADOW_ENV_REMOVED in os.environ:
+    val = os.environ[FCA11_SHADOW_ENV_REMOVED]
+    msg = f"{FCA11_SHADOW_ENV_REMOVED} is set ({val!r}) but there is no env override for FCA11 Shadow (patch 0045): "
+    msg += "Shadow is enabled ONLY through the HyundaiFca11Shadow param "
+    msg += "(Params -> initialize_params -> setup_interfaces -> CP_SP.fca11Shadow). Unset the variable."
+    raise RuntimeError(msg)
+
+
+def fca11_disabled_debug_params(CP_SP) -> structs.CarParamsSP:
+  """DEBUG ONLY - the FCA11-DISABLED mode (the first shadow build's semantics, kept for offline A/B isolation): a COPY of
+  CP_SP with our FCA11 stack fully off (fca11Brake / fca11AffineGain False, safetyParam bit 256 clear) and the V3 core still
+  computing + logging (fca11Shadow True). Called by NO production code and written by NO param: setup_interfaces never
+  produces this configuration (pinned by test_fca11_shadow.py::TestFca11DisabledDebugMode). Never use it on a car."""
+  from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
+  d = {f: getattr(CP_SP, f) for f in structs.CarParamsSP.__dataclass_fields__}
+  d.update(fca11Brake=False, fca11AffineGain=False, fca11Shadow=True)
+  d["safetyParam"] = int(d["safetyParam"]) & ~int(HyundaiSafetyFlagsSP.FCA11_LONG)
+  return structs.CarParamsSP(**d)
+
+
+def _shadow_core_params() -> structs.CarParamsSP:
+  """The synthetic, ARMED CarParamsSP the private V3 core is built on. It never leaves this module: it is not the car's
+  CP_SP, never reaches card / the panda, and carries no safetyParam bit."""
+  return structs.CarParamsSP(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=True, fca11Shadow=False)
+
+
+class _ShadowCC:
+  """The CarControl fields the V3 core reads (enabled, longActive, actuators.accel), with the ask clipped to the PID bound
+  the actuating FCA11 arm has (-FCA11_A_MAX_MSS2; identity with Braking ON, a clip with Braking OFF = pedal-only -3.5)."""
+  class _Act:
+    def __init__(self, accel: float):
+      self.accel = accel
+
+  def __init__(self, enabled: bool, long_active: bool, accel_law: float):
+    self.enabled = bool(enabled)
+    self.longActive = bool(long_active)
+    self.actuators = _ShadowCC._Act(float(accel_law))
+
+
+class _ShadowCSView:
+  """Read-through view of the real CS for the V3 core: reads fall through to CS, WRITES stay on the view, so the core can
+  never publish anything (CS._fca11_braking_now, alert flags, ...) onto the car's CarState object."""
+  def __init__(self, cs):
+    object.__setattr__(self, "_cs", cs)
+
+  def __getattr__(self, name):
+    return getattr(object.__getattribute__(self, "_cs"), name)
+
+
+@dataclass
+class ShadowOutput:
+  """0045: one frame of Shadow output. ``non_actuating`` is ALWAYS True: the V3 values here are never sent."""
+  non_actuating: bool = True
+  frame: int = -1
+  v3_ok: bool = True                   # False once V3 is disabled by a fault (the v3_* values are then None)
+  v3_wouldbe_lsb: int | None = 0       # V3 would-be SENT CR_VSM_DecCmd on this frame (0 = none/passive)
+  v3_send_wouldbe: bool = False        # V3 would have put a 0x38D on the wire this frame
+  wouldbe_sends: tuple = ()            # the V3 would-be frames (CanData) - NEVER returned / sent
+  oldlaw_cmd_lsb: int = 0              # the OLD-LAW CR_VSM_DecCmd actually COMMANDED on the wire this frame (0 = none)
+  oldlaw_send: bool = False            # an OLD-LAW 0x38D actually went on the wire this frame
+  oldlaw_instant_lsb: int = 0          # the unshaped instant OLD-LAW mapping of the same ask (pure function)
+
+
+# camera-frame freshness for the mirror source (s): the camera sends ~50 Hz; anything older than
+# two periods means we do not know the ESC's last-seen state -> no send (never a hardcoded frame).
+FCA11_CAM_FRESH_S = 0.100
+
+# send rate divisor: controller frames are 100 Hz; every other frame = the camera's own 50 Hz.
+FCA11_SEND_EVERY = 2
+
+# bit positions of the camera's request fields (the shadow log's camera_warn reads CAM_ACT_WARN_BITS). 0053: the
+# hand-back itself is decided ONLY by the shared masks (camera_braking below), never by hand-written bit tests.
+CAM_ACT_PREFILL_BIT = 0
+CAM_ACT_HBA_BITS = (1, 2)
+CAM_ACT_WARN_BITS = (3, 2)
+CAM_ACT_CMDACT_BIT = 20
+CAM_ACT_STOPREQ_BIT = 21
+CAM_ACT_DECCMDACT_BIT = 31
+
+# *** personality-indexed decel cap (adurham fork) ***
+# The driver's LongitudinalPersonality is the feel dial for FCA11-long braking STRENGTH (the commanded decel cap), the
+# same lever the pedal law / launch ceiling / A_CRUISE_MAX read. Personality is cereal log.LongitudinalPersonality
+# (0 = aggressive, 1 = standard, 2 = relaxed) and reaches here raw via CarControlSP.personality. Raw CR_VSM_DecCmd cap
+# per tier (0.01 g/LSB, delivered decel ~= 0.67 x command):
+#   relaxed    12 = 0.12 g  (~0.79 m/s^2 delivered)
+#   standard   20 = 0.20 g  (~1.31 m/s^2 delivered)
+#   aggressive 30 = 0.30 g  (== HYUNDAI_FCA11_LONG_MAX_DEC: today's cap, the max)
+# Every tier is <= the PANDA firmware gate (HYUNDAI_FCA11_LONG_MAX_DEC, safety/modes/hyundai.h), which is
+# personality-AGNOSTIC (it only rejects CR_VSM_DecCmd > 30). Indexing the cap python-side is therefore a strict subset of
+# the firmware allow-window: NO safety/firmware change is needed and deployed firmware 00e086b9 stays valid. An unknown
+# / out-of-range personality falls back to STANDARD (the middle, never the strongest).
+PERSONALITY_AGGRESSIVE = 0
+PERSONALITY_STANDARD = 1
+PERSONALITY_RELAXED = 2
+PERSONALITY_MAX_DEC = {
+  PERSONALITY_RELAXED: 12,
+  PERSONALITY_STANDARD: 20,
+  PERSONALITY_AGGRESSIVE: 30,   # the deployed tier ceiling; the WIRE gate (HYUNDAI_FCA11_LONG_MAX_DEC) is not a feel cap
+}
+
+
+# 2026-11-03 (route 190): the tier cap is a FEEL dial, but it was also capping SAFETY. Measured: closing a lead at
+# 3.7-8.8 m/s the planner ask sat at the -2.0 request clip, the command at the 20 LSB standard ceiling (2.28 m/s^2), the
+# car delivered -1.5..-2.0 and the gap closed to 2.9 m; one stop episode released at 1.1 km/h instead of finishing. The
+# car itself reaches 3.6 m/s^2 at the panda gate (30 LSB) and the driver's own brake hit -3.2 in the same window, so the
+# authority exists and was simply not given. A GENUINE hard-stop ask (planner at or below FCA11_URGENT_ASK_MSS2) now
+# gets the panda gate regardless of tier; every normal follow ask keeps its tier cap byte-for-byte.
+FCA11_URGENT_ASK_MSS2 = -2.4
+
+
+def effective_max_dec(personality, ask_mss2: float, ceiling: int = 0) -> int:
+  """Tier cap for a normal ask; ``ceiling`` (an LSB gate) for a genuine hard-stop ask (0 = no raised gate)."""
+  try:
+    urgent = float(ask_mss2) <= FCA11_URGENT_ASK_MSS2
+  except (TypeError, ValueError):
+    urgent = False
+  return int(ceiling) if (urgent and ceiling) else personality_max_dec(personality)
+
+
+def personality_max_dec(personality) -> int:
+  """Raw CR_VSM_DecCmd cap for a LongitudinalPersonality raw value. Unknown / missing -> STANDARD (never the strongest).
+
+  Mirrors the pedal law's normalization (``int(getattr(p, 'raw', p))``) so a capnp _DynamicEnum, a bare int, or junk
+  all resolve the same way. The result is always <= HYUNDAI_FCA11_LONG_MAX_DEC (the panda gate)."""
+  try:
+    pid = int(getattr(personality, 'raw', personality))
+  except (TypeError, ValueError):
+    pid = PERSONALITY_STANDARD
+  return PERSONALITY_MAX_DEC.get(pid, PERSONALITY_MAX_DEC[PERSONALITY_STANDARD])
+
+
+def dec_cmd_from_accel(accel: float) -> int:
+  """accel request (m/s^2, negative = brake) -> raw CR_VSM_DecCmd (0.01 g/LSB), clamp [1, cap].
+
+  Zero for anything above the onset threshold (coast territory: not a brake request)."""
+  if accel > FCA11_BRAKE_ONSET_ACCEL:
+    return 0
+  dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81
+  return int(round(dec_g * 100))
+
+
+def clamp_dec_cmd(dec_cmd: int, personality=PERSONALITY_STANDARD) -> int:
+  """Clamp a raw CR_VSM_DecCmd to the personality's tier cap (>= 1). Standard reproduces the pre-personality cap."""
+  return max(1, min(personality_max_dec(personality), dec_cmd))
+
+
+@dataclass
+class Fca11MirrorFrame:
+  """The override fields for one mirrored FCA11 frame, before CRC/alive are applied."""
+  dec_cmd: int
+  prefill: bool
+  warn: int
+  cmd_act: bool
+  dec_cmd_act: bool
+
+
+def _get_bits(dat: bytes, start: int, length: int) -> int:
+  v = 0
+  for i in range(length):
+    pos = start + i
+    v |= ((dat[pos // 8] >> (pos % 8)) & 1) << i
+  return v
+
+
+def _cam_word(dat: bytes) -> int:
+  """The camera frame's first 4 bytes, little-endian (= DBC start bits 0..31) - exactly the panda's GET_BYTES_LE(msg, 0, 4)."""
+  return int.from_bytes(bytes(dat[:4]), "little")
+
+
+def camera_braking(dat: bytes) -> bool:
+  """0053: True if a bus-2 camera FCA11 frame is BRAKING class (HYUNDAI_FCA11_CAM_BRAKE_MASK) -> hand back."""
+  if dat is None or len(dat) != 8:
+    return False
+  return (_cam_word(dat) & HYUNDAI_FCA11_CAM_BRAKE_MASK) != 0
+
+
+def camera_warning(dat: bytes) -> bool:
+  """0053: True if the frame carries a WARNING-class field (Prefill / Warn). Informational only - never a gate."""
+  if dat is None or len(dat) != 8:
+    return False
+  return (_cam_word(dat) & HYUNDAI_FCA11_CAM_WARN_MASK) != 0
+
+
+def camera_requesting(dat: bytes) -> bool:
+  """Braking OR warning class (the pre-0053 predicate). 0053: INFORMATIONAL ONLY (shadow log field
+  ``camera_requesting``); no gate may use it - the hand-back is ``camera_braking``."""
+  return camera_braking(dat) or camera_warning(dat)
+
+
+def fca11_passive(dat: bytes) -> bool:
+  """A host 0x38D in the camera's idle shape: no brake field and no warning field set (DecCmd 0, Prefill 0, Warn 0,
+  CmdAct 0, DecCmdAct 0, HBA 0, StopReq 0, Belt 0). The panda accepts such a frame unless its cam_brake is set."""
+  return dat is not None and len(dat) == 8 and \
+    (_cam_word(dat) & (HYUNDAI_FCA11_CAM_BRAKE_MASK | HYUNDAI_FCA11_CAM_WARN_MASK)) == 0
+
+
+def build_fca11_frame(cam_dat: bytes, cam_alive: int, m: Fca11MirrorFrame) -> bytes:
+  """The camera's frame with ONLY the brake fields overridden + alive+1 + a fresh CRC.
+
+  ``cam_dat`` is the camera's raw 8-byte FCA11 frame; every other byte (FCA_Status, Failinfo,
+  DrvSetStatus, BeltCmd, RelativeVelocity, TimetoCollision, PAINT1, StopReq, HBA, and the
+  undefined bits this car always carries, e.g. byte4 bit7 = 1 in 10549/10549 logged frames) is
+  copied byte-for-byte, so the ESC only ever sees a shape it has already accepted - with a
+  different brake command in it.
+  """
+  if cam_dat is None or len(cam_dat) != 8:
+    raise ValueError(f"FCA11 mirror needs a fresh 8-byte camera frame, got {cam_dat!r}")
+  b = bytearray(cam_dat)
+
+  def clear(start: int, length: int) -> None:
+    for i in range(length):
+      pos = start + i
+      b[pos // 8] &= (~(1 << (pos % 8))) & 0xFF
+
+  def setb(start: int, length: int, val: int) -> None:
+    for i in range(length):
+      pos = start + i
+      b[pos // 8] |= ((int(val) >> i) & 1) << (pos % 8)
+
+  # override ONLY: Prefill, DecCmd, Warn, CmdAct, DecCmdAct, Alive. Everything else is mirrored.
+  clear(0, 1)      # CF_VSM_Prefill
+  clear(8, 8)      # CR_VSM_DecCmd
+  clear(3, 2)      # CF_VSM_Warn
+  clear(20, 1)     # FCA_CmdAct
+  clear(31, 1)     # CF_VSM_DecCmdAct
+  clear(35, 4)     # CR_FCA_Alive
+
+  setb(0, 1, 1 if m.prefill else 0)
+  setb(8, 8, int(m.dec_cmd) & 0xFF)
+  setb(3, 2, int(m.warn) & 0x3)
+  setb(20, 1, 1 if m.cmd_act else 0)
+  setb(31, 1, 1 if m.dec_cmd_act else 0)
+  setb(35, 4, int(cam_alive) & 0xF)
+
+  out = bytes(b[:7])
+  return out + bytes([hyundai_checksum(out)])
+
+
+class Fca11LongBrake:
+  """Owned by GasInterceptorCarController; steps once per 100 Hz controller frame.
+
+  Inert (``update`` returns [] and ``braking`` is False) unless ``CP_SP.fca11Brake`` is set. All
+  panda-facing state comes through ``CS`` attributes only (CarState writes them), so the class
+  works identically against the real card loop and a test double.
+
+  ``braking`` is True only while an ACTUATING frame is being sent; on the true -> false edge the
+  class emits exactly one PASSIVE mirror frame (the camera's idle shape: all brake fields 0, Warn 0)
+  to close the panda's FCA11-long episode. There is no duration budget: an episode runs as long as the
+  planner (or a cal hold) asks and every gate holds.
+  """
+
+  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, dbc_names: dict | None = None,
+               core: bool = False):
+    self.CP = CP
+    self.CP_SP = CP_SP
+    # 0045: `core` = a PRIVATE shadow compute core (built only by a Shadow instance below): no episode log, no cal
+    # sequencer, its CS writes go to a view. 0045 SHADOW: the actuating instance is NEVER enabled in Shadow (setup_interfaces
+    # already leaves fca11Brake False; re-applied here so a hand-built CP_SP can never actuate in Shadow).
+    _refuse_shadow_env()
+    self._core = bool(core)
+    # 2026-11-03 (owner: guard 0.5 g): only the V3 shaping instance may spend the raised gate on a hard-stop ask.
+    # 2026-11-03 (Opus, route 191): this was `... if bool(core) else 0`, and the ACTUATING instance is built with
+    # core=False - so the car never had the raised gate at all: every hard-stop ask was clipped to the deployed 30 LSB
+    # and the 0.5 g guard could not be spent. The tiers, the aggressive cap and the standstill hold are pinned to 30
+    # separately, so giving the actuating instance the gate changes no normal level.
+    self._urgent_ceiling_lsb = int(HYUNDAI_FCA11_LONG_MAX_DEC)
+    self.shadow = (not self._core) and shadow_enabled(CP_SP)
+    self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
+    # 0045 (PROPOSAL, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard via setup_interfaces), read
+    # ONCE here. Masked, so an unknown bit / a hand-built CP_SP / a test double is the deployed rule (0). Mirrors the
+    # panda's safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES - the two layers must not drift.
+    self.pedal_guard = int(getattr(CP_SP, "fca11PedalGuard", 0) or 0) & HYUNDAI_FCA11_PEDAL_GUARD_MASK
+    # The grace anchor: the first frame this ENABLED instance processed (the ignition's arm on the real path).
+    self._pedal_arm_frame: int | None = None
+    # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
+    # frame. OFF -> the 0.67 through-origin law and the 8 LSB floor, byte-identical to 0040. 0044: CP_SP is the ONLY
+    # source (the env override is refused, the Params fallback is gone). 0045: in Shadow the WIRE is OLD-LAW, always:
+    # setup_interfaces already forces fca11AffineGain False; re-applied here so V3 can never actuate in Shadow.
+    _refuse_affine_env()
+    self.affine_gain = affine_gain_enabled(CP_SP) and not self.shadow
+    # 18x: `_actuating` is "an FCA11 actuating frame was sent THIS frame" - the flag the whole law reads. The public
+    # `braking` (a property, see its docstring) additionally covers the panda's own 100 ms gas window, which is what
+    # gas_interceptor.py consumes; splitting them is what lets the pedal be held at 0 exactly as long as the panda
+    # refuses gas WITHOUT touching the 0x38D stream.
+    self._actuating = False           # an FCA11 actuating frame was sent THIS frame
+    self._gas_guard_left = 0          # 18x: controller frames left in the post-actuation gas hold-off
+    self._in_rel_ramp = False         # 18x: a soft release ramp is running THIS frame (the alerts must not read it as a lost hold)
+    self._crawl_rel_frame: int | None = None  # 18x (b): frame of the last release at crawl speed (onset hold-off)
+    self.blocked_until_resume = False  # a CUT latched: no braking until the next resume press
+    # G9b/0042: split the cut the way the panda does. _driver_cut (brake / gear != D) re-arms on the resume
+    # edge but clears on the first clean engaged frame; _pedal_cut (pedal fault, 0042) is fail-closed and NOT
+    # re-armed. 0042 v2: blocked_until_resume is the DRIVER cut only - the pedal mirror is ALERT-ONLY and never
+    # gates a send (a pre-arm over-latch must never fabricate a brake loss); see update() for the full reasoning.
+    # 0053: the camera hand-back is no longer a latch (the old _hard_cut is deleted): see cam_brake below.
+    self._driver_cut = False
+    self._pedal_cut = False            # 0042: the panda's hyundai_interceptor_pedal_fault, latched (see update())
+    self._rearm_pending = False        # a resume edge armed a driver-latch re-arm; consumed by a clean frame
+    # 0040: the single low-speed hand-over alert (below the old 12 km/h floor) is DELETED - it is now false. Replaced
+    # by three owner-approved alerts (steady yellow / steady yellow / persistent red), all state read by the
+    # superproject from CarStateSP. low_speed_alert is kept as an alias of supervise_stop for any stale consumer.
+    self.supervise_stop = False        # YELLOW steady, slow + a stop requested
+    self.stop_complete = False         # YELLOW steady at standstill while holding (an explicit hand-off, NOT a cap)
+    self.brake_now = False             # RED persistent: ESC non-response or hold lost; clears ONLY on driver brake
+    self.brake_now_reason = ""         # "no_response" | "hold_lost"
+    self.low_speed_alert = False       # alias of supervise_stop (kept so pre-0040 readers do not crash)
+    self._noresp_since: float | None = None
+    self._hold_lost_armed = False
+    # 0041 gating state: `_noresp_cmd_since` is the monotonic time the command has been continuously >= MIN_LSB
+    # (the ESC-lag "command stable" gate); `_brake_now_clear_since` is the time BOTH trigger conditions last went
+    # false (the 2 s self-heal timer, armed only while brake_now is up).
+    self._noresp_cmd_since: float | None = None
+    self._brake_now_clear_since: float | None = None
+    # 0040: per-episode logger (/data/fca11-log/episodes.jsonl). See fca11_log.py for the schema and reasoning.
+    self.log = fca11_log.EpisodeLogger()
+    if self._core:
+      self.log.enabled = False         # 0045: the V3 core never writes the ACTUATION episode log (episodes.jsonl)
+    self._last_why = ""                # this frame's fca11_ok reason (the episode-end reason when !ok)
+    # 0038: gas hold-off state. `_gas_release_frame` is the controller frame the pedal last read released (None =
+    # none yet this controller); the hold-off refuses actuation for GAS_HOLDOFF_FRAMES after it. No edge is needed to
+    # clear it (it just ages out), and gas is NOT part of _driver_cut any more.
+    self._gas_release_frame: int | None = None
+    self._gas_prev = False
+    # 0030 (D1-b) / 0042: surface the fail-closed loss. The panda's hyundai_fca11_long_cut is fail-closed for the
+    # REST OF THE IGNITION and cannot be cleared, so while FCA11-long is armed it refuses EVERY actuating frame for
+    # the whole drive - and that failure was otherwise SILENT (the driver just sees openpilot plan stops it cannot
+    # execute; route 156 lost ALL braking this way). The car layer mirrors the panda latch SOURCE as _pedal_cut (a
+    # PEDAL FAULT, 0042; fail-closed, NOT re-armed). 0053: the camera hand-back is no longer a source - it is the
+    # self-releasing cam_brake with its own transient alert. _refused_cut is the ECHO-CONFIRMED wall (B): the panda's own verdict on our
+    # in-flight frames, so even a latch the Python mirror cannot see still surfaces. CarStateExt publishes the OR as
+    # CarStateSP.fca11Unavailable; the superproject raises a persistent driver alert from it.
+    # 0042 v2: this flag is KNOW + ALERT only - it drives NO send gate (see blocked_until_resume below). While it is
+    # set, the three 0040/0041 braking alerts are SUPPRESSED in _alerts() (they all assume we are actually braking):
+    # the dedicated unavailability alert supersedes them.
+    self.fca11_unavailable = False
+    # 0044: WHY it is unavailable (FCA11_CUT_SOURCE_*). Written at the same site as fca11_unavailable so the two can
+    # never disagree; CarStateExt publishes it as CarStateSP.fca11CutSource for the qlog. Observability only.
+    self.fca11_cut_source = FCA11_CUT_SOURCE_NONE
+    # 0030 (D2-iii): echo-confirmation of the passive close frame. The panda only CLOSES its FCA11-long episode on an
+    # ACCEPTED passive 0x38D (hyundai.h:1027-1030); if the close frame was REFUSED (engage/disengage edge), the
+    # episode never closes. The car layer sees the pandad echo of every 0x38D it sends (src 128 = sent, 192 = REJECTED)
+    # and can re-owe a refused close frame instead of treating a frame that never landed as a hand-back. Inert until
+    # the car layer feeds it via observe_echo (a no-op otherwise, so shipping it unwired is safe).
+    self._pending_echo: bytes | None = None   # the last passive frame we emitted, awaiting its echo
+    self._pending_echo_frame = -1              # controller frame at which it was emitted
+    self._echo_rejected = False               # that frame came back 192 (never closed the episode)
+    self._echo_wired = False                  # observe_echo has been called
+    # 0042 (B): the echo-confirmed refusal wall. `_refused_streak` counts CONSECUTIVE refused ACTUATING echoes while
+    # braking; at FCA11_REFUSED_STREAK_CUT it sets `_refused_cut` (surfaced via fca11_unavailable). An ACCEPTED
+    # actuating echo resets the streak and self-heals the flag (the wall is gone). No send gating rides on this.
+    self._refused_streak = 0
+    self._refused_cut = False
+    # 0053: the NON-LATCHING camera hand-back (see the FCA11_CAM_* block). `cam_brake` = the camera is braking (a
+    # braking-class bus-2 0x38D within the last FCA11_CAM_RESUME_FRAMES camera frames): no 0x38D of ours goes out at
+    # all and the pedal command is forced to 0. `_cam_quiet` = non-braking camera frames since the last braking one
+    # (saturating). Starts released, like the panda's hyundai_init.
+    self.cam_brake = False
+    self._cam_quiet = FCA11_CAM_RESUME_FRAMES
+    # 16a: controller frames left in which the camera STILL OWNS our refusals after we released (see
+    # FCA11_CAM_RELEASE_TAIL_FRAMES). 0 = the panda's hand-back cannot outlive ours any more.
+    self._cam_tail = 0
+    self.camera_braking_alert = False  # transient "camera braking - openpilot braking paused" (CarStateSP)
+    # 0053: refusal-cut probation (FCA11_PROBATION_*): actuating echoes left in the window, refused ones counted in it,
+    # and whether the window tripped the cut (held until the window closes).
+    self._probation_left = 0
+    self._probation_refused = 0
+    self._probation_cut = False
+    # 0053: divergence guard (FCA11_DIVERGENCE_*). `_div_armed` = an accepted 0x38D echo was seen (the panda is armed);
+    # `_div_refused_passive` = refused PASSIVE echoes waiting to be judged after this tick's camera frames are ingested;
+    # `_div_streak` consecutive ones; `_div_events` per ignition; `_div_latched` = withhold every 0x38D until the next
+    # ignition (the only hard camera-side cut left). `fca11_divergence` drives the driver alert.
+    self._div_armed = False
+    self._div_refused_passive = 0
+    self._div_streak = 0
+    self._div_events = 0
+    self._div_latched = False
+    self._div_active = False
+    self.fca11_divergence = False
+    self._attrib_hold = 0              # controller frames left of a refusal-attribution hold (passive frames only)
+    self._cam_ingested_frame: int | None = None
+    self._engaged_prev = False         # CC.enabled edge tracker (resume = the re-engage rising edge)
+    self._dec_last_sent = 0
+    self._sent_this_episode = False
+    # 0043: the shaped-law state (ON path only). `_shape_acc` is the float LSB accumulator the jerk slew ramps
+    # (starts at the floor); `_shape_sent_n` counts SENT actuating frames since this episode opened (the onset
+    # hold is measured in SENT-frame time); `_shape_in_hold_band` is the hold-band latch (ENTRY <= 3 km/h, EXIT
+    # >= 5 km/h - 0043 v2 hysteresis). Never read on the OFF path -> the OFF behaviour is untouched.
+    self._shape_acc = float(FCA11_SHAPE_FLOOR_LSB)
+    self._shape_sent_n = 0
+    self._shape_in_hold_band = False
+    # 0049: the FEEL layer (OLD-LAW instance only; see the FCA11_FEEL_* block). Read ONCE here. Never on the shaping/V3
+    # path (affine_gain) - so the Shadow V3 core and the shadow log are untouched.
+    self.feel = bool(FCA11_FEEL_ENABLED) and self.enabled and not self.affine_gain
+    self._feel_acc = 0.0               # float LSB accumulator of the onset ramp (episode-local)
+    self._feel_slope = 0.0             # EMA of d(ask)/dt over SENT frames (m/s^3), episode-local
+    self._feel_prev_ask: float | None = None
+    self._feel_in_hold_band = False    # hold-band latch (ENTER <= 3 km/h or standstill, EXIT >= 5 km/h)
+    # 17c: the standstill-hold latch (FCA11_STANDSTILL_HOLD_*). Feel path only, read once like every other law switch.
+    self.standstill_hold = self.feel and bool(FCA11_STANDSTILL_HOLD_ENABLED)
+    self._feel_standstill_hold = False  # set at standstill in the band; cleared by band EXIT / episode (re)open / reset
+    self._feel_cal_prev = False        # previous frame's cal_on (a cal->planner hand-off re-seeds the ramp)
+    self._feel_dwell = 0               # consecutive frames of (ok AND ask <= the deployed -0.5 onset): the dwell escape
+    self._feel_dwell_slow = 0          # the same, AND vEgo < FCA11_FEEL_DWELL_SLOW_MPS on every counted frame (crawl escape)
+    # 0051: the feel FIX round (wobble damping, gentle gain, lead-loss hold). Read ONCE; only ever on the feel path.
+    self.feel_fix = self.feel and bool(FCA11_FEEL_FIX_0051)
+    # 0054: the MEASURED ask -> LSB inverse + its release-below-the-floor arm. Read ONCE here, like every other law
+    # switch. Scoped to the FEEL layer on purpose: that is the deployed request path, and `self.feel` already carries
+    # "enabled AND not the 0043 shaping law AND not Shadow", so this flag can never reach the shaped law, cal, the
+    # shadow core or a disabled instance. OFF -> the pre-0054 request map and release rule, byte-for-byte.
+    self.meas_inverse = bool(FCA11_FEEL_ENABLED) and bool(FCA11_MEAS_INVERSE) and self.feel
+    # 18x: the DYNAMIC-BRAKES build (FCA11_DYN_*). Read ONCE, from CP_SP only, DEFAULT OFF. `getattr` (not an attribute
+    # access) is deliberate: the field is wired in the superproject (param HyundaiFca11DynamicRelease -> capnp
+    # CarParamsSP.fca11DynamicBrakes -> structs.CarParamsSP), and this tree must stay OFF - byte-for-byte the deployed
+    # law - for every CP_SP that does not carry it, including every existing test double and the car as it is today.
+    # Scoped to the FEEL path like meas_inverse: it can never reach the shaped law, cal, or the Shadow core.
+    self.dynamic_brakes = bool(FCA11_DYN_BRAKES_ENABLED) and self.feel and \
+        bool(getattr(CP_SP, "fca11DynamicBrakes", False))
+    # 0035 (routes 193/194): the TRACKING layer on the SHAPED law - the path the car actually runs with AffineGain AND
+    # DynamicBrakes both ON (feel/dynamic_brakes are False there; see the FCA11_TRACK_* block). Read ONCE; never on the
+    # old-law/feel instance, never on the Shadow V3 core, never without the DynamicBrakes toggle.
+    self.shape_track = bool(FCA11_TRACK_ENABLED) and self.affine_gain and (not self._core) and \
+        bool(getattr(CP_SP, "fca11DynamicBrakes", False))
+    # 0037: the CONTINUOUS brake law replaces the shaped/track layers on exactly the instance the car runs (shaped law,
+    # tracking, not the Shadow core). Read ONCE like every other law switch; False -> the pre-0037 law byte-for-byte.
+    self.cont_law = bool(FCA11_CONT_ENABLED) and self.shape_track
+    if self.cont_law:
+      self._shape_acc = 0.0   # 0037: the level starts at TRUE zero (there is no 4 LSB floor to sit on)
+    self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
+    self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
+    self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
+    self._cont_q_last = 0                # 0040: the level last SENT on the continuous path (the down-step floor / the
+    self._cont_q_bus = 0                 # non-send frame's answer) and the level the BUS last carried (the hysteresis
+    #                                      reference; sub_bite_gate zeroes it when it withholds a sub-bite frame)
+    # 0043-CD: the standstill hold countdown. `_nag_frames` counts CONTINUOUS SENT frames that put a level
+    # >= FCA11_HOLD_NAG_MIN_LSB on the wire while the car is held at standstill; `hold_nag` is the published state
+    # (0 none / 1 soft / 2 loud / 3 final / 4 EXPIRED-LATCH) the superproject turns into an alert. Neither is ever
+    # read by the law.
+    self._nag_frames = 0
+    self._hold_expired = False         # 0043-CD: the sticky latch (hold_nag == 4). Cleared by the driver's brake press
+    #                                    or by a car DRIVEN AWAY ON THE GAS (> 3 m/s); never by gas alone, gear, the
+    #                                    disengage or time.
+    self.hold_nag = FCA11_HOLD_NAG_NONE
+    self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
+    # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
+    # throttle (see sub_bite_gate). A counter only - it never feeds the law.
+    self.sub_bite_muted = 0
+    # 0038-excl (lane F): controller frames left in the host's mirror of the panda's 100 ms throttle-exclusion window,
+    # armed by every frame we actually SEND with a level (see FCA11_WIRE_WINDOW_FRAMES / _wire_arm).
+    self._wire_arm_left = 0
+    self._rel_acc: float | None = None  # 18x: the release ramp's level accumulator (None = no ramp in progress)
+    self._rel_sent = 0                 # 18x: the last level the ramp put on the wire (1-2 LSB per sent frame, enforced)
+    self._rel_fast = False             # 18x: this ramp is a standstill release (the 0.5 s rate), latched at its start
+    self._dyn_log = None                # 18x: the k="b" per-sent-frame channel (created below, only when ON)
+    self._dyn_n = 0                    # 18x: records written (diagnostics)
+    self._feel_slope_ant = 0.0         # slow EMA of d(ask)/dt (anticipation only; FCA11_FEEL_SLOPE_ALPHA_0051)
+    self._feel_peak = 0.0              # episode peak of the feel accumulator (re-rise deadband reference)
+    self._feel_lead_prev = False       # previous frame's lead presence (edge detector)
+    self._feel_ll_frame: int | None = None   # frame of the lead-loss edge while an episode was open (None = no hold)
+    self._feel_ll_lsb = 0              # level frozen at that edge (the last SENT level)
+    self._feel_ll_hold_from = 0        # frame the HOLD phase is counted from (advances while the lead stays absent)
+    # ---- G5 anti-flap state ----
+    self._ask_frames = 0               # consecutive frames of (window-open AND accel <= ONSET) since last reset
+    self._on_frames = 0                # consecutive frames we have wanted to brake (the current episode age)
+    # ---- G7 passive release edge ----
+    self._release_pending = False      # a passive frame is owed (the braking true -> false edge)
+    # ---- 0035: tool-side CAL watchdog (the panda no longer bounds a hold's duration) ----
+    self._cal_frames = 0               # consecutive frames the cal sequencer has asked for a hold
+    self.cal_watchdog_trips = 0        # diagnostics: how often the watchdog had to force a release
+    # ---- 0029 CAL command mode (patch: 0029-hyundai-fca11-cal-command-mode) ----
+    # A file-gated, autonomous sequencer that can replace the SOURCE of the decel command (the planner
+    # ask) with an exact scripted level, WHILE every production gate stays on. Subordinate to the
+    # production toggle: it is only ever ticked from the `enabled` branch of update(). Inert (and
+    # byte-identical to the shipped behaviour) unless /data/fca11-cal/plan.json exists, parses, and is
+    # fresh. See cal_mode.py for the full design.
+    self.cal_seq = None
+    if self.enabled and not self._core and os.environ.get("FCA11_CAL_DIR") != "0":
+      self.cal_seq = cal_mode.CalSequencer(os.environ.get("FCA11_CAL_DIR", cal_mode.CAL_DIR))
+      self.cal_seq.mark_session(os.getpid())
+    self._cal_active = False           # this frame is a CAL hold (drives the gas neutralization)
+    self._cal_prev = False             # 0043 v2: previous frame's cal_on, for the cal-active EDGE reset of the shaped ramp
+    # ---- 0045 SHADOW: the private V3 compute core + the shadow log. None unless Shadow. ----
+    self.shadow_out = ShadowOutput()
+    self._shadow_v3 = None
+    self.shadow_log = None
+    self._v3_pending = None            # this frame's V3 inputs, captured in update(), consumed by v3_post_send()
+    self._v3_disabled = False          # a V3 fault (exception / FCA11_V3_OVERRUN_TRIP overruns) disabled V3 this ignition
+    self.v3_failures = 0               # exceptions + overruns seen (each one logged as k="v3fail")
+    self.v3_overruns = 0
+    self._v3_overrun_streak = 0        # CONSECUTIVE overruns (a lone GC pause is logged, never disables V3)
+    if self.shadow:
+      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
+      self._shadow_v3 = Fca11LongBrake(CP, _shadow_core_params(), dbc_names, core=True)
+      assert self._shadow_v3.affine_gain and not self.affine_gain
+      self.shadow_log = fca11_shadow_log.ShadowLogger(header=dict(
+        note="FCA11 SHADOW (0045 v2): wire = OLD-LAW (deployed law, as today); V3 computed + logged post-send, NEVER sent; "
+             "V3 values are an open-loop counterfactual",
+        oldlaw_armed=bool(self.enabled),
+        consts=dict(K=FCA11_SHAPE_K, BITE=FCA11_SHAPE_BITE, CLIFF_LO_EXTRA=FCA11_SHAPE_CLIFF_LO_EXTRA,
+                    CLIFF_HI_EXTRA=FCA11_SHAPE_CLIFF_HI_EXTRA, ONSET_HOLD_SENT=FCA11_SHAPE_ONSET_HOLD_SENT,
+                    JERK_TARGET=FCA11_SHAPE_JERK_TARGET, BRAKE_GAIN=FCA11_BRAKE_GAIN, A_MAX_MSS2=FCA11_A_MAX_MSS2,
+                    ONSET_ACCEL=FCA11_BRAKE_ONSET_ACCEL, RELEASE_ACCEL=FCA11_BRAKE_RELEASE_ACCEL,
+                    V3_BUDGET_S=FCA11_V3_BUDGET_S, V3_OVERRUN_TRIP=FCA11_V3_OVERRUN_TRIP)))
+    self._sh_engaged_prev = False
+    self._sh_engage_frame: int | None = None
+    self._sh_episode_id = 0
+    self._sh_ep: dict | None = None
+    self._sh_prev_echo: list = []      # 0045 (V3 core only): synthetic ACCEPTED echoes of the previous frame's frames
+    # 0054: the IDLE availability trace (armed but longActive off, or fca11_unavailable): last frame an idle record went
+    # out, and the diagnostic state tuple it carried. Written by _shadow_record only; read by nothing else.
+    self._sh_idle_last_frame: int | None = None
+    self._sh_diag_prev: dict | None = None
+    # 18x: the k="b" LEVEL TRACE channel (dynamic release ON only). It reuses the shadow log's FILE and channel pattern
+    # (one JSONL stream of k=<kind> records, written by fca11_shadow_log.ShadowLogger - no new file format, no new
+    # module): when Shadow already opened the stream we share that writer (one writer per path, never two), otherwise we
+    # open the same stream with our own header. OFF -> no logger is created and no record is ever written.
+    if self.dynamic_brakes and not self._core:
+      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
+      self._dyn_log = self.shadow_log
+      if self._dyn_log is None:
+        self._dyn_log = fca11_shadow_log.ShadowLogger(header=dict(
+          note="FCA11 DYNAMIC-RELEASE trace (k=b): one record per SENT actuating 0x38D with the level actually on the "
+               "wire and the measured aEgo, so the low levels (1-3 LSB) can be read from ordinary drives",
+          dyn_gentle_first_lsb=FCA11_DYN_GENTLE_FIRST_LSB,
+          dyn_decrease_lsb_per_sent=FCA11_DYN_DECREASE_LSB_PER_SENT,
+          dyn_standstill_decrease_lsb_per_sent=FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT,
+          gas_window_hold_frames=FCA11_GAS_WINDOW_HOLD_FRAMES,
+          rolling_release_accel=FCA11_ROLLING_RELEASE_ACCEL, rolling_release_v_max=FCA11_ROLLING_RELEASE_V_MAX,
+          rolling_release_lead_m=FCA11_ROLLING_RELEASE_LEAD_M))
+    # 17c FEEDBACK (k="m"): the driver's verdict channel. Same writer discipline as the k="b" channel above - share the
+    # shadow writer when it exists, else the dynamic-release one, else open the same stream lazily on the FIRST mark
+    # (so an idle drive opens no file and writes nothing). See driver_mark.py for the gesture and the typing rules.
+    self._mark_log = None              # resolved by _mark_writer(); never a second writer on the same path
+    self._mark_alert = driver_mark.MARK_CODE_NONE   # 0 none, 1 "marked GOOD", 2 "marked BAD" (CarStateSP.driverMark)
+    self._mark_alert_until = -1        # controller frame the current confirmation expires on
+    self._lsb_hist = deque(maxlen=driver_mark.MARK_LEVEL_WINDOW_FRAMES)  # (frame, lsb) of SENT actuating frames
+    self._plateau_sent: tuple[int, int] | None = None  # PLATEAU: (frame, lsb) of the last SENT actuating frame
+    self._frame_last = 0               # last controller frame seen by update() (the record's frame reference)
+    self._ask_last = 0.0               # the planner ask consumed this frame, clipped to FCA11_A_MAX_MSS2
+    self._personality_last = 0         # raw LongitudinalPersonality of the last frame
+
+  # ---- 18x: the gas-facing flag ----
+
+  @property
+  def braking(self) -> bool:
+    """True while the pedal must stay at EXACTLY 0 (gas_interceptor.py reads `gas_hold` for that, which is this flag
+    gated on the level reaching the measured first bite), which is _actuating OR the panda's own 100 ms gas window after
+    the last actuating frame (FCA11_GAS_WINDOW_HOLD_*).
+
+    The split matters: `_actuating` is "an actuating 0x38D went out this frame" - the flag every piece of the law uses
+    (episode state, holding, the feel ramp, the echo attribution, the div/probation guard, the logs). `braking` adds the
+    window the panda enforces anyway (BRAKE_THROTTLE_EXCL_US), so the car layer stops offering gas frames the panda
+    would strip: today the pedal resumed on the frame after ours went passive and the panda refused 90-130 ms of it on
+    44/45 (181) and 49/55 (182) releases. The 0x38D stream is untouched by this: same actuating frames, same passive
+    close frame, same frame numbers - only the pedal is muted instead of being refused.
+    """
+    return bool(self._actuating or self._gas_guard_left > 0)
+
+  @property
+  def episode_open(self) -> bool:
+    """The DEPLOYED meaning of `braking`: an actuating 0x38D went out this frame (True on a non-send frame inside an
+    episode too, as it always was). Use this - not `braking` - for "is the brake episode open/closed"."""
+    return bool(self._actuating)
+
+  @property
+  def brake_level(self) -> int:
+    """The level of the 0x38D that is on the wire for the state `braking` describes: the last level actually SENT
+    (0 once the episode has closed - the release path zeroes the reference with the passive close frame). Read by the
+    gas side (M1) and by the tests; never by the brake law itself."""
+    return int(self._dec_last_sent) if self.braking else 0
+
+  @property
+  def gas_hold(self) -> bool:
+    """0038-excl: True -> the throttle must be commanded to EXACTLY 0 this frame.
+
+    The predicate is now the PANDA'S OWN WINDOW, read off the WIRE: a non-zero ``GAS_COMMAND`` is refused for
+    ``HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US`` (100 ms) after any actuating 0x38D, i.e. after any frame that
+    carried a level >= 1 LSB. ``_wire_arm_left`` is armed by exactly those frames (and only by frames actually sent, so
+    a sub-bite level withheld by ``sub_bite_gate`` does NOT arm it). So the pedal is at zero exactly when - and only
+    when - a non-zero frame would be stripped, which is what keeps the 0x700 stream gap-free.
+
+    This replaces the 0037/M1 form (``braking and _dec_last_sent >= FCA11_FEEL_FIRST_LSB``): that one was right about
+    the ONSET (a 1-3 LSB phantom must not cut the throttle - the 5.2 % -> 0 -> 5.2 % dip the owner calls flutter) but
+    it let the throttle resume while the panda's window was still open, from the last >= 4 LSB frame of a RELEASE and
+    from the clear frame that re-arms it while the pedal is faulted. Measured through the real filter: 10 refused
+    pedal frames on a 500 ms phantom (lane-F/cp1_after.txt, first run) - gone with this one.
+
+    It cannot change the pedal's OUTPUT anywhere: a frame that arms the window is only ever sent on a frame that
+    commands exactly zero gas (>= 4 LSB -> gas_hold; 1-3 LSB -> sub_bite_gate only sends it when the pedal is at zero),
+    so at the moment the window opens the pedal's last applied command is already 0. Holding it for 110 ms instead of
+    letting it be refused changes the wire, not the pedal.
+
+    OFF PATH (`FCA11_CONT_ENABLED` False, the pre-0037 law) keeps the deployed 0037/M1 form byte-for-byte: the OFF law
+    can only ever send >= 4 LSB frames (its own moving floor), so nothing there needs the wire-side window.
+    """
+    if not getattr(self, "cont_law", False):
+      return bool(self.braking and int(self._dec_last_sent) >= FCA11_FEEL_FIRST_LSB)
+    return bool(self._wire_arm_left > 0)
+
+  def _wire_arm(self, level: int) -> None:
+    """0038-excl: arm the host's mirror of the panda's throttle-exclusion window for a frame that carries `level` on the
+    WIRE. Never clears it (a passive frame does not clear the panda's window either)."""
+    if int(level) > 0:
+      self._wire_arm_left = FCA11_WIRE_WINDOW_FRAMES
+
+  def cont_coast(self, accel: float, v_ego_mps: float) -> bool:
+    """0037: True -> the gas must be at its TRUE ZERO (0x700 ENABLE=0 pass-through) this frame.
+
+    Engine braking first: when the planner's own ask (``accel``) is a deceleration the measured coast at this speed
+    already delivers, the friction brake adds nothing and the throttle must be genuinely closed - not `hold_cmd(v)`,
+    which would hold the car's speed against the ask. This is the same `coast(v)` curve the brake law subtracts in
+    `fca11_cont_brake_need`, so the two actuators hand over at one shared point (DESIGN.md §3). Read by
+    gas_interceptor.create_gas_command; False on every non-continuous instance (pre-0037 behaviour untouched).
+    """
+    if not getattr(self, "cont_law", False) or not self.enabled:
+      return False
+    return bool(float(accel) < 0.0 and -float(accel) >= fca11_cont_coast(v_ego_mps))
+
+  # ---- window ----
+
+  def _gas_holdoff_ok(self, frame: int) -> bool:
+    """0038: True once the driver's gas has been released for at least GAS_HOLDOFF_FRAMES controller frames (or no
+    release has been seen this controller). A plain elapsed-frame check - no edge is needed to clear it, it just
+    ages out, so it can never lock out a later braking event."""
+    if self._gas_release_frame is None:
+      return True
+    return (frame - self._gas_release_frame) >= GAS_HOLDOFF_FRAMES
+
+  def fca11_ok(self, CS, frame: int = 0) -> tuple[bool, str]:
+    """(ok, why-not) from the CarState-provided inputs. The panda re-polices everything anyway."""
+    if not self.enabled:
+      return False, "disabled"
+    if self.blocked_until_resume:
+      return False, "blocked_until_resume"
+    # 0038: the driver's gas overrides braking per-frame (human always wins), and the short elapsed-frame hold-off
+    # after it releases stops a 1-2 Hz brake/gas fight. This is NOT the old latch - it clears on time alone, so a NEW
+    # brake request after the hold-off is served normally.
+    if bool(CS.out.gasPressed):
+      return False, "gas_pressed"
+    if not self._gas_holdoff_ok(frame):
+      return False, "gas_holdoff"
+    # 0040: the speed floor ("below_floor") is DELETED. There is NO minimum speed to request FCA11 braking; the car
+    # layer commands through zero and holds at a stop. See the FCA11_SUPERVISE_KPH block above.
+    # pedal STATE 0 = NO_FAULT only. 4 STARTUP / 5 TIMEOUT are boot states the panda also accepts,
+    # but from openpilot's side a pedal that has never taken a command must not be mixed with a
+    # brake. 1 BAD_CHECKSUM / 2 SEND / 3 SCE / 6 INVALID are faults -> never brake. 0042: the accepted
+    # set is the shared HYUNDAI_FCA11_PEDAL_STATE_OK mirror (one source of truth with the panda + the latch).
+    state = int(getattr(CS, "interceptor_state", 0))
+    if state not in HYUNDAI_FCA11_PEDAL_STATE_OK:
+      return False, "pedal_fault"
+    if CS.out.gearShifter != structs.CarState.GearShifter.drive:
+      return False, "gear_not_d"
+    cam = getattr(CS, "fca11_cam_frame", None)
+    now = getattr(CS, "fca11_now_nanos", None)
+    if cam is None or now is None:
+      return False, "no_camera_frame"
+    t_cam, dat = cam
+    if len(dat) != 8 or (now - t_cam) > FCA11_CAM_FRESH_S * 1e9:
+      return False, "stale_camera_frame"
+    # 0053: ONLY the braking class hands back (a warning keeps openpilot braking). update() already withholds every
+    # frame while cam_brake / the divergence latch hold; this is the belt-and-braces gate on the freshest frame.
+    if self._div_latched:
+      return False, "divergence_latched"
+    if self.cam_brake or camera_braking(dat):
+      return False, "camera_braking"
+    return True, ""
+
+  def _alerts(self, CS, frame: int, v_kph: float, dec_cmd: int) -> None:
+    """0040 three-alert state machine (drives CarStateSP.superviseStop / stopComplete / brakeNow).
+
+    YELLOW "supervise stop"  - steady while we are commanding a brake below FCA11_SUPERVISE_KPH.
+    YELLOW "stop complete"   - steady while at/near a full stop and still holding (an explicit hand-off, NOT a cap:
+                               the command keeps flowing; this only tells the driver to put a foot on the brake).
+    RED    "BRAKE NOW"       - persistent; ESC non-response (measured aEgo < 0.4x expected for 500 ms while MOVING
+                               above FCA11_NORESPONSE_MIN_KPH and commanding >= 8 LSB, itself sustained for the ESC
+                               lag first) or hold lost (v > 2 km/h with no gas while we STILL command the stop hold).
+                               Persistence is frame-to-frame survival, not "never clears": it clears immediately on
+                               driver brake / gear != D / driver gas, and SELF-HEALS after both conditions have been
+                               continuously false for FCA11_BRAKE_NOW_CLEAR_S. There is deliberately NO hold-duration
+                               alert.
+
+    0041 FIX (ship-blocker): the 0040 tests for both triggers were too weak. 'no_response' fired at EVERY standstill
+    hold (aEgo ~ 0 at a red light, where delivering ~0 net decel is correct) and 'hold_lost' fired on openpilot's own
+    launches (the arm ignored whether we were still holding). Both are gated here: no_response requires MOVING above
+    5 km/h with a real, SUSTAINED command, and hold_lost disarms the instant we stop commanding the hold - so a
+    planner launch (planner releases braking -> self._actuating False) can never arm it.
+    """
+    if not self.enabled:
+      self.supervise_stop = self.stop_complete = self.brake_now = False
+      self.low_speed_alert = False
+      self._noresp_since = None
+      self._noresp_cmd_since = None
+      self._hold_lost_armed = False
+      self._brake_now_clear_since = None
+      self._hold_nag_step(CS, frame, 0)   # 0043: a disabled law holds nothing, so the countdown is not running
+      return
+    now_us = time.monotonic() * 1e6
+    gas = bool(CS.out.gasPressed)
+    standstill = bool(getattr(CS.out, "standstill", False))
+    moving = bool(v_kph > FCA11_NORESPONSE_MIN_KPH and not standstill)
+    commanding = bool(dec_cmd >= FCA11_NORESPONSE_MIN_LSB)
+    holding_cmd = bool(self._actuating and dec_cmd > 0)   # STILL commanding the hold this frame
+
+    # Hard clears: driver brake / gear != D / driver gas end the alert at once (never a latch). On a planner launch
+    # v > 0 is expected, so these two conditions are what take a standing brake_now down; the self-heal (c) covers
+    # the plain "condition went away" case.
+    if bool(CS.out.brakePressed) or CS.out.gearShifter != structs.CarState.GearShifter.drive or gas:
+      self.brake_now = False
+      self.brake_now_reason = ""
+      self._noresp_since = None
+      self._hold_lost_armed = False
+      self._brake_now_clear_since = None
+
+    # (a) ESC non-response: ONLY while MOVING above 5 km/h with a real command (>= 8 LSB) that has been SUSTAINED for
+    # at least the ESC lag (0.62 s) before the 500 ms measurement timer may run. At/below a stop this is not a fault
+    # (a held stop correctly delivers ~0 net decel) - that case is hold_lost's job. The command-stable gate resets
+    # whenever the command drops below 8 LSB, so the timer never spans a release/re-ask.
+    if commanding:
+      if self._noresp_cmd_since is None:
+        self._noresp_cmd_since = now_us
+    else:
+      self._noresp_cmd_since = None
+    expected = dec_cmd * 0.01 * 9.81 * FCA11_BRAKE_GAIN
+    aego = float(getattr(CS.out, "aEgo", 0.0) or 0.0)
+    nonresp = bool(moving and commanding and
+                   aego > -(FCA11_NORESPONSE_FACTOR * expected) and
+                   self._noresp_cmd_since is not None and
+                   (now_us - self._noresp_cmd_since) >= FCA11_NORESPONSE_CMD_STABLE_S * 1e6)
+
+    # (b) hold lost: ARM only while we are ACTIVELY COMMANDING a stop hold at/near a full stop; once armed it LATCHES
+    # (a hold established at a stop that then creeps is exactly the lost condition). DISARM the instant the hold is
+    # broken - we stop braking (a planner release / launch), the command drops below 8 LSB, gear != D, or the driver
+    # brakes/gases. Fires only while the hold is STILL commanded and the car moves anyway with no driver gas.
+    # 18x: a release ramp is us ENDING the hold, never losing it, so it can neither arm nor fire hold_lost.
+    arm_now = bool(self._actuating and dec_cmd > 0 and not self._in_rel_ramp and
+                   (v_kph <= FCA11_STOP_KPH or standstill))
+    if arm_now:
+      self._hold_lost_armed = True
+    elif (not self._actuating or dec_cmd < FCA11_NORESPONSE_MIN_LSB or self._in_rel_ramp or
+          CS.out.gearShifter != structs.CarState.GearShifter.drive or bool(CS.out.brakePressed) or gas):
+      self._hold_lost_armed = False
+    hold_lost = bool(self._hold_lost_armed and holding_cmd and v_kph > FCA11_HOLD_LOST_KPH and not gas)
+
+    if self.brake_now:
+      # (c) persistent: only the hard clears above or the 2 s self-heal may take it down. While either condition is
+      # true the latch stands; once BOTH have been continuously false for FCA11_BRAKE_NOW_CLEAR_S it self-heals.
+      if not nonresp and not hold_lost:
+        if self._brake_now_clear_since is None:
+          self._brake_now_clear_since = now_us
+        elif (now_us - self._brake_now_clear_since) >= FCA11_BRAKE_NOW_CLEAR_S * 1e6:
+          self.brake_now = False
+          self.brake_now_reason = ""
+          self._noresp_since = None
+          self._brake_now_clear_since = None
+      else:
+        self._brake_now_clear_since = None
+    else:
+      self._brake_now_clear_since = None
+      if nonresp:
+        if self._noresp_since is None:
+          self._noresp_since = now_us
+        elif (now_us - self._noresp_since) >= FCA11_NORESPONSE_MS * 1000.0:
+          self.brake_now = True
+          self.brake_now_reason = "no_response"
+      else:
+        self._noresp_since = None
+      if not self.brake_now and hold_lost:
+        self.brake_now = True
+        self.brake_now_reason = "hold_lost"
+
+    self.supervise_stop = bool(self._actuating and v_kph <= FCA11_SUPERVISE_KPH)
+    self.stop_complete = bool(self._actuating and (v_kph <= FCA11_STOP_KPH or standstill))
+    self.low_speed_alert = self.supervise_stop   # alias
+    # 0042 v2: while FCA11-long is UNAVAILABLE (the panda refuses every actuating frame for the rest of the
+    # ignition: pedal-fault latch / echo-confirmed refusal wall; 0053: no longer the camera), the three 0040/0041 alerts
+    # above are MISLEADING - they all assume we are actually braking and delivering decel. The dedicated
+    # "FCA11 Braking Unavailable" permanent alert supersedes them, so force them off; they re-arm normally on
+    # their own conditions once availability returns (fca11_unavailable clears on an accepted actuating echo).
+    if self.fca11_unavailable:
+      self.supervise_stop = False
+      self.stop_complete = False
+      self.brake_now = False
+      self.brake_now_reason = ""
+      self.low_speed_alert = False
+    # 0043: the hold countdown (60 / 90 / 110 s alerts, 120 s expiry). LAST, so it sees this frame's published level
+    # and the final availability state; it only writes `_nag_frames` / `hold_nag` - the level, the cap and the
+    # release paths above are already decided.
+    self._hold_nag_step(CS, frame, dec_cmd)
+
+  def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
+    """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
+
+    An episode opens on the first commanded frame and closes on the braking true -> false edge, at which point ONE
+    compact JSON line is appended. Best-effort throughout: it must never affect control.
+    """
+    if not self.log.enabled:
+      return
+    v_kph = float(CS.out.vEgo) * 3.6
+    wheel_kph = getattr(CS, "fca11_wheel_min_kph", None)
+    if dec_cmd >= 1:
+      if not self._actuating:
+        self.log.begin(frame, v_kph, wheel_kph)
+      self.log.note_frame(frame, dec_cmd, v_kph, wheel_kph, getattr(CS.out, "aEgo", None),
+                          bool(CS.out.standstill), FCA11_STOP_KPH)
+      # PLATEAU (instrumentation only): feed the plant-curve plateau tracker with the level actually SENT on this frame
+      # (the exact dec_cmd built into the 0x38D, recorded by _note_sent_level on the 50 Hz send slot). Non-send frames
+      # carry no new wire level and are skipped; the tracker tolerates the send cadence as its sample gap. Reads only.
+      sent = self._plateau_sent
+      if sent is not None and sent[0] == int(frame):
+        self.log.note_sent(frame, sent[1], float(CS.out.vEgo), getattr(CS.out, "aEgo", None),
+                           bool(CS.out.gasPressed), bool(CS.out.brakePressed), FCA11_SEND_EVERY)
+    elif self.log._open:
+      reason = self._last_why if self._last_why not in ("", "disabled") else "release"
+      self.log.flush(frame, reason, FCA11_STOP_KPH, self.cont_low_lsb_frames)
+
+  def _camera_owns_refusal(self) -> bool:
+    """0053/route 16a: True when a REFUSED actuating echo this tick is the camera hand-back's doing, not a wall.
+
+    Route 16a: the stock camera's bus-2 0x38D carried BRAKING-class frames through 130.64-136.11 s, so the panda's
+    cam_brake held and it refused our actuating frames at 136.07, 136.09 and 136.11 - the panda doing exactly what the
+    camera hand-back requires, and the mirror of our own withhold. The car layer counted those three as evidence of a
+    wall, _refused_cut latched at 136.13 and the driver got "FCA11 Braking Unavailable", which then outlived the
+    condition by 170 s: the wall could only heal on an ACCEPTED actuating echo and the next brake request was at
+    306.63 s, while the car had braking available again ~1.5 s after the camera went quiet. A refusal the hand-back
+    explains is therefore not evidence and must never advance (or leave standing) the streak.
+
+    Ownership holds for every tick in which this layer is withheld from 0x38D on the camera's behalf: while
+    ``cam_brake`` is set, through the quiet tail it keeps after the last braking camera frame (``_cam_quiet``
+    below FCA11_CAM_RESUME_FRAMES), and through FCA11_CAM_RELEASE_TAIL_FRAMES controller frames after its release
+    (``_cam_tail``) - the panda counts its quiet window in ticks, we count ours in camera frames, so our release can
+    come first and its hand-back still refuse our resumption frames. Both tails decay: a camera that never braked,
+    or one that released long ago and stayed quiet, owns nothing and a real wall still latches.
+    """
+    return bool(self.cam_brake or self._cam_quiet < FCA11_CAM_RESUME_FRAMES or self._cam_tail > 0)
+
+  def observe_echo(self, echoes) -> None:
+    """0030 (D2-iii): the car layer's half of the echo-confirmed close.
+
+    ``echoes`` is the pandad echo of every host 0x38D we sent this CAN tick: an iterable of (src, dat) with
+    src 128 = accepted / forwarded by the panda TX hook, src 192 = REJECTED by it. The panda CLOSES its
+    FCA11-long episode (drops its rate reference to 0) ONLY on an ACCEPTED passive 0x38D. If it comes back
+    REFUSED we RE-OWE the close frame and retry, so the hand-back is never assumed on a frame that never
+    landed. (0035: there is no cooldown to stamp any more; the echo only drives the re-owe.)
+
+    Called once per controller frame from create_gas_command. Inert (and byte-identical to the shipped
+    behaviour) until the first call, which is what sets ``_echo_wired``.
+    """
+    self._echo_wired = True
+    if self._cam_tail > 0:
+      self._cam_tail -= 1              # 16a: one controller frame of the camera's post-release ownership
+    if not echoes:
+      return
+    # 0035: a REFUSED ACTUATING frame while we are still braking restarts the ramp. The panda's onset rule resets its
+    # rate reference to 0 once our stream has been stale > TX_STALE (the camera has re-owned the ESC), and a refused
+    # frame does not refresh the stream - so if a host/USB hiccup ever leaves a gap, continuing at the old level would
+    # be refused on EVERY frame until the planner released (a silent loss of the rest of the brake). Dropping our own
+    # reference to 0 makes the next frame RATE_STEP, which the panda accepts, and the ramp climbs back in ~150 ms.
+    # It can only ever LOWER the command.
+    if self._actuating and any(int(src) == 192 and len(dat) == 8 and dat[1] != 0 for src, dat in echoes):
+      self._dec_last_sent = 0
+    # 0040: count the PANDA's own refusals of our ACTUATING frames (src 192 = the TX hook rejected it) for the
+    # episode log - the firmware's verdict is the ground truth on whether the ESC was ever asked.
+    if self.log.enabled and self._actuating:
+      self.log.note_panda_refusal(sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0))
+    # 0042 (B): echo-based refusal surfacing. The panda's verdict on our in-flight frames is the ground truth. A
+    # REFUSED ACTUATING echo (src 192) while braking extends the consecutive streak; an ACCEPTED ACTUATING echo
+    # (src 128) means the panda is taking our frames again, so reset the streak and self-heal the wall flag. At
+    # FCA11_REFUSED_STREAK_CUT consecutive refusals the wall is surfaced via fca11_unavailable. NO send suppression
+    # rides on this: refused frames never reach the car, so keeping our sends live keeps the ground truth flowing with
+    # zero deadlock. (A refused PASSIVE close frame is the separate re-owe path below, not counted here.)
+    refused = sum(1 for src, dat in echoes if int(src) == 192 and len(dat) == 8 and dat[1] != 0)
+    accepted = sum(1 for src, dat in echoes if int(src) == 128 and len(dat) == 8 and dat[1] != 0)
+    # 0053: refusals that land while the camera hand-back is active are the hand-back doing its job, not a wall - see
+    # _camera_owns_refusal. They are EXPECTED and say nothing about a wall or a divergence, so they feed neither the
+    # refusal streak, the probation, nor the guard. (`_refused_streak` is zeroed too: a wall cannot be "in progress"
+    # across a hand-back, so a mixed sequence - a couple of unexplained refusals, then hand-back refusals, then more -
+    # must not add up to FCA11_REFUSED_STREAK_CUT. ingest_camera runs BEFORE observe_echo on the real path, so the
+    # hand-back state already reflects this tick's camera.)
+    owned = self._camera_owns_refusal()
+    if owned:
+      refused = 0
+      if self._actuating:
+        self._refused_streak = 0
+    # 0053 divergence guard: an ACCEPTED 0x38D of any shape arms it (the panda is in FCA11-long and taking frames) and
+    # breaks a refused-passive streak; a REFUSED PASSIVE echo while we believe the camera is NOT braking extends it.
+    if any(int(src) == 128 and len(dat) == 8 for src, dat in echoes):
+      self._div_armed = True
+      self._div_streak = 0
+      if any(int(src) == 128 and fca11_passive(bytes(dat)) for src, dat in echoes):
+        self._attrib_hold = 0            # attribution answered: the panda takes passive frames -> not the camera
+    elif self._div_armed and not self.cam_brake and \
+        any(int(src) == 192 and fca11_passive(bytes(dat)) for src, dat in echoes):
+      self._div_streak += 1
+      if self._div_streak >= FCA11_DIVERGENCE_PASSIVE_STREAK:
+        self._divergence_event()
+    # 0053 probation: the first FCA11_PROBATION_ECHOES actuating echoes after a resume also run a CUMULATIVE refusal
+    # count (an accepted echo does not reset it). Fed only by real braking: no probe decel is ever sent for it.
+    if self._probation_left > 0 and (accepted or (refused and self._actuating)):
+      n = accepted + (refused if self._actuating else 0)
+      self._probation_refused += refused if self._actuating else 0
+      self._probation_left = max(0, self._probation_left - n)
+      if self._probation_refused >= FCA11_PROBATION_REFUSED_CUT:
+        self._probation_cut = True
+        self._refused_cut = True
+      if self._probation_left == 0:
+        self._probation_cut = False   # the window closed: the ordinary consecutive rule (and its heal) owns the cut
+    if accepted and self._probation_cut:
+      # a probation trip is held until its window closes: an occasional accepted frame in a mostly refused wall is
+      # exactly what the cumulative count exists to catch. (The pedal-fault heal below still applies: an accepted
+      # actuating frame proves the panda's pedal cut is clear.)
+      self._refused_streak = 0
+      self._pedal_cut = False
+    elif accepted:
+      # An ACCEPTED ACTUATING echo (src 128, len 8, dat[1]!=0) is PROOF the panda is NOT latched: it accepted a
+      # frame that only goes out while FCA11-long is armed AND its cut is clear. So it resets the refusal streak,
+      # clears _refused_cut (the wall is gone) AND clears _pedal_cut (the pedal-fault latch cannot be live if the
+      # panda is accepting our actuating frames). 0042 v2: this is the mirror's PROOF-BASED SELF-HEAL - the only
+      # thing that clears _pedal_cut, and why a pre-arm over-latch (route 155) self-corrects at the first accepted
+      # actuating echo instead of holding a phantom alert all drive. A PASSIVE accepted echo (dat[1]==0) is NOT
+      # proof (150709 passive frames flowed on route 156 WITH the cut latched) and must not heal anything.
+      self._refused_streak = 0
+      self._refused_cut = False
+      self._pedal_cut = False
+    elif refused and self._actuating:
+      # 16a: `refused` is zero here whenever the camera owns the tick's refusals (see _camera_owns_refusal, which also
+      # zeroes the streak), so this increment can only ever count refusals the hand-back does NOT explain.
+      was = self._refused_streak
+      self._refused_streak += refused
+      if self._refused_streak >= FCA11_REFUSED_STREAK_CUT:
+        self._refused_cut = True
+        # 0053 ATTRIBUTION: a refused ACTUATING frame is ambiguous (window, rate, gas hold-off ... or the panda's
+        # cam_brake), a refused PASSIVE one is not. On the crossing into a wall, end the episode so the owed passive
+        # close goes out (zero decel - the ESC was getting nothing from us anyway): accepted -> a real wall, the cut
+        # stands; refused twice -> the panda is handing back to a camera brake we never saw -> divergence (resync).
+        if was < FCA11_REFUSED_STREAK_CUT and self._div_armed and not self.cam_brake:
+          self._attrib_hold = FCA11_ATTRIB_HOLD_FRAMES
+    if self._pending_echo is None:
+      return
+    pending = self._pending_echo
+    for src, dat in echoes:
+      if bytes(dat) != pending:
+        continue
+      if int(src) == 192 and not self._actuating:
+        # the close frame was REFUSED: the panda episode is STILL OPEN. Re-owe it (a later send slot retries).
+        # 0035: never while braking again - re-owing then would force the live brake off for a slot (a silent
+        # mid-brake truncation); the new episode's own release will owe its own close frame.
+        self._echo_rejected = True
+        self._release_pending = True
+      self._pending_echo = None
+      return
+
+  # ---- 0053: camera hand-back + divergence guard ----
+
+  def _cam_step(self, dat: bytes) -> None:
+    """One bus-2 camera 0x38D through the hand-back state machine (the panda's hyundai_fca11_long_cam_step, released
+    FCA11_CAM_QUIET_MARGIN frames later)."""
+    if dat is None or len(dat) != 8:
+      return
+    if camera_braking(dat):
+      if not self.cam_brake:
+        self._refused_streak = 0         # refusals around the hand-back edge are the hand-back, not a wall
+      self.cam_brake = True
+      self._cam_quiet = 0
+      self._cam_tail = 0                 # the hand-back itself owns them now; no tail is owed
+    elif self._cam_quiet < FCA11_CAM_RESUME_FRAMES:
+      self._cam_quiet += 1
+      if self._cam_quiet >= FCA11_CAM_RESUME_FRAMES and self.cam_brake:
+        self.cam_brake = False
+        self._div_active = False         # a resync hold ends with the hand-back it adopted
+        self._start_probation()
+        # 16a: we released on OUR clock (camera frames), which can run ahead of the panda's (its ticks), so the panda may
+        # still be handing back for up to its own quiet window: the camera keeps ownership of refusals until then.
+        self._cam_tail = FCA11_CAM_RELEASE_TAIL_FRAMES
+        # the FIRST host 0x38D after every release is a PASSIVE frame (the camera's idle shape, zero decel - not a
+        # probe): it re-opens our stream cleanly at the panda AND is the divergence guard's evidence - the panda
+        # refuses a well-formed passive frame ONLY while its own cam_brake still holds.
+        self._release_pending = True
+
+  def _start_probation(self) -> None:
+    self._probation_left = FCA11_PROBATION_ECHOES
+    self._probation_refused = 0
+    self._probation_cut = False
+
+  def _divergence_event(self) -> None:
+    """The panda refused passive frames while we believed the camera was not braking: adopt the panda's view (the
+    stricter direction), raise the alert, latch on the FCA11_DIVERGENCE_LATCH_EVENTS-th event this ignition."""
+    self._div_streak = 0
+    self._div_events += 1
+    self._div_active = True
+    self._attrib_hold = 0
+    self._refused_streak = 0             # the refusals were the panda's hand-back, not a wall
+    self._refused_cut = False
+    self.cam_brake = True
+    self._cam_quiet = 0
+    if self._div_events >= FCA11_DIVERGENCE_LATCH_EVENTS:
+      self._div_latched = True
+
+  def ingest_camera(self, CS, frame: int) -> None:
+    """0053: feed EVERY bus-2 camera 0x38D of this tick to the hand-back state machine, in order. Runs once per
+    controller frame, BEFORE observe_echo and update (create_gas_command calls it first; update() calls it itself if
+    nobody did). Never gated on engagement or on longActive: the drive-14d divergence was exactly such a gate.
+
+    Real path: CS.fca11_cam_frames (CarStateExt, every frame of the tick). Fallback for callers that only carry the
+    freshest frame (CS.fca11_cam_frame): a non-braking frame counts once per 50 Hz send slot (the camera's own rate),
+    a BRAKING-class frame counts on every controller frame (the stricter direction: a brake is never skipped)."""
+    if self._cam_ingested_frame == frame:
+      return
+    self._cam_ingested_frame = frame
+    if not self.enabled:
+      return
+    frames = getattr(CS, "fca11_cam_frames", None)
+    if frames is None:
+      cam = getattr(CS, "fca11_cam_frame", None)
+      frames = [cam] if (cam is not None and (frame % FCA11_SEND_EVERY == 0 or camera_braking(cam[1]))) else []
+    for _t, dat in frames:
+      self._cam_step(bytes(dat))
+
+  def _hold_nag_still(self, CS) -> bool:
+    """CD3: a DEAD STOP - openpilot's standstill bit AND every one of the four wheels at rest.
+
+    `CS.out.standstill` is only FL and RR (carstate.py:117). The strict signal is `CS.fca11_wheel_max_kph`, the FASTEST
+    of the four wheels (carstate.py:127), which the real CarState populates whenever CP_SP.fca11Brake is on - the only
+    case this countdown can run in. A double (or a CarState without the signal) returns False here rather than raising,
+    and a fail-closed gate can only ever keep the countdown from starting, never start it early.
+    """
+    if not bool(getattr(CS.out, "standstill", False)):
+      return False
+    wheel_max = getattr(CS, "fca11_wheel_max_kph", None)
+    if wheel_max is None:
+      return False
+    return float(wheel_max) <= FCA11_HOLD_NAG_STILL_KPH
+
+  def _hold_nag_driven_away(self, CS) -> bool:
+    """CD6: the latch's second clear - the DRIVER has driven the car away, on the gas, above 3 m/s.
+
+    The red alert asks for the brake pedal, and the brake is what clears a latched car that is still stopped. A driver
+    who wakes at "BRAKES RELEASED" and presses the GAS instead would otherwise drive off at speed under a PERMANENT
+    red full-screen alert - and under the engage strip - until their next brake press.
+
+    SPEED ALONE IS NOT EVIDENCE THAT A DRIVER IS THERE. A latched car with nobody in it gains speed on its own: a
+    roll-away down a grade reaches FCA11_HOLD_NAG_CLEAR_V_MS in about 6 s at 0.5 m/s^2, and a backward roll reads
+    EXACTLY like a forward one because the wheel speeds are unsigned (WHL_SPD11 is `@1+`). One bad wheel-speed frame
+    reaches it too: the speed filter jumps to the raw mean on any change above 2 m/s, so a single frame of one wheel
+    at 43.3 km/h at a standstill is vEgo 3.01 - and this latch is permanent, so one frame would end the alarm for
+    good. Ending the alarm exactly while an unattended car is gaining speed is the worst possible moment. So the gas
+    pedal is required as well: `gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS`, which is a driver who is driving.
+
+    WHY THE GAS PEDAL CANNOT BE OPENPILOT'S OWN COMMAND (this car runs the interceptor): `gasPressed` is the
+    GAS_SENSOR (0x201/0x701) ADC of the DRIVER's pedal, assigned after carstate.py's EMS16 value and replacing it
+    (carstate_ext.py:194-200). The pedal applies max(driver, openpilot) only at its DAC output, never on GAS_SENSOR
+    (gas_interceptor.py:80-83), and while latched the car is disengaged so openpilot commands no throttle at all.
+    The threshold is 420 raw counts against a measured foot-off rest of 353 +/- 12, i.e. ~4 % of travel - a foot
+    actually on the pedal.
+
+    On the recorded drives (2026-11-06, re-run by CD7 with the CORRECT per-extract column layout): 38 manual
+    dead-stop launches cross 3.0 m/s on 195, 196, 197, 198, 199, 19b and 19c, and 38/38 have the gas pedal down at
+    the crossing - 0 brake-only, 0 with neither pedal - so requiring the pedal costs 0 of the 38. Every gas launch
+    held the gas for at least 98 consecutive frames past the crossing (min 98, max 2533). This was checked against
+    the raw pedal signal itself (GAS_SENSOR 0x201/0x701, `(A+B)//2 > 420`): the gas column agrees with the raw ADC on
+    99.9-100 % of carState frames on all six drives tested.
+    (The earlier "24 launches - 14 with the gas, 10 with the brake" was a COLUMN SWAP, not a measurement: the two
+    extractors store carState in opposite orders - `extract_seg.py` writes t, vEgo, aEgo, gasPressed, brakePressed,
+    standstill (gas col 3) while `lane-R/extract197.py` writes t, vEgo, standstill, brakePressed, gasPressed, brake,
+    gas (gas col 4) - and the first census read gas/brake from columns 3/4 on BOTH, i.e. brakePressed as the gas on
+    the 197/198/199/19b/19c sets. With the right columns those 10 are gas launches too, and the count is 38 because
+    the 197 set was never loaded.)
+
+    FAIL CLOSED: a missing gasPressed, or a missing/non-numeric/non-finite vEgo, returns False. A signal we cannot
+    read is not evidence that the driver has taken over, and this latch must never be released on a guess.
+    """
+    # the pedal FIRST: it is the "a driver is in the car" term, and an unreadable one must never count as pressed
+    if not bool(getattr(CS.out, "gasPressed", False)):
+      return False
+    v = getattr(CS.out, "vEgo", None)
+    if v is None:
+      return False
+    try:
+      v = float(v)
+    except (TypeError, ValueError):
+      return False
+    return math.isfinite(v) and v > FCA11_HOLD_NAG_CLEAR_V_MS
+
+  def _hold_nag_step(self, CS, frame: int, dec_cmd: int) -> int:
+    """0043-CD: the standstill hold countdown. Called on EVERY controller frame from _alerts() with the frame index and
+    the level the law commanded this frame.
+
+    Advance the clock only on a SENT frame (`frame % FCA11_SEND_EVERY == 0` - the only slot the law puts 0x38D on the
+    wire) at >= FCA11_HOLD_NAG_MIN_LSB while we are holding the car at a DEAD STOP (CD3: all four wheels at rest, see
+    `_hold_nag_still`); a SENT frame below the level does not advance it and does not reset it (a dip from 30 to 7
+    mid-hold is still the same hold). Reset the COUNT on anything that ends the hold the timer is about: the car moves
+    (any wheel) / standstill is lost, gear leaves D, driver gas, the panda marks the law unavailable, or we stop
+    actuating (a released hold is not a hold - and the next one is a new episode with a new countdown).
+
+    THE LATCH IS NOT PART OF THAT RESET. Once the count reaches FCA11_HOLD_NAG_EXPIRE_FRAMES the hold has expired:
+    `_hold_expired` goes True and `hold_nag` becomes FCA11_HOLD_NAG_EXPIRED (4) for as long as the latch lasts, which
+    is what makes the superproject disengage and the release path take the brakes off. The counter resets on the very
+    frame openpilot disengages (we stop actuating) and the latch has to survive exactly that, so it is stored
+    separately and is cleared ONLY by `CS.out.brakePressed` - not by gas alone, not by gear, not by the disengage, not
+    by re-engaging and not by time - or (CD6) by the car being DRIVEN AWAY: the driver's gas pedal down AND
+    `CS.out.vEgo` above FCA11_HOLD_NAG_CLEAR_V_MS, which is what takes the permanent red alert off a driver who
+    accelerates instead of braking. A new ignition is a new instance (`__init__`).
+
+    NOTHING here touches the level: the wire is identical with and without this function (pinned by test).
+    """
+    if not self.enabled:
+      self._nag_frames = 0
+      self._hold_expired = False
+      self.hold_nag = FCA11_HOLD_NAG_NONE
+      return FCA11_HOLD_NAG_NONE
+    if bool(CS.out.brakePressed) or self._hold_nag_driven_away(CS):
+      # the two clears: the driver's brake (what the red alert asks for), and a DRIVER who has driven away on the gas
+      # above 3.0 m/s (`_hold_nag_driven_away`: gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS - speed alone is not
+      # a driver, a roll-away and a single wheel glitch reach 3 m/s too).
+      self._hold_expired = False
+    holding = bool(self._actuating and self._hold_nag_still(CS) and
+                   not bool(CS.out.brakePressed) and not bool(CS.out.gasPressed) and
+                   CS.out.gearShifter == structs.CarState.GearShifter.drive and not self.fca11_unavailable)
+    if not holding:
+      self._nag_frames = 0
+      # THE LATCH IS DELIBERATELY NOT CLEARED HERE. This branch is what runs on the very frame the superproject
+      # disengages (we stop actuating), which is exactly the reset the latch has to survive - see the docstring.
+    elif frame % FCA11_SEND_EVERY == 0 and dec_cmd >= FCA11_HOLD_NAG_MIN_LSB:
+      self._nag_frames += 1
+      if self._nag_frames >= FCA11_HOLD_NAG_EXPIRE_FRAMES:
+        self._hold_expired = True
+    self.hold_nag = FCA11_HOLD_NAG_EXPIRED if self._hold_expired else hold_nag_level(self._nag_frames)
+    return self.hold_nag
+
+  def _passive_frame(self, CS, frame: int) -> list[CanData]:
+    """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
+    DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+
+    This is the clean release / hand-back frame the panda accepts while ``controls_allowed`` AND
+    ``heartbeat_engaged`` (safety/modes/hyundai.h); it is what ENDS an actuation episode (the panda's
+    rate reference drops to 0). Only sent on the FCA11_SEND_EVERY slot, same 50 Hz stream
+    as the actuating frames, and only when a fresh camera frame is in hand (never a hardcoded frame -
+    the mirror is always sourced from the latest bus-2 0x38D).
+    """
+    cam = getattr(CS, "fca11_cam_frame", None)
+    if cam is None or len(cam[1]) != 8 or frame % FCA11_SEND_EVERY != 0:
+      return []
+    t_cam, dat = cam
+    cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
+    m = Fca11MirrorFrame(dec_cmd=0, prefill=False, warn=0, cmd_act=False, dec_cmd_act=False)
+    return [CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0)]
+
+  def sub_bite_gate(self, brake_sends: list[CanData], CS, frame: int, gas_on_wire: float) -> list[CanData]:
+    """0038-excl (lane F): a SUB-BITE actuating frame is never SENT while this same frame commands throttle.
+
+    THE CONSTRAINT IS PHYSICAL, so the host's law has to be consistent with it (owner rule: only physical/safety
+    distinctions are allowed - this is one). opendbc/safety/modes/hyundai.h l.1152-1157 arms
+    ``host_brake_active_ts`` on ANY actuating 0x38D - ``CR_VSM_DecCmd != 0 || FCA_CmdAct || CF_VSM_DecCmdAct ||
+    CF_VSM_Prefill``, i.e. from 1 LSB - and l.1356-1361 then refuses every NON-ZERO ``GAS_COMMAND`` for the next
+    ``HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US`` = 100 ms. The pedal stream and the brake stream both run on the
+    same 50 Hz slot and the pedal frame is appended FIRST (gas_interceptor.create_gas_command l.832-836), so every
+    actuating frame is followed by a refused pedal frame 20 ms later. A 1-3 LSB episode is below the measured first
+    bite (FCA11_FEEL_FIRST_LSB = 4 LSB = 1.00 m/s^2), so it does nothing physical while the throttle is HELD - but
+    the panda still strips the throttle for it, and the comma pedal then times out (102 ms without an applied frame)
+    into pass-through, i.e. the driver-felt dip the owner calls flutter. Measured through the real filter
+    (lane-F/cp1_before.txt): a 250 ms / 3 LSB phantom refuses 17 pedal frames and drops the pedal output to exactly
+    0 for 320 ms.
+
+    So: below the bite, the brake rides on the COAST only (the engine-braking-first principle this law is built on).
+    With the pedal at true zero the frame goes out unchanged (light braking over coast is untouched); with the pedal
+    commanding gas the same slot carries the PASSIVE shape instead - level 0 on the wire, which does not arm the
+    panda's window at all, so the throttle keeps flowing and NOTHING is refused. The law's own level, episode, trim
+    and ramp state are untouched: only the wire frame differs, and ``_dec_last_sent`` is set to what the wire carries
+    (0) so the next frame's +RATE_STEP clamp still matches the panda's reference.
+
+    At/above the bite this is a no-op: ``gas_hold`` already forces the pedal to exactly 0 on those frames, so there
+    is no throttle to refuse (a >= 4 LSB episode cuts the throttle exactly as before).
+    """
+    if not getattr(self, "cont_law", False) or not brake_sends or int(frame) != int(self._frame_last):
+      return brake_sends
+    level = int(self._dec_last_sent)
+    if level <= 0 or level >= FCA11_FEEL_FIRST_LSB:
+      return brake_sends
+    if not (float(gas_on_wire) > 0.):
+      self._wire_arm(level)     # the frame goes out at 1-3 LSB: the panda's throttle window is armed by it
+      return brake_sends
+    passive = self._passive_frame(CS, frame)
+    if not passive:
+      # no fresh camera frame in hand: an episode cannot be open without one (ok requires it), so this is unreachable;
+      # refuse to guess and leave the actuating frame as it is.
+      return brake_sends
+    self._dec_last_sent = 0     # the panda's rate reference is this PASSIVE frame now, not the level
+    # 0040 v2 (review K3): the hysteresis reference is the BUS, so a withheld frame's 0 is what the quantiser must
+    # compare against next time. `_cont_q_last` deliberately keeps the law's own level: it answers a NON-SEND frame
+    # (`_cont_level`'s early return) and it is the down-step floor, and zeroing it here would close the episode on the
+    # very next odd frame (`cont_dec = 0` -> `want_brake = False`) every time a sub-bite frame was muted.
+    self._cont_q_bus = 0
+    # the wire carried no level: keep the 17c level window and the PLATEAU tracker on the WIRE (a plateau sample at
+    # lsb 0 closes the open window and does not qualify - fca11_log.PlateauTracker.sample), so a withheld sub-bite frame
+    # can never be logged as a delivered 1-3 LSB plateau.
+    self._note_sent_level(frame, 0)
+    if 0 < level <= 3:
+      self.cont_low_lsb_frames = max(0, self.cont_low_lsb_frames - 1)   # that frame carried 0 on the wire, not 1-3 LSB
+    self.sub_bite_muted += 1
+    return passive
+
+  def _shape_reset(self) -> None:
+    """0043: arm a fresh shaped episode - the float LSB accumulator starts at the floor, the onset-hold
+    sent-frame counter and the hold-band latch are cleared. Called on every (re)open, on disable, on the
+    longActive-off exit, and on a cal-active EDGE (0043 v2: a cal->planner hand-off must not carry stale state).
+
+    0037: on the CONTINUOUS instance the accumulator starts at TRUE ZERO (there is no 4 LSB floor to sit on; the first
+    level the slew may reach from 0 is 1 LSB), so an episode really does begin from "no brake". The pre-0037 law keeps
+    its floor, byte-for-byte."""
+    self._shape_acc = 0.0 if getattr(self, "cont_law", False) else float(FCA11_SHAPE_FLOOR_LSB)
+    self._shape_sent_n = 0
+    self._shape_in_hold_band = False
+    self._shape_band_clear()
+    self._track_reset()
+
+  def _track_reset(self) -> None:
+    """0035: a fresh tracking episode - no trim, no need history, no latched ceiling.
+
+    0040: also forgets the wire quantiser's hysteresis reference (the next episode starts from 0, the level the wire
+    is at when an episode ends), so a stale level can never be held into a new episode.
+    """
+    self._track_trim = 0.0
+    self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)
+    self._track_ceil_hi = False
+    self._cont_q_last = 0
+    self._cont_q_bus = 0
+
+  def _track_ceiling(self, need: float, personality) -> int:
+    """0035: the tier cap, or the 30 LSB law ceiling while the need exceeds what the tier cap measurably delivers.
+
+    Fable F2 corrections, all three in this function:
+    (a) LATCHED with hysteresis: enter above ``plant(tier cap) + FCA11_TRACK_URGENT_MARGIN`` (1.67 m/s^2 for the standard
+        cap) and leave only below ``FCA11_TRACK_CEIL_EXIT_FRAC`` of what the cap delivers (1.33). Un-latched, a need
+        hovering at the switch re-clamped the level 27 -> 20 in one 20 ms frame, repeating every second.
+    (b) this path can never command more than ``FCA11_TRACK_CEIL_MAX_LSB`` (30, 0.30 g): the 31-46 LSB urgent lane is
+        behind ``FCA11_TRACK_URGENT46_ENABLED`` (DEFAULT OFF) - it was never measured on this plant.
+    (c) the raised ceiling belongs to the STANDARD tier and up: a RELAXED tier (cap 12) keeps its own cap, so the tier
+        cap bounds the level in every personality (it leaked to 26 LSB before this).
+    """
+    cap = personality_max_dec(personality)
+    hi = min(int(FCA11_MEAS_CEIL_LSB), int(FCA11_TRACK_CEIL_MAX_LSB))
+    if cap >= personality_max_dec(PERSONALITY_STANDARD) and hi > cap:
+      enter = fca11_track_plant_decel(cap) + FCA11_TRACK_URGENT_MARGIN
+      leave = FCA11_TRACK_CEIL_EXIT_FRAC * fca11_track_plant_decel(cap)
+      if need > enter:
+        self._track_ceil_hi = True
+      elif need < leave:
+        self._track_ceil_hi = False
+    else:
+      self._track_ceil_hi = False
+    ceil = hi if self._track_ceil_hi else cap
+    if FCA11_TRACK_URGENT46_ENABLED and float(getattr(self, "_planner_ask", 0.0)) <= FCA11_URGENT_ASK_MSS2:
+      ceil = max(ceil, int(getattr(self, "_urgent_ceiling_lsb", 0)) or ceil)
+    top = int(HYUNDAI_FCA11_LONG_MAX_DEC) if FCA11_TRACK_URGENT46_ENABLED else int(FCA11_TRACK_CEIL_MAX_LSB)
+    return int(min(ceil, top))
+
+  def _track_level(self, need: float, CS, frame: int, personality, hard: bool) -> int:
+    """0035: the TRACKING level for one frame of a moving shaped episode (see the FCA11_TRACK_* block).
+
+    State advances only on the 50 Hz send slot, like _shape_level. ``need`` (m/s^2, >= 0) is the planner ask merged with
+    the closing-lead demand. Level = measured inverse + integral trim on (need 0.3 s ago - delivered), slewed at a jerk
+    limit through the measured slope in BOTH directions, clamped [4, ceiling], <= +RATE_STEP over the last sent frame.
+
+    Fable F2: the ceiling bounds the TARGET above, never the slewed OUTPUT below. Clamping the output meant a ceiling
+    that stepped down CUT the level in one frame (27 -> 20 = a 0.69 m/s^2 release step, 41 -> 30 = 1.4) - exactly the
+    "slewed both ways" claim it was hiding. Now the level walks down at the (2x) down-slew, ~0.4-1.1 LSB per sent frame
+    on the measured table, so no such step exists. The panda contract on the last line is still the hard bound on what
+    may leave the law, and it only ever LOWERS a sent frame.
+    """
+    if frame % FCA11_SEND_EVERY != 0:
+      return int(round(self._shape_acc))
+    ceil = self._track_ceiling(need, personality)
+    self._track_hist.append(need)
+    prev = self._shape_acc
+    if self._shape_sent_n >= FCA11_TRACK_FB_DELAY_SENT and len(self._track_hist) > FCA11_TRACK_LAG_SENT:
+      delivered = -float(getattr(CS.out, "aEgo", 0.0))
+      err = self._track_hist[0] - delivered
+      # anti-windup: never integrate further into a limit the level is already pinned against
+      if not ((err > 0 and prev >= ceil - 0.5) or (err < 0 and prev <= FCA11_SHAPE_FLOOR_LSB + 0.5)):
+        self._track_trim += FCA11_TRACK_KI * err * FCA11_SHAPE_SENT_DT
+        self._track_trim = max(-FCA11_TRACK_TRIM_DOWN, min(FCA11_TRACK_TRIM_UP, self._track_trim))
+    target = max(float(FCA11_SHAPE_FLOOR_LSB), min(float(ceil), fca11_track_lsb(need) + self._track_trim))
+    rate = FCA11_TRACK_JERK * FCA11_SHAPE_SENT_DT / fca11_track_slope(prev)
+    step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+    if (not hard) and self._shape_sent_n < FCA11_SHAPE_ONSET_HOLD_SENT:
+      # the 0043 onset hold, unchanged: no growth for 0.2 s of a comfort episode, decreases allowed
+      new_acc = min(prev if target >= prev else target, float(max(self._dec_last_sent, FCA11_SHAPE_FLOOR_LSB)))
+    elif target >= prev:
+      new_acc = min(target, prev + (step if hard else min(step, rate)))
+    else:
+      new_acc = max(target, prev - min(step, 2.0 * rate, float(FCA11_TRACK_DOWN_STEP_LSB)))
+    # F2: NO `min(ceil, ...)` here - see the docstring. The floor is the only post-slew clamp; a ceiling drop rides the
+    # down slew above.
+    new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
+    self._shape_acc = new_acc
+    self._shape_sent_n += 1
+    return min(int(round(new_acc)), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+
+  def _cont_level(self, accel_ask: float, v_kph: float, CS, frame: int, personality) -> int:
+    """0037: the ONE continuous brake level for one frame (DESIGN.md lane-E §4). Returns the raw CR_VSM_DecCmd.
+
+    need -> brake_need (§3: demand above the measured coast) -> personality GAIN -> the brake's own plant inverse ->
+    feedback trim -> the stop-band blend -> ONE jerk slew (2.0 m/s^3 up, 2x down, <= 3 LSB/frame, <= the panda's
+    +RATE_STEP over the last accepted frame) -> round at the wire. No debounce, no threshold, no latch, no tier cap,
+    no floor: 0 is a legal level (it means "no friction brake", and the gas side is then at its true zero coast).
+
+    ``accel_ask`` is the MERGED ask the planner asked for this frame (negative = brake, closing-lead demand included).
+    State advances only on the 50 Hz SENT slot; a non-send frame re-offers the accumulator (not transmitted).
+    """
+    if not self._actuating and self._shape_acc <= 1e-9:
+      # at rest between episodes: the accumulator is exactly 0 (it can only be here when an episode ended, since the
+      # slew stops AT its target), so the trim and the lag line restart with the next episode. While a ramp is still
+      # sub-1-LSB it is NOT reset - that is the continuous start of the next episode, not a new bucket.
+      self._track_reset()
+    if frame % FCA11_SEND_EVERY != 0:
+      # 0040 v2 (review K1): a NON-SEND frame re-offers the level last SENT, not a fresh quantisation of the
+      # accumulator. Re-quantising here returned a level the wire does not carry (the onset clamp and the down-step
+      # clamp both hold the wire away from `_shape_acc`), and `cont_dec` feeds `want_brake = cont_dec > 0` on EVERY
+      # frame - so a stale recomputation could open or hold an episode on a frame that sends nothing.
+      return int(self._cont_q_last)
+    v = max(0.0, float(v_kph) / 3.6)
+    standstill = bool(getattr(CS.out, "standstill", False))
+    need = max(0.0, -float(accel_ask))
+    bn = fca11_cont_brake_need(need, v)
+    # M4 (review): the trim is NOT zeroed on `bn <= 0`. Around the coast handover the plan dithers at 2-4 Hz across
+    # need == coast(v), so zeroing on every zero-demand frame disarmed the only closed loop on this actuator and
+    # restarted it from its 0.5 s delay exactly at the 1-3 LSB levels whose gain is least known. It cannot wind up
+    # (its update is gated on bn > 0), it is not APPLIED while bn <= 0 (the target below is 0, so the level walks down),
+    # and it IS dropped when the episode genuinely closes - `_track_reset()` at the top of the next frame, which is
+    # what actually killed the phantom hold this guard was first added for.
+    self._track_hist.append(bn)
+    prev = float(self._shape_acc)
+    # feedback trim: the same numbers as 0035 (KI 8, +12/-6, 0.5 s delay, 0.3 s lag), but compared in the brake's OWN
+    # domain - what the pads delivered is the measured net decel MINUS the coast the engine is already providing - and
+    # only while there IS a demand to correct (see above). `_shape_sent_n` counts SENT frames that actually carried a
+    # level, so the 0.5 s delay is 0.5 s of real braking, not of sitting at 0.
+    # 0040: the trim is ON in this slice (FCA11_CONT_TRIM_ENABLED = True, the 0037 path byte-identical to shipped).
+    # With the flag False it never integrates and (below) is never added, so it contributes EXACTLY zero and the level
+    # is a pure function of the demand. See the FCA11_CONT_TRIM_ENABLED block.
+    if (FCA11_CONT_TRIM_ENABLED and bn > 0.0 and self._shape_sent_n >= FCA11_TRACK_FB_DELAY_SENT
+            and len(self._track_hist) > FCA11_TRACK_LAG_SENT):
+      delivered_b = max(0.0, -float(getattr(CS.out, "aEgo", 0.0)) - fca11_cont_coast(v))
+      err = self._track_hist[0] - delivered_b
+      ceil_now = float(FCA11_CONT_CEIL_LSB)
+      if not ((err > 0.0 and prev >= ceil_now - 0.5) or (err < 0.0 and prev <= 0.5)):
+        self._track_trim += FCA11_TRACK_KI * err * FCA11_SHAPE_SENT_DT
+        self._track_trim = max(-FCA11_TRACK_TRIM_DOWN, min(FCA11_TRACK_TRIM_UP, self._track_trim))
+    if bn > 0.0:
+      # 0040-nz: the UNTRIMMED demand, in LSB - the feed-forward half of the target. Everything that decides whether this
+      # frame still brakes (the zero-snap in the quantiser, and the floor below) is decided on THIS value; the trim is
+      # added afterwards and may only refine the level.
+      untrimmed = fca11_cont_lsb(fca11_cont_gain(personality) * bn)
+      target = untrimmed + (self._track_trim if FCA11_CONT_TRIM_ENABLED else 0.0)
+    else:
+      # M4: no demand -> target 0 whatever the held trim says, so the level walks down (no phantom hold) while the
+      # trim itself survives the handover for the next real ask.
+      untrimmed = 0.0
+      target = 0.0
+    # the stop/hold band is a BLEND now: the creep floor (or the standstill hold) fades in over 3->5 km/h instead of
+    # swapping the law at 3 km/h. Only while the demand is a stop demand (bn > 0) - the planner asking to move must
+    # release, exactly like the panda's gas/brake exclusion does.
+    bw = fca11_cont_band_weight(v_kph)
+    if bw > 0.0 and bn > 0.0:
+      hold = float(fca11_standstill_hold_lsb()) if standstill else float(FCA11_CONT_HOLD_FLOOR_LSB)
+      target = (1.0 - bw) * target + bw * max(target, hold)
+    target = max(0.0, min(float(FCA11_CONT_CEIL_LSB), target))
+    # 0040-nz (lane N): a CORRECTION term must refine a level, never END an episode. The trim is a feedback term on the
+    # level, so while a level is on the wire it may lower it to the weakest actuating step (1 LSB) but not to 0 as long
+    # as the UNTRIMMED demand is still asking for the pads: an untrimmed demand of >= 0.5 LSB is exactly what
+    # `fca11_cont_qhyst` refuses to zero-snap, so the sum is floored at 1 LSB on that same condition. Measured cause of
+    # the 11 isolated zeros in 195/196 (lane L): the trim's down-rail (-0.2 .. -6.0 LSB) walked a 0.37..0.50 LSB target
+    # below the snap, the last level released, the episode closed, `_track_reset()` zeroed the trim and the SAME ask
+    # re-opened at 1 LSB one frame later - a 20 ms brake-off blip on the wire per occurrence.
+    # `_cont_q_last > 0` is the "a level is actually being held" half, and it is NOT cosmetic: a level of 0 has nothing
+    # to refine, and without it the floor also raises the OPENING threshold from 1.0 LSB (the band holds 0 until the
+    # target is a full LSB away) to 0.5 LSB, i.e. this fix would start episodes slice 1a never starts (measured: 5
+    # isolated zeros instead of 1 on the 23 windows).
+    # NOT confined to the sub-1-LSB regime (lane W, review D2 - the earlier "byte-identical opening path" claim was
+    # false): holding an episode open also changes the trim's own walk, so later levels differ too. Measured against
+    # slice 1a: brake-on 95.4 -> 105.2 s (195/196) and 211.2 -> 233.6 s (197); time at level 1 16.7 -> 30.9 s and
+    # 32.0 -> 61.5 s; 23 / 42 frames above 0 where 1a sends 0; levels up to 16 differ. What IS unchanged is the
+    # release: below 0.5 LSB of untrimmed demand nothing is floored and the target walks to 0 exactly as 1a does.
+    if FCA11_CONT_TRIM_ENABLED and untrimmed >= 0.5 and int(self._cont_q_last) > 0:
+      if target < 1.0:
+        # 0040-nz3 (lane W, review D1): BACK-CALCULATE the trim from the correction actually applied. Without this the
+        # floor holds `_shape_acc` at 1.0, so the trim's own anti-windup guard above (`err < 0 and prev <= 0.5`) can
+        # never fire: the trim integrates to its -6 rail while the level sits on the floor, and the next real demand
+        # starts 4-8 LSB short of slice 1a for 1-3 s (195 t=11022-11025: 1,1,2,4,8,11,15 where 1a sends
+        # 5,6,8,10,12,16,20). The applied correction here IS `1.0 - untrimmed` - that is what the floor puts on the
+        # wire - so the integrator state is pinned to it (the textbook back-calculation). A no-op whenever the floor
+        # does not bind (`target >= 1.0` implies the trim is already above `1.0 - untrimmed`).
+        self._track_trim = max(self._track_trim, 1.0 - untrimmed)
+      target = max(target, 1.0)
+    rate = FCA11_CONT_JERK * FCA11_SHAPE_SENT_DT / fca11_cont_slope(prev)
+    step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+    if target >= prev:
+      new_acc = min(target, prev + min(step, rate))
+    else:
+      new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
+    new_acc = max(0.0, new_acc)
+    self._shape_acc = new_acc
+    # 0040 v2: the WIRE quantiser (see the block below). The slew above stays continuous, and the demand is untouched.
+    # 0040: the WIRE quantiser rounds with a one-LSB hysteresis band against the level the BUS last carried
+    # (`_cont_q_bus`, not `_cont_q_last`: a sub-bite frame withheld by sub_bite_gate put 0 on the wire, and the physical
+    # band the ESC holds is around THAT). Then the two wire limits the law already owed, in this order:
+    #   1. the down-step clamp (FCA11_CONT_DOWN_STEP_LSB = 3 per sent frame) - a property of OUR law;
+    #   2. the panda's +RATE_STEP onset gate - OUTERMOST (review K3). It is the firmware's own reference, computed from
+    #      the last frame it ACCEPTED (`_dec_last_sent`, updated at the send site of THIS function's caller, l.3941,
+    #      i.e. after this law and before the 0038 sub-bite substitution), so it must be the LAST word: applied first it
+    #      was raised again by the down clamp (v1 could emit `_dec_last_sent + 4 + 1` after an episode closed with a
+    #      non-zero wire level, and the panda refused the frame -> _refused_cut -> fca11Unavailable).
+    prev_wire = int(self._cont_q_last)
+    dec = fca11_cont_qhyst(new_acc, self._cont_q_bus)
+    dec = max(dec, prev_wire - int(FCA11_CONT_DOWN_STEP_LSB))
+    dec = min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+    dec = max(0, int(dec))
+    self._cont_q_last = dec
+    self._cont_q_bus = dec     # sub_bite_gate zeroes this on a frame it withholds (the wire then carries 0)
+    if dec > 0:
+      if not self._actuating:
+        # M3: the harvest counter is PER EPISODE - it restarts when a new episode opens (a cumulative lifetime count
+        # cannot be quoted next to one episode's plateaus in episodes.jsonl).
+        self.cont_low_lsb_frames = 0
+      self._shape_sent_n += 1     # SENT frames that carried a level (the trim's 0.5 s delay is real braking time)
+    # 0038-excl: `cont_low_lsb_frames` (a SENT frame at 1-3 LSB) is counted at the SEND SITE below, not here - a
+    # sub-bite level withheld from the wire (throttle held) is not a sent 1-3 LSB frame and must not inflate the
+    # first-drive harvest of what 1-3 LSB actually delivers.
+    return dec
+
+  def _shape_band_clear(self) -> None:
+    """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
+    self._shape_band_entry_lsb: int | None = None   # the level held at band entry (None = not in the band yet)
+    self._shape_band_capped = False                  # latched: standstill / hard ask / timeout ramp done -> tier cap
+    self._shape_band_low_since: int | None = None    # controller frame the current continuous <= 3 km/h run began
+    self._shape_band_ramp_n: int | None = None       # frames since the timeout ramp started (None = no ramp)
+    self._shape_band_ramp_frame = 0                  # controller frame the timeout ramp started
+    self._shape_band_ramp_from = float(FCA11_SHAPE_FLOOR_LSB)
+
+  def _shape_band_target(self, cap: int, shaped: int, v_kph: float, standstill: bool, hard: bool, frame: int) -> int:
+    """WI3: the hold band's level target, called on EVERY frame while in the band (see the FCA11_SHAPE_BAND_* block).
+
+    The tier cap once the car is confirmed stopped (or a hard ask / the timeout ramp has finished); while still rolling,
+    the creep floor only: the shaped level floored at max(band-entry level, FCA11_CRAWL_MIN_LSB), <= cap; after
+    FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES at/below 3 km/h without standstill, a linear ramp to the cap over
+    FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES starting from the level then held."""
+    if self._shape_band_entry_lsb is None:
+      self._shape_band_entry_lsb = int(min(cap, max(FCA11_SHAPE_FLOOR_LSB, int(self._shape_acc))))
+    if standstill or hard:
+      self._shape_band_capped = True
+    if self._shape_band_capped:
+      return cap
+    creep = int(min(cap, max(shaped, self._shape_band_entry_lsb, FCA11_CRAWL_MIN_LSB)))
+    # the timeout counts CONTINUOUS time at/below the 3 km/h edge in controller frames (100 Hz; frame numbers, so it is
+    # real time whatever the call cadence). A creep back above 3 km/h inside the 3-5 km/h exit hysteresis restarts it.
+    if self._shape_band_ramp_n is None:
+      if v_kph > FCA11_SHAPE_HOLD_BAND_KPH:
+        self._shape_band_low_since = None
+      elif self._shape_band_low_since is None:
+        self._shape_band_low_since = int(frame)
+      if self._shape_band_low_since is not None and \
+          frame - self._shape_band_low_since >= FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES:
+        self._shape_band_ramp_n = 0
+        self._shape_band_ramp_frame = int(frame)
+        self._shape_band_ramp_from = float(max(creep, int(self._shape_acc)))
+    if self._shape_band_ramp_n is None:
+      return creep
+    self._shape_band_ramp_n = max(0, int(frame) - self._shape_band_ramp_frame)
+    frac = min(1.0, self._shape_band_ramp_n / FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES)
+    if frac >= 1.0:
+      self._shape_band_capped = True
+    ramp = self._shape_band_ramp_from + (cap - self._shape_band_ramp_from) * frac
+    return int(min(cap, max(creep, int(ramp))))
+
+  def _shape_level(self, accel_ask: float, v_kph: float, CS, frame: int,
+                   personality=PERSONALITY_STANDARD) -> int:
+    """0043: the raw CR_VSM_DecCmd the SHAPED law requests for one 100 Hz frame (ON path).
+
+    State advances ONLY on the 50 Hz SENT slot (frame % FCA11_SEND_EVERY == 0): the emitted level is a staircase
+    and the jerk slew counts per SENT frame. On a non-send frame the last accumulator value is re-offered (it is
+    not transmitted, so this only feeds the alert/logger view). The return is capped by the panda contract - a
+    sent frame may grow at most +RATE_STEP over the last ACCEPTED frame (0 at an episode open, which is why the
+    FIRST sent frame is the floor 4). Never returns 0 within an episode; a release is the caller's job.
+    """
+    cap = personality_max_dec(personality)
+    want = max(0.0, -accel_ask)
+    # 0043 v2: hold-band EXIT hysteresis. ENTER at <= FCA11_SHAPE_HOLD_BAND_KPH (3 km/h) or CarState.standstill;
+    # leave only at >= FCA11_SHAPE_HOLD_EXIT_KPH (5 km/h). Without it a DCT creeping across the 3 km/h edge steps the
+    # command cap<->level (e.g. 20 -> 6 -> 20), a repeated ~1 m/s^2 step. The latch is updated every frame (it is
+    # above the send-slot return) so the exit is seen promptly.
+    standstill = bool(getattr(CS.out, "standstill", False))
+    if standstill or v_kph <= FCA11_SHAPE_HOLD_BAND_KPH:
+      self._shape_in_hold_band = True
+    elif v_kph >= FCA11_SHAPE_HOLD_EXIT_KPH:
+      self._shape_in_hold_band = False
+    in_hold_band = self._shape_in_hold_band
+    hard = bool(accel_ask <= FCA11_ONSET_BYPASS_ACCEL)
+    # level-law target (integer LSB): the shaped inverse of the demand; in the stop/hold band (WI3) the tier cap only
+    # once the car is confirmed stopped / a hard ask / the timeout ramp, else the creep floor. The band state is stepped
+    # on EVERY frame (above the send-slot return) so the 1.5 s timeout is counted in real time.
+    if getattr(self, "shape_track", False) and not in_hold_band:
+      # 0035: moving, outside the band -> the TRACKING layer owns the level (see FCA11_TRACK_*).
+      self._shape_band_clear()
+      # 0035 (Fable R1): `accel_ask` here is the MERGED need (planner ask + this law's own closing-lead demand). The
+      # +RATE_STEP fast lane / onset-hold bypass belongs to the PLANNER's hard ask only (the F1 open-bypass rule): keyed
+      # on the merged need, a one-frame phantom inside a planner-opened episode ramped 4 -> 30 LSB in ~0.16 s. The demand
+      # still raises the level through `want`, at the comfort jerk slew. (The hold band keeps `hard` as before.)
+      hard_planner = bool(float(getattr(self, "_planner_ask", accel_ask)) <= FCA11_ONSET_BYPASS_ACCEL)
+      return self._track_level(want, CS, frame, personality, hard_planner)
+    target = shape_dec_cmd_from_extra(want, cap)
+    if in_hold_band:
+      # 0035 (Fable R2): the band ends the moving episode's raised-ceiling latch. Band entry does not call _track_reset
+      # (the episode stays open), so without this a creep-out (> 5 km/h, no release) resumed on the 30 LSB lane for any
+      # need inside the 1.33..1.67 hysteresis. Cleared on every band frame -> a creep-out starts from the tier cap.
+      self._track_ceil_hi = False
+      target = self._shape_band_target(cap, target, v_kph, standstill, hard, frame)
+    else:
+      self._shape_band_clear()
+    if frame % FCA11_SEND_EVERY != 0:
+      return int(self._shape_acc)
+    # 0043 v2: a HARD ask is an EMERGENCY. It bypasses the onset hold AND the comfort jerk slew: its growth runs at
+    # up to the panda ceiling, the SAME +RATE_STEP/sent-frame rate the (pre-shaping) fast ramp uses, so a hard demand
+    # reaches the tier cap in a few sent frames (~0.1 s) instead of seconds. The shaped LEVEL target is kept (an
+    # honest inverse level once reached). The hold band is exempt for the same reason (a stop wants the cap promptly);
+    # WI3: inside the band the target itself is now gated (creep floor / standstill cap / linear timeout ramp), so the
+    # fast lane's +RATE_STEP only governs the creep-floor take-up (<= +3 LSB at entry) and the standstill cap take-up.
+    fast = bool(hard or in_hold_band)
+    prev = self._shape_acc
+    if (not in_hold_band) and (not hard) and self._shape_sent_n < FCA11_SHAPE_ONSET_HOLD_SENT:
+      # onset hold: NO GROWTH before the hold has elapsed. At an episode open `prev` IS the floor, so this holds the
+      # floor exactly as before. 0043 v2: after a HARD phase (the fast lane grew `prev` above the floor) an ask that
+      # eases into the soft band inside the onset hold must NOT be forced back down to the floor - that would be a
+      # 12 -> 4 step across the delivered-decel cliff and a re-climb at the comfort slew (a release-and-reapply). Hold
+      # the level, and follow the (lower) honest soft level down immediately (decreases are the safe direction).
+      new_acc = prev if target >= prev else float(target)
+      # ... and NO growth of the SENT value either. `_shape_acc` is stored BEFORE the panda clamp below, so after a
+      # short HARD phase it sits up to one +RATE_STEP AHEAD of the last sent frame; without this cap a soft ask
+      # that eases in during the hold would let the sent value CLIMB to it (4 -> 7 in one frame). Cap at the last
+      # sent level (the floor at an episode open, where _dec_last_sent is 0). Only ever lowers the command.
+      new_acc = min(new_acc, float(max(self._dec_last_sent, FCA11_SHAPE_FLOOR_LSB)))
+    elif target >= prev:
+      # grow toward the target: the panda's own +RATE_STEP on a hard ask / in the hold band, the comfort jerk slew
+      # on a soft (comfort) moving ask.
+      slew = float(HYUNDAI_FCA11_LONG_RATE_STEP) if fast else shape_slew_lsb_per_sent(prev)
+      new_acc = min(float(target), prev + slew)
+    else:
+      # decrease is immediate (safe direction; release ramp deferred).
+      # 0035 F4: EXCEPT the hold-band seam on the tracking instance - the band may inherit a level ABOVE its own target
+      # from the tracked moving episode (up to 30 -> the tier cap 20), which was a one-frame 10 LSB lurch at the end of
+      # exactly the firm stops this layer serves. Walk it down over >= FCA11_TRACK_BAND_DESCENT_FRAMES sent frames.
+      # Only the tracking instance (the pre-0035 law keeps its immediate decrease) and only for a step the panda's own
+      # +RATE_STEP would not already bound.
+      gap = prev - float(target)
+      if getattr(self, "shape_track", False) and in_hold_band and gap > float(HYUNDAI_FCA11_LONG_RATE_STEP):
+        new_acc = max(float(target), prev - min(float(HYUNDAI_FCA11_LONG_RATE_STEP),
+                                                max(1.0, gap / FCA11_TRACK_BAND_DESCENT_FRAMES)))
+      else:
+        new_acc = float(target)
+    new_acc = max(float(FCA11_SHAPE_FLOOR_LSB), new_acc)
+    self._shape_acc = new_acc
+    self._shape_sent_n += 1
+    # panda contract: never exceed +RATE_STEP over the last ACCEPTED frame (0 at an episode open -> the first
+    # sent frame is the floor 4, which the panda accepts).
+    return min(int(new_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+
+  def _feel_reset(self, seed: float = float(FCA11_FEEL_FIRST_LSB)) -> None:
+    """0049: arm the feel ramp for a (re)opened episode: the accumulator starts at ``seed`` (the first-frame level, or
+    the last SENT level on a cal->planner hand-off so there is no step), the slope estimate is cleared."""
+    self._feel_acc = float(seed)
+    self._feel_slope = 0.0
+    self._plant_ref_lsb = None         # 2026-11-03 (Fable): a (re)opened episode starts the curve backlash with no history
+    self._plant_lsb_last = None
+    self._feel_prev_ask = None
+    self._feel_slope_ant = 0.0         # 0051: the slow (anticipation-only) slope EMA
+    self._feel_peak = float(seed)      # 0051: the re-rise deadband reference restarts with the episode
+    self._feel_ll_frame = None         # 0051: no lead-loss hold survives into a new episode
+    self._feel_standstill_hold = False  # 17c: nor a standstill hold (re-set at once if the car is still at standstill)
+    self._rel_acc = None               # 18x: nor a release ramp (a re-opened episode starts from the wire, not mid-ramp)
+    self._rel_sent = 0
+    self._rel_fast = False
+
+  def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
+                   v_mps=None) -> int:
+    """0051 (b): the feel target for the (possibly anticipated) ask ``a_tgt``, with the gentle-ask gain chosen by the RAW ask
+    ``accel`` and the (b2) low-speed restore ``gain_speed``. Off the fix (feel_fix False) this is exactly the 0049
+    feel_target_lsb(a_tgt).
+
+    0054: on the MEASURED law (self.meas_inverse) this is the measured inverse of the ask and NOTHING ELSE. The 0051
+    gentle gain (0.70) existed only to cancel the 0.67 inverse's ~2x over-delivery; applied on top of an honest inverse
+    it would UNDER-deliver by 30%, so it is not applied. Same for the anticipation/low-speed-restore plumbing downstream:
+    they keep working on the level, they just have a level that means what it says.
+    0055: ``v_mps`` selects the speed-indexed floor (fca11_floor_lsb) instead of the fixed 4, so the level rises into the
+    stop band as the car slows instead of stepping at band entry. None = at speed = the moving floor.
+    """
+    if self.meas_inverse:
+      # 2026-11-03 (Fable review): this passed the raised gate unconditionally, so EVERY level on this path - a gentle ask,
+      # a lead-loss hold, a standstill level - could spend 46 LSB. The gate is now keyed on the ask itself, which is the only
+      # thing the owner's ruling covers: an ask at/below FCA11_URGENT_ASK_MSS2, i.e. a genuine hard stop.
+      # 2026-11-03 (Fable): keyed on the PLANNER's ask, never on this law's own closing demand or shortfall boost - a
+      # law-internal demand must never reach the 31-46 LSB region.
+      _gate_ask = float(getattr(self, '_planner_ask', a_tgt))
+      _ceil = getattr(self, '_urgent_ceiling_lsb', 0) if _gate_ask <= FCA11_URGENT_ASK_MSS2 else 0
+      if getattr(self, 'dynamic_brakes', False):
+        # 2026-11-03 (routes 190/191): ON, the level IS the inverse of the measured plant curve, so the target - and with
+        # it every level the ramp/anticipation/deadband/floors downstream can reach - is bounded by what the ask is
+        # measurably worth (<= 20 LSB / 1.57 m/s^2). The ONE deliberate override is the existing urgent lane (the owner's
+        # 0.5 g ruling): a genuine hard-stop PLANNER ask (<= FCA11_URGENT_ASK_MSS2) may still spend the analytic map up to
+        # the raised gate, and only ever ADDS to the curve level (max), so the urgent lane can never brake less.
+        # 2026-11-03 (Fable): the curve level goes through the backlash operator (dec_cmd_from_plant_curve_hyst) against
+        # the level COMMITTED on the last sent-slot target (_plant_ref_lsb, written only by _feel_level), so a hover on the
+        # flat 13-20 segment cannot chatter. Same contract as dec_cmd_from_accel_plant otherwise (coast -> 0, speed floor).
+        if a_tgt > FCA11_BRAKE_ONSET_ACCEL:
+          self._plant_lsb_last = None
+          lsb = 0
+        else:
+          self._plant_lsb_last = dec_cmd_from_plant_curve_hyst(-a_tgt, getattr(self, '_plant_ref_lsb', None))
+          lsb = max(fca11_floor_lsb(v_mps), self._plant_lsb_last)
+        if _ceil:
+          lsb = max(lsb, dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+        return min(effective_max_dec(personality, a_tgt, _ceil), lsb)
+      return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+    if not self.feel_fix:
+      return feel_target_lsb(a_tgt, personality)
+    return feel_gentle_target_lsb(a_tgt, personality, gain_accel=accel, gain_speed=gain_speed)
+
+  def _feel_lead_loss_floor(self, frame: int) -> float:
+    """0051 (c): the lead-loss floor (LSB) at ``frame``: the level frozen at the edge for LEAD_LOSS_HOLD_S, then linear to 0
+    over LEAD_LOSS_TAPER_S; 0 when no hold is active (and the hold is cleared once it has run out)."""
+    if self._feel_ll_frame is None:
+      return 0.0
+    dt = (frame - self._feel_ll_hold_from) * 0.01
+    if dt < FCA11_FEEL_LEAD_LOSS_HOLD_S:
+      return float(self._feel_ll_lsb)
+    frac = (dt - FCA11_FEEL_LEAD_LOSS_HOLD_S) / FCA11_FEEL_LEAD_LOSS_TAPER_S
+    if frac >= 1.0:
+      self._feel_ll_frame = None
+      return 0.0
+    return float(self._feel_ll_lsb) * (1.0 - frac)
+
+  def _low_speed_release_accel(self, v_mps: float, CS) -> float:
+    """18x: the ask threshold above which an OPEN episode releases, at low speed.
+
+    - v < FCA11_CRAWL_V_MAX (2 m/s): FCA11_CRAWL_RELEASE_ACCEL (-0.10) - a stop in progress is never released (the
+      clutch-torque measurement, see the FCA11_CRAWL_* block). No lead is needed: the creep happens with or without one.
+    - FCA11_CRAWL_V_MAX <= v < FCA11_ROLLING_RELEASE_V_MAX (4 m/s) AND a lead at or inside FCA11_ROLLING_RELEASE_LEAD_M:
+      the same -0.10 (17 of the 18 measured rolling drop-outs on 181/182 never stopped within 3 s).
+    - otherwise the deployed FCA11_BRAKE_RELEASE_ACCEL (-0.30), byte-for-byte.
+    The lead is the one the car layer publishes every controller frame (CS.fca11_lead_drel_m, carcontroller.py), with a
+    fall back to the presence of CS.fca11_lead_one (written on the same line of the same frame): a lead whose DISTANCE is
+    missing keeps the brake, the conservative direction for a "do not creep toward the car in front" rule. A CS without
+    either attribute (a unit double, an old replay) reads as no lead -> the deployed threshold."""
+    if v_mps < FCA11_CRAWL_V_MAX:
+      return FCA11_CRAWL_RELEASE_ACCEL
+    if v_mps >= FCA11_ROLLING_RELEASE_V_MAX:
+      return FCA11_BRAKE_RELEASE_ACCEL
+    d = getattr(CS, "fca11_lead_drel_m", None)
+    if d is None:
+      return FCA11_ROLLING_RELEASE_ACCEL if getattr(CS, "fca11_lead_one", None) is not None else FCA11_BRAKE_RELEASE_ACCEL
+    try:
+      d = float(d)
+    except (TypeError, ValueError):
+      return FCA11_BRAKE_RELEASE_ACCEL
+    return FCA11_ROLLING_RELEASE_ACCEL if 0.0 < d <= FCA11_ROLLING_RELEASE_LEAD_M else FCA11_BRAKE_RELEASE_ACCEL
+
+  def _dyn_first_lsb(self, accel: float, personality, v_kph) -> int:
+    """18x (a): the first SENT level of a NEW episode. OFF (or a HARD ask) = FCA11_FEEL_FIRST_LSB (4, the deployed onset
+    frame). ON with the law's OWN target for this ask at/below the measured 4 LSB floor = FCA11_DYN_GENTLE_FIRST_LSB (1),
+    so the episode climbs 1 -> target at the existing comfort rise rate instead of stepping straight to 4. The target is
+    the same function _feel_level uses (same gentle gain, same speed-indexed floor input), so "gentle" here means exactly
+    "the level this episode is going to sit at anyway is <= 4 LSB". A target > 4 (a real stop) keeps the deployed first
+    frame, so no stop is ever slower than it is today."""
+    if not self.dynamic_brakes:
+      return FCA11_FEEL_FIRST_LSB
+    v_mps = None if v_kph is None else v_kph / 3.6
+    gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
+    target = self._feel_target(accel, accel, personality, gain_speed, v_mps)
+    # 18x v2: EVERY episode ramps in, not only the gentle ones; only an emergency ask keeps the deployed first frame.
+    if accel <= FCA11_DYN_EMERGENCY_ACCEL:
+      return FCA11_FEEL_FIRST_LSB
+    return FCA11_DYN_GENTLE_FIRST_LSB
+
+  def _dyn_release_level(self, frame: int, prev_sent: int, standstill: bool = False) -> int:
+    """18x (c): the level (raw CR_VSM_DecCmd) for ONE frame of a soft release ramp; 0 = the ramp is over, close now.
+
+    The ramp starts from the level that is actually on the wire (``prev_sent``) and decreases by
+    FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame (4 -> 0 in 0.27 s), or by
+    FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT when it started from a standstill/stop-band hold (>= 8 LSB, 30 -> 0 in
+    FCA11_DYN_STANDSTILL_RELEASE_S = 0.5 s). It only ever LOWERS the command, it is capped by nothing else, and it never
+    exceeds the panda's gate. Non-send frames do not advance it (they are not transmitted). Nothing here is a safety
+    path: the CALLER decides whether a ramp is allowed at all (see _update_law), and every veto closes immediately."""
+    if self._rel_acc is None:
+      if prev_sent <= 0:
+        return 0                     # nothing on the wire -> there is nothing to ramp
+      self._rel_acc = float(prev_sent)
+      self._rel_sent = int(prev_sent)
+      # the rate is latched at the start of the ramp: a release from the standstill/stop-band hold gets the 0.5 s ramp,
+      # every other release the 0.3 LSB/frame comfort rate (from the 4 LSB floor that is 0.27 s).
+      self._rel_fast = bool(standstill)
+    if frame % FCA11_SEND_EVERY != 0:
+      return int(self._rel_sent)
+    step = (FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT if self._rel_fast
+            else FCA11_DYN_DECREASE_LSB_PER_SENT)
+    self._rel_acc = max(0.0, self._rel_acc - step)
+    # The emitted integer may never be more than max_drop LSB below the previous one, whatever the float accumulator does
+    # (rounding a 1.2 LSB step lands on a 2 LSB jump on the frames where the accumulator sits just above an integer). It
+    # only ever keeps the level HIGHER for a frame or two - slower to release, the safe direction - and it still walks to
+    # 0 because the bound is relative. The comfort rate is bounded at 1 LSB (= 0.1 m/s^2 per 20 ms); the standstill rate
+    # allows 2 so that 30 -> 0 still lands inside FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s): at 50 Hz a uniform 1 LSB/frame
+    # would take 0.6 s, and 0.2 m/s^2 is still 15x smaller than the deployed one-frame 30 -> 0 (3.0 m/s^2).
+    max_drop = FCA11_DYN_STANDSTILL_MAX_DROP_LSB if step > 1.0 else FCA11_DYN_DECREASE_MAX_DROP_LSB
+    level = max(int(round(self._rel_acc)), self._rel_sent - max_drop)
+    level = max(0, min(fca11_standstill_hold_lsb(), level))
+    self._rel_sent = level
+    return level
+
+  def _log_dyn_send(self, CS, frame: int, dec_cmd: int, accel: float, v_kph: float) -> None:
+    """18x (d): one k="b" record per SENT actuating frame - the level actually on the wire and the measured aEgo, in the
+    FCA11 shadow log's own JSONL stream (same file, same channel pattern, no new format). This is the instrument that
+    answers, from ORDINARY drives and with no calibration protocol, whether 1-3 LSB produce graded braking: with the
+    dynamic release ON every gentle stop now walks 1 -> 2 -> 3 -> 4 and every sent frame carries the level next to the
+    aEgo it produced. Inert (no I/O) when the param is off or the log dir is disabled."""
+    if self._dyn_log is None:
+      return
+    try:
+      self._dyn_log.write(dict(
+        k="b", t_wall=time.time(), frame=int(frame), ep=int(self._sh_episode_id),
+        dec_lsb=int(dec_cmd), a_ego=float(getattr(CS.out, "aEgo", 0.0) or 0.0), v_ego=float(CS.out.vEgo),
+        v_kph=float(v_kph), ask_mps2=float(accel), gas_pressed=bool(CS.out.gasPressed),
+        standstill=bool(getattr(CS.out, "standstill", False)),
+        lead_drel_m=getattr(CS, "fca11_lead_drel_m", None), last_sent=int(self._dec_last_sent),
+        # 18x (b): the driveline's creep torque, so the next drive can prove the clutch is open through the hold and only
+        # engages when we intend to roll. Published by the car layer as CS.fca11_clutch_tq_nm (TCU_DCT13 0x162,
+        # Clutch_Driving_Tq, raw10-512 Nm); None until that one line lands in carstate_ext.py.
+        clutch_tq_nm=getattr(CS, "fca11_clutch_tq_nm", None)))
+      self._dyn_n += 1
+    except Exception:
+      self._dyn_log = None           # a broken log must never affect the law
+      return
+
+  # ---- 17c FEEDBACK: the driver's verdict (k="m") ----
+
+  @property
+  def frame_now(self) -> int:
+    """The last controller frame update() saw - the frame reference a driver mark is typed against."""
+    return int(self._frame_last)
+
+  def _note_sent_level(self, frame: int, lsb: int) -> None:
+    """Remember the level actually SENT this frame (the k="b" population), so a mark can report the last 5 s of our
+    own level. A bounded deque push: no I/O, no send-path read, nothing that can change a CanData byte."""
+    self._lsb_hist.append((int(frame), int(lsb)))
+    self._plateau_sent = (int(frame), int(lsb))   # PLATEAU: the level built into THIS frame's 0x38D (read by _log_tick)
+
+  def _mark_writer(self):
+    """The writer for the k="m" channel: the SAME stream (fca11-shadow.jsonl) and the SAME one-writer-per-path rule as
+    the k="b" channel - share the shadow writer, else the dynamic-release one, else open our own header. Opened LAZILY
+    (first mark only) so an idle drive touches no file; None when the log dir is disabled."""
+    if self._mark_log is None:
+      from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
+      self._mark_log = self.shadow_log if self.shadow_log is not None else self._dyn_log
+      if self._mark_log is None:
+        self._mark_log = fca11_shadow_log.ShadowLogger(header=dict(
+          note=("FCA11 DRIVER-MARK trace (k=m): one record per driver verdict, by SOURCE. GOOD = the bookmark swipe "
+                "(the UI's pair, button half first); a SECOND press within mark_gap_s also reads bad, the original "
+                "burst convention kept on top of the swipe. BAD = a TWO-FINGER TAP (source touch2), one action, sent as "
+                "the same pair in the REVERSED order (userBookmark first) and typed immediately. " +
+                "The snapshot is frozen at the PRESS instant (t_wall/t_mono_ns); a swipe's record lands when the burst "
+                "closes, a tap's as soon as its press window closes."),
+          mark_gap_s=driver_mark.MARK_GAP_S, mark_pair_dedup_s=driver_mark.MARK_PAIR_DEDUP_S,
+          mark_level_window_frames=driver_mark.MARK_LEVEL_WINDOW_FRAMES))
+    return self._mark_log
+
+  def mark_snapshot(self, CS, now_nanos: int, frame: int | None = None,
+                    engaged: bool = False, long_active: bool = False) -> dict:
+    """Freeze the state a driver mark is about, AT THE PRESS. Nothing here is invented: every field is what the law and
+    the car layer hold on this frame. Lead fields follow the k="f" trace convention (vRel = vLead - vEgo, negative =
+    closing; absent lead => lead_present False and every lead value null, never 0)."""
+    f = self.frame_now if frame is None else int(frame)
+    # CARD CALLS THIS WITH carState (capnp), NOT ONLY WITH THE opendbc CarState: capnp has no `.out` member, so the old
+    # `CS.out.aEgo` killed card on the first mark press - card exit 1, no carState, no engagement for the rest of the
+    # drive (route 18e 2026-11-03, 17:49). Accept either object: an opendbc CarState exposes `.out`, a capnp carState
+    # IS the out struct. Fields the capnp struct does not carry read as their neutral default instead of raising.
+    out = CS
+    if hasattr(CS, "out"):
+      out = CS.out
+    lead = getattr(CS, "fca11_lead_one", None)
+    rec = dict(
+      t_wall=time.time(), t_mono_ns=int(now_nanos), frame=f, ep=int(self._sh_episode_id),
+      # our commanded level: the last level that went ON THE WIRE (the panda's reference), and whether we are actuating
+      lsb_cmd=int(self._dec_last_sent), braking=bool(self._actuating),
+      ask_mps2=round(float(self._ask_last), 4),
+      a_ego_mps2=float(getattr(out, "aEgo", 0.0) or 0.0), v_ego_mps=float(getattr(out, "vEgo", 0.0) or 0.0),
+      standstill=bool(getattr(out, "standstill", False)),
+      gas_pressed=bool(getattr(out, "gasPressed", False)), brake_pressed=bool(getattr(out, "brakePressed", False)),
+      personality=int(self._personality_last),
+      clutch_tq_nm=getattr(CS, "fca11_clutch_tq_nm", None),
+      lead_present=lead is not None,
+      lead_drel_m=getattr(CS, "fca11_lead_drel_m", None) if lead is not None else None,
+      lead_vrel_mps=getattr(CS, "fca11_lead_vrel_mps", None) if lead is not None else None,
+      engaged=bool(engaged), long_active=bool(long_active), armed=bool(self.enabled),
+    )
+    rec.update(driver_mark.level_window_stats(list(self._lsb_hist), f))
+    return rec
+
+  def on_driver_mark(self, verdict: str, source: str, snapshot: dict) -> dict:
+    """THE write path for a driver verdict. One function, so a future wheel-button (or any other) trigger is a caller
+    change and never a law change.
+
+    Writes one k="m" record (schema 2) into the FCA11 shadow stream and arms the transient on-screen confirmation. Inert
+    when the log dir is disabled (no record, no exception) - but the CONFIRMATION is independent of logging: the owner
+    must still see that his press landed. A broken log can never take card down (the writer swallows OSErrors; the
+    record build is wrapped here).
+    """
+    code = driver_mark.MARK_VERDICT_CODE.get(verdict, driver_mark.MARK_CODE_NONE)
+    # arm the confirmation first: it must never depend on the log succeeding
+    self._mark_alert = code
+    self._mark_alert_until = self.frame_now + driver_mark.MARK_ALERT_FRAMES
+    rec = dict(snapshot, k="m", verdict=verdict, source=source)
+    try:
+      w = self._mark_writer()
+      if w is not None:
+        w.write(rec)
+        w.flush()   # a mark is a driver event, not a 50 Hz stream: it must survive an abrupt end of drive
+    except Exception:  # a broken mark log must never affect the law or card
+      self._mark_log = None
+    return rec
+
+  def mark_alert_code(self, frame: int) -> int:
+    """CarStateSP.driverMark for this frame: the confirmation code while its 2 s window is open, else 0. Read by
+    GasInterceptorCarController.create_gas_command and surfaced by the superproject (car_specific -> events)."""
+    return int(self._mark_alert) if int(frame) < self._mark_alert_until else driver_mark.MARK_CODE_NONE
+
+  def _feel_update_band(self, v_kph: float, CS) -> bool:
+    """0049: update + return the hold-band latch (ENTER <= FCA11_FEEL_HOLD_BAND_KPH or standstill; EXIT >= EXIT_KPH)."""
+    if bool(getattr(CS.out, "standstill", False)) or v_kph <= FCA11_FEEL_HOLD_BAND_KPH:
+      self._feel_in_hold_band = True
+    elif v_kph >= FCA11_FEEL_HOLD_EXIT_KPH:
+      self._feel_in_hold_band = False
+      self._feel_standstill_hold = False   # 17c: the standstill hold leaves with the band (the UNCHANGED exit hysteresis)
+    return self._feel_in_hold_band
+
+  def _feel_band_clamp(self, dec: int, personality) -> int:
+    """17c: the hold band's clamp. Not latched -> clamp_dec_cmd (the deployed tier clamp, byte-for-byte). Latched at
+    standstill -> the same clamp with the ceiling raised to max(tier cap, the standstill hold level)."""
+    if not self._feel_standstill_hold:
+      return clamp_dec_cmd(dec, personality)
+    return max(1, min(max(personality_max_dec(personality), fca11_standstill_hold_lsb()), dec))
+
+  def _feel_level(self, accel: float, frame: int, personality=PERSONALITY_STANDARD, v_kph=None,
+                  standstill: bool = False) -> int:
+    """0049: the raw CR_VSM_DecCmd the OLD-LAW feel layer requests for one 100 Hz frame (planner ask, moving).
+
+    State advances only on the 50 Hz SENT slot (the ramp + slope are per SENT frame); a non-send frame re-offers the
+    accumulator (not transmitted - alerts/logger view only). The return is ALWAYS capped by the panda contract (+RATE_STEP
+    over the last SENT frame), and is never above the deployed law's request for the same ask.
+    0051 (b2): ``v_kph`` feeds the low-speed restore (the gentle gain fades back as the car slows so the stop band cannot
+    step the level up at band entry). v_kph None (unit callers) = at speed = the gain in full force."""
+    if self._feel_in_hold_band:
+      # the stop/hold band runs the DEPLOYED law exactly: request clamped like before, +RATE_STEP over the last sent frame.
+      # 0055: its floor is now the SPEED-INDEXED one, taken EXPLICITLY (fca11_floor_lsb) instead of being inherited from
+      # the -0.5 onset clamp at 8. At every band speed (<= FCA11_FEEL_HOLD_BAND_KPH = 3 km/h = 0.83 m/s <= 1.0 m/s) that
+      # floor IS 8, so the band is unchanged here -- that is the point: the ramp finishes ABOVE the band edge, so entry
+      # no longer steps the level. An ask the deployed request takes ABOVE the floor still commands what it commanded
+      # (max(), never min()): the standstill hold is not weakened. Gated on meas_inverse so the 0054 kill switch still
+      # restores the pre-0054 map byte-for-byte.
+      # 17c: at TRUE standstill the band's ceiling (both tier clamps below) is raised to the standstill hold level, latched
+      # until the band exits / the episode re-opens (FCA11_STANDSTILL_HOLD_*). The +RATE_STEP limiter is unchanged.
+      if self.standstill_hold and standstill:
+        self._feel_standstill_hold = True
+      dec = self._feel_band_clamp(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
+      if self.meas_inverse:
+        band_floor = fca11_floor_lsb(None if v_kph is None else v_kph / 3.6, soft=self.dynamic_brakes)
+        dec = max(dec, min(band_floor, personality_max_dec(personality)))
+      dec = self._feel_band_clamp(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
+      if frame % FCA11_SEND_EVERY == 0:
+        self._feel_acc = float(dec)
+        self._feel_prev_ask = accel
+      return dec
+    if frame % FCA11_SEND_EVERY != 0:
+      return max(1, min(int(self._feel_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP))
+    gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
+    # 0055: the speed-indexed floor's speed input. None (unit callers with no speed) = at speed = the moving floor 4.
+    v_mps = None if v_kph is None else v_kph / 3.6
+    prev_ask = self._feel_prev_ask
+    if self._feel_prev_ask is not None:
+      inst = (accel - self._feel_prev_ask) / (FCA11_SEND_EVERY * 0.01)
+      self._feel_slope += FCA11_FEEL_SLOPE_ALPHA * (inst - self._feel_slope)
+      # 0051 (a): anticipation reads a SLOWER EMA of the same slope; the fast one above still drives the deepening bypass
+      self._feel_slope_ant += FCA11_FEEL_SLOPE_ALPHA_0051 * (inst - self._feel_slope_ant)
+    self._feel_prev_ask = accel
+    ll_floor = self._feel_lead_loss_floor(frame) if self.feel_fix else 0.0
+    if ll_floor > 0.0:   # bounded by the PRE-0049 deployed request for this ask (never more than the old law would command)
+      ll_floor = min(ll_floor, float(clamp_dec_cmd(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)))
+    # 0051 (c): while a lead-loss hold is active the ask is NOT anticipated (an ask easing because the track vanished is not
+    # a trend to run ahead of).
+    ant_slope = self._feel_slope_ant if self.feel_fix else self._feel_slope
+    a_tgt = accel if ll_floor > 0.0 else feel_anticipated_accel(accel, ant_slope)
+    target = self._feel_target(a_tgt, accel, personality, gain_speed, v_mps)
+    # 2026-11-03 (Fable): commit THIS sent-slot's curve level as the backlash reference. Only here: the other _feel_target
+    # calls (first-frame pick, re-rise comparison) read the reference but never move it. Inert OFF (never set there).
+    self._plant_ref_lsb = getattr(self, '_plant_lsb_last', None)
+    prev = self._feel_acc
+    if target > prev:
+      rate = feel_rate_lsb_per_sent(accel, prev)
+      if self.dynamic_brakes:
+        # 18x (a2): the RISE is jerk-limited through the measured map (FCA11_DYN_RISE_JERK), except where a ramp would
+        # delay a real stop: an emergency ask and a step the planner is outrunning both keep the panda max. The old
+        # DEEPEN_SLOPE bypass is deliberately NOT used here - at -2.0 m/s^3 an ordinary planner ramp trips it, which
+        # would silently turn the feature off on exactly the asks it exists for.
+        ask_step = abs(accel - prev_ask) if prev_ask is not None else 0.0
+        if (accel <= FCA11_DYN_EMERGENCY_ACCEL or ask_step >= FCA11_DYN_ASK_STEP_ACCEL
+            or self._feel_standstill_hold):
+          # the standstill hold's 10-13 -> 30 LSB take-up is where the car moves 0-1.6 cm; slowing it makes the creep
+          # worse, so that band keeps the deployed rise (owner constraint, pinned by its own test).
+          rate = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+        else:
+          rate = min(rate, dyn_rise_lsb_per_sent(prev))
+      elif self._feel_slope <= FCA11_FEEL_DEEPEN_SLOPE:
+        rate = float(HYUNDAI_FCA11_LONG_RATE_STEP)   # a fast-building demand is not throttled by the comfort ramp
+      new_acc = min(float(target), prev + rate)
+      # 0051 (a) RE-RISE DEADBAND: after the level came down from the episode peak, a GENTLE, not-fast-deepening ask must
+      # call for >= RERISE_LSB more (un-anticipated) before the level climbs again; otherwise it holds (never lower).
+      # 0051 (b2): the comparison uses the RESTORE target (gain_speed), so in the restore zone the fast-rising deployed
+      # level nearly always clears RERISE_LSB and the restore proceeds; at worst the deadband holds the LAST 1 LSB, which is
+      # the 0049 band-entry step shape (measured: rise med/max at band entry 1/4, +4 slot 4 of 36 entries, 0 of the 25
+      # scored stops - identical to 0049). It is NOT suspended there: suspending it re-exposed ask ripple at 6-8 km/h
+      # (30 dips vs 28 with it active, same band-entry result) for no benefit.
+      if (self.feel_fix and prev < self._feel_peak - 0.5 and accel > FCA11_FEEL_RATE_SOFT_ACCEL and
+          self._feel_slope > FCA11_FEEL_DEEPEN_SLOPE and
+          self._feel_target(accel, accel, personality, gain_speed, v_mps) < prev + FCA11_FEEL_RERISE_LSB):
+        new_acc = prev
+    else:
+      # 18x (b): with the dynamic release ON a decrease is limited to FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame
+      # (~1.5 m/s^3) instead of dropping in one frame. It can only ever LOWER the level more slowly - never raise it, never
+      # hold it above the honest target - and the floor below still applies. OFF = the deployed one-frame decrease.
+      if self.dynamic_brakes:
+        new_acc = max(float(target), prev - FCA11_DYN_DECREASE_LSB_PER_SENT)
+      else:
+        new_acc = float(target)        # decreases are immediate (the safe direction)
+    # 0055: the mid-episode floor is the SPEED-INDEXED one on the measured law (so a level the deadband held at 4 cannot
+    # lag under a floor that has since risen to 6-8); off the measured path it stays the 0049 constant 4. Never 0: 0 is
+    # the release, and a release is the caller's job (see the FCA11_MEAS_* block).
+    # 18x (a)/(a2): with the dynamic brakes ON the floor is lowered to the ramp's first level for EVERY target, so the
+    # ramp governs the onset at any depth instead of the level being lifted straight back to 4 on the next frame. The
+    # crawl floor below still applies as a max().
+    floor = float(fca11_floor_lsb(v_mps, soft=self.dynamic_brakes) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB)
+    if self.dynamic_brakes:
+      floor = min(floor, float(FCA11_DYN_GENTLE_FIRST_LSB))
+    # 18x (b) (d): at crawl the level is never in the half-applied 1-5 LSB band: the measured clutch reads -20 Nm (creep
+    # torque closed) from 6 LSB, and 4 LSB - the deployed moving floor - reads +26 Nm with the car still rolling. This can
+    # only RAISE a command inside an episode that is already open; it never opens one and never survives a release.
+    if v_mps is not None and v_mps < FCA11_CRAWL_V_MAX:
+      floor = max(floor, float(FCA11_CRAWL_MIN_LSB))
+    new_acc = max(floor, new_acc, ll_floor)
+    if self.feel_fix:
+      self._feel_peak = max(self._feel_peak, new_acc)
+    # the panda contract caps the SENT value at +RATE_STEP over the last SENT frame (0 at an episode open -> the first
+    # frame is 4). The accumulator is held to the same ceiling so it can never run AHEAD of the wire: otherwise growth
+    # earned on a capped frame would be released in one +4 jump on the next (the 4 -> 8 step this layer exists to remove).
+    ceiling = self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP
+    self._feel_acc = min(new_acc, float(ceiling))
+    return max(1, min(int(new_acc), ceiling))
+
+  # ---- 0045 SHADOW: V3 computed post-send + logged, never sent ----
+
+  def update(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+    # 17c FEEDBACK: latch the frame-local facts a driver mark may be typed against later in the same step (the press is
+    # seen in card's carState phase, the snapshot must describe THIS frame). Three assignments, no effect on the law.
+    self._frame_last = int(frame)
+    self._ask_last = float(min(float(CC.actuators.accel), FCA11_A_MAX_MSS2))
+    self._personality_last = int(personality)
+    sends = self._update_law(CC, CS, frame, personality)
+    if self.shadow:   # 0045 SEAM: capture the V3 inputs only; V3 runs in v3_post_send() AFTER the send, never on the wire
+      self._v3_pending = (float(CC.actuators.accel), bool(CC.enabled), bool(CC.longActive), CS, int(frame), personality, tuple(sends))
+    return sends
+
+  def v3_post_send(self) -> None:
+    """0045: compute V3 for the frame update() just returned (called by card.py AFTER sendcan is published, via
+    GasInterceptorCarController.fca11_post_send) and write the shadow log. NEVER raises; never touches OLD-LAW state."""
+    p, self._v3_pending = self._v3_pending, None
+    if p is None or not self.shadow:
+      return
+    accel, enabled, long_active, CS, frame, personality, oldlaw_sends = p
+    v3_sends = None
+    if not self._v3_disabled:
+      t0 = time.monotonic()
+      try:
+        v3_sends = self._v3_step(accel, enabled, long_active, CS, frame, personality)
+      except Exception as e:  # noqa: BLE001 - V3 must never take the OLD-LAW path (or card) down
+        self._v3_fault("exception", frame, f"{type(e).__name__}: {e}"[:300], 1e3 * (time.monotonic() - t0))
+        v3_sends = None
+      else:
+        dt = time.monotonic() - t0
+        if dt > FCA11_V3_BUDGET_S:
+          self.v3_overruns += 1
+          self._v3_overrun_streak += 1
+          self._v3_fault("overrun", frame, f"V3 step {1e3 * dt:.2f} ms > budget {1e3 * FCA11_V3_BUDGET_S:.1f} ms",
+                         1e3 * dt, disable=self._v3_overrun_streak >= FCA11_V3_OVERRUN_TRIP)
+        else:
+          self._v3_overrun_streak = 0
+    try:
+      self._shadow_publish(accel, enabled, long_active, CS, frame, personality, oldlaw_sends, v3_sends)
+    except Exception:  # noqa: BLE001 - a log must never take card down
+      pass
+
+  def _v3_step(self, accel: float, enabled: bool, long_active: bool, CS, frame: int, personality) -> list[CanData]:
+    core = self._shadow_v3
+    assert core is not None
+    cc = _ShadowCC(enabled, long_active, max(accel, -FCA11_A_MAX_MSS2))
+    core.observe_echo(list(core._sh_prev_echo))
+    v3_sends = core.update(cc, _ShadowCSView(CS), frame, personality)
+    core._sh_prev_echo = [(128, bytes(s.dat)) for s in v3_sends]
+    return v3_sends
+
+  def _v3_fault(self, kind: str, frame: int, err: str, elapsed_ms: float, disable: bool = True) -> None:
+    self.v3_failures += 1
+    if disable:
+      self._v3_disabled = True
+    try:
+      if self.shadow_log is not None:
+        self.shadow_log.write(dict(k="v3fail", t_wall=time.time(), frame=int(frame), kind=kind, err=err,
+                                   elapsed_ms=round(float(elapsed_ms), 3), n_failures=self.v3_failures,
+                                   n_overruns=self.v3_overruns, v3_disabled=bool(self._v3_disabled)))
+        self.shadow_log.flush()
+    except Exception:  # noqa: BLE001
+      pass
+
+  def _shadow_publish(self, accel, enabled, long_active, CS, frame, personality, oldlaw_sends, v3_sends) -> None:
+    accel_law = max(accel, -FCA11_A_MAX_MSS2)
+    ol = [s for s in oldlaw_sends if (s[0] if isinstance(s, tuple) else s.address) == FCA11_ADDR]
+    ol_lsb = int(bytes(ol[-1][1] if isinstance(ol[-1], tuple) else ol[-1].dat)[1]) if ol else 0
+    inst = clamp_dec_cmd(dec_cmd_from_accel(min(accel_law, FCA11_BRAKE_ONSET_ACCEL)), personality) \
+      if accel_law <= FCA11_BRAKE_ONSET_ACCEL else 0
+    v3_ok = v3_sends is not None
+    self.shadow_out = ShadowOutput(non_actuating=True, frame=int(frame), v3_ok=v3_ok,
+                                   v3_wouldbe_lsb=(int(v3_sends[-1].dat[1]) if v3_sends else 0) if v3_ok else None,
+                                   v3_send_wouldbe=bool(v3_sends), wouldbe_sends=tuple(v3_sends or ()),
+                                   oldlaw_cmd_lsb=ol_lsb, oldlaw_send=bool(ol), oldlaw_instant_lsb=int(inst))
+    self._shadow_record(accel, enabled, long_active, CS, frame, personality, accel_law)
+
+  def _shadow_diag_state(self, CS) -> dict:
+    """0054: the diagnostic tuple the IDLE availability trace watches (and embeds in every idle record as ``diag``).
+
+    These are the OLD-LAW instance's own availability inputs - the ones that actually raise/clear the driver-facing
+    "FCA11 Braking Unavailable" - NOT the V3 core's mirrors the frame record's ``hc_unavailable`` / ``hard_cut`` /
+    ``pedal_cut`` fields carry (V3 synthesises ACCEPTED echoes, so its refusal wall can never latch: route 16a's
+    ``fca11_unavailable`` was True for 170 s while those three fields read false). ``cam_quiet`` is BUCKETED
+    (2 = the camera is braking, 1 = its quiet tail is still running, 0 = quiet) so the once-per-camera-frame decay can
+    never trigger an edge on its own - the budget stays 2 Hz.
+    """
+    quiet = int(self._cam_quiet)
+    try:
+      gear = int(getattr(CS.out.gearShifter, "raw", CS.out.gearShifter))
+    except (TypeError, ValueError):
+      gear = -1
+    return dict(
+      fca11_unavailable=bool(self.fca11_unavailable), pedal_cut=bool(self._pedal_cut),
+      refused_cut=bool(self._refused_cut), cam_brake=bool(self.cam_brake),
+      cam_quiet=(0 if quiet >= FCA11_CAM_RESUME_FRAMES else (1 if quiet > 0 else 2)),
+      interceptor_state=int(getattr(CS, "interceptor_state", 0) or 0),
+      interceptor_fault_seen=bool(getattr(CS, "interceptor_fault_seen", False)),
+      brake_pressed=bool(CS.out.brakePressed), gas_pressed=bool(CS.out.gasPressed),
+      gear=gear,
+    )
+
+  def _shadow_idle_due(self, CS, frame: int, long_active: bool) -> bool:
+    """0054: is an IDLE (availability-trace) frame record due on THIS controller frame?
+
+    True while the feature is ARMED and either longitudinal is NOT active or the surfaced loss (fca11_unavailable)
+    stands; then one record every FCA11_SHADOW_IDLE_FRAMES (2 Hz) and, whatever the cadence, ONE on every change of the
+    _shadow_diag_state tuple. Called on EVERY frame, before the 50 Hz slot gate, so a change is logged on the tick it
+    happens. Cheap on the hot path: an armed + longActive + available frame returns after one boolean expression, and
+    nothing here is read by a send decision or an alert (a log must never change control).
+    """
+    if self.shadow_log is None or not self.shadow_log.enabled or self.shadow_log.truncated:
+      return False                    # nothing can be written: skip the tuple build entirely
+    if not (self.enabled and (not long_active or self.fca11_unavailable)):
+      return False
+    diag = self._shadow_diag_state(CS)
+    changed = self._sh_diag_prev is not None and diag != self._sh_diag_prev
+    self._sh_diag_prev = diag
+    last = self._sh_idle_last_frame
+    due = bool(changed or last is None or frame < last or (frame - last) >= FCA11_SHADOW_IDLE_FRAMES)
+    if due:
+      self._sh_idle_last_frame = int(frame)
+    return due
+
+  def _shadow_record(self, accel, enabled, long_active, CS, frame: int, personality, accel_law: float) -> None:
+    v3 = self._shadow_v3
+    assert v3 is not None
+    o = self.shadow_out
+    if enabled and not self._sh_engaged_prev:
+      self._sh_engage_frame = frame
+    if not enabled:
+      self._sh_engage_frame = None
+    self._sh_engaged_prev = enabled
+    v3_braking = bool(o.v3_ok and v3.braking)
+    v = float(CS.out.vEgo)
+    cap = personality_max_dec(personality)
+    if v3_braking and self._sh_ep is None:
+      self._sh_episode_id += 1
+      self._sh_ep = dict(episode_id=self._sh_episode_id, frame_start=frame, t_wall_start=time.time(), n_frames=0,
+                         n_sent=0, v3_min=None, v3_max=0, v3_last=0, oldlaw_instant_max=0, oldlaw_cmd_max=0,
+                         cap_hit_frames=0, held_band_frames=0, v_start_mps=v, v_min_mps=v, ask_min_mps2=accel_law,
+                         camera_request_seen=False, tier_cap=cap)
+    # 0054: the IDLE availability-trace decision is taken on EVERY frame (not only the 50 Hz slot) so a state change
+    # is recorded on the tick it happens; it is inert unless the feature is armed and either longitudinal is inactive
+    # or fca11_unavailable holds, and it never reaches past the shadow log.
+    idle_due = self._shadow_idle_due(CS, frame, long_active)
+    if frame % FCA11_SEND_EVERY != 0 and not (self._sh_ep is not None and not v3_braking) \
+       and not idle_due:
+      return   # frame records ride the 50 Hz send slot; an episode close is never missed
+    cam = getattr(CS, "fca11_cam_frame", None)
+    dat = cam[1] if cam is not None and len(cam[1]) == 8 else None
+    cam_req = bool(dat is not None and camera_requesting(dat))
+    ep = self._sh_ep
+    if ep is not None and v3_braking:
+      ep["n_frames"] += 1
+      if o.v3_send_wouldbe and o.v3_wouldbe_lsb:
+        ep["n_sent"] += 1
+        ep["v3_min"] = o.v3_wouldbe_lsb if ep["v3_min"] is None else min(ep["v3_min"], o.v3_wouldbe_lsb)
+        ep["v3_max"] = max(ep["v3_max"], o.v3_wouldbe_lsb)
+        ep["v3_last"] = o.v3_wouldbe_lsb
+        ep["cap_hit_frames"] += int(o.v3_wouldbe_lsb >= cap)
+      ep["oldlaw_instant_max"] = max(ep["oldlaw_instant_max"], o.oldlaw_instant_lsb)
+      ep["oldlaw_cmd_max"] = max(ep["oldlaw_cmd_max"], o.oldlaw_cmd_lsb)
+      ep["held_band_frames"] += int(bool(v3._shape_in_hold_band))
+      ep["v_min_mps"] = min(ep["v_min_mps"], v)
+      ep["ask_min_mps2"] = min(ep["ask_min_mps2"], accel_law)
+      ep["camera_request_seen"] = bool(ep["camera_request_seen"] or cam_req)
+    why = ((v3._last_why or None) if long_active else "long_inactive") if o.v3_ok else "v3_disabled"
+    lead = getattr(CS, "fca11_lead_one", None)
+    lead_present = bool(lead is not None and getattr(lead, "status", False))
+    lead_vr = getattr(CS, "fca11_lead_vrel_mps", None) if lead_present else None
+
+    def _lf(name, nd):
+      x = getattr(lead, name, None) if lead_present else None
+      return None if x is None else round(float(x), nd)
+    rec = dict(
+      t_wall=time.time(), t_mono_ns=int(getattr(CS, "fca11_now_nanos", 0) or 0), frame=int(frame),
+      t_since_engage=(None if self._sh_engage_frame is None else round((frame - self._sh_engage_frame) * 0.01, 2)),
+      v_ego_mps=round(v, 4), a_ego_mps2=round(float(getattr(CS.out, "aEgo", 0.0) or 0.0), 4),
+      ask_mps2=round(accel, 4), ask_law_mps2=round(accel_law, 4), camera_requesting=cam_req,
+      camera_request_level=(int(dat[1]) if dat is not None else None),
+      camera_warn=(_get_bits(dat, CAM_ACT_WARN_BITS[0], CAM_ACT_WARN_BITS[1]) if dat is not None else None),
+      cam_hex=(dat.hex() if dat is not None else None),
+      oldlaw_armed=bool(self.enabled), oldlaw_cmd_lsb=int(o.oldlaw_cmd_lsb), oldlaw_send=bool(o.oldlaw_send),
+      oldlaw_braking=bool(self._actuating), oldlaw_instant_lsb=int(o.oldlaw_instant_lsb),
+      v3_ok=bool(o.v3_ok), v3_wouldbe_lsb=o.v3_wouldbe_lsb, v3_send_wouldbe=bool(o.v3_send_wouldbe),
+      v3_target_lsb=((int(cap) if v3._shape_in_hold_band else
+                      int(shape_dec_cmd_from_extra(max(0.0, -min(accel_law, FCA11_BRAKE_ONSET_ACCEL)), cap)))
+                     if v3_braking else 0) if o.v3_ok else None,
+      tier_cap=int(cap), personality=int(getattr(personality, "raw", personality)),
+      engaged=bool(enabled), long_active=bool(long_active), v3_braking=v3_braking,
+      held_band=bool(o.v3_ok and v3._shape_in_hold_band), latched=bool(v3.blocked_until_resume),
+      hc_unavailable=bool(v3.fca11_unavailable), hard_cut=bool(v3.cam_brake), pedal_cut=bool(v3._pedal_cut),
+      excl_reason=why, episode_id=(ep["episode_id"] if ep is not None else None),
+      standstill=bool(getattr(CS.out, "standstill", False)), gas_pressed=bool(CS.out.gasPressed),
+      brake_pressed=bool(CS.out.brakePressed),
+      lead_present=lead_present, lead_drel_m=_lf("dRel", 2),
+      lead_vrel_mps=(None if lead_vr is None else round(float(lead_vr), 3)),
+      lead_vlead_mps=_lf("vLead", 3), lead_alead_mps2=_lf("aLeadK", 3), lead_model_prob=_lf("modelProb", 3),
+      lead_radar=(bool(getattr(lead, "radar", False)) if lead_present else None),
+      v3_alert_bits_wouldbe=(int(v3.supervise_stop) | (int(v3.stop_complete) << 1) | (int(v3.brake_now) << 2)) if o.v3_ok else None,
+    )
+    if self.shadow_log is not None:
+      window = bool(v3_braking or self._actuating or cam_req or (long_active and accel_law <= FCA11_BRAKE_RELEASE_ACCEL))
+      if window or not idle_due:
+        self.shadow_log.frame(rec, window)        # the windowed 50 Hz trace, byte-for-byte as before
+      else:
+        # 0054: the IDLE record - the SAME record, written outside the window, plus `idle` and the diagnostic tuple.
+        self.shadow_log.frame_idle(dict(rec, idle=True, diag=self._sh_diag_prev))
+    if ep is not None and not v3_braking:
+      ep.update(frame_end=int(frame), t_wall_end=time.time(), duration_s=round((frame - ep["frame_start"]) * 0.01, 2),
+                v_end_mps=v, end_reason=(why or "release"), v3_min=(ep["v3_min"] or 0))
+      ep = {kk: (round(x, 4) if isinstance(x, float) else x) for kk, x in ep.items()}
+      if self.shadow_log is not None:
+        self.shadow_log.epilogue(ep)
+      self._sh_ep = None
+
+  def _closing_demand(self, CS, accel: float) -> float:
+    """The law's OWN closing-lead demand, or ``accel`` unchanged.
+
+    To stop short of a lead at distance d while closing at c: a = -c^2 / (2 * (d - gap)). Takes the harder of that and
+    the planner's ask, never softens it, only ever runs on the dynamic-brakes instance, and is capped by the wire gate.
+    A missing lead, a lead beyond range, or any non-closing state leaves the ask exactly as the planner sent it.
+    """
+    # 0035: also live on the shaped-law tracking instance (the path the car runs with AffineGain + DynamicBrakes ON).
+    if not (getattr(self, "dynamic_brakes", False) or getattr(self, "shape_track", False)):
+      return accel
+    try:
+      d = float(getattr(CS, "fca11_lead_drel_m", None))
+      vr = float(getattr(CS, "fca11_lead_vrel_mps", None))
+    except (TypeError, ValueError):
+      return accel
+    if not (0.0 < d <= FCA11_AEB_MAX_RANGE_M):
+      return accel
+    closing = -vr                       # vRel is v_lead - v_ego, so closing is its negative
+    if closing < FCA11_AEB_MIN_CLOSING_MPS:
+      return accel
+    room = max(d - FCA11_AEB_GAP_M, 1.0)
+    a_req = -(closing * closing) / (2.0 * room)
+    a_req = max(a_req, -FCA11_AEB_MAX_MSS2)
+    return min(float(accel), a_req)
+
+  def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+    """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
+    sends: list[CanData] = []
+    # 18x: the gas window ages out one controller frame per frame, on EVERY frame (including a disabled one and one with
+    # longActive off): it is a fact about the panda's BRAKE_THROTTLE_EXCL_US, not about our episode.
+    if self._gas_guard_left > 0:
+      self._gas_guard_left -= 1
+    # 0038-excl (lane F): same ageing for the WIRE-side window mirror (gas_hold reads this one)
+    if self._wire_arm_left > 0:
+      self._wire_arm_left -= 1
+    # 18x: this frame's release-ramp state (only ever read by _alerts, so a ramp in progress cannot be mistaken for a
+    # LOST hold - see arm_now there). Set by the else branch below.
+    self._in_rel_ramp = False
+    if not self.enabled:
+      self._actuating = False
+      self.low_speed_alert = False
+      # 0040: the three alerts and the logger are all inert when the feature is off.
+      self.supervise_stop = self.stop_complete = self.brake_now = False
+      self.brake_now_reason = ""
+      self._noresp_since = None
+      self._hold_lost_armed = False
+      # 0041: and the gating timers, so a disable is a clean start.
+      self._noresp_cmd_since = None
+      self._brake_now_clear_since = None
+      # 0043: and the hold countdown - a disabled law holds nothing.
+      self._nag_frames = 0
+      self.hold_nag = FCA11_HOLD_NAG_NONE
+      self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames)
+      # G5: an inert controller must not carry debounce/min-on state into a later re-enable.
+      self._ask_frames = 0
+      self._on_frames = 0
+      # G7: likewise no owed close frame survives a disable (a re-arm is a clean panda episode too).
+      self._release_pending = False
+      self._cal_frames = 0
+      # G9b/0042: and no cut/re-arm state either (a disable is a fresh start, matching the panda's init).
+      self._driver_cut = False
+      self._pedal_cut = False
+      self._rearm_pending = False
+      self.blocked_until_resume = False
+      # 0042: and nothing is UNAVAILABLE while the feature is off (the surfaced flag is the OR of the cut sources).
+      self.fca11_unavailable = False
+      self.fca11_cut_source = FCA11_CUT_SOURCE_NONE   # 0044: same write site as the flag
+      # 0042 (B): clear the echo-confirmed refusal wall too.
+      self._refused_streak = 0
+      self._refused_cut = False
+      # 0053: the camera hand-back, the probation and the divergence guard start clean too (the panda's hyundai_init).
+      self.cam_brake = False
+      self._cam_quiet = FCA11_CAM_RESUME_FRAMES
+      self._cam_tail = 0
+      self.camera_braking_alert = False
+      self._probation_left = self._probation_refused = 0
+      self._probation_cut = False
+      self._div_armed = self._div_latched = self._div_active = self.fca11_divergence = False
+      self._div_streak = self._div_events = self._attrib_hold = 0
+      self._cal_active = False
+      # 0038: no gas hold-off state either.
+      self._gas_release_frame = None
+      self._gas_prev = False
+      # 0043: and no shaped-law state survives a disable (a re-arm starts at the floor). 0043 v2: nor the cal-edge tracker.
+      self._shape_reset()
+      self._cal_prev = False
+      self._feel_reset()                     # 0049: no feel-ramp state survives a disable
+      self._feel_cal_prev = False
+      self._feel_in_hold_band = False
+      self._feel_dwell = 0
+      self._feel_dwell_slow = 0
+      return sends
+
+    # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+    # pattern as fca11_now_nanos: the controller writes a CS attribute the class later reads).
+    CS._fca11_braking_now = self._actuating
+    # 0045 (PROPOSAL): the grace anchor - the first frame of this ENABLED instance (the ignition's arm on the real path).
+    if self._pedal_arm_frame is None:
+      self._pedal_arm_frame = frame
+
+    # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
+    # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
+    # G9b (drive-14): the resume edge only ARMS the re-arm; the driver latch clears on the first CLEAN
+    # frame after the grant, so an input merely HELD at the grant (engaging with the foot still on the
+    # gas: gasReleased mid-engagement) stops barring FCA11 the moment it is actually released instead
+    # of killing braking for the whole engagement (the panda refuses every frame otherwise).
+    engaged = bool(CC.enabled)
+    if engaged and not self._engaged_prev:
+      self._rearm_pending = True
+      self._start_probation()          # 0053: every (re)engage opens a refusal-cut probation window
+    self._engaged_prev = engaged
+
+    # latch the cut on what the car layer CAN observe (driver brake, gear).
+    # 0038: GAS is deliberately NOT part of _driver_cut any more (owner requires a gas press never lock out future
+    # braking). It is enforced per-frame in fca11_ok below plus the elapsed-frame hold-off. The DRIVER latch
+    # (_driver_cut) mirrors the panda's hyundai_fca11_long_driver_cut (brake / gear != D): it re-arms on the resume
+    # edge but clears only on the first clean engaged frame. A pedal FAULT goes to _pedal_cut (0042), mirroring the
+    # panda's hyundai_fca11_long_cut. 0053: the camera is NOT a latch any more (cam_brake, ingest_camera).
+    driver_cut = (bool(CS.out.brakePressed) or
+                  CS.out.gearShifter != structs.CarState.GearShifter.drive)
+    if CC.longActive and driver_cut:
+      self._driver_cut = True
+    elif self._rearm_pending and engaged:
+      self._driver_cut = False
+      self._rearm_pending = False
+    cam = getattr(CS, "fca11_cam_frame", None)
+    # 0053: the camera hand-back. EVERY bus-2 0x38D of this tick steps the non-latching state machine REGARDLESS of
+    # longActive / engagement, exactly like the panda's hyundai_fca11_long_cam_step (the 0030 D1-a lesson: the old
+    # `CC.longActive and ...` gate on drive 14d let the two layers disagree for 16 minutes). Idempotent per frame: the
+    # real path already ran it in create_gas_command BEFORE observe_echo. Only the BRAKING class sets cam_brake; a
+    # warning (the whole of 14d and 15b) leaves openpilot braking. While cam_brake holds, nothing of ours goes out on
+    # 0x38D (see `withhold` below) and the pedal is forced to 0 (gas_interceptor.py).
+    self.ingest_camera(CS, frame)
+    withhold = bool(self.cam_brake or self._div_latched)
+    self.camera_braking_alert = bool(self.enabled and self.cam_brake and not self._div_active)
+    self.fca11_divergence = bool(self.enabled and (self._div_active or self._div_latched))
+    # 0042 (A): latch the PEDAL FAULT exactly like the panda. The panda computes pedal_state = (data[4] >> 4) & 0xF
+    # from ANY 0x701 frame and sets hyundai_interceptor_pedal_fault = state not in {0,4,5} (hyundai.h:962-963), which
+    # hyundai_fca11_long_rx folds into hyundai_fca11_long_cut on ANY rx frame regardless of engagement/arm and only
+    # hyundai_init clears it (hyundai.h:369-371). CS.interceptor_state is that same nibble (carstate_ext.py reads the
+    # DBC STATE of GAS_SENSOR_R), so latching it here is EXACT panda equivalence: any frame, no longActive gate,
+    # sticky against a clean pedal state and a resume edge (this instance's lifetime); the ONLY thing that clears it is the
+    # proof-based heal in observe_echo (an accepted ACTUATING echo), or the end of the ignition.
+    # 0042 v3: the panda faults on EVERY 0x701 frame, but the CANParser `vl` view keeps only the LAST value of the
+    # window - so a single fault frame sandwiched between accepted states (route 156's boot handshake, STATE [5, 3, 5])
+    # is invisible to CS.interceptor_state (its last value is an accepted 5). CS.interceptor_fault_seen carries the
+    # all-frames verdict from carstate_ext.py (vl_all), so the latch is panda-equivalent on the real path too.
+    # 0045 (PROPOSAL, OWNER DECISION): the two opt-in guards are vetoes on the SAME rule. With HyundaiFca11PedalGuard = 0
+    # (the shipped default) this is bit-for-bit the deployed mirror: ANY fault frame in the window latches. With a guard
+    # on, the latch reads the TRAILING run (CS.interceptor_fault_run, carstate_ext) instead of the any-frame flag, so a
+    # fault frame the guard suppressed can never latch later on a stale 1 s window; a persisting fault keeps producing
+    # trailing fault frames, so the grace expires and the run reaches N - still fail-closed.
+    #   (a) grace: no latch while frame - arm_frame < FCA11_PEDAL_GUARD_GRACE_FRAMES (0.5 s = 50 frames @ 100 Hz).
+    #   (b) frames: no latch until FCA11_PEDAL_GUARD_FRAMES (3) consecutive trailing fault frames.
+    # KNOWN, DOCUMENTED EDGE (only with a guard ON): a single NON-trailing fault frame inside an otherwise-clean window,
+    # observed OUTSIDE the grace, is caught by the panda's all-frame rule but not by this trailing-run mirror - the panda
+    # still refuses, and the divergence guard surfaces the disagreement. With the shipped guard = 0 there is no such edge.
+    guard = self.pedal_guard
+    if guard:
+      fault_run = int(getattr(CS, "interceptor_fault_run", 0))
+      in_grace = bool(guard & HYUNDAI_FCA11_PEDAL_GUARD_GRACE) and self._pedal_arm_frame is not None and \
+          (frame - self._pedal_arm_frame) < FCA11_PEDAL_GUARD_GRACE_FRAMES
+      short_run = bool(guard & HYUNDAI_FCA11_PEDAL_GUARD_FRAMES) and fault_run < FCA11_PEDAL_GUARD_FRAMES
+      if fault_run > 0 and not in_grace and not short_run:
+        self._pedal_cut = True
+    else:
+      pedal_state = int(getattr(CS, "interceptor_state", 0))
+      if pedal_state not in HYUNDAI_FCA11_PEDAL_STATE_OK or bool(getattr(CS, "interceptor_fault_seen", False)):
+        self._pedal_cut = True
+    if not engaged:
+      self._rearm_pending = False
+    # 0042 v2: SEND GATE vs ALERT. blocked_until_resume stays the DRIVER cut ONLY (0053: the camera gate is cam_brake,
+    # which releases on its own; it is not a resume-gated latch any more) - the pedal mirror
+    # (_pedal_cut) must NEVER gate a send. The car-layer mirror has no per-frame ARM gate (its arm is the constant
+    # `enabled`), so on route 155 it over-latches on a pre-arm STATE=1 blip the deployed panda never saw; letting
+    # that fabricate a `blocked_until_resume` would invent a brake loss and suppress every send for the rest of the
+    # ignition. Refused sends are inert (they never reach the car), so keeping ours LIVE preserves the ground truth
+    # + the echo evidence, and there is no deadlock. _pedal_cut (and _refused_cut) only drive fca11_unavailable:
+    # KNOW + ALERT (and the alert-state suppression in _alerts()), never control.
+    self.blocked_until_resume = self._driver_cut
+    # 0038: track the driver's gas RELEASE edge (for the elapsed-frame hold-off). CS.out.gasPressed is the driver's
+    # physical pedal (the panda's gas source is the interceptor sensor, not our throttle command). On the frame the
+    # pedal releases, stamp the frame; _gas_holdoff_ok refuses for GAS_HOLDOFF_FRAMES after it. No latch.
+    gas_now = bool(CS.out.gasPressed)
+    if self._gas_prev and not gas_now:
+      self._gas_release_frame = frame
+    self._gas_prev = gas_now
+    # 0042: surface the fail-closed loss. _pedal_cut (pedal fault) is the hyundai_fca11_long_cut latch source and
+    # _refused_cut (B) is the echo-confirmed refusal wall. 0053: these two - and ONLY these two - own the PERMANENT
+    # "unavailable until restart" alert; the camera owns the transient camera_braking_alert instead.
+    self.fca11_unavailable = bool(self.enabled and (self._pedal_cut or self._refused_cut))
+    # 0044: the SOURCE bitfield, at the same write site so the two can never disagree. 1 = pedal-fault latch,
+    # 2 = echo-confirmed refusal wall, 3 = both (0 = not unavailable). Published as CarStateSP.fca11CutSource so the
+    # NEXT occurrence is answerable from a qlog alone - route 1a0 needed the rlog + a safety replay to tell these
+    # apart, because both surface through the same boolean. Observability only: no send reads it.
+    self.fca11_cut_source = FCA11_CUT_SOURCE_NONE
+    if self.fca11_unavailable:
+      self.fca11_cut_source = ((FCA11_CUT_SOURCE_PEDAL if self._pedal_cut else 0) |
+                               (FCA11_CUT_SOURCE_REFUSED if self._refused_cut else 0))
+
+    # 0040: this frame's speed (km/h); the alert state machine + logger both read it.
+    v_kph_now = float(CS.out.vEgo) * 3.6
+
+    if not CC.longActive:
+      # R7-D: a mid-episode longActive drop must still close the FCA11 episode with a passive frame. We cannot
+      # send it here (longActive is off), so we OWE it: the first longActive send slot back emits it before any
+      # new actuation. An episode that never opened owes nothing.
+      if self._actuating:
+        self._release_pending = True
+      self._actuating = False
+      self._cal_frames = 0
+      self._dec_last_sent = 0
+      # G5: disengaging long clears the debounce/min-on state; the next engagement starts clean.
+      self._ask_frames = 0
+      self._on_frames = 0
+      # 0043: and the shaped-law ramp state (the next episode re-opens at the floor with the onset hold armed).
+      self._shape_reset()
+      self._feel_reset()                     # 0049: and the feel ramp
+      self._feel_cal_prev = False
+      self._feel_dwell = 0
+      self._feel_dwell_slow = 0
+      self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
+      self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+      return sends
+
+    self._planner_ask = float(CC.actuators.accel)   # the raw planner ask: the ONLY thing that may open the 46 LSB gate
+    accel = self._closing_demand(CS, self._planner_ask)
+    ok, _why = self.fca11_ok(CS, frame)
+    self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
+
+    # ---- 0029 CAL: step the autonomous sequencer and set the scripted ask source -------------------
+    # The sequencer decides (off the plan file + progress) whether a scripted level is DUE now. It is
+    # ticked ONLY here, in the enabled+longActive path, and ONLY on the 50 Hz SEND slot
+    # (frame % FCA11_SEND_EVERY == 0) -- the same slot the FCA11 frame goes out on. Deciding on the
+    # send slot means cal_on can never be true on a non-send frame, so a hold's first ACTUATING frame
+    # is its first TICK frame: there is no same-frame gap between "cal active" (gas forced to 0) and
+    # the first dec_cmd frame (Fable's gas-neutralization timing item). cal_on is LATCHED between
+    # ticks; it can only ever be true while the last tick commanded a hold AND a gate still holds.
+    if self.cal_seq is not None and frame % FCA11_SEND_EVERY == 0:
+      # 0035: no budget mirror is published any more (the panda has no duration budget); the sequencer
+      # arms on its own conditions and bounds the hold itself (CAL_MAX_HOLD_S + the watchdog below).
+      self.cal_seq.tick(CC, CS, frame)
+    # cal_on is the scripted ASK, gated by `ok` exactly like a planner ask: a production veto (camera
+    # owns, gear out of D, below floor, pedal fault, driver-cut latch) suppresses it on the SAME frame.
+    cal_ask = bool(self.cal_seq is not None and self.cal_seq.active_actuation)
+    # ---- 0035 tool-side CAL WATCHDOG -------------------------------------------------------------
+    # The panda's 2.5 s budget used to be the hard backstop on a scripted hold. It is gone, so the TOOL
+    # bounds itself, independently of the sequencer's own hold arithmetic: a cal ask that stays up longer
+    # than CAL_MAX_HOLD_S + the watchdog margin is a sequencer fault -> drop the ask this frame, tell the
+    # sequencer to abort the rep (outcome "watchdog"), and let the production release path emit the
+    # passive close frame. Bounds ONLY the scripted ask - a planner ask is never silenced by this.
+    self._cal_frames = self._cal_frames + 1 if cal_ask else 0
+    if cal_ask and self._cal_frames > cal_mode.CAL_WATCHDOG_FRAMES:
+      self.cal_watchdog_trips += 1
+      self.cal_seq.watchdog_abort(frame)
+      cal_ask = False
+      self._cal_frames = 0
+    cal_on = bool(cal_ask and ok)
+    self._cal_active = False   # re-latched below iff THIS frame commands a scripted hold
+    # 0043 v2: reset the shaped ramp on a cal-active EDGE. While cal is active the shaped law takes the 0041-era
+    # path; without this reset an episode that OPENS under cal and then continues on the planner ask would inherit
+    # stale `_shape_acc`/`_shape_sent_n` (which can skip the onset hold). A cal->planner hand-off must start fresh.
+    if self.affine_gain and bool(cal_on) != self._cal_prev:     # ON path only: the OFF path runs no shaped-law code here
+      self._shape_reset()
+      self._cal_prev = bool(cal_on)
+    # 0049: the feel layer's cal edge tracker is read in the want_brake branch below; it is updated AFTER that use.
+
+    # ---- G5 anti-flap decision ----------------------------------------------------------------
+    # ask: the planner wants a brake THIS frame and every pre-condition (fca11_ok) holds. `ask` drives
+    # the onset debounce only; the release/min-on logic below consumes the *raw* accel.
+    # 0049 COAST-FIRST: on the OLD-LAW feel path, while moving above the hold band, a NEW episode needs the residual demand
+    # beyond zero-throttle coast (open at FCA11_FEEL_OPEN_ACCEL, -0.60 by default); the release rule below is unchanged
+    # (that is the hysteresis). Off the feel path / in the hold band the deployed -0.5 is used, byte-identical.
+    open_accel = FCA11_BRAKE_ONSET_ACCEL
+    # the hold-band latch is stepped on EVERY feel frame (it has its own exit hysteresis and clears the standstill latch);
+    # the crawl rule below only changes the THRESHOLD used on this frame.
+    in_band = bool(self.feel and self._feel_update_band(v_kph_now, CS))
+    crawl = bool(float(CS.out.vEgo) < FCA11_CRAWL_V_MAX)
+    if self.feel and not in_band:
+      open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
+    # 0035: at speed on the tracking instance an ask the weakest level cannot serve (4 LSB ~1.0 m/s^2) does not open a
+    # brake episode (coast / throttle lift owns it). `accel` already carries the closing-lead demand, so a closing lead
+    # still opens. Below FCA11_TRACK_LIGHT_V_MIN (every stop approach) the deployed onset is untouched.
+    track_light = bool(getattr(self, "shape_track", False) and float(CS.out.vEgo) >= FCA11_TRACK_LIGHT_V_MIN)
+    if track_light:
+      open_accel = min(open_accel, FCA11_TRACK_LIGHT_OPEN)
+    ask = bool(ok and accel <= open_accel)
+    # 18x: ROLLING-RELEASE HOLD (see the FCA11_ROLLING_RELEASE_* block). Below 4 m/s with a lead at or inside 20 m an OPEN
+    # episode is held until the ask is above -0.10 instead of -0.30: 17 of the 18 measured rolling drop-outs on 181/182
+    # never stopped within 3 s. Only the THRESHOLD changes - `ok` (every veto), the onset rule and the min-on are as
+    # they were, and above 4 m/s or without a lead this is the deployed -0.30 exactly.
+    release_accel = self._low_speed_release_accel(float(CS.out.vEgo), CS)
+    if track_light:
+      release_accel = min(release_accel, FCA11_TRACK_LIGHT_RELEASE)   # 0035: same rule for an open episode at speed
+    self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
+    _slow = bool(float(CS.out.vEgo) < FCA11_FEEL_DWELL_SLOW_MPS)
+    self._feel_dwell_slow = self._feel_dwell_slow + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL and _slow) else 0
+    self._ask_frames = self._ask_frames + 1 if ask else 0
+
+    # onset: a NEW episode opens only after ONSET_HOLD_FRAMES consecutive ask frames (0.2 s), EXCEPT a
+    # hard ask (<= -1.2) which opens immediately so a real demand is never delayed (safety/coverage).
+    # holding: an EXISTING episode stays open until the ask rises above the release threshold (-0.30)
+    # AND the minimum on-time (0.6 s) has elapsed. `self._on_frames` is the previous frame's episode age.
+    # Every `ok == False` (blocked latch, below floor, pedal fault, gear, stale/no camera, camera owns)
+    # makes both terms False -> immediate release: the safety paths are untouched.
+    # 0029 CAL: `cal_on` is the scripted ask. While a cal hold is active the release/min-on logic below
+    # is bypassed (held True) so the scripted level is held for the sequencer's whole hold window --
+    # but STILL AND ONLY while `ok` holds. When the sequencer drops cal_on, the episode releases through
+    # the PRODUCTION path (a veto stops braking on this frame; a soft cal end lets the same release
+    # logic run).
+    # 0035 (Fable F1): the hard-ask bypass keys on the PLANNER's OWN ask, never on `accel`. `accel` carries this law's
+    # internal closing-lead demand, which is memoryless (-c^2/2(d-gap) for one frame of ANY in-range closing lead), so a
+    # single 20 Hz model frame of a false vision object opened an episode with no debounce at all (30 m / 25 m/s -> 12
+    # LSB for 0.58 s; three frames -> 30 LSB). The demand may still raise the level INSIDE an open episode, and it may
+    # still OPEN one - but only after the same 0.2 s of consecutive ask frames every mild planner ask must serve.
+    _bypass = bool(float(getattr(self, "_planner_ask", 0.0)) <= FCA11_ONSET_BYPASS_ACCEL)
+    onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or _bypass))
+    if self.feel and self._feel_dwell >= FCA11_FEEL_DWELL_FRAMES:
+      onset = True   # 0049 dwell escape (feel path only; `ok` is part of the dwell count): a SUSTAINED small ask opens
+    if self.feel and self._feel_dwell_slow >= FCA11_FEEL_DWELL_SLOW_FRAMES:
+      onset = True   # cycle 1 crawl escape: the same sustained ask opens after 0.7 s while every counted frame was slow
+    if crawl and onset and self._crawl_rel_frame is not None and \
+        (frame - self._crawl_rel_frame) < FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES and \
+        accel > FCA11_ONSET_BYPASS_ACCEL:
+      onset = False   # 18x (b): a crawl release stays released for 0.5 s (a HARD ask still opens at once)
+    holding = bool(self._actuating and ok and
+                   (accel <= release_accel or self._on_frames < FCA11_MIN_ON_FRAMES))
+    want_brake = bool(onset or holding or cal_on)
+    # 0037: the CONTINUOUS law - the LEVEL is the episode. There is no debounce, no bypass, no open/release threshold,
+    # no min-on and no crawl hold-off: a phantom cannot open because the slew cannot reach 1 LSB inside a 50 ms model
+    # frame (DESIGN.md §5), and a release is the level reaching 0, not a threshold. `ok` (every safety veto) still owns
+    # the frame, and cal (a scripted test hold) is untouched.
+    cont_dec = 0
+    if self.cont_law and not cal_on:
+      cont_dec = self._cont_level(accel, v_kph_now, CS, frame, personality) if ok else 0
+      want_brake = bool(cont_dec > 0)
+    # 0035: the G7 budget-edge stop and the 3 s cooldown hold-off that used to sit here are DELETED with the
+    # panda's budget/cooldown. The only things that end a brake are the planner/cal release above and the `ok`
+    # gates (driver, gear, floor, camera, pedal, staleness). The one remaining hold-off is the close-frame
+    # ORDERING: a passive frame still owed from the previous episode goes out first, so a re-brake waits at most
+    # ONE 50 Hz send slot (<= 20 ms). It cannot wedge: the owed frame is emitted on the next send slot whenever a
+    # fresh camera frame exists (and without one `ok` is False anyway), and observe_echo never re-owes a close
+    # frame while braking.
+    if want_brake and self._release_pending:
+      want_brake = False
+    # 0053: refusal attribution (see FCA11_ATTRIB_HOLD_FRAMES): end the episode briefly so the passive close frame is
+    # the next thing the panda judges. Bounded, so it can never wedge braking.
+    if self._attrib_hold > 0:
+      self._attrib_hold -= 1
+      want_brake = False
+    # 0054: there is NO release-below-the-floor gate here. An ask softer than the ESC's weakest actuating level
+    # (FCA11_MEAS_FLOOR_EXTRA) is commanded at FCA11_MEAS_FLOOR_LSB = 4, not released: the release variant was measured
+    # and rejected on route 16a, where the last 2 s of all four stops asked 0.00-0.66 while the car delivered 1.19-1.71,
+    # so releasing there sent nothing at exactly the asks that bring the car to standstill -- a brake loss at every stop,
+    # and it disarmed the cycle-1 crawl-dwell escapes (they open on asks <= -0.5). See the FCA11_MEAS_* block.
+    # 0051 (c): lead present -> absent EDGE while a feel episode is open and moving (not the hold band, not cal): freeze the
+    # last SENT level as a decaying floor (see FCA11_FEEL_LEAD_LOSS_*). The edge is tracked on every frame so a lead lost
+    # BEFORE an episode never arms it. Inert off the fix (CS without the lead attribute reads as no lead -> never an edge).
+    if self.feel_fix:
+      lead_now = getattr(CS, "fca11_lead_one", None) is not None
+      if (self._feel_lead_prev and not lead_now and want_brake and self._actuating and not cal_on and
+          not self._feel_in_hold_band and self._dec_last_sent > 0):
+        self._feel_ll_frame = self._feel_ll_hold_from = frame
+        self._feel_ll_lsb = int(self._dec_last_sent)
+      elif (self._feel_ll_frame is not None and not lead_now and
+            (frame - self._feel_ll_frame) * 0.01 < FCA11_FEEL_LEAD_LOSS_MAX_ABSENT_S):
+        self._feel_ll_hold_from = frame    # still absent (bounded): the HOLD phase is counted from the lead's return
+      self._feel_lead_prev = lead_now
+
+    dec_cmd_now = 0   # 0040: the level COMMANDED this frame (0 = no actuating frame); feeds the alerts + logger
+
+    if want_brake:
+      # 18x (D2): a frame that ACTUATES belongs to an episode that is (again) open, so NO release ramp may survive it: the
+      # next release must re-seed from the level actually on the wire (_rel_acc is cleared in _feel_reset only, and that is
+      # skipped while the episode stays open). Without this, an interrupted ramp left a stale accumulator/rate behind and the
+      # next release continued from it - emitting a level ABOVE the wire (e.g. 20 from a wire at 8) on a release frame, where
+      # the normal-episode +RATE_STEP cap does not apply, so the panda's rise gate refused every ramp frame (>= 3 ->
+      # _refused_cut -> fca11Unavailable, with real re-asks refused meanwhile). See _dyn_release_level.
+      self._rel_acc = None
+      self._rel_sent = 0
+      self._rel_fast = False
+      # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
+      # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
+      self._cal_active = bool(cal_on and ok)
+      accel_ask = min(accel, FCA11_BRAKE_ONSET_ACCEL)
+      # 0043: the OPT-IN brake-shaping law (self.affine_gain, DEFAULT OFF). On the planner-ask path it SUPERSEDES
+      # the 0041 affine-only LEVEL path (and the 0.67 through-origin path): it owns its own jerk-limited slew and
+      # the 4 LSB moving floor / tier-cap hold floor, so it replaces the whole request+floor+rate-limit block
+      # below. cal_on still takes the 0041-era path UNCHANGED (cal is a subordinate test tool - a scripted level
+      # with a clean +RATE_STEP entry step). OFF (no cal, no affine) is byte-identical to 0042.
+      if self.feel and not cal_on:
+        # 0049: the OLD-LAW feel layer (coast-first / lag-aware onset ramp / anticipatory release); see FCA11_FEEL_*.
+        # A (re)opened episode starts at the first-frame level; a cal->planner hand-off re-seeds at the last SENT level.
+        if not self._actuating:
+          # 18x: ON + a GENTLE ask seeds the ramp at 1 LSB (and _feel_level's floor follows it down), so the episode
+          # CLIMBS to its target instead of stepping to 4 on its first frame. OFF / a hard ask = the deployed 4.
+          self._feel_reset(float(self._dyn_first_lsb(accel, personality, v_kph_now)))
+        elif self._feel_cal_prev:
+          self._feel_reset(float(max(self._dec_last_sent, FCA11_FEEL_FLOOR_LSB)))
+        dec_cmd = self._feel_level(accel, frame, personality, v_kph_now,
+                                   standstill=bool(getattr(CS.out, "standstill", False)))
+      elif self.affine_gain and not cal_on:
+        if self.cont_law:
+          # 0037: _cont_level already produced this frame's level (it owns its own reset and slew)
+          dec_cmd = int(cont_dec)
+        else:
+          if not self._actuating:
+            self._shape_reset()   # a (re)opened episode starts at the floor with the onset hold armed
+          dec_cmd = self._shape_level(accel_ask, v_kph_now, CS, frame, personality)
+      else:
+        # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+        # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+        # 0041: the OPT-IN affine law (self.affine_gain, DEFAULT OFF) replaces the through-origin inverse with the
+        # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040. 0054: this branch is
+        # only reached with the FEEL layer off, and 0054 rides the FEEL path, so it is byte-identical to 0040 still.
+        # 0050 CAL: under cal the planner term is computed from the RAW ask, NOT the onset-clamped one. The scripted
+        # level below enters as a FLOOR (`max()`), so a COASTING planner must contribute 0 -- but the -0.5 onset clamp
+        # maps through the 0.67 inverse to 8, so every scripted level <= 8 became 8 on the wire (the degenerate class;
+        # wsSTOP/m57 MEASUREMENT-5-7.md §0.3). A planner that IS braking (accel <= ONSET_ACCEL) is a no-op for the
+        # clamp, so there the mapping is unchanged and `max()` still means "cal only ADDS braking". Gated on cal_on:
+        # with cal off `_ask_for_law` IS `accel_ask`, so the planner path is byte-identical (identity.py).
+        _ask_for_law = accel if cal_on else accel_ask
+        if self.affine_gain:
+          dec_cmd = dec_cmd_from_accel_affine(_ask_for_law)
+        else:
+          dec_cmd = dec_cmd_from_accel(_ask_for_law)
+        # production tiering of the planner ask (unchanged when cal is off -> byte-identical). 0041: under the affine
+        # law the command may legitimately taper to 0 (no honest request), so the floor is the honest level, not the
+        # fixed 1 the through-origin law uses; OFF keeps the 0040 clamp exactly (raw CR_VSM_DecCmd >= 1).
+        if self.affine_gain:
+          dec_cmd = min(dec_cmd, effective_max_dec(personality, _ask_for_law))
+        else:
+          dec_cmd = clamp_dec_cmd(dec_cmd, personality)
+        # 0041 (low-speed refusal fix): the affine hold/release floor is applied to the REQUEST here, BEFORE the
+        # +RATE_STEP rate limiter below -- NOT after it. Applied after, the floor lifted the FIRST frame of an episode
+        # straight to 8 LSB, over the panda's onset gate (the firmware allows only +RATE_STEP over the last ACCEPTED
+        # frame, which is 0 at an episode open), so panda refused EVERY actuating frame (dec=8 last=0) and the brake
+        # never engaged at low speed. Applied to the request, the limiter still governs the ONSET: request 8 ->
+        # min(8, 0+4) = 4 (first frame, ACCEPTED) -> min(8, 4+4) = 8 (ACCEPTED) -> 4 -> 8 in ~40 ms. The floor applies
+        # ONLY when the law commands > 0 (an honest taper to 0 stays 0) and never when cal sets the level itself.
+        if self.affine_gain and not cal_on and dec_cmd > 0:
+          in_hold_band = bool(v_kph_now <= FCA11_AFFINE_STOP_BAND_KPH or getattr(CS.out, "standstill", False))
+          dec_cmd = max(dec_cmd, FCA11_AFFINE_HOLD_LSB if in_hold_band else FCA11_AFFINE_RELEASE_LSB)
+          dec_cmd = min(dec_cmd, effective_max_dec(personality, _ask_for_law))
+        if cal_on:
+          # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
+          # planner. max() with the scripted level means: planner coasting -> the cal level (the
+          # controlled step the fit needs); a HARDER planner ask (e.g. a lead cuts in mid-hold) -> the
+          # planner wins, so cal can never make the car brake LESS than production would (Fable: closes
+          # the planner-silenced window). The level is clamped to the PANDA gate 30 LSB = 0.30 g, NOT the
+          # personality tier cap -- cal must reach 0.30 g regardless of the feel dial, and 30 is the
+          # personality-agnostic firmware gate, so there is NO new authority. (Deliberate, disclosed
+          # exception: cal may exceed the owner's configured tier cap, never the panda gate.)
+          dec_cmd = max(dec_cmd, max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, int(self.cal_seq.level_lsb))))
+        # rate-limit the REQUEST too (the panda enforces its own): at most +RATE_STEP (0.04 g) per
+        # camera period of growth; release is immediate. Reference = our last SENT frame.
+        # 0029 CAL: this +RATE_STEP-per-SENT-frame clamp IS the clean entry step the BITE fit needs --
+        # a scripted step enters through the panda-rate ramp even for a low level (where the production
+        # path's LPF + slew would otherwise smear the step). Do NOT bypass it for cal.
+        dec_cmd = min(dec_cmd, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+        if cal_on:
+          dec_cmd = max(cal_mode.CAL_MIN_LSB, min(cal_mode.CAL_MAX_LSB, dec_cmd))  # <= panda gate (30)
+        elif not self.affine_gain:
+          # 0041: the affine ON path applies its hold/release floor to the REQUEST *before* this limiter (above), so the
+          # panda's onset gate still governs the ramp and there is nothing left to clamp for it here. OFF keeps the 0040
+          # clamp exactly.
+          dec_cmd = clamp_dec_cmd(dec_cmd, personality)  # first frame of an episode: <= RATE_STEP, then ramps
+
+      t_cam, dat = cam
+      if frame % FCA11_SEND_EVERY == 0:
+        cam_alive = (dat[4] >> 3) & 0xF  # CR_FCA_Alive is 35|4 = byte4 bits 3-6
+        m = Fca11MirrorFrame(dec_cmd=dec_cmd, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+        out = build_fca11_frame(dat, (cam_alive + 1) & 0xF, m)
+        sends.append(CanData(FCA11_ADDR, out, 0))
+        # R7-A: the panda allows +RATE_STEP over the last ACCEPTED frame, and we only SEND on the 50 Hz
+        # slot. Advancing the reference on every 100 Hz frame (the pre-G8 code) made the SENT ramp step
+        # +2*RATE_STEP, so the panda refused every actuating frame after the first. The reference must
+        # advance ONLY on frames actually sent (the panda's last-accepted frame).
+        self._dec_last_sent = dec_cmd
+        if 0 < dec_cmd <= 3:
+          # 0038-excl: a SENT frame that really carried a 1-3 LSB level (see sub_bite_gate, which decrements it again
+          # on the frames it withholds from the wire)
+          self.cont_low_lsb_frames += 1
+        # 0038-excl: the panda's throttle window is armed by ANY level on the wire (>= 1 LSB). Only a >= bite frame is
+        # armed HERE (it is never muted: gas_hold forces its pedal to exactly 0) - a 1-3 LSB frame may still be
+        # withheld from the wire by sub_bite_gate, which arms the window itself on the frames it does send.
+        if dec_cmd >= FCA11_FEEL_FIRST_LSB:
+          self._wire_arm(dec_cmd)
+      self._actuating = True
+      self._gas_guard_left = 0          # 18x: an actuating frame re-arms the panda's window; the guard restarts at the edge
+      self._sent_this_episode = True
+      dec_cmd_now = dec_cmd   # 0040: the level COMMANDED this frame (feeds the alerts + logger)
+      # 18x (d): the level-on-the-wire trace (no-op unless the dynamic release is ON).
+      if frame % FCA11_SEND_EVERY == 0:
+        self._log_dyn_send(CS, frame, dec_cmd, accel, v_kph_now)
+        self._note_sent_level(frame, dec_cmd)   # 17c FEEDBACK: the 5 s level window a driver mark reads back
+    else:
+      # not braking: the camera's own FCA11 keeps flowing, and G7 sends ONE passive frame to close the
+      # panda's episode (see _passive_frame). The camera path alone does NOT pass the panda TX hook, so
+      # without this the panda's act_active stays latched across brakes (round-5 N1).
+      was_braking = self._actuating
+      prev_sent = self._dec_last_sent
+      self._actuating = False
+      self._sent_this_episode = False
+      dec_cmd_now = 0   # 0040: no actuating frame this frame
+      # 18x (c): DYNAMIC RELEASE RAMP (opt-in). A SOFT release ramps the level to 0 over a few sent frames instead of
+      # dropping it in one (4 -> 0 = +0.8 m/s^2 step; 30 -> 0 at a standstill release is the launch lurch). The ramp is
+      # still a RELEASE, so every safety path is excluded EXPLICITLY here and still cuts on THIS frame exactly as today:
+      #   * ok == False - driver brake / driver gas / the gas hold-off / gear != D / pedal fault / no or stale camera /
+      #     camera_braking / the divergence latch / blocked_until_resume (the veto list of fca11_ok);
+      #   * withhold (cam_brake, or the divergence latch again) - the camera owns 0x38D, we send nothing;
+      #   * an OWED close frame (_release_pending) - the hand-back must go out first, in this frame;
+      #   * the refusal-attribution hold (_attrib_hold) - it exists to make the passive close frame the next thing the
+      #     panda judges;
+      #   * the BRAKE NOW alert (ESC non-response / hold lost) - an alarm must never be answered by a slow release;
+      #   * cal (a scripted hold is a test tool, not a feel path);
+      #   * an episode that is not open (was_braking False) - nothing to ramp.
+      # The final frame of the ramp is the ordinary passive close below (level 0 -> the panda hand-back), so the close
+      # frame, its frame number and the echo re-owe are the deployed ones.
+      ramp = 0
+      if self.dynamic_brakes and was_braking and ok and not cal_on and not withhold and \
+          not self._release_pending and self._attrib_hold == 0 and not self.brake_now:
+        ramp = self._dyn_release_level(frame, prev_sent,
+                                       standstill=bool(getattr(CS.out, "standstill", False)) or self._feel_standstill_hold)
+      if ramp > 0:
+        # one more ACTUATING frame at the ramped level: the episode stays open, the pedal stays at exactly 0 (braking),
+        # and the panda's rate reference follows the decaying command down. A re-ask during the ramp does NOT reset the
+        # feel ramp (_actuating stays True) and it continues from where the wire is, so it cannot jump.
+        assert cam is not None   # ok == True guarantees a fresh camera frame (fca11_ok)
+        t_cam, dat = cam
+        self._feel_acc = float(ramp)
+        if frame % FCA11_SEND_EVERY == 0:
+          cam_alive = (dat[4] >> 3) & 0xF
+          m = Fca11MirrorFrame(dec_cmd=ramp, prefill=True, warn=3, cmd_act=True, dec_cmd_act=False)
+          sends.append(CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0))
+          self._dec_last_sent = ramp          # the panda's last ACCEPTED frame is this one
+          # 0040 v2 (review K4): the law's own wire references follow the release ramp too, so a non-send frame
+          # answers with the RAMPE level and the down-step floor is measured from it - a stale pre-release level left
+          # the next frame's floor (and the hysteresis band) up at the level the release had already left.
+          self._cont_q_last = int(ramp)
+          self._cont_q_bus = int(ramp)
+          self._log_dyn_send(CS, frame, ramp, accel, v_kph_now)
+          self._note_sent_level(frame, ramp)  # 17c FEEDBACK: a SENT ramp frame is part of the 5 s level window too
+        self._actuating = True
+        self._in_rel_ramp = True
+        self._sent_this_episode = True
+        dec_cmd_now = ramp
+      if ramp <= 0:
+        # 18x (D1): the panda's last ACCEPTED frame is the passive close (level 0) ONLY when the episode really ends on
+        # THIS frame. Zeroing it on every non-braking frame (as the deployed law did) left the reference at 0 across the
+        # NON-SEND frames of a release ramp, so a re-ask landing on the next SEND frame was capped at 0 + RATE_STEP: a
+        # 16 -> 4 (reviewer: 22 -> 4) drop, ~0.6..1.8 m/s^2 of brake gone in one sent frame mid-episode, exactly what the
+        # "cannot jump" note on the ramp branch below promises. While the ramp keeps the episode open the reference
+        # stays on the last level actually SENT (restored on the send slot above).
+        self._dec_last_sent = 0
+        # 0040 v2 (review K4): the episode is CLOSED at level 0 on the wire, so both of the law's wire references go to
+        # 0 with it. Leaving them on the last level was the whole of the v1 re-open defect: the down-step floor
+        # `prev_wire - 3` then held the next frame at `level - 3` and the panda's onset gate was applied BEFORE that
+        # floor, so the frame could go out at `_dec_last_sent + RATE_STEP + 1` and be refused.
+        self._cont_q_last = 0
+        self._cont_q_bus = 0
+        # 0040-nz3 (lane W, review D3): a VETO close (`ok == False`: driver gas / driver brake / gear / pedal fault /
+        # stale or absent camera / camera braking / the divergence latch / blocked_until_resume) ends the episode
+        # without ever calling `_cont_level`, so the trim was never reset: `_track_reset()` at the top of `_cont_level`
+        # only fires once `_shape_acc` <= 1e-9, and the -6 LSB rail then crossed the gas-press gap and shortened the
+        # next demand (1a leaves 0.46 / -2.66 on the same frames). The floor makes that railed state routine, so the
+        # trim side goes with the episode. A release the ask itself drove (`ok == True`) still keeps the trim for the
+        # next ask - that is the M4 note in `_cont_level`.
+        # `_shape_acc` is deliberately NOT zeroed: it is the level the ESC may still be holding, and it is what the
+        # re-open walks down onto the 1 LSB floor from (pinned by Test0040Corrections K1 and Test0040NoTrimClose (d)).
+        # The defect this closes is the TRIM crossing the gap, and `_track_reset()` also drops the hysteresis
+        # references - the whole of the stale state that is a correction rather than a level.
+        if not ok and self.cont_law:
+          self._track_reset()
+        self._rel_acc = None                  # 18x: no ramp in progress once it is over (or was never allowed)
+        if was_braking:
+          # braking true -> false edge: end the panda episode, owe a passive frame (the clean hand-back).
+          self._release_pending = True
+          if float(CS.out.vEgo) < FCA11_CRAWL_V_MAX:
+            self._crawl_rel_frame = frame   # 18x (b): a crawl release stays a release for the hold-off window
+          # 18x: arm the 100 ms gas window from THIS frame (the last actuating one): frames N+1..N+10 hold gas at 0.
+          self._gas_guard_left = FCA11_GAS_WINDOW_HOLD_FRAMES
+        # 0053: while the camera is braking (or the divergence latch holds) NOTHING of ours goes out on 0x38D, not even
+        # the passive close frame (the panda refuses it then, and the camera's own frame is what the ESC must see). The
+        # close frame stays OWED and goes out on the first send slot after the hand-back releases.
+        if self._release_pending and not withhold:
+          sends += self._passive_frame(CS, frame)
+          if sends:  # emitted (frame % SEND_EVERY == 0); if [] we retry next frame
+            self._release_pending = False
+            if self._echo_wired:
+              # 0030 (D2-iii): record the frame we just put on the wire and wait for the pandad echo (observe_echo):
+              # refused (src 192) RE-OWES the close frame so the hand-back is retried.
+              self._pending_echo = bytes(sends[-1].dat)
+              self._pending_echo_frame = frame
+              self._echo_rejected = False
+
+    self._feel_cal_prev = bool(cal_on)   # 0049: previous frame's cal_on, for the feel ramp's cal->planner re-seed
+    # episode age AFTER this frame's decision (consumed by `holding` on the next frame).
+    # 18x: the age keeps counting while a release RAMP is still sending actuating frames - without that the min-on term
+    # (`_on_frames < FCA11_MIN_ON_FRAMES`) reads the reset age as "a brand new episode" and re-opens the brake the ramp
+    # is closing. OFF: `_actuating` is False whenever want_brake is False, so this is exactly the deployed expression.
+    self._on_frames = self._on_frames + 1 if (want_brake or self._actuating) else 0
+
+    # 0040: alert state (over this frame's braking) and the per-episode log (one line on the true -> false edge).
+    self._alerts(CS, frame, v_kph_now, dec_cmd_now)
+    self._log_tick(CS, frame, dec_cmd_now)
+
+    return sends

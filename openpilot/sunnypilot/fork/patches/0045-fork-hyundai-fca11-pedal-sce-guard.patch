@@ -1,0 +1,593 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index ef73ee24..c91a0bb3 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -88,6 +88,12 @@ class CarParamsSP:
+   # 0042-Z: RISE-ONLY ask lag (param HyundaiGasRiseLag, default OFF). Written ONLY by setup_interfaces from that param;
+   # when unset no frame of the pedal path changes (the deployed tree skips the branch). Coupled with custom.capnp @12.
+   gasRiseLag: bool = auto_field()
++  # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default "0").
++  # Bitfield: 1 = a fault observed within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch,
++  # 2 = latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES consecutive fault frames; 0 = the deployed rule (any frame
++  # latches, fail-closed). Written ONLY by setup_interfaces; read once by the car layer and mirrored into the panda's
++  # safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES. Coupled with custom.capnp CarParamsSP @13.
++  fca11PedalGuard: int = auto_field()
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index e0fcb1a0..708fd059 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -302,6 +302,45 @@ static uint32_t hyundai_fca11_long_host_hb_ts;  // ts of the previous host TX ho
+ #define HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US 100000U  // 100 ms
+ static uint32_t hyundai_fca11_long_host_brake_active_ts;  // last host 0x38D frame that carried actuating brake fields (0 = none)
+ 
++// *** PROPOSAL (0045, OWNER DECISION): the two pedal-fault guards ***
++// The deployed rule latches hyundai_fca11_long_cut on ANY 0x701 frame whose STATE is a fault (not 0/4/5), and only
++// hyundai_init clears it. That is fail-closed, but it has a STARTUP RACE: the pedal emits an SCE burst at EVERY power
++// transition, and a single frame landing just after hyundai_init (route 1a0, 2026-11-09: 7.191973 s, 0-19 ms after the
++// switch) latched the cut for the whole ignition - 187/187 actuating frames refused at 666.33-670.07 s, no FCA11
++// braking for 20.7 min. Both guards are OPT-IN (safetyParam bits 4096/8192, written from the car layer's
++// HyundaiFca11PedalGuard param) and OFF by default, so an unmodified build is byte-for-byte the deployed rule.
++//   (a) GRACE: a fault OBSERVED within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch. A fault that
++//       PERSISTS past the window latches on its first observation outside it - still fail-closed.
++//   (b) FRAMES: latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES CONSECUTIVE fault frames; any accepted 0x701 frame
++//       resets the run. 1 = the deployed rule (any single frame).
++// MUST equal HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US / _FAULT_FRAMES in opendbc/sunnypilot/car/hyundai/values.py.
++#define HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US 500000U   // option (a): 0.5 s = ~25x the observed 12-19 ms startup race
++#define HYUNDAI_FCA11_PEDAL_FAULT_FRAMES 3U          // option (b): 3 frames @ 100 Hz = ~30 ms of continuous fault
++
++// 0045: the last pedal-fault OBSERVATION (its frame time, not the evaluation time - a grace-suppressed frame must never
++// latch later on a stale flag) and its CONSECUTIVE run, both reset by any accepted 0x701 frame. hyundai_init_ts is
++// stamped by every hyundai_init (the panda's ignition / re-arm edge) in hyundai_fca11_long_reset().
++static uint32_t hyundai_init_ts;
++static uint32_t hyundai_interceptor_pedal_fault_ts;
++static uint32_t hyundai_interceptor_pedal_fault_run;
++
++// 0045: may the CURRENT pedal-fault observation latch the cut? Both guards are vetoes, so with their safetyParam bits
++// clear this is exactly the deployed `fault -> cut` rule. A persisting fault keeps sending frames, so guard (a) only
++// DELAYS the latch to the first observation outside the window, and guard (b) to the Nth consecutive frame.
++static bool hyundai_fca11_pedal_fault_cut_ok(void) {
++  if (!hyundai_interceptor_pedal_fault) {
++    return false;
++  }
++  if (hyundai_fca11_pedal_grace &&
++      (safety_get_ts_elapsed(hyundai_interceptor_pedal_fault_ts, hyundai_init_ts) < HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US)) {
++    return false;
++  }
++  if (hyundai_fca11_pedal_frames_guard && (hyundai_interceptor_pedal_fault_run < HYUNDAI_FCA11_PEDAL_FAULT_FRAMES)) {
++    return false;
++  }
++  return true;
++}
++
+ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_cut = false;
+   // G9: the driver-input latch starts SET. hyundai_init also clears brake_pressed/gas_pressed, so a mid-drive
+@@ -340,6 +379,12 @@ static void hyundai_fca11_long_reset(void) {
+   hyundai_fca11_long_tx_seen = false;
+   hyundai_fca11_long_ts_tx = 0U;
+   hyundai_fca11_long_dec_last = -1;
++  // 0045 (PROPOSAL): the pedal-fault guard anchors. Every hyundai_init is the reference for the grace window (it is the
++  // only thing that clears the cut, so it is the exact edge the guards protect), and a fresh arm has no fault
++  // observation / run on record.
++  hyundai_init_ts = microsecond_timer_get();
++  hyundai_interceptor_pedal_fault_ts = 0U;
++  hyundai_interceptor_pedal_fault_run = 0U;
+ }
+ 
+ // 0053: one bus-2 camera 0x38D frame through the hand-back state machine (counted in CAMERA FRAMES).
+@@ -440,8 +485,9 @@ static void hyundai_fca11_long_rx(const CANPacket_t *msg) {
+     hyundai_fca11_long_driver_cut_pending = false;
+   }
+   // Pedal FAULT stays hard-latched for the whole arm in hyundai_fca11_long_cut (see hyundai_rx_hook): the pedal is
+-  // passing through with no throttle authority, which a resume press must not paper over.
+-  if (hyundai_interceptor_pedal_fault) {
++  // passing through with no throttle authority, which a resume press must not paper over. 0045 (PROPOSAL): the two
++  // opt-in guards are vetoes on this same rule; with their safetyParam bits clear it is exactly the deployed rule.
++  if (hyundai_fca11_pedal_fault_cut_ok()) {
+     hyundai_fca11_long_cut = true;
+   }
+   hyundai_fca11_long_controls_prev = controls_allowed;
+@@ -1036,6 +1082,16 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
+       // stays truthful - this cut is belt-and-braces on top of the gas_pressed window check.
+       uint8_t pedal_state = (uint8_t)((msg->data[4] >> 4) & 0xFU);
+       hyundai_interceptor_pedal_fault = (pedal_state != 0U) && (pedal_state != 4U) && (pedal_state != 5U);
++      // 0045 (PROPOSAL): the guard inputs, recorded on the OBSERVATION (this frame's stamp), so a grace-suppressed
++      // fault can never latch later on a stale flag. Any accepted frame ends the run.
++      if (hyundai_interceptor_pedal_fault) {
++        hyundai_interceptor_pedal_fault_ts = microsecond_timer_get();
++        if (hyundai_interceptor_pedal_fault_run < 0xFFFFU) {
++          hyundai_interceptor_pedal_fault_run += 1U;
++        }
++      } else {
++        hyundai_interceptor_pedal_fault_run = 0U;
++      }
+     } else {
+     }
+ 
+diff --git a/opendbc/safety/modes/hyundai_common.h b/opendbc/safety/modes/hyundai_common.h
+index c953cbb3..18fafdb0 100644
+--- a/opendbc/safety/modes/hyundai_common.h
++++ b/opendbc/safety/modes/hyundai_common.h
+@@ -34,6 +34,10 @@ enum {
+   // field is uint16_t (current_safety_param_sp) so the block cannot simply move up. Upstream's bit therefore takes the
+   // first free slot above it. Values are symbolic everywhere, so this is invisible to both car layers.
+   HYUNDAI_PARAM_SP_CCNC = 2048,
++  // PROPOSAL (0045, OWNER DECISION): the pedal-fault guards on the FCA11-long cut. 4096 = grace window after
++  // hyundai_init, 8192 = N consecutive fault frames; both clear = the deployed rule. See hyundai.h.
++  HYUNDAI_PARAM_SP_PEDAL_FAULT_GRACE = 4096,
++  HYUNDAI_PARAM_SP_PEDAL_FAULT_FRAMES = 8192,
+ };
+ 
+ // common state
+@@ -116,6 +120,14 @@ bool hyundai_fca11_rolling_test = false;
+ extern bool hyundai_fca11_long;
+ bool hyundai_fca11_long = false;
+ 
++// PROPOSAL (0045, OWNER DECISION): the two pedal-fault guards on the FCA11-long cut (safetyParam bits 4096/8192, set
++// from the car layer's HyundaiFca11PedalGuard param). Both false = the deployed fail-closed rule: ANY pedal fault frame
++// latches hyundai_fca11_long_cut for the arm. Rules and state: hyundai.h (hyundai_fca11_pedal_fault_cut_ok).
++extern bool hyundai_fca11_pedal_grace;
++bool hyundai_fca11_pedal_grace = false;
++extern bool hyundai_fca11_pedal_frames_guard;
++bool hyundai_fca11_pedal_frames_guard = false;
++
+ // TEST-ONLY, NOT FOR ROAD USE (HYUNDAI_PARAM_SP_LKAS_PARK_TEST, bit 512). Parked steering-torque sweep: armed ONLY by the
+ // steer-test runner (raw 0xdf/0xdc, openpilot stopped). While armed the ONLY transmittable message is LKAS11 (0x340),
+ // and only while the car is parked (gear P or N, every wheel at standstill, inputs fresh), within a 60 s cap per arm,
+@@ -390,6 +402,10 @@ void hyundai_common_init(uint16_t param) {
+   hyundai_non_scc = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_NON_SCC);
+   hyundai_cn7_steer_ramp = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CN7_STEER_RAMP);
+   hyundai_ccnc = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CCNC);
++  // PROPOSAL (0045): the two pedal-fault guards, only meaningful on the FCA11-long path (hyundai.h); both clear = the
++  // deployed fail-closed rule.
++  hyundai_fca11_pedal_grace = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_PEDAL_FAULT_GRACE);
++  hyundai_fca11_pedal_frames_guard = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_PEDAL_FAULT_FRAMES);
+ 
+   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
+ 
+diff --git a/opendbc/safety/tests/test_hyundai.py b/opendbc/safety/tests/test_hyundai.py
+index 090a6e1e..d237859f 100755
+--- a/opendbc/safety/tests/test_hyundai.py
++++ b/opendbc/safety/tests/test_hyundai.py
+@@ -27,7 +27,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP, HYUNDAI_
+   HYUNDAI_LKAS_PARK_MAX_DRIVER_TQ_NM
+ from opendbc.sunnypilot.car.hyundai.pause_resume import PAUSE_RELEASE_SAMPLES as HYUNDAI_PAUSE_RELEASE_SAMPLES
+ from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_CAM_BRAKE_MASK, HYUNDAI_FCA11_CAM_WARN_MASK, \
+-  HYUNDAI_FCA11_CAM_QUIET_FRAMES
++  HYUNDAI_FCA11_CAM_QUIET_FRAMES, HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US, HYUNDAI_FCA11_PEDAL_FAULT_FRAMES
+ from opendbc.sunnypilot.car.hyundai.tests import fca11_cam_vectors as cam_vectors
+ 
+ # a nonzero pedal command inside openpilot's cap (fraction of travel), for tests about *whether* gas may be sent
+@@ -3589,6 +3589,104 @@ class TestHyundaiFca11LongSafety(TestHyundaiNonSCCGasInterceptorSafety):
+     self._rx(self._wheel_msg(self.IN_WINDOW_RAW))
+     self.assertFalse(self._tx(self._brake_cmd(1)))    # a resume edge does not release it
+ 
++  # *** 0045 (PROPOSAL, OWNER DECISION): the two pedal-fault guards ***
++  # Route 1a0 (2026-11-09) proved the deployed rule's STARTUP RACE: ONE STATE=3 (SCE) frame 12-19 ms after hyundai_init
++  # was the first 0x701 frame after the mode switch, so it latched hyundai_fca11_long_cut for the whole ignition
++  # (187/187 actuating frames refused at 666.33-670.07 s; FCA11 braking off 20.7 min). Each guard is one safetyParam bit
++  # (4096 = grace, 8192 = N consecutive); with BOTH CLEAR every rule above keeps its deployed meaning, which the first
++  # test below re-asserts. The car layer mirrors both (fca11_long.Fca11LongBrake.pedal_guard).
++
++  def _sp_with(self, *bits) -> int:
++    sp = self._pedal_sp()
++    for b in bits:
++      sp |= b
++    return sp
++
++  def _rearm_guarded(self, *bits):
++    # the grace window is anchored to hyundai_init's OWN timer stamp, and _rearm sets the timer AFTER set_safety_hooks -
++    # so stamp the arm clock FIRST, then re-arm (the guard tests are the only ones that read the init time).
++    self.safety.set_timer(1000000)
++    self._rearm(self._sp_with(*bits))
++
++  def _tx_refused(self) -> bool:
++    return not self._tx(self._brake_cmd(1))
++
++  def _fault_at(self, dt_us: int, state: int = 3, refresh: bool = False):
++    """One pedal fault frame dt_us after the arm's hyundai_init. The frame's OWN stamp is what the grace guard reads.
++    refresh=True re-feeds the OTHER window inputs at the same instant (they go stale after ~100 ms, and a stale window
++    refuses an actuating frame for a reason that has nothing to do with the cut - the 0x701 itself is NOT re-fed clean,
++    which would reset the consecutive run)."""
++    self.safety.set_timer(1000000 + dt_us)
++    if refresh:
++      self.assertTrue(self._rx(self._user_brake_msg(False)))
++      self.assertTrue(self._rx(self._user_gas_msg(0)))
++      self.assertTrue(self._rx(self._gear_msg(5)))
++      self.assertTrue(self._rx(self._wheel_msg(self.IN_WINDOW_RAW)))
++    self.assertTrue(self._rx(self._interceptor_user_gas(0, state=state)))
++
++  def test_guard_off_is_the_deployed_rule(self):
++    # both bits clear (the shipped default): a SINGLE fault frame latches, whatever its timing after the arm
++    self._rearm()
++    self._open_window()
++    self._fault_at(12000)
++    self.assertTrue(self._tx_refused())
++
++  def test_guard_grace_suppresses_the_startup_frame(self):
++    # the 1a0 timeline exactly: ONE SCE frame 19 ms after hyundai_init must NOT latch under the grace window ...
++    self._rearm_guarded(HyundaiSafetyFlagsSP.PEDAL_FAULT_GRACE)
++    self._open_window()
++    self._fault_at(19000)
++    self.assertTrue(self._tx(self._brake_cmd(1)), "the 1a0 startup frame must not latch under the grace guard")
++    # ... and a fault observed OUTSIDE the window still latches (fresh window, so the refusal IS the cut)
++    self._fault_at(HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US + 100000, refresh=True)
++    self.assertFalse(self._tx(self._brake_cmd(1)))
++    self.assertTrue(self._tx(self._fca11()))                     # the passive carrier stream still flows
++    self._fault_at(HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US + 200000, refresh=True)
++    self.assertFalse(self._tx(self._brake_cmd(1)), "still cut until the next init")
++
++  def test_guard_grace_still_fails_closed_on_a_stuck_pedal(self):
++    # a pedal STUCK in SCE keeps sending frames: the latch fires on the first observation outside the window
++    self._rearm_guarded(HyundaiSafetyFlagsSP.PEDAL_FAULT_GRACE)
++    self._open_window()
++    for dt in (10000, 20000, 30000):
++      self._fault_at(dt)
++      self.assertTrue(self._tx(self._brake_cmd(1)), dt)   # every observation is still inside the window
++    self._fault_at(HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US + 10000, refresh=True)
++    self.assertFalse(self._tx(self._brake_cmd(1)), "a persisting fault must latch once past the window")
++
++  def test_guard_frames_requires_n_consecutive_faults(self):
++    self._rearm(self._sp_with(HyundaiSafetyFlagsSP.PEDAL_FAULT_FRAMES))
++    self._open_window()
++    for i in range(HYUNDAI_FCA11_PEDAL_FAULT_FRAMES - 1):
++      self._fault_at(20000 + 10000 * i)
++      self.assertTrue(self._tx(self._brake_cmd(1)), i)    # fewer than N consecutive frames: not a wall yet
++    self._fault_at(20000 + 10000 * (HYUNDAI_FCA11_PEDAL_FAULT_FRAMES - 1))
++    self.assertTrue(self._tx_refused(), "the Nth consecutive fault frame must latch")
++
++  def test_guard_frames_resets_on_an_accepted_frame(self):
++    self._rearm(self._sp_with(HyundaiSafetyFlagsSP.PEDAL_FAULT_FRAMES))
++    self._open_window()
++    self._fault_at(20000)
++    self._fault_at(30000)
++    self.assertTrue(self._rx(self._interceptor_user_gas(0, state=0)))   # accepted state -> the run resets
++    self._fault_at(40000)
++    self._fault_at(50000)
++    self.assertTrue(self._tx(self._brake_cmd(1)), "two faults either side of a clean frame are not N consecutive")
++    self._fault_at(60000)
++    self.assertTrue(self._tx_refused())
++
++  def test_guards_compose(self):
++    # both bits: a frame inside the grace AND short of the run must not latch; past the grace with N consecutive must
++    self._rearm_guarded(HyundaiSafetyFlagsSP.PEDAL_FAULT_GRACE, HyundaiSafetyFlagsSP.PEDAL_FAULT_FRAMES)
++    self._open_window()
++    self._fault_at(19000)
++    self.assertTrue(self._tx(self._brake_cmd(1)), "inside grace: suppressed even though the run is short")
++    base = HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US
++    self._fault_at(base + 10000, refresh=True)                    # past grace, run = 2 < N
++    self.assertTrue(self._tx(self._brake_cmd(1)), "past grace, but still fewer than N consecutive")
++    self._fault_at(base + 20000, refresh=True)                    # run = 3 = N
++    self.assertFalse(self._tx(self._brake_cmd(1)), "past the grace with N consecutive frames must latch")
++
+   def test_driver_input_on_the_grant_frame_still_cuts_then_rearms_on_release(self):
+     """T5 (G9b, drive-14): the SET runs BEFORE the clear, so a driver input ON the grant frame re-latches (driver
+     wins that frame). The frame AFTER the input is released is CLEAN and — because the resume edge already armed
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 18daf68b..fcfddbe3 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -48,6 +48,10 @@ class CarStateExt:
+     # invisible to interceptor_state. This carries the all-frames verdict so the Fca11LongBrake pedal latch mirrors
+     # the panda's per-frame faulting. Published on THIS object, exactly like interceptor_state / fca11_unavailable.
+     self.interceptor_fault_seen = False
++    # 0045 (PROPOSAL): the TRAILING run of fault frames in the window (0 = the newest 0x701 frame is an accepted state).
++    # The pedal-fault guards read this instead of the any-frame flag: a fault frame the post-init grace suppressed then
++    # cannot latch later on a stale 1 s window, while a persisting fault keeps the run alive at the window's end.
++    self.interceptor_fault_run = 0
+     self.pedal_fault_monitor = PedalFaultMonitor()
+     # fork: FCA11 long braking (HyundaiFca11Brake) inputs the controller reads off CS: the freshest raw bus-2 camera
+     # 0x38D frame (t_nanos, dat) for the byte-exact mirror, and the "now" the freshness check compares it against
+@@ -215,6 +219,15 @@ class CarStateExt:
+       # True if any frame in the window is a fault, False when the window carried no 0x701 frame.
+       state_frames = cp_gas.vl_all[sensor_msg].get("STATE", []) if sensor_msg in cp_gas.vl_all else []
+       self.interceptor_fault_seen = any(int(s) not in HYUNDAI_FCA11_PEDAL_STATE_OK for s in state_frames)
++      # 0045 (PROPOSAL): the TRAILING consecutive fault run (newest first), the evidence the pedal-fault guards read.
++      # A persisting fault ends the window in a fault state, so the run grows tick after tick; a recovered pedal ends it
++      # at 0. Cheap: the window is ~50 frames and the loop stops at the first accepted state.
++      fault_run = 0
++      for s in reversed(state_frames):
++        if int(s) in HYUNDAI_FCA11_PEDAL_STATE_OK:
++          break
++        fault_run += 1
++      self.interceptor_fault_run = fault_run
+       # pedal fault the clear frames could not recover (set by the controller on the previous frame): standard cruise
+       # fault -> immediate disengage + alert, so the driver knows openpilot no longer has throttle authority
+       if self.pedal_fault_monitor.escalated:
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 4e46d9fb..eaf91723 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -64,7 +64,10 @@ from opendbc.car.can_definitions import CanData
+ from opendbc.sunnypilot.car.hyundai import cal_mode, driver_mark
+ from opendbc.sunnypilot.car.hyundai.values import (HYUNDAI_FCA11_LONG_MAX_DEC, HYUNDAI_FCA11_LONG_RATE_STEP,
+                                                    HYUNDAI_FCA11_PEDAL_STATE_OK, HYUNDAI_FCA11_CAM_BRAKE_MASK,
+-                                                   HYUNDAI_FCA11_CAM_WARN_MASK, HYUNDAI_FCA11_CAM_QUIET_FRAMES)
++                                                   HYUNDAI_FCA11_CAM_WARN_MASK, HYUNDAI_FCA11_CAM_QUIET_FRAMES,
++                                                   HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US, HYUNDAI_FCA11_PEDAL_FAULT_FRAMES,
++                                                   HYUNDAI_FCA11_PEDAL_GUARD_GRACE, HYUNDAI_FCA11_PEDAL_GUARD_FRAMES,
++                                                   HYUNDAI_FCA11_PEDAL_GUARD_MASK)
+ from opendbc.sunnypilot.car.hyundai import fca11_log
+ 
+ FCA11_ADDR = 0x38D
+@@ -175,6 +178,17 @@ FCA11_CUT_SOURCE_NONE = 0      # not unavailable
+ FCA11_CUT_SOURCE_PEDAL = 1     # the pedal-fault latch (_pedal_cut): pedal STATE not in {0,4,5}
+ FCA11_CUT_SOURCE_REFUSED = 2   # the echo-confirmed refusal wall (_refused_cut)
+ 
++# *** 0045 (PROPOSAL, OWNER DECISION): the car-layer half of the pedal-fault guards ***
++# Mirrors safety/modes/hyundai.h exactly (the 0042 design rule: the two layers must not drift). Off unless the owner sets
++# HyundaiFca11PedalGuard (bit 1 = grace, bit 2 = consecutive frames; 0 = the deployed rule, which is what ships). The
++# grace window is anchored to the FIRST ENABLED FRAME of this instance - on the real path the controller is created at
++# ignition, so that frame is within one 100 Hz tick of the panda's hyundai_init (route 1a0: the panda's init was at
++# 7.19 s and the mirror's latch 14 ms later), which is the edge the guard protects.
++# MUST equal HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US / _FAULT_FRAMES in values.py (unit-tested; the panda counts microseconds,
++# this layer counts 100 Hz controller frames).
++FCA11_PEDAL_GUARD_GRACE_FRAMES = HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US // 10000   # 0.5 s @ 100 Hz = 50 frames
++FCA11_PEDAL_GUARD_FRAMES = HYUNDAI_FCA11_PEDAL_FAULT_FRAMES
++
+ # *** 0053: NON-LATCHING camera hand-back (owner policy 2026-10-21) ***
+ # "A camera WARNING must not stop openpilot braking. A warning just means we got close to something. If the camera
+ # starts sending actual BRAKE messages, hand back - but do not latch until the next ignition: when the camera stops
+@@ -1834,6 +1848,12 @@ class Fca11LongBrake:
+     self._urgent_ceiling_lsb = int(HYUNDAI_FCA11_LONG_MAX_DEC)
+     self.shadow = (not self._core) and shadow_enabled(CP_SP)
+     self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
++    # 0045 (PROPOSAL, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard via setup_interfaces), read
++    # ONCE here. Masked, so an unknown bit / a hand-built CP_SP / a test double is the deployed rule (0). Mirrors the
++    # panda's safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES - the two layers must not drift.
++    self.pedal_guard = int(getattr(CP_SP, "fca11PedalGuard", 0) or 0) & HYUNDAI_FCA11_PEDAL_GUARD_MASK
++    # The grace anchor: the first frame this ENABLED instance processed (the ignition's arm on the real path).
++    self._pedal_arm_frame: int | None = None
+     # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
+     # frame. OFF -> the 0.67 through-origin law and the 8 LSB floor, byte-identical to 0040. 0044: CP_SP is the ONLY
+     # source (the env override is refused, the Params fallback is gone). 0045: in Shadow the WIRE is OLD-LAW, always:
+@@ -3904,6 +3924,9 @@ class Fca11LongBrake:
+     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+     # pattern as fca11_now_nanos: the controller writes a CS attribute the class later reads).
+     CS._fca11_braking_now = self._actuating
++    # 0045 (PROPOSAL): the grace anchor - the first frame of this ENABLED instance (the ignition's arm on the real path).
++    if self._pedal_arm_frame is None:
++      self._pedal_arm_frame = frame
+ 
+     # resume model: any disengage -> re-engage transition clears a cut latch (the pause/resume
+     # press is the only engagement path in pedal mode, so this IS the driver's deliberate press).
+@@ -3952,9 +3975,28 @@ class Fca11LongBrake:
+     # window - so a single fault frame sandwiched between accepted states (route 156's boot handshake, STATE [5, 3, 5])
+     # is invisible to CS.interceptor_state (its last value is an accepted 5). CS.interceptor_fault_seen carries the
+     # all-frames verdict from carstate_ext.py (vl_all), so the latch is panda-equivalent on the real path too.
+-    pedal_state = int(getattr(CS, "interceptor_state", 0))
+-    if pedal_state not in HYUNDAI_FCA11_PEDAL_STATE_OK or bool(getattr(CS, "interceptor_fault_seen", False)):
+-      self._pedal_cut = True
++    # 0045 (PROPOSAL, OWNER DECISION): the two opt-in guards are vetoes on the SAME rule. With HyundaiFca11PedalGuard = 0
++    # (the shipped default) this is bit-for-bit the deployed mirror: ANY fault frame in the window latches. With a guard
++    # on, the latch reads the TRAILING run (CS.interceptor_fault_run, carstate_ext) instead of the any-frame flag, so a
++    # fault frame the guard suppressed can never latch later on a stale 1 s window; a persisting fault keeps producing
++    # trailing fault frames, so the grace expires and the run reaches N - still fail-closed.
++    #   (a) grace: no latch while frame - arm_frame < FCA11_PEDAL_GUARD_GRACE_FRAMES (0.5 s = 50 frames @ 100 Hz).
++    #   (b) frames: no latch until FCA11_PEDAL_GUARD_FRAMES (3) consecutive trailing fault frames.
++    # KNOWN, DOCUMENTED EDGE (only with a guard ON): a single NON-trailing fault frame inside an otherwise-clean window,
++    # observed OUTSIDE the grace, is caught by the panda's all-frame rule but not by this trailing-run mirror - the panda
++    # still refuses, and the divergence guard surfaces the disagreement. With the shipped guard = 0 there is no such edge.
++    guard = self.pedal_guard
++    if guard:
++      fault_run = int(getattr(CS, "interceptor_fault_run", 0))
++      in_grace = bool(guard & HYUNDAI_FCA11_PEDAL_GUARD_GRACE) and self._pedal_arm_frame is not None and \
++          (frame - self._pedal_arm_frame) < FCA11_PEDAL_GUARD_GRACE_FRAMES
++      short_run = bool(guard & HYUNDAI_FCA11_PEDAL_GUARD_FRAMES) and fault_run < FCA11_PEDAL_GUARD_FRAMES
++      if fault_run > 0 and not in_grace and not short_run:
++        self._pedal_cut = True
++    else:
++      pedal_state = int(getattr(CS, "interceptor_state", 0))
++      if pedal_state not in HYUNDAI_FCA11_PEDAL_STATE_OK or bool(getattr(CS, "interceptor_fault_seen", False)):
++        self._pedal_cut = True
+     if not engaged:
+       self._rearm_pending = False
+     # 0042 v2: SEND GATE vs ALERT. blocked_until_resume stays the DRIVER cut ONLY (0053: the camera gate is cam_brake,
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index 00360046..653255e5 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -169,7 +169,7 @@ class _CS:
+   """Minimal CarState double: the only attributes Fca11LongBrake reads."""
+   def __init__(self, v_ego=20.0, gear=structs.CarState.GearShifter.drive, brake=False, gas=False,
+                state=0, cam=None, now=0, lead_closing=False, a_ego=0.0, standstill=False, wheel_min_kph=None,
+-               fault_seen=False, lead_m=None, lead_one=None):
++               fault_seen=False, lead_m=None, lead_one=None, fault_run=0):
+     self.out = structs.CarState()
+     self.out.vEgo = v_ego
+     self.out.gearShifter = gear
+@@ -181,6 +181,8 @@ class _CS:
+     # 0042 v3: the any-frame pedal-fault verdict carstate_ext.py publishes (vl_all). Defaults False so every
+     # pre-v3 test double keeps its meaning (last-value only); the sandwich cases set it explicitly.
+     self.interceptor_fault_seen = fault_seen
++    # 0045: the TRAILING consecutive fault run carstate_ext publishes; the pedal-fault guards read it.
++    self.interceptor_fault_run = fault_run
+     self.fca11_cam_frame = cam
+     self.fca11_now_nanos = now
+     self.fca11_lead_closing = lead_closing
+@@ -4614,3 +4616,88 @@ class TestClosingDemand(unittest.TestCase):
+   def test_beyond_range_is_not_a_stopping_problem(self):
+     law = self._law()
+     self.assertEqual(-0.2, law._closing_demand(self._cs(45.0, -10.0), -0.2))
++
++
++class TestFca11PedalSceGuard(unittest.TestCase):
++  """0045 (PROPOSAL, OWNER DECISION): the car-layer half of the two pedal-fault guards.
++
++  Route 1a0 (2026-11-09) proved the deployed rule's startup race: ONE pedal STATE=3 (SCE) frame 12-19 ms after
++  hyundai_init latched the panda's hyundai_fca11_long_cut and this mirror for the whole ignition (187/187 actuating
++  frames refused; no FCA11 braking for 20.7 min). Each guard is one CP_SP.fca11PedalGuard bit (1 = grace window after
++  the arm, 2 = N consecutive fault frames); 0 - the shipped value - keeps the deployed single-frame rule that
++  TestFca11PedalCutLatch pins. With a guard ON the latch reads the TRAILING run (CS.interceptor_fault_run) so a
++  suppressed frame cannot latch later on a stale window; a persisting fault still latches (fail-closed preserved).
++  """
++
++  def _cc(self):
++    cc = structs.CarControl()
++    cc.enabled = True
++    cc.longActive = True
++    cc.actuators.accel = -1.0
++    return cc
++
++  def _brake(self, guard=0):
++    cp_sp = structs.CarParamsSP()
++    cp_sp.fca11Brake = True
++    cp_sp.enableGasInterceptor = True
++    cp_sp.fca11PedalGuard = guard
++    return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++  def test_guard_is_read_once_and_masked(self):
++    self.assertEqual(0, self._brake(0).pedal_guard)
++    self.assertEqual(1, self._brake(1).pedal_guard)
++    self.assertEqual(3, self._brake(3).pedal_guard)
++    self.assertEqual(1, self._brake(0b10001).pedal_guard, "unknown bits are masked off, never a behaviour")
++
++  def test_guard_zero_keeps_the_deployed_single_frame_latch(self):
++    b = self._brake(0)
++    b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=1, cam=_cam()), 0)
++    self.assertTrue(b._pedal_cut)
++    self.assertTrue(b.fca11_unavailable)
++    self.assertEqual(fl.FCA11_CUT_SOURCE_PEDAL, b.fca11_cut_source)
++
++  def test_grace_suppresses_the_startup_frame(self):
++    b = self._brake(fl.HYUNDAI_FCA11_PEDAL_GUARD_GRACE)
++    b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=1, cam=_cam()), 0)
++    self.assertFalse(b._pedal_cut, "the startup SCE frame must not latch under the grace guard")
++    self.assertFalse(b.fca11_unavailable)
++    # the pedal recovers: a clean trailing state must NOT resurrect the suppressed frame later
++    sent = [x for f in range(1, 60) for x in b.update(self._cc(), _CS(state=0, fault_run=0, cam=_cam()), f)
++            if fl._get_bits(x.dat, 8, 8) > 0]
++    self.assertTrue(sent)
++    self.assertFalse(b._pedal_cut)
++    # a fault observed AFTER the window latches (fail-closed preserved)
++    b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=1, cam=_cam()), 60)
++    self.assertTrue(b._pedal_cut)
++
++  def test_grace_still_fails_closed_on_a_stuck_pedal(self):
++    b = self._brake(fl.HYUNDAI_FCA11_PEDAL_GUARD_GRACE)
++    latched_at = None
++    for f in range(0, 60):
++      b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=f + 1, cam=_cam()), f)
++      if b._pedal_cut and latched_at is None:
++        latched_at = f
++    self.assertEqual(fl.FCA11_PEDAL_GUARD_GRACE_FRAMES, latched_at,
++                     "a stuck pedal must latch on the first observation outside the window")
++
++  def test_frames_requires_n_consecutive(self):
++    b = self._brake(fl.HYUNDAI_FCA11_PEDAL_GUARD_FRAMES)
++    for run in (1, fl.FCA11_PEDAL_GUARD_FRAMES - 1):
++      b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=run, cam=_cam()), run)
++      self.assertFalse(b._pedal_cut, run)
++    b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=fl.FCA11_PEDAL_GUARD_FRAMES, cam=_cam()),
++             fl.FCA11_PEDAL_GUARD_FRAMES)
++    self.assertTrue(b._pedal_cut)
++
++  def test_frames_does_not_latch_on_a_short_run(self):
++    b = self._brake(fl.HYUNDAI_FCA11_PEDAL_GUARD_FRAMES)
++    b.update(self._cc(), _CS(state=3, fault_seen=True, fault_run=1, cam=_cam()), 0)
++    b.update(self._cc(), _CS(state=0, fault_run=0, cam=_cam()), 1)
++    self.assertFalse(b._pedal_cut)
++    self.assertFalse(b.fca11_unavailable)
++
++  def test_mirror_constants_stay_equal_to_the_panda(self):
++    from opendbc.sunnypilot.car.hyundai.values import HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US, HYUNDAI_FCA11_PEDAL_FAULT_FRAMES
++    self.assertEqual(HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US // 10000, fl.FCA11_PEDAL_GUARD_GRACE_FRAMES)
++    self.assertEqual(HYUNDAI_FCA11_PEDAL_FAULT_FRAMES, fl.FCA11_PEDAL_GUARD_FRAMES)
++    self.assertEqual(HYUNDAI_FCA11_PEDAL_FAULT_FRAMES, 3, "the doc/comment cites N = 3; change both together")
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index bd974247..374d671e 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -45,6 +45,12 @@ class HyundaiSafetyFlagsSP:
+   # 384. C mirror: HYUNDAI_PARAM_SP_CN7_STEER_RAMP. Must match CarControllerParams.STEER_DELTA_UP for that platform.
+   # Both are test/car-layer SP bits on distinct flags: 512 LKAS_PARK_TEST (unshipped, this file) and 1024 CN7_STEER_RAMP.
+   CN7_STEER_RAMP = 1024
++  # PROPOSAL (0045, OWNER DECISION): the two pedal-fault guards against the power-transition SCE race (see the
++  # HYUNDAI_FCA11_PEDAL_FAULT_* block below). Selected by the INT param HyundaiFca11PedalGuard (bitfield:
++  # 1 = grace window after hyundai_init, 2 = N consecutive fault frames, 3 = both; 0 = the deployed rule, DEFAULT).
++  # C mirror: HYUNDAI_PARAM_SP_PEDAL_FAULT_GRACE / _FRAMES (safety/modes/hyundai_common.h); both bits clear = deployed.
++  PEDAL_FAULT_GRACE = 4096
++  PEDAL_FAULT_FRAMES = 8192
+   # ccNC (upstream b5e8fe58). Upstream asked for 16 / 2**11, which this fork's gas-interceptor bits already own; those
+   # values are mirrored in safety/modes/hyundai_common.h and pinned by fork tests, and current_safety_param_sp is
+   # uint16_t, so the fork block cannot move up. Upstream's bit takes the first free slot above it instead. Every use
+@@ -96,6 +102,22 @@ HYUNDAI_FCA11_LONG_HOST_HB_TIMEOUT_US = 500000   # 0.5 s
+ # The car layer mirrors the accepted set here (ONE source of truth) for BOTH its per-frame pedal gate and the 0042
+ # fail-closed latch, so Python and the panda cannot drift apart. Unit test pins {0, 4, 5}.
+ HYUNDAI_FCA11_PEDAL_STATE_OK = (0, 4, 5)
++# *** 0045 (PROPOSAL, OWNER DECISION): the two pedal-fault guards ***
++# The deployed rule is fail-closed but has a STARTUP RACE, proven on route 1a0 (2026-11-09): the pedal emits a fault
++# burst at EVERY power transition, and a SINGLE STATE=3 (SCE) frame that lands just after `hyundai_init` latched the
++# panda's hyundai_fca11_long_cut (cleared only by the next hyundai_init) 14 ms before the car-layer mirror, costing the
++# whole drive (187/187 actuating frames refused 666.33-670.07 s; FCA11 braking off 20.7 min). Both guards are OFF at
++# their deployed values (HyundaiFca11PedalGuard = 0), so an unmodified build is byte-for-byte today's rule.
++#   (a) GRACE: a fault OBSERVED within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch. Bounded - a
++#       fault that PERSISTS past the window latches on its first frame outside it (still fails closed).
++#   (b) FRAMES: latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES CONSECUTIVE fault frames; any accepted 0x701 frame
++#       resets the run. 1 = deployed (any single frame latches).
++# C mirrors, unit-tested equal: safety/modes/hyundai.h HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US / _FAULT_FRAMES.
++HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US = 500000   # option (a): 0.5 s = ~25x the observed 12-19 ms startup race
++HYUNDAI_FCA11_PEDAL_FAULT_FRAMES = 3          # option (b): 3 consecutive @ 100 Hz = ~30 ms of continuous fault
++HYUNDAI_FCA11_PEDAL_GUARD_GRACE = 1           # HyundaiFca11PedalGuard bit 0
++HYUNDAI_FCA11_PEDAL_GUARD_FRAMES = 2          # HyundaiFca11PedalGuard bit 1
++HYUNDAI_FCA11_PEDAL_GUARD_MASK = 3            # any other value is junk -> treated as 0 (deployed)
+ # *** TEST-ONLY parked LKAS11 sweep (LKAS_PARK_TEST) constants; unit tests pin each against safety/modes/hyundai.h ***
+ HYUNDAI_LKAS_PARK_MAX_TORQUE = 384      # = CarControllerParams STEER_MAX
+ HYUNDAI_LKAS_PARK_RATE_UP = 3           # = STEER_DELTA_UP
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index 0a5e55a6..d98f7d70 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -23,7 +23,8 @@ from opendbc.car.volkswagen.values import VolkswagenFlags
+ from opendbc.car.toyota.values import ToyotaSafetyFlags
+ from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
+ from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
+-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
++from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP, HYUNDAI_FCA11_PEDAL_GUARD_GRACE, \
++  HYUNDAI_FCA11_PEDAL_GUARD_FRAMES, HYUNDAI_FCA11_PEDAL_GUARD_MASK
+ from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
+ from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP, SubaruSafetyFlagsSP
+ from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP, TeslaSafetyFlagsSP
+@@ -195,6 +196,20 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # Read at CarParams build time => next ignition. The panda's 0033 window is the hard bound on where it can act.
+   if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StopHoldClutch")) and not shadow:
+     CP_SP.fca11StopHoldClutch = True
++  # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0"). A bitfield:
++  # 1 = grace window after hyundai_init, 2 = N consecutive fault frames, 3 = both; 0 = the deployed fail-closed rule.
++  # Written HERE because the car layer only READS CP_SP.fca11PedalGuard - without this writer the key would be a no-op
++  # in every build (the 0043/0044 unreachable-key class the reachability guard exists for). Same dependency as the
++  # siblings: the guard only shapes FCA11-long, so it is inert without HyundaiFca11Brake (and in Shadow, whose wire is
++  # the OLD-LAW). Junk / missing key / any bit outside the mask -> 0, never raises. Each enabled bit also sets its panda
++  # safetyParam mirror bit, so the two layers cannot disagree about whether a guard is in force. Next ignition to apply.
++  if CP_SP.fca11Brake and not shadow:
++    guard = _param_int(params_dict.get("HyundaiFca11PedalGuard")) & HYUNDAI_FCA11_PEDAL_GUARD_MASK
++    CP_SP.fca11PedalGuard = guard
++    if guard & HYUNDAI_FCA11_PEDAL_GUARD_GRACE:
++      CP_SP.safetyParam |= HyundaiSafetyFlagsSP.PEDAL_FAULT_GRACE
++    if guard & HYUNDAI_FCA11_PEDAL_GUARD_FRAMES:
++      CP_SP.safetyParam |= HyundaiSafetyFlagsSP.PEDAL_FAULT_FRAMES
+   # 17c DELIVERY (HyundaiPedalDeliveryLaw, PERSISTENT BOOL, default "0" = OFF): the measured-inverse law for NEGATIVE
+   # accel asks (the car's pedal has a dead band the linear law is 2.5-3x too weak on, so shallow braking asks ran away
+   # at +0.06..+0.13 m/s^2) plus a one-sided filter on the pedal path so the plan's 2-4 Hz ask dither cannot reach the
+@@ -225,6 +240,18 @@ def _param_truthy(raw) -> bool:
+   return bool(raw is True or str(raw or "0").strip() == "1")
+ 
+ 
++def _param_int(raw, default: int = 0) -> int:
++  """0045: the fork's INT-param parser, same never-raise rule as _param_truthy. Params.get() can hand back an int, a
++  str or bytes for an INT key; None (missing key on a stale libparams), junk and negatives are the default. Used by the
++  pedal-fault guard mode (HyundaiFca11PedalGuard); the car layer masks the value, so an unknown bit is inert."""
++  if isinstance(raw, bytes):
++    raw = raw.decode(errors="ignore")
++  try:
++    return max(default, int(str(raw).strip()))
++  except (TypeError, ValueError):
++    return default
++
++
+ def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
+   """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
+   standard_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED)

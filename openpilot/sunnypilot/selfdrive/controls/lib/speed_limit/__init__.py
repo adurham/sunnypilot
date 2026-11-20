@@ -17,3 +17,18 @@ CONFIRM_SPEED_THRESHOLD = {
   True: 80,   # km/h
   False: 50,  # mph
 }
+
+# Speed Limit Assist (fork): auto-apply a set-speed change without a press at ANY vehicle speed,
+# EXCEPT when the change would DECREASE the set speed by more than this cap (then still ask — the
+# risky case is a wrong/stale limit at speed forcing an unexpected hard slowdown). Increases always
+# auto-apply. Units are the native display unit used by CONFIRM_SPEED_THRESHOLD: km/h : mph.
+MAX_AUTO_DECREASE = {
+  True: 24.0,   # km/h
+  False: 15.0,  # mph
+}
+
+# Speed Limit Assist (fork): after a manual set-speed override, keep honouring it for at least this
+# many seconds regardless of speed-limit changes, so a fast-changing area (limits that flip every
+# block) does not immediately re-engage SLA under the driver's hands. Clearing the override requires
+# BOTH a speed-limit change since the override AND this window to have elapsed.
+OVERRIDE_MEMORY_S = 600.0  # s

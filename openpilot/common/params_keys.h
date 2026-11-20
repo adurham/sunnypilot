@@ -5,6 +5,7 @@
 
 #include "openpilot/cereal/gen/cpp/log.capnp.h"
 
+// Fork-owned settings inventory (one table for every key): see SETTINGS.md at the repo root.
 inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AccessToken", {CLEAR_ON_MANAGER_START | DONT_LOG, STRING}},
     {"AdbEnabled", {PERSISTENT | BACKUP, BOOL}},
@@ -240,6 +241,72 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BackupManager_RestoreVersion", {PERSISTENT, STRING}},
 
     // sunnypilot car specific params
+    // fork (0046): ONE longitudinal model for the Hyundai page. 0 = Stock, 1 = Comma pedal,
+    // 2 = Pedal + FCA11. It owns the pair below; the old pair is kept registered/readable and is
+    // migrated into this key once (openpilot/sunnypilot/fork/hyundai_settings.py). Read at CarParams
+    // build time => takes effect at the NEXT ignition. Default 0 = the old default pair (0, 0).
+    {"HyundaiLongitudinalMode", {PERSISTENT | BACKUP, INT, "0"}},
+    // fork (0046): user-facing brake-shaping key; replaces the historical misnomer
+    // HyundaiFca11AffineGain. The shim reads the old key while this one is absent and writes this
+    // one once; the car layer still receives the value under the old name (opendbc
+    // setup_interfaces). Inert unless mode 2 (Pedal + FCA11). Default 0 = the old default.
+    {"HyundaiFca11Shaping", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork: comma pedal longitudinal (non-SCC), opt-in. LEGACY (0046): no UI row; still the key the
+    // car layer receives, resolved from HyundaiLongitudinalMode. Kept registered/readable for at
+    // least one release; PERSISTENT | BACKUP so an old backup restore cannot break libparams.
+    {"HyundaiGasInterceptor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: comma pedal longitudinal (non-SCC), opt-in
+    {"HyundaiGasInterceptorIDSet", {PERSISTENT | BACKUP, STRING, "auto"}},  // fork: pedal CAN IDs: auto/standard/remapped
+    // fork: FCA11 longitudinal braking on the comma pedal (default OFF). LEGACY (0046): no UI row;
+    // resolved from HyundaiLongitudinalMode (mode 2). Kept registered/readable.
+    {"HyundaiFca11Brake", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: FCA11 longitudinal braking on the comma pedal (default OFF)
+    // fork (0044): FCA11 brake-SHAPING law, default OFF. LEGACY NAME (0046): the user-facing key is
+    // HyundaiFca11Shaping; this one is read as the fallback until the shim has written the new key,
+    // and stays registered/readable for at least one release. Inert unless
+    // HyundaiFca11Brake is also ON (enforced in opendbc setup_interfaces). Read at CarParams build time => a toggle takes
+    // effect at the NEXT ignition; the UI only enables it offroad.
+    {"HyundaiFca11AffineGain", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0045): log-only shadow of the FCA11 V3 shaping law; computes + logs V3's would-be output; V3 NEVER sends;
+    // next-ignition; for fresh-route data. The wire stays OLD-LAW (the deployed law): HyundaiFca11Brake keeps its meaning,
+    // HyundaiFca11AffineGain is ignored (opendbc setup_interfaces). Writes /data/fca11-log/fca11-shadow.jsonl. Default OFF.
+    {"HyundaiFca11Shadow", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (18x): the DYNAMIC-RELEASE build of the FCA11 law - gentle 1 LSB onset, a per-sent-frame decrease limit, a soft
+    // release ramp, and the k="b" level trace (level + measured aEgo + ask, per sent frame, in the FCA11 shadow log file).
+    // Read at CarParams build time => takes effect at the NEXT ignition. Inert unless HyundaiFca11Brake is also ON
+    // (enforced in opendbc setup_interfaces). Default OFF; the three UNCONDITIONAL 18x rules (low-speed release hold,
+    // crawl floor, 100 ms gas window) are NOT behind this key and run on every build.
+    {"HyundaiFca11DynamicBrakes", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // PROPOSAL (0045, OWNER DECISION): pedal-fault guard mode for FCA11-long. Bitfield, default "0" = the deployed
+    // fail-closed rule (ANY pedal fault frame latches the cut for the ignition). 1 = a pedal fault observed within
+    // HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US (0.5 s) of hyundai_init does not latch; 2 = latch only after
+    // HYUNDAI_FCA11_PEDAL_FAULT_FRAMES (3) consecutive fault frames; 3 = both. Targets the power-transition SCE race
+    // that cost route 1a0's whole drive (2026-11-09). Inert unless HyundaiFca11Brake is ON. Read at CarParams build
+    // time => takes effect at the NEXT ignition; it changes a FAIL-CLOSED path, so it must stay 0 until the owner
+    // signs off on a first-drive test.
+    {"HyundaiFca11PedalGuard", {PERSISTENT | BACKUP, INT, "0"}},
+    // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
+    // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
+    // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
+    // "REGISTRATION ONLY ... Setting it here is INERT" note here was stale - it described the pre-merge state.)
+    // It also only runs in NORMAL drive mode: gas_interceptor.py:734 gates the measured law on driveMode == NORMAL
+    // (the table was fit on route 17c, which ran in NORMAL), so ECO / SPORT / N and an undecoded mode keep the
+    // deployed linear pedal law. Default OFF.
+    // fork (17c delivery): measured-inverse pedal law for NEGATIVE accel asks (the car's pedal dead band makes the
+    // linear PEDAL_SCALE law 2.5-3x too weak, so shallow braking asks under-lifted and the car gained speed) plus a
+    // one-sided filter on the pedal path against the plan's 2-4 Hz ask dither. Inert unless HyundaiGasInterceptor is
+    // armed (opendbc setup_interfaces). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
+    // OFF (the default) = the deployed pedal law, byte for byte.
+    {"HyundaiPedalDeliveryLaw", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0042-Z rise-lag): rise-only first-order lag on the accel ask ahead of the pedal law (lane Y: the small gas
+    // moves in NORMAL are real 1.3-2 s planner asks, so only the ASK can smooth them). Rises are slowed (tau 0.45 s);
+    // falls pass through unchanged, so lifting off is never delayed, and the pedal never sits above where the unlagged
+    // law would put it. Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
+    // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal path, byte for byte.
+    {"HyundaiGasRiseLag", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
+    // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
+    // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may
+    // select remote outputs). See openpilot/offload/INTERFACES.md.
+    {"OffloadMode", {PERSISTENT, STRING}},
     {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"SubaruStopAndGoManualParkingBrake", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -249,6 +316,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ToyotaStopAndGoHack", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ToyotaTSS2Smooth", {PERSISTENT | BACKUP, BOOL, "0"}},
 
+    {"AdaptiveFollowDistance", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/adaptive_follow.py
+    {"NoCloseOnLead", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/no_close.py (never accelerate toward a lead)
+    {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params

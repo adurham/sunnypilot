@@ -1,0 +1,209 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 42535391..f0e2581a 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -496,6 +496,19 @@ FCA11_FEEL_HOLD_BAND_KPH = 3.0       # at/below (or standstill): the deployed la
+ # (and then ramps softly). Coast-first must suppress transient small asks, never leave a SUSTAINED one unactuated while
+ # a gap closes (the planner would only re-ask later and deeper). 100 frames = 1.0 s.
+ FCA11_FEEL_DWELL_FRAMES = 100
++# cycle 1 (route 167 seg 9, 15:50:36-39 CDT): a SLOW-CRAWL dwell escape. At a crawl toward a closing lead the planner's
++# ask hovers at -0.50..-0.62; the 1.0 s dwell then never completes (74 frames at <= -0.5, one shallow lift to -0.46, 68
++# more) and the car crept 1.13 -> 1.49 m/s for 2.65 s with no brake until the driver stepped in. Below
++# FCA11_FEEL_DWELL_SLOW_MPS a SECOND consecutive counter - same qualifying frames (ok AND ask <= -0.5) AND speed below the
++# limit, hard-reset otherwise - opens after FCA11_FEEL_DWELL_SLOW_FRAMES (0.7 s). It is strict (every counted frame was
++# below the limit), so a car slowing through the limit can never open off frames it accumulated at speed; at/above it the
++# 1.0 s dwell runs unchanged. Open-loop replay of routes 167/168 (wsSTOP/feel-167-168/underbrake-fix): seg 9 opens at
++# 15:50:37.99 (1.35 s before the driver's brake); 2 other openings move, both at 1.39 m/s in one shared 167-s25 window;
++# no changed opening above 1.4 m/s; +1.52 s brake-on over both drives. A dwell of 70 at ALL speeds moves 38 openings, 36
++# of them above 2 m/s (up to 26 m/s) - the early-braking-at-speed complaint - and dropout-tolerant counters at 100 cannot
++# open before ~15:50:38.2 on this ask (the lift is a 53-frame shallow dip, not a dropout). Release/gain/min-on untouched.
++FCA11_FEEL_DWELL_SLOW_MPS = 2.0
++FCA11_FEEL_DWELL_SLOW_FRAMES = 70
+ # DEEPENING bypass: while the ask is getting more negative faster than this (m/s^3, EMA over sent frames), the onset ramp
+ # grows at the panda's full +RATE_STEP - a demand that is building quickly is not throttled by the comfort ramp.
+ FCA11_FEEL_DEEPEN_SLOPE = -2.0
+@@ -1049,6 +1062,7 @@ class Fca11LongBrake:
+     self._feel_in_hold_band = False    # hold-band latch (ENTER <= 3 km/h or standstill, EXIT >= 5 km/h)
+     self._feel_cal_prev = False        # previous frame's cal_on (a cal->planner hand-off re-seeds the ramp)
+     self._feel_dwell = 0               # consecutive frames of (ok AND ask <= the deployed -0.5 onset): the dwell escape
++    self._feel_dwell_slow = 0          # the same, AND vEgo < FCA11_FEEL_DWELL_SLOW_MPS on every counted frame (crawl escape)
+     # 0051: the feel FIX round (wobble damping, gentle gain, lead-loss hold). Read ONCE; only ever on the feel path.
+     self.feel_fix = self.feel and bool(FCA11_FEEL_FIX_0051)
+     self._feel_slope_ant = 0.0         # slow EMA of d(ask)/dt (anticipation only; FCA11_FEEL_SLOPE_ALPHA_0051)
+@@ -1850,6 +1864,7 @@ class Fca11LongBrake:
+       self._feel_cal_prev = False
+       self._feel_in_hold_band = False
+       self._feel_dwell = 0
++      self._feel_dwell_slow = 0
+       return sends
+ 
+     # 0029 CAL: expose last frame's braking to the sequencer's release/recovery detection (same
+@@ -1949,6 +1964,7 @@ class Fca11LongBrake:
+       self._feel_reset()                     # 0049: and the feel ramp
+       self._feel_cal_prev = False
+       self._feel_dwell = 0
++      self._feel_dwell_slow = 0
+       self._alerts(CS, frame, v_kph_now, 0)   # 0040: braking is over -> supervise/stop-complete off (brake_now persists)
+       self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+@@ -2005,6 +2021,8 @@ class Fca11LongBrake:
+       open_accel = min(FCA11_BRAKE_ONSET_ACCEL, FCA11_FEEL_OPEN_ACCEL)
+     ask = bool(ok and accel <= open_accel)
+     self._feel_dwell = self._feel_dwell + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL) else 0
++    _slow = bool(float(CS.out.vEgo) < FCA11_FEEL_DWELL_SLOW_MPS)
++    self._feel_dwell_slow = self._feel_dwell_slow + 1 if (self.feel and ok and accel <= FCA11_BRAKE_ONSET_ACCEL and _slow) else 0
+     self._ask_frames = self._ask_frames + 1 if ask else 0
+ 
+     # onset: a NEW episode opens only after ONSET_HOLD_FRAMES consecutive ask frames (0.2 s), EXCEPT a
+@@ -2021,6 +2039,8 @@ class Fca11LongBrake:
+     onset = bool(ok and (self._ask_frames >= FCA11_ONSET_HOLD_FRAMES or accel <= FCA11_ONSET_BYPASS_ACCEL))
+     if self.feel and self._feel_dwell >= FCA11_FEEL_DWELL_FRAMES:
+       onset = True   # 0049 dwell escape (feel path only; `ok` is part of the dwell count): a SUSTAINED small ask opens
++    if self.feel and self._feel_dwell_slow >= FCA11_FEEL_DWELL_SLOW_FRAMES:
++      onset = True   # cycle 1 crawl escape: the same sustained ask opens after 0.7 s while every counted frame was slow
+     holding = bool(self.braking and ok and
+                    (accel <= FCA11_BRAKE_RELEASE_ACCEL or self._on_frames < FCA11_MIN_ON_FRAMES))
+     want_brake = bool(onset or holding or cal_on)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
+new file mode 100644
+index 00000000..374a4c3b
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_crawl_dwell.py
+@@ -0,0 +1,137 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++cycle 1: the SLOW-CRAWL dwell escape (route 167 seg 9 under-brake). Pins:
++  * below FCA11_FEEL_DWELL_SLOW_MPS a sustained ask <= -0.5 opens after FCA11_FEEL_DWELL_SLOW_FRAMES (not one frame sooner);
++  * at/above the limit the deployed 1.0 s dwell is unchanged (no opening moves at speed);
++  * the slow counter is STRICT: frames accumulated at speed never count, a lift above -0.5 or any `ok` veto resets it;
++  * the seg-9 ask shape (74 frames <= -0.5, a 53-frame shallow lift to -0.46, 68 frames <= -0.5) now opens while crawling;
++  * FEEL off: no crawl escape at all (pre-0049 law untouched); disengage clears the counter.
++"""
++import unittest
++
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_feel import _brake, _cc
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam
++
++SLOW = fl.FCA11_FEEL_DWELL_SLOW_FRAMES
++DWELL = fl.FCA11_FEEL_DWELL_FRAMES
++CRAWL = 1.3     # m/s: seg 9 crept 1.13 -> 1.49 (4.1-5.4 km/h, above the 3 km/h hold band entry)
++
++
++def _first_open(b, asks, v_fn, start=0, gas_fn=None):
++  """Frame index of the first frame the controller is braking, else None."""
++  for i, a in enumerate(asks):
++    f = start + i
++    b.update(_cc(a), _CS(v_ego=v_fn(f), cam=_cam(), gas=bool(gas_fn and gas_fn(f))), f)
++    if b.braking:
++      return f
++  return None
++
++
++class TestCrawlDwell(unittest.TestCase):
++
++  def test_constants(self):
++    self.assertEqual(70, SLOW)
++    self.assertEqual(100, DWELL, "the at-speed dwell is unchanged")
++    self.assertEqual(2.0, fl.FCA11_FEEL_DWELL_SLOW_MPS)
++
++  def test_sustained_small_ask_opens_after_the_crawl_dwell(self):
++    b = _brake(True)
++    self.assertEqual(SLOW - 1, _first_open(b, [-0.55] * 150, lambda f: CRAWL))
++
++  def test_at_and_above_the_limit_the_deployed_dwell_is_unchanged(self):
++    for v in (fl.FCA11_FEEL_DWELL_SLOW_MPS, 2.5, 5.0, 12.0, 25.0):
++      with self.subTest(v=v):
++        b = _brake(True)
++        self.assertEqual(DWELL - 1, _first_open(b, [-0.55] * 150, lambda f, v=v: v))
++
++  def test_counter_is_strict_frames_at_speed_never_count(self):
++    # 50 frames at 3 m/s then crawl: the slow counter starts at frame 50 -> it would reach 70 at 119, the 1.0 s dwell
++    # reaches 100 first (frame 99). A non-strict scoped dwell (speed checked only at the open) would open at frame 69.
++    b = _brake(True)
++    self.assertEqual(DWELL - 1, _first_open(b, [-0.55] * 150, lambda f: 3.0 if f < 50 else CRAWL))
++
++  def test_crossing_the_limit_resets(self):
++    # 60 slow frames, one at 2.0 m/s, then slow again: reopens only after a fresh 70 (or the 1.0 s dwell at 99).
++    b = _brake(True)
++    self.assertEqual(DWELL - 1, _first_open(b, [-0.55] * 150, lambda f: 2.0 if f == 60 else CRAWL))
++    b = _brake(True)
++    self.assertEqual(61 + SLOW - 1, _first_open(b, [-0.55] * 60 + [-0.40] + [-0.55] * 150, lambda f: CRAWL))
++
++  def test_lift_above_onset_resets(self):
++    b = _brake(True)
++    asks = ([-0.55] * (SLOW - 1) + [-0.49]) * 4
++    self.assertIsNone(_first_open(b, asks, lambda f: CRAWL))
++    self.assertEqual(0, b._feel_dwell_slow)
++
++  def test_ok_veto_resets(self):
++    b = _brake(True)
++    self.assertIsNone(_first_open(b, [-0.55] * 150, lambda f: CRAWL, gas_fn=lambda f: True))
++    self.assertEqual(0, b._feel_dwell_slow)
++    # a gas tap mid-count: hold-off (GAS_HOLDOFF_FRAMES) then a fresh 70
++    b = _brake(True)
++    self.assertEqual(41 + fl.GAS_HOLDOFF_FRAMES + SLOW - 1,
++                     _first_open(b, [-0.55] * 300, lambda f: CRAWL, gas_fn=lambda f: f == 40))
++
++  def test_seg9_shape_opens_while_crawling(self):
++    # the logged 167 seg-9 ask: 74 frames -0.56..-0.50, 53 frames -0.50..-0.46, 68 frames -0.51..-0.62 (14 <= -0.60)
++    asks = [-0.52] * 74 + [-0.48] * 53 + [-0.55] * 54 + [-0.61] * 14
++
++    def v(f):
++      return 1.25 + 0.25 * f / len(asks)
++    b = _brake(True)
++    self.assertEqual(SLOW - 1, _first_open(b, asks, v), "opens inside the first 74-frame run (log: 15:50:37.99)")
++    self.assertTrue(b.braking)
++    # the deployed gate never opened here (74 < 100, 68 < 100, 14 < 20 at <= -0.60)
++    prev = fl.FCA11_FEEL_DWELL_SLOW_FRAMES
++    fl.FCA11_FEEL_DWELL_SLOW_FRAMES = 10 ** 9
++    try:
++      self.assertIsNone(_first_open(_brake(True), asks, v))
++    finally:
++      fl.FCA11_FEEL_DWELL_SLOW_FRAMES = prev
++
++  def test_episode_holds_through_the_shallow_lift(self):
++    # once open, the deployed release rule (-0.30 + min-on) keeps it open across the -0.48 lift
++    asks = [-0.52] * 74 + [-0.48] * 53 + [-0.55] * 68
++    b = _brake(True)
++    _first_open(b, asks[:SLOW], lambda f: CRAWL)
++    for i, a in enumerate(asks[SLOW:], start=SLOW):
++      b.update(_cc(a), _CS(v_ego=CRAWL, cam=_cam()), i)
++      self.assertTrue(b.braking, i)
++
++  def test_feel_off_has_no_crawl_escape(self):
++    b = _brake(False)
++    _first_open(b, [-0.40] * 150, lambda f: CRAWL)    # above -0.5: the pre-0049 law never opens, neither does the escape
++    self.assertFalse(b.braking)
++    self.assertEqual(0, b._feel_dwell_slow)
++    b = _brake(False)
++    _first_open(b, [-0.55] * 150, lambda f: CRAWL)     # the pre-0049 law opens at 0.2 s; the crawl counter never runs
++    self.assertTrue(b.braking)
++    self.assertEqual(0, b._feel_dwell_slow)
++
++  def test_disengage_clears_the_counter(self):
++    b = _brake(True)
++    _first_open(b, [-0.55] * (SLOW - 5), lambda f: CRAWL)
++    self.assertEqual(SLOW - 5, b._feel_dwell_slow)
++    b.update(_cc(-0.55, long_active=False), _CS(v_ego=CRAWL, cam=_cam()), SLOW)
++    self.assertEqual(0, b._feel_dwell_slow)
++    self.assertIsNone(_first_open(b, [-0.55] * (SLOW - 1), lambda f: CRAWL, start=SLOW + 1))
++    self.assertFalse(b.braking)
++    self.assertEqual(2 * SLOW, _first_open(b, [-0.55], lambda f: CRAWL, start=2 * SLOW), "a fresh 70 after re-engage")
++
++  def test_feature_disable_clears_the_counter(self):
++    b = _brake(True)
++    _first_open(b, [-0.55] * (SLOW - 5), lambda f: CRAWL)
++    b.enabled = False                                     # the toggle goes off (as test_fca11_long does)
++    b.update(_cc(-0.55), _CS(v_ego=CRAWL, cam=_cam()), SLOW)
++    self.assertEqual(0, b._feel_dwell_slow)
++    b.enabled = True
++    self.assertIsNone(_first_open(b, [-0.55] * (SLOW - 1), lambda f: CRAWL, start=SLOW + 1))
++
++
++if __name__ == "__main__":
++  unittest.main()

@@ -1,0 +1,286 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -442,8 +442,160 @@
+     msg += "the FCA11 brake-shaping law is enabled ONLY through the HyundaiFca11AffineGain param "
+     msg += "(Params -> initialize_params -> setup_interfaces -> CP_SP.fca11AffineGain, requires HyundaiFca11Brake). Unset the variable."
+     raise RuntimeError(msg)
++
++
++# *** 0054: FCA11_MEAS_* — the MEASURED ask -> LSB inverse, and the RELEASE BELOW THE FLOOR rule ***
++#
++# WHAT IT REPLACES (quoted, so the next reader sees the exact thing rather than a paraphrase):
++#   fca11_long.py:843-850   def dec_cmd_from_accel(accel):
++#                             if accel > FCA11_BRAKE_ONSET_ACCEL: return 0
++#                             dec_g = (-accel / FCA11_BRAKE_GAIN) / 9.81
++#                             return int(round(dec_g * 100))
++#   fca11_long.py:255       FCA11_BRAKE_GAIN = 0.67        <- through-the-origin gain (delivered = 0.67 * commanded)
++#   fca11_long.py:75        FCA11_BRAKE_ONSET_ACCEL = -0.5 <- with `min(accel, ONSET)` at fca11_long.py:2198 and :1669
++#                             this IS the 8 LSB floor: dec_cmd_from_accel(-0.5) = round(7.60) = 8
++#   fca11_long.py:853-855   clamp_dec_cmd()               <- the per-frame cap: max(1, min(tier cap, dec_cmd))
++#   fca11_long.py:824-828   PERSONALITY_MAX_DEC           <- the ceiling: 12 / 20 / 30 (30 == HYUNDAI_FCA11_LONG_MAX_DEC)
++# So the deployed request was lsb = clamp(round(100 * (-accel / 0.67 / 9.81)), 8, 30): a through-origin inverse whose floor
++# was fixed by the onset clamp. Two errors in one, and they conspire: (i) the plant is AFFINE, so the slope is ~1.5x off
++# and every mid-band ask is commanded nearly twice as hard as asked; (ii) the 8 LSB floor turns ANY ask softer than
++# ~1.25 m/s^2 into ~1.25 m/s^2 of delivered decel -- including the planner's own roll-out asks (0.0 ... 0.6), which the
++# PLAN believes are coasting. Route 16a: 3 of 4 stops came to rest 2.07 / 2.69 / 2.06 m beyond the planner's own 6.0 m
++# standstill target, and the last 2 s before stop t=152 asked 0.0 / 0.0 / 0.62 m/s^2 while the law held 8-9 LSB
++# (1.19-1.29 m/s^2 delivered). The car was not failing to execute the plan; it was braking when the plan said coast.
++#
++# THE MEASUREMENT (91 routes; sustained FCA11 frames >= 0.5 s into an episode, driver not braking, v >= 12 km/h, no lead
++# within 60 m; ~/comma-sim/wsSTOP/drive-169-16c/sub/esc-floor/frames.csv): delivered decel BEYOND COAST by level
++#   4 LSB -> 0.78 m/s^2 (p10 0.65)   5 -> 0.84 (0.71)   6 -> 0.91   8 -> 1.25   10 -> 1.44   20 -> 2.28   30 -> 3.64
++# i.e. affine: extra = BITE + K * cmd_g. Refitted on tonight's per-level medians over 4-20 LSB (the band the law uses):
++# K = 8.94 (CI95 [8.52, 9.36]) m/s^2/g, BITE = 0.49 (CI95 [0.42, 0.55]) m/s^2, max residual 0.11 m/s^2. This block keeps
++# the 0041/0043 POOLED fit (17260 production frames, 126 events) -- BITE 0.40 [0.33, 0.48], K 9.9 [9.43, 10.38] -- which
++# sits inside/next to that CI and is the pair the 0043 shaping law already inverts, so the two laws can never disagree
++# about the ESC. The two fits differ by <= 0.11 m/s^2 anywhere in the band (<= 0.6 LSB of inverse error), i.e. below the
++# command resolution. Do NOT re-tune one without the other.
++#
++# THE LAW (moving, above the stop/hold band):
++#   want_extra = -accel                                          (m/s^2 beyond coast the planner wants)
++#   lsb        = round(100 * (want_extra - BITE) / K)            clamped [FCA11_MEAS_FLOOR_LSB, FCA11_MEAS_CEIL_LSB]
++# An ask softer than FCA11_MEAS_FLOOR_EXTRA is commanded at the FLOOR (4 LSB), never released: see the REJECTED
++# release variant below. FCA11_MEAS_FLOOR_EXTRA is what 4 LSB actually delivers, so the law's output is either 0
++# (an ask above the onset, i.e. coast territory) or an honest level in [0.80, 3.64] m/s^2.
++#
++# THE REJECTED RELEASE VARIANT (measured, do NOT re-add). An earlier revision RELEASED any moving ask below
++# FCA11_MEAS_FLOOR_EXTRA (closed the episode passively) on the theory that flooring it up is "more braking than asked".
++# Replay of the four route-16a stops says otherwise: the last 2 s of ALL FOUR asked 0.00-0.66 m/s^2 (below the floor) while
++# the car was demonstrably delivering 1.19-1.71 m/s^2 -- so a release there sends NOTHING exactly where the car needs
++# brake, and every one of those stops becomes a coast that never reaches standstill, i.e. a BRAKE LOSS. It also broke the
++# cycle-1 crawl-dwell escapes, which open on asks <= -0.5 (below the floor) for the creep-into-a-closing-lead case. The
++# FLOOR change alone recovers the error: replay give-back against observed is +1.91/+1.81/-0.48/+5.55 m vs observed
++# +2.07/+2.69/-0.01/+2.06 m on the four stops (sub/rollout-replay/replay_16a_flooronly.py), i.e. 1.9 of the 2.07 m on the
++# first stop, two stops inside +-0.5 m of the 6.0 m target and three inside +-0.9 m (the 4th stop's residual -3.49 m is the
++# plant model's own domain error: the log shows 1.71 m/s^2 delivered at 3 m/s, i.e. ~2x the fit's 4 LSB value, and the fit
++# was made at >= 12 km/h with no lead). The release arm added nothing but the brake loss.
++#
++# UNTOUCHED (each a deliberate boundary, not an oversight):
++#   * the ONSET rule (:75, :89, :2139-2160) and the +RATE_STEP rate step (:2265) -- this block chooses a LEVEL, never a
++#     timing, and the panda's +RATE_STEP onset gate still governs every ramp;
++#   * the 30 LSB cap and the personality tiers (:824-828, :853-855);
++#   * the driver cut / gas hold-off / camera hand-back / refusal wall (:2009-2062, :2274);
++#   * the STOP/HOLD band (:1667-1674): at/below FCA11_FEEL_HOLD_BAND_KPH the DEPLOYED request still runs, because a
++#     standstill hold on a DCT car that creeps must not be weakened and the measured curve is LOWER there (a -2.0 ask is
++#     16 LSB, not the 20 the deployed request gives). The 2 m this patch recovers is spent between 4 and 12 km/h, ABOVE
++#     the band edge, so excluding the band loses none of the fix. 0055: the band's FLOOR is now fca11_floor_lsb(v), which
++#     is 8 at every band speed; the request above the floor is untouched. See the 0055 block below;
++#   * the 0043 shaping law (shape_dec_cmd_from_extra) and cal -- both take their own paths (:2212, :2250).
++# Kill switch: FCA11_MEAS_INVERSE = False restores the pre-0054 request map byte-for-byte (read once per
++# instance; it also needs the feel layer, which is where the deployed request lives -- see self.meas_inverse).
++FCA11_MEAS_INVERSE = True
++FCA11_MEAS_BITE = 0.40       # m/s^2 delivered beyond coast at 0 LSB (the plant's own bite); CI95 [0.33, 0.48]
++FCA11_MEAS_K = 9.9           # m/s^2 per g of command (per 100 LSB);                     CI95 [9.43, 10.38]
++FCA11_MEAS_FLOOR_LSB = 4     # the weakest actuating level the ESC accepts (was 8, set by the onset clamp at :2198)
++FCA11_MEAS_CEIL_LSB = HYUNDAI_FCA11_LONG_MAX_DEC   # 30 == the panda gate; the personality tier cap is applied on top
++# What the floor actually delivers beyond coast: 0.40 + 9.9 * 0.04 = 0.796 m/s^2 (measured 0.78, p10 0.65). An ask softer
++# than this cannot be served by ANY actuating frame; it is commanded at the FLOOR anyway (see the rejected release
++# variant above: releasing such an ask is a brake loss at exactly the asks where the car needs brake).
++FCA11_MEAS_FLOOR_EXTRA = FCA11_MEAS_BITE + FCA11_MEAS_K * FCA11_MEAS_FLOOR_LSB / 100.0
+ 
+ 
++# *** 0055: fca11_floor_lsb — the SPEED-INDEXED band floor (4 LSB moving -> 8 LSB in the stop band) ***
++#
++# WHY THERE IS A RAMP AT ALL (Fable's ruling on the 0054 stop-band step; intent quoted): 0054 dropped the MOVING floor
++# from 8 to 4 LSB but left the STOP band at 8 - the deployed request floors there through the -0.5 onset clamp. That
++# reproduced exactly the jerk 0054 exists to remove, just later and in one frame:
++#   (a) holding 4 LSB *through* the stop band is NOT supportable: there is no stop-hold evidence below ~12 km/h, and
++#       0.31 m/s^2 (what a 4 LSB-class command can leave you with at creeping speed) from 2 m/s is up to ~6 m of
++#       roll-out into a lead. The planner's own standstill plan for that approach is 1.9-2.5 m;
++#   (b) letting the level step 4 -> 8 in ONE frame at band entry is a SECOND jerk event of the same magnitude as the
++#       one we are fixing (+0.4 m/s^2 in 20 ms, at the end of every stop).
++# So the floor is a CONTINUOUS function of v instead of a piecewise step: 4 LSB at v >= 2.0 m/s, rising LINEARLY to 8 LSB
++# at v <= 1.0 m/s, and constant 8 below 1.0 m/s (i.e. through the whole stop band and at standstill).
++#
++# SPEED-INDEXED, NOT TIME-INDEXED, on purpose: the level is a pure function of the CURRENT v, so it is deterministic,
++# reproducible frame-for-frame in a pin test, has no state to arm/reset/migrate, and cannot drift with a different
++# frame cadence or a pause in the frame stream. There is NO time term anywhere in this function.
++#
++# THE MEASURED TABLE IT INTERPOLATES (85-91 routes; sustained FCA11 frames >= 0.5 s into an episode, driver not braking,
++# v >= 12 km/h, no lead within 60 m; delivered decel BEYOND COAST in m/s^2 - full table in the FCA11_MEAS_* block above):
++#   4 LSB -> 0.78 (median, p10 0.65)   6 -> 0.91   8 -> 1.25   10 -> 1.44   20 -> 2.28   30 -> 3.64
++# The ramp's endpoints are two of those medians - the weakest actuating frame the ESC accepts (4) and the deployed
++# stop-hold floor (8) - so every interpolated value between them is a level the plant has been measured at, and the
++# ramp never asks for a level below the floor (which is the rejected release shape) or above the stop hold.
++#
++# JERK AND ROLL-OUT (the arithmetic behind the ruling): at the 1 m/s^2 decel a stop is planned with, 2.0 -> 1.0 m/s takes
++# 1.0 s and the floor climbs 4 LSB, i.e. ~0.40 m/s^3 of jerk (0.39 m/s^2 of extra decel spread over 1 s) - well under the
++# owner's 1.4 m/s^3 limit, and it is the same 0.4 m/s^2 delivered over 50 sent frames instead of 1. DISTANCE: integrating
++# v/a(v) over v = 2.0 -> 0 with a(v) = 0.40 + 9.9 * floor(v)/100 (0.80 m/s^2 at 2.0 m/s rising to 1.19 by 1.0 m/s) gives
++# 1.99 m -- inside the planner's own 1.9-2.5 m standstill plan. Holding 4 LSB all the way instead would need 2.51 m from
++# the same 2 m/s (4 / 2*0.80), and the ~6 m the ruling quotes is that same arithmetic at the ~0.31 m/s^2 the plant can
++# leave you with at creep (4 / 2*0.31 = 6.4 m) -- a stop that undershoots its plan by metres into a lead. A constant 8
++# from 2 m/s would stop in 1.68 m, i.e. it overshoots the plan's SHORT end, which is why 8 belongs to the last metre
++# (the hold) and not to the whole approach.
++#
++# APPLIED EVERYWHERE THE MEASURED FLOOR IS APPLIED: dec_cmd_from_accel_measured, the feel target (_feel_target) and the
++# stop-band path that used to hard-code 8 (it now takes this floor explicitly instead of inheriting 8 from the -0.5
++# onset clamp; at <= 1.0 m/s, i.e. at every band speed, it IS 8, so the band stays byte-identical to 0054 there).
++# The stop HOLD itself is untouched: a deployed request ABOVE the floor still commands what it commanded. ``None`` means
++# "at speed" (>= 2.0 m/s) -> 4, so a caller with no speed gets the moving floor, which is what every pre-0055 pin means.
++FCA11_FLOOR_RAMP_TOP_MPS = 2.0   # at/above: FCA11_MEAS_FLOOR_LSB (4), the moving floor
++FCA11_FLOOR_RAMP_BOT_MPS = 1.0   # at/below: FCA11_NORESPONSE_MIN_LSB (8), the stop-band hold floor
++
++
++def fca11_floor_lsb(v_ego_mps=None) -> int:
++  """0055: the SPEED-INDEXED floor (LSB) of the measured law at ego speed ``v_ego_mps`` (m/s).
++
++  v >= 2.0 -> 4 LSB; v <= 1.0 -> 8 LSB; in between, linear 4 -> 8 and rounded to the nearest LSB; None -> 4 (at speed).
++  A pure function of v: no state, no time term, same v always gives the same LSB. See the 0055 block above for the
++  ruling it implements, the measured table it interpolates and the jerk/roll-out arithmetic.
++  """
++  if v_ego_mps is None:
++    return FCA11_MEAS_FLOOR_LSB
++  if v_ego_mps >= FCA11_FLOOR_RAMP_TOP_MPS:
++    return FCA11_MEAS_FLOOR_LSB
++  if v_ego_mps <= FCA11_FLOOR_RAMP_BOT_MPS:
++    return FCA11_NORESPONSE_MIN_LSB
++  moving, stop = float(FCA11_MEAS_FLOOR_LSB), float(FCA11_NORESPONSE_MIN_LSB)
++  frac = (v_ego_mps - FCA11_FLOOR_RAMP_BOT_MPS) / (FCA11_FLOOR_RAMP_TOP_MPS - FCA11_FLOOR_RAMP_BOT_MPS)
++  return int(round(stop + (moving - stop) * frac))
++
++
++def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None) -> int:
++  """0054: the MEASURED ask -> raw CR_VSM_DecCmd inverse (0.01 g/LSB), for a MOVING episode above the stop band.
++
++  want_extra = -accel (m/s^2 beyond coast); lsb = round(100 * (want_extra - BITE) / K), clamped to
++  [fca11_floor_lsb(v_ego_mps), FCA11_MEAS_CEIL_LSB]. Above the onset threshold the ask is coast territory, not a brake
++  request -> 0. An ask softer than what the floor delivers returns the FLOOR: that is the weakest level that can be
++  sent, and this law SENDS it rather than releasing (the release variant was measured and rejected -- brake loss).
++  0055: the floor is speed-indexed (4 LSB at/above 2.0 m/s, ramping to 8 LSB by 1.0 m/s); ``v_ego_mps`` None = at speed.
++  Monotone non-decreasing in the ask, monotone non-decreasing in 1/v (slower -> never a weaker floor), and never above
++  the deployed 0.67 inverse for the same ask.
++  """
++  if accel > FCA11_BRAKE_ONSET_ACCEL:
++    return 0
++  want_extra = -accel
++  lsb = int(round((want_extra - FCA11_MEAS_BITE) / FCA11_MEAS_K * 100.0))
++  return max(fca11_floor_lsb(v_ego_mps), min(FCA11_MEAS_CEIL_LSB, lsb))
++
++
+ # *** 0049: FCA11_FEEL_* — brake FEEL on the DEPLOYED (OLD-LAW) path: coast-first open, lag-aware onset ramp through the
+ # intermediate LSBs, and an anticipatory release (DEFAULT ON; the shaping/V3 path and cal are untouched) ***
+ #
+@@ -482,6 +634,11 @@
+ # slows growth), a HARD ask from idle produces the deployed law's frames byte-for-byte, and the steady level for any ask
+ # <= -0.5 is unchanged. Every panda contract (Warn 3, +RATE_STEP over the last SENT frame, passive close on every exit,
+ # R7 latch, camera hand-back, no auto-resume, arming) is untouched - this block only chooses a level <= the old one.
++# 0054 SUPERSEDES the second half of that invariant ON THE MEASURED LAW: the level map is now the measured affine inverse
++# (dec_cmd_from_accel_measured, floor 4 LSB), so the steady level for a given ask is LOWER than the deployed one and a
++# sustained -0.55 still actuates (at the 4 LSB floor, as the dwell escape requires). The "never above the deployed level"
++# half still holds (the measured map is <= the 0.67 map for every ask). The pre-0054 behaviour - and every test that pins
++# it - is restored byte-for-byte by FCA11_MEAS_INVERSE = False.
+ # Set FCA11_FEEL_ENABLED False to restore the pre-0049 OLD-LAW byte-for-byte (read once per instance).
+ FCA11_FEEL_ENABLED = True
+ FCA11_FEEL_COAST_DECEL = 0.15        # m/s^2 zero-throttle coast near the onset asks (measured 0.13-0.19 by speed band)
+@@ -1088,6 +1245,11 @@
+     self._feel_dwell_slow = 0          # the same, AND vEgo < FCA11_FEEL_DWELL_SLOW_MPS on every counted frame (crawl escape)
+     # 0051: the feel FIX round (wobble damping, gentle gain, lead-loss hold). Read ONCE; only ever on the feel path.
+     self.feel_fix = self.feel and bool(FCA11_FEEL_FIX_0051)
++    # 0054: the MEASURED ask -> LSB inverse + its release-below-the-floor arm. Read ONCE here, like every other law
++    # switch. Scoped to the FEEL layer on purpose: that is the deployed request path, and `self.feel` already carries
++    # "enabled AND not the 0043 shaping law AND not Shadow", so this flag can never reach the shaped law, cal, the
++    # shadow core or a disabled instance. OFF -> the pre-0054 request map and release rule, byte-for-byte.
++    self.meas_inverse = bool(FCA11_FEEL_ENABLED) and bool(FCA11_MEAS_INVERSE) and self.feel
+     self._feel_slope_ant = 0.0         # slow EMA of d(ask)/dt (anticipation only; FCA11_FEEL_SLOPE_ALPHA_0051)
+     self._feel_peak = 0.0              # episode peak of the feel accumulator (re-rise deadband reference)
+     self._feel_lead_prev = False       # previous frame's lead presence (edge detector)
+@@ -1626,10 +1788,21 @@
+     self._feel_peak = float(seed)      # 0051: the re-rise deadband reference restarts with the episode
+     self._feel_ll_frame = None         # 0051: no lead-loss hold survives into a new episode
+ 
+-  def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0) -> int:
++  def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
++                   v_mps=None) -> int:
+     """0051 (b): the feel target for the (possibly anticipated) ask ``a_tgt``, with the gentle-ask gain chosen by the RAW ask
+     ``accel`` and the (b2) low-speed restore ``gain_speed``. Off the fix (feel_fix False) this is exactly the 0049
+-    feel_target_lsb(a_tgt)."""
++    feel_target_lsb(a_tgt).
++
++    0054: on the MEASURED law (self.meas_inverse) this is the measured inverse of the ask and NOTHING ELSE. The 0051
++    gentle gain (0.70) existed only to cancel the 0.67 inverse's ~2x over-delivery; applied on top of an honest inverse
++    it would UNDER-deliver by 30%, so it is not applied. Same for the anticipation/low-speed-restore plumbing downstream:
++    they keep working on the level, they just have a level that means what it says.
++    0055: ``v_mps`` selects the speed-indexed floor (fca11_floor_lsb) instead of the fixed 4, so the level rises into the
++    stop band as the car slows instead of stepping at band entry. None = at speed = the moving floor.
++    """
++    if self.meas_inverse:
++      return min(personality_max_dec(personality), dec_cmd_from_accel_measured(a_tgt, v_mps))
+     if not self.feel_fix:
+       return feel_target_lsb(a_tgt, personality)
+     return feel_gentle_target_lsb(a_tgt, personality, gain_accel=accel, gain_speed=gain_speed)
+@@ -1666,7 +1839,16 @@
+     step the level up at band entry). v_kph None (unit callers) = at speed = the gain in full force."""
+     if self._feel_in_hold_band:
+       # the stop/hold band runs the DEPLOYED law exactly: request clamped like before, +RATE_STEP over the last sent frame.
++      # 0055: its floor is now the SPEED-INDEXED one, taken EXPLICITLY (fca11_floor_lsb) instead of being inherited from
++      # the -0.5 onset clamp at 8. At every band speed (<= FCA11_FEEL_HOLD_BAND_KPH = 3 km/h = 0.83 m/s <= 1.0 m/s) that
++      # floor IS 8, so the band is unchanged here -- that is the point: the ramp finishes ABOVE the band edge, so entry
++      # no longer steps the level. An ask the deployed request takes ABOVE the floor still commands what it commanded
++      # (max(), never min()): the standstill hold is not weakened. Gated on meas_inverse so the 0054 kill switch still
++      # restores the pre-0054 map byte-for-byte.
+       dec = clamp_dec_cmd(dec_cmd_from_accel(min(accel, FCA11_BRAKE_ONSET_ACCEL)), personality)
++      if self.meas_inverse:
++        band_floor = fca11_floor_lsb(None if v_kph is None else v_kph / 3.6)
++        dec = max(dec, min(band_floor, personality_max_dec(personality)))
+       dec = clamp_dec_cmd(min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), personality)
+       if frame % FCA11_SEND_EVERY == 0:
+         self._feel_acc = float(dec)
+@@ -1675,6 +1857,8 @@
+     if frame % FCA11_SEND_EVERY != 0:
+       return max(1, min(int(self._feel_acc), self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP))
+     gain_speed = feel_gentle_gain_speed_frac(v_kph) if (self.feel_fix and v_kph is not None) else 1.0
++    # 0055: the speed-indexed floor's speed input. None (unit callers with no speed) = at speed = the moving floor 4.
++    v_mps = None if v_kph is None else v_kph / 3.6
+     if self._feel_prev_ask is not None:
+       inst = (accel - self._feel_prev_ask) / (FCA11_SEND_EVERY * 0.01)
+       self._feel_slope += FCA11_FEEL_SLOPE_ALPHA * (inst - self._feel_slope)
+@@ -1688,7 +1872,7 @@
+     # a trend to run ahead of).
+     ant_slope = self._feel_slope_ant if self.feel_fix else self._feel_slope
+     a_tgt = accel if ll_floor > 0.0 else feel_anticipated_accel(accel, ant_slope)
+-    target = self._feel_target(a_tgt, accel, personality, gain_speed)
++    target = self._feel_target(a_tgt, accel, personality, gain_speed, v_mps)
+     prev = self._feel_acc
+     if target > prev:
+       rate = feel_rate_lsb_per_sent(accel, prev)
+@@ -1704,11 +1888,14 @@
+       # (30 dips vs 28 with it active, same band-entry result) for no benefit.
+       if (self.feel_fix and prev < self._feel_peak - 0.5 and accel > FCA11_FEEL_RATE_SOFT_ACCEL and
+           self._feel_slope > FCA11_FEEL_DEEPEN_SLOPE and
+-          self._feel_target(accel, accel, personality, gain_speed) < prev + FCA11_FEEL_RERISE_LSB):
++          self._feel_target(accel, accel, personality, gain_speed, v_mps) < prev + FCA11_FEEL_RERISE_LSB):
+         new_acc = prev
+     else:
+       new_acc = float(target)          # decreases are immediate (the safe direction)
+-    new_acc = max(float(FCA11_FEEL_FLOOR_LSB), new_acc, ll_floor)
++    # 0055: the mid-episode floor is the SPEED-INDEXED one on the measured law (so a level the deadband held at 4 cannot
++    # lag under a floor that has since risen to 6-8); off the measured path it stays the 0049 constant 4. Never 0: 0 is
++    # the release, and a release is the caller's job (see the FCA11_MEAS_* block).
++    new_acc = max(float(fca11_floor_lsb(v_mps) if self.meas_inverse else FCA11_FEEL_FLOOR_LSB), new_acc, ll_floor)
+     if self.feel_fix:
+       self._feel_peak = max(self._feel_peak, new_acc)
+     # the panda contract caps the SENT value at +RATE_STEP over the last SENT frame (0 at an episode open -> the first
+@@ -2175,6 +2362,11 @@
+     if self._attrib_hold > 0:
+       self._attrib_hold -= 1
+       want_brake = False
++    # 0054: there is NO release-below-the-floor gate here. An ask softer than the ESC's weakest actuating level
++    # (FCA11_MEAS_FLOOR_EXTRA) is commanded at FCA11_MEAS_FLOOR_LSB = 4, not released: the release variant was measured
++    # and rejected on route 16a, where the last 2 s of all four stops asked 0.00-0.66 while the car delivered 1.19-1.71,
++    # so releasing there sent nothing at exactly the asks that bring the car to standstill -- a brake loss at every stop,
++    # and it disarmed the cycle-1 crawl-dwell escapes (they open on asks <= -0.5). See the FCA11_MEAS_* block.
+     # 0051 (c): lead present -> absent EDGE while a feel episode is open and moving (not the hold band, not cal): freeze the
+     # last SENT level as a decaying floor (see FCA11_FEEL_LEAD_LOSS_*). The edge is tracked on every frame so a lead lost
+     # BEFORE an episode never arms it. Inert off the fix (CS without the lead attribute reads as no lead -> never an edge).
+@@ -2217,7 +2409,8 @@
+         # Release hysteresis: inside the band [-0.50, -0.30] the command is floored at the ONSET value so
+         # the ESC never sees a 0 mid-episode (a 0 would be an immediate release, defeating the hysteresis).
+         # 0041: the OPT-IN affine law (self.affine_gain, DEFAULT OFF) replaces the through-origin inverse with the
+-        # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040.
++        # fitted affine plant inverse (dec_cmd_from_accel_affine); OFF -> byte-identical to 0040. 0054: this branch is
++        # only reached with the FEEL layer off, and 0054 rides the FEEL path, so it is byte-identical to 0040 still.
+         # 0050 CAL: under cal the planner term is computed from the RAW ask, NOT the onset-clamped one. The scripted
+         # level below enters as a FLOOR (`max()`), so a COASTING planner must contribute 0 -- but the -0.5 onset clamp
+         # maps through the 0.67 inverse to 8, so every scripted level <= 8 became 8 on the wire (the degenerate class;

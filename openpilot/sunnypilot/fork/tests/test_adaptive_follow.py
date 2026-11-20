@@ -1,0 +1,238 @@
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+"""
+from openpilot.cereal import log
+from openpilot.common.test import OpenpilotTestCase
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
+from openpilot.sunnypilot.fork import adaptive_follow as af
+
+STANDARD = log.LongitudinalPersonality.standard
+PERSONALITIES = (log.LongitudinalPersonality.relaxed, STANDARD, log.LongitudinalPersonality.aggressive)
+
+
+class FakeParams:
+  def __init__(self, enabled=True, unknown=False):
+    self.enabled = enabled
+    self.unknown = unknown
+
+  def get_bool(self, key):
+    assert key == af.PARAM
+    if self.unknown:
+      raise KeyError(key)  # stands in for UnknownKeyName (stale libparams)
+    return self.enabled
+
+
+class TestRoadSpeedFactor(OpenpilotTestCase):
+  def test_urban_never_changes_the_gap(self):
+    # a brakeless car must not follow closer in town: urban is exactly the base gap at every speed
+    for v in (0., 10., 15., 20., 25., 30., 40.):
+      self.assertEqual(af.speed_gap_factor("urban", v), 1.0)
+
+  def test_highway_shrinks_with_speed(self):
+    # owner's ruling 2026-11-01: the interstate gap is too wide, so it must SHRINK as speed rises
+    for rt in af.HIGHWAY_ROAD_TYPES:
+      self.assertEqual(af.speed_gap_factor(rt, 15.), 1.0)
+      self.assertAlmostEqual(af.speed_gap_factor(rt, 32.), af.GAP_FACTOR_V[-1])
+      self.assertAlmostEqual(af.speed_gap_factor(rt, 40.), af.GAP_FACTOR_V[-1])
+      vs = [15. + i for i in range(20)]
+      fs = [af.speed_gap_factor(rt, v) for v in vs]
+      self.assertEqual(fs, sorted(fs, reverse=True))   # monotone non-increasing
+
+  def test_highway_numbers_65mph(self):
+    # NORMAL: base 1.25 s, factor 0.85375 at 29 m/s -> T 1.067 s, MPC gap T*v + 6 m = 36.9 m = 1.27 s effective
+    self.assertEqual(af.GAP_FACTOR_V, [1.0, 0.82])
+    self.assertEqual(af.GAP_FACTOR_V_AGGRESSIVE, [1.0, 0.60])
+    t = af.get_adaptive_t_follow(STANDARD, 29., "interstate", True, 29., True)
+    self.assertAlmostEqual(t, 0.85375 * af.BASE_T_NORMAL)
+    self.assertAlmostEqual((t * 29. + 6.) / 29., 1.27, places=2)
+    # AGGRESSIVE: base 1.00 s -> T 0.854 s, 30.8 m = 1.06 s effective at 65 mph (the owner's "1 s +/- 0.4 s")
+    ta = af.get_adaptive_t_follow(0, 29., "interstate", True, 29., True)
+    self.assertAlmostEqual(ta, 0.675 * af.BASE_T_AGGRESSIVE)     # 1.0 -> 0.6 between 16 and 32 m/s
+    self.assertAlmostEqual((ta * 29. + 6.) / 29., 0.88, places=2)
+    # never wider than its own base on the open road
+    for v in (16., 20., 25., 29., 35.):
+      self.assertLessEqual(af.speed_gap_factor("highway", v), 1.0)
+      self.assertLessEqual(af.speed_gap_factor("highway", v, af.GAP_FACTOR_V_AGGRESSIVE), 1.0)
+
+  def test_unknown_follows_speed_only(self):
+    self.assertAlmostEqual(af.speed_gap_factor("unknown", 30.), af.GAP_FACTOR_V[-1] if False else af.speed_gap_factor("highway", 30.))
+    self.assertEqual(af.speed_gap_factor("unknown", 15.), 1.0)
+
+
+class TestClosingMargin(OpenpilotTestCase):
+  def test_no_margin_when_not_closing(self):
+    self.assertEqual(af.closing_margin(30., 30.), 0.)
+    self.assertEqual(af.closing_margin(30., 32.), 0.)
+    self.assertEqual(af.closing_margin(0.5, 0.), 0.)
+
+  def test_margin_matches_coast_physics(self):
+    # 30 m/s closing on a 28 m/s lead: coasting at 0.42 vs braking at 2.5 needs vrel^2/2*(1/0.42-1/2.5) extra metres
+    v, vl = 30., 28.
+    expected = (2. ** 2 / 2. * (1. / 0.42 - 1. / 2.5)) / v
+    self.assertAlmostEqual(af.closing_margin(v, vl), expected, places=6)
+
+  def test_margin_is_capped(self):
+    self.assertEqual(af.closing_margin(30., 20.), af.MAX_CLOSING_MARGIN)
+
+  def test_margin_grows_with_closing_speed(self):
+    ms = [af.closing_margin(30., 30. - dv) for dv in (0.5, 1., 1.5, 2., 3.)]
+    self.assertEqual(ms, sorted(ms))
+    self.assertGreater(ms[-1], ms[0])
+
+
+class TestAdaptiveTFollow(OpenpilotTestCase):
+  def test_normal_is_stock_aggressive_and_aggressive_is_1s(self):
+    # owner 2026-11-01: "whatever the aggressive profile to be the new normal profile and the aggressive profile to be
+    # like 1s +/- 0.4s" -> NORMAL base = stock aggressive 1.25 s; AGGRESSIVE base 1.00 s, elastic down to 0.60 s.
+    self.assertAlmostEqual(af.BASE_T_NORMAL, get_T_FOLLOW(log.LongitudinalPersonality.aggressive))
+    self.assertAlmostEqual(af.BASE_T_AGGRESSIVE, 1.00)
+    for p in PERSONALITIES:
+      expected = af.BASE_T_AGGRESSIVE if p == 0 else af.BASE_T_NORMAL
+      with self.subTest(personality=p):
+        self.assertAlmostEqual(af.get_adaptive_t_follow(p, 15., "urban", False, 0., True), expected)
+        if p == 0:
+          self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True),
+                                 af.speed_gap_factor("highway", 31., af.GAP_FACTOR_V_AGGRESSIVE) * expected)
+        else:
+          self.assertAlmostEqual(af.get_adaptive_t_follow(p, 31., "highway", False, 0., True),
+                                 af.speed_gap_factor("highway", 31.) * expected)
+    # the aggressive band the owner asked for: 1.0 s in town, never below 0.6 s
+    self.assertAlmostEqual(af.get_adaptive_t_follow(0, 5., "urban", False, 0., True), 1.00)
+    self.assertAlmostEqual(af.get_adaptive_t_follow(0, 40., "highway", False, 0., True), 0.60)
+
+  def test_closing_margin_only_for_throttle_only_cars_with_a_lead(self):
+    with_brakes = af.get_adaptive_t_follow(STANDARD, 30., "highway", True, 28., throttle_only=False)
+    no_lead = af.get_adaptive_t_follow(STANDARD, 30., "highway", False, 28., throttle_only=True)
+    pedal = af.get_adaptive_t_follow(STANDARD, 30., "highway", True, 28., throttle_only=True)
+    self.assertAlmostEqual(with_brakes, no_lead)
+    self.assertGreater(pedal, with_brakes)
+
+
+class TestAdaptiveFollowController(OpenpilotTestCase):
+  def test_disabled_is_inert(self):
+    a = af.AdaptiveFollow(True, params=FakeParams(enabled=False))
+    for _ in range(50):
+      self.assertIsNone(a.update(STANDARD, 31., "highway", True, 28.))
+
+  def test_stale_libparams_is_inert(self):
+    a = af.AdaptiveFollow(True, params=FakeParams(unknown=True))
+    self.assertIsNone(a.update(STANDARD, 31., "highway", True, 28.))
+
+  def test_param_is_reread(self):
+    p = FakeParams(enabled=False)
+    a = af.AdaptiveFollow(True, params=p)
+    self.assertIsNone(a.update(STANDARD, 31., "highway", False, 0.))
+    p.enabled = True
+    out = [a.update(STANDARD, 31., "highway", False, 0.) for _ in range(int(1. / a.dt) + 1)]
+    self.assertAlmostEqual(out[-1], af.speed_gap_factor("highway", 31.) * af.BASE_T_FOLLOW)
+
+  def test_rate_limits(self):
+    a = af.AdaptiveFollow(True, params=FakeParams())
+    t0 = a.update(STANDARD, 15., "urban", False, 0.)
+    self.assertAlmostEqual(t0, af.BASE_T_FOLLOW)
+    # jump to highway speed with no lead: the gap now SHRINKS, at most T_FOLLOW_RATE_DOWN per second
+    t1 = a.update(STANDARD, 31., "highway", False, 0.)
+    self.assertAlmostEqual(t0 - t1, af.T_FOLLOW_RATE_DOWN * a.dt, places=6)
+    for _ in range(100):
+      t_hi = a.update(STANDARD, 31., "highway", False, 0.)
+    self.assertAlmostEqual(t_hi, af.get_adaptive_t_follow(STANDARD, 31., "highway", False, 0., True), places=6)
+    # back to urban: the gap is given back slowly
+    t2 = a.update(STANDARD, 15., "urban", False, 0.)
+    self.assertAlmostEqual(t2 - t_hi, af.T_FOLLOW_RATE_UP * a.dt, places=6)
+
+  def test_throttle_only_detection(self):
+    class P:
+      def __init__(self, **kw):
+        self.__dict__.update(kw)
+    self.assertTrue(af.is_throttle_only(P(brand="hyundai"), P(enableGasInterceptor=True)))
+    self.assertFalse(af.is_throttle_only(P(brand="hyundai"), P(enableGasInterceptor=False)))
+    self.assertFalse(af.is_throttle_only(P(brand="toyota"), P(enableGasInterceptor=True)))
+
+
+# A bus-0 frame set like the owner's car with the comma pedal's sensor frame (0x201) present.
+PEDAL_FINGERPRINT = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8, 0x201: 6}
+
+
+def _real_car_params(candidate: str):
+  """Real CarParams straight from the opendbc interface, with the gas interceptor actually enabled.
+
+  Goes through the fingerprint + opt-in path (no hand-built stubs) so the brand string, the
+  GAS_INTERCEPTOR capability flag and ``enableGasInterceptor`` are exactly what the car produces at runtime.
+  """
+  from opendbc.car.car_helpers import interfaces
+  from opendbc.sunnypilot.car.interfaces import setup_interfaces
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = dict(PEDAL_FINGERPRINT)
+  CarInterface = interfaces[candidate]
+  CP = CarInterface.get_params(candidate, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, candidate, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": 1}])
+  return CP, CP_SP
+
+
+class TestThrottleOnlyRealCarParams(OpenpilotTestCase):
+  """is_throttle_only against the real Hyundai interface, not a stub.
+
+  The guard keys off ``CP.brand == "hyundai"`` (no upstream brand enum/constant exists). If that string is ever
+  renamed, these tests fail loudly instead of the guard silently going inert on the owner's car.
+  """
+
+  def test_real_hyundai_elantra_interceptor_is_throttle_only(self):
+    from opendbc.car.hyundai.values import CAR
+    CP, CP_SP = _real_car_params(CAR.HYUNDAI_ELANTRA_2022_NON_SCC)
+    self.assertTrue(CP_SP.enableGasInterceptor)         # the pedal really got enabled through the interface
+    self.assertEqual(CP.brand, "hyundai")               # the brand string the guard compares against
+    self.assertTrue(af.is_throttle_only(CP, CP_SP))     # ... and the guard is live for it
+
+  def test_real_non_hyundai_interceptor_is_not_throttle_only(self):
+    # a comma-pedal car of another brand keeps its brakes: the guard must stay off, so only the brand decides it
+    from opendbc.car.toyota.values import CAR
+    CP, CP_SP = _real_car_params(CAR.TOYOTA_COROLLA_TSS2)
+    self.assertTrue(CP_SP.enableGasInterceptor)
+    self.assertFalse(af.is_throttle_only(CP, CP_SP))
+
+
+class TestPlannerFollowsOverride(OpenpilotTestCase):
+  """End to end through the real LongitudinalPlanner + acados MPC (openpilot's longitudinal_maneuvers Plant).
+
+  Asserts the wiring (the time gap the MPC was actually given) and the steady-state gap change vs stock.
+  """
+
+  @staticmethod
+  def _run(adaptive, v_lead=30., t_end=120.):
+    from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant
+    plant = Plant(lead_relevancy=True, speed=v_lead, distance_lead=100., personality=STANDARD)
+    # Plant's non-essential Honda CP has openpilotLongitudinalControl False and Plant never sets selfdriveState.enabled,
+    # so the planner would reset to carState every step (why upstream's test_following_distance fails 15/18 here).
+    plant.planner.CP.openpilotLongitudinalControl = True
+    # the Plant builds a Honda planner (has brakes) -> no closing margin; its liveMapDataSP is empty -> roadType
+    # unknown -> speed-only factor (0.82 at >= 32 m/s)
+    plant.planner.adaptive_follow = af.AdaptiveFollow(False, params=FakeParams(enabled=adaptive))
+    while plant.current_time < t_end:
+      out = plant.step(v_lead=v_lead, prob_lead=1.0, v_cruise=40.)
+    return plant, out['distance_lead'] - out['distance']
+
+  def test_disabled_passes_stock_t_follow_to_mpc(self):
+    plant, _ = self._run(adaptive=False, t_end=2.)
+    self.assertTrue((plant.planner.mpc.params[:, 4] == get_T_FOLLOW(STANDARD)).all())
+
+  def test_enabled_passes_adaptive_t_follow_to_mpc(self):
+    plant, _ = self._run(adaptive=True, t_end=2.)
+    got = float(plant.planner.mpc.params[0, 4])
+    self.assertLess(got, get_T_FOLLOW(STANDARD))                       # not the stock gap any more
+    self.assertGreaterEqual(got, af.GAP_FACTOR_V[-1] * af.BASE_T_FOLLOW - 1e-6)   # and never below the open-road floor
+    self.assertLessEqual(got, af.BASE_T_FOLLOW)
+
+  def test_enabled_shortens_steady_state_gap(self):
+    # Relative check only: in this Plant both stock and adaptive settle ~9 m beyond T*v + 6 at 30 m/s on this host
+    # (upstream's absolute test_following_distance.py fails 15/18 on an unmodified tree here), so the oracle is the
+    # stock run itself. Expected change: -(1 - 0.8425) * T*v = -6.9 m at 30 m/s.
+    _, stock = self._run(adaptive=False)
+    _, adaptive_gap = self._run(adaptive=True)
+    # stock settles at T_FOLLOW(standard) = 1.45 s, adaptive at BASE_T_NORMAL (1.25 s) x the speed factor
+    expected = (get_T_FOLLOW(STANDARD) - af.speed_gap_factor("unknown", 30.) * af.BASE_T_NORMAL) * 30.
+    self.assertGreater(stock - adaptive_gap, 0.5 * expected)
+    self.assertLess(stock - adaptive_gap, 1.5 * expected)

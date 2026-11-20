@@ -23,7 +23,8 @@ from opendbc.car.volkswagen.values import VolkswagenFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
 from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
 from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP, HYUNDAI_FCA11_PEDAL_GUARD_GRACE, \
+  HYUNDAI_FCA11_PEDAL_GUARD_FRAMES, HYUNDAI_FCA11_PEDAL_GUARD_MASK
 from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
 from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP, SubaruSafetyFlagsSP
 from opendbc.sunnypilot.car.tesla.values import MadsScreenButtonType, TeslaFlagsSP, TeslaSafetyFlagsSP
@@ -112,12 +113,157 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
 
   params_dict = {k: v for param in params_list for k, v in param.items()}
 
+  _initialize_hyundai_gas_interceptor(CP, CP_SP, params_dict)
   _initialize_custom_longitudinal_tuning(CI, CP, CP_SP, params_dict)
   _initialize_coop_steering(CP, CP_SP, params_dict)
   _initialize_tesla_mads_screen_button(CP, CP_SP, params_dict)
   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
   _initialize_stop_and_go(CP, CP_SP, params_dict)
   _initialize_toyota(CP, CP_SP, params_dict)
+
+
+def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
+  """comma pedal longitudinal on Hyundai non-SCC ICE cars. Requires BOTH a pedal seen on the bus (capability flag set in
+  the Hyundai interface) AND the explicit HyundaiGasInterceptor param. Otherwise CarParams are left untouched.
+
+  CAN ID dialect: standard (0x200/0x201) or remapped (0x700/0x701, custom pedal firmware), from what the fingerprint saw.
+  HyundaiGasInterceptorIDSet = auto (default; standard wins if both were seen) / standard / remapped. A forced dialect
+  whose sensor was NOT seen leaves the feature off (never command a pedal we can't hear)."""
+  if CP.brand != 'hyundai':
+    return
+  if int(params_dict.get("HyundaiGasInterceptor", 0) or 0) != 1:
+    return
+
+  remapped = _select_hyundai_gas_interceptor_remapped(CP_SP, params_dict.get("HyundaiGasInterceptorIDSet"))
+  if remapped is None:
+    return
+
+  if remapped:
+    CP_SP.safetyParam |= HyundaiSafetyFlagsSP.GAS_INTERCEPTOR_REMAPPED
+  CP_SP.enableGasInterceptor = True
+  CP.openpilotLongitudinalControl = True
+  CP.pcmCruise = False  # openpilot owns set speed (up/down arrows); panda + openpilot engage on the pause/resume release
+  CP_SP.safetyParam |= HyundaiSafetyFlagsSP.GAS_INTERCEPTOR
+  # Accelerator-only, no brake actuator. No engage floor (as upstream Toyota with an interceptor): the deliberate
+  # pause/resume press engages at any speed incl. a standstill; the driver brakes for every stop. The launch is
+  # throttle-limited (gas_interceptor.py LOW_SPEED_MAX_GAS). autoResumeSng is irrelevant (openpilot never resumes by itself).
+  CP.minEnableSpeed = -1.
+  CP.longitudinalActuatorDelay = 0.5  # TBD-BENCH: pedal -> ECU torque request -> DCT, unmeasured
+
+  # fork: production FCA11 longitudinal braking (HyundaiFca11Brake, PERSISTENT BOOL, default "0" = OFF). Rides ON TOP of
+  # the pedal: same car layer already proven on-car (roll-20261005T232357Z). Armed ONLY with the explicit param + the
+  # pedal feature armed; leaves safetyParam bit 256 (FCA11_LONG) clear otherwise, so the panda TX path is byte-for-byte
+  # today's. A NEW key can be unreadable on a stale libparams (missing key -> get() returns None): treat anything but a
+  # clean "1" as OFF (never raise, never default ON).
+  # 0045 (v2, settlement Amendment 1): FCA11 SHADOW mode (HyundaiFca11Shadow, PERSISTENT BOOL, default "0" = OFF), same
+  # truthy parser. ON = the WIRE stays the OLD-LAW (the currently deployed law), always: HyundaiFca11Brake keeps its
+  # deployed meaning (ON -> OLD-LAW actuates + safetyParam bit 256, exactly as today; OFF -> no FCA11 frames, as today) and
+  # fca11AffineGain is FORCED False whatever HyundaiFca11AffineGain says, so V3 can never reach the wire; V3 is computed +
+  # logged alongside (fca11_long.py, post-send). Read at CarParams build time => takes effect at the NEXT ignition.
+  # (The FCA11-DISABLED configuration - braking forced off - is NOT produced here for any param combination; it exists only
+  # as the debug transform fca11_long.fca11_disabled_debug_params.)
+  shadow = _param_truthy(params_dict.get("HyundaiFca11Shadow"))
+  if shadow:
+    CP_SP.fca11Shadow = True
+  fca11_raw = params_dict.get("HyundaiFca11Brake")
+  # Params.get() returns a python bool for a BOOL key (openpilot/common/params.py CPP_2_PYTHON), while the raw libparams
+  # value is the string "1"/"0" -- accept both. Anything else (key missing on a stale libparams -> None, or junk) is OFF.
+  if _param_truthy(fca11_raw):
+    CP_SP.fca11Brake = True
+    CP_SP.safetyParam |= HyundaiSafetyFlagsSP.FCA11_LONG
+
+  # 0044: the opt-in FCA11 brake-SHAPING law (HyundaiFca11AffineGain, PERSISTENT BOOL, default "0" = OFF). Before 0044
+  # NOTHING wrote CP_SP.fca11AffineGain (the key was not even registered in params_keys.h), so the law was unreachable
+  # on the car; the sim reached it through an env override that hid the gap. Read it HERE, from the SAME params_dict and
+  # with the SAME truthy parser as the sibling HyundaiFca11Brake (True or "1"/b"1"; anything else - missing key on a
+  # stale libparams, junk - is OFF, never raises). The DEPENDENCY is enforced in the car layer, not only in the UI: a
+  # persisted ON with FCA11 Braking off is INERT (the shaping law shapes FCA11 braking; without it there is nothing to
+  # shape). Read at CarParams build time => a toggle takes effect at the NEXT ignition.
+  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11AffineGain")) and not shadow:   # 0045: Shadow wire = OLD-LAW
+    CP_SP.fca11AffineGain = True
+
+  # 18x: the DYNAMIC-RELEASE build (HyundaiFca11DynamicBrakes, PERSISTENT BOOL, default "0" = OFF): gentle 1 LSB onset,
+  # a per-sent-frame decrease limit, a soft release ramp and the k="b" level trace. Written HERE because the car layer
+  # only READS getattr(CP_SP, "fca11DynamicBrakes", False) - without this writer the key was a no-op in every build
+  # (the 0043/0044 class the reachability guard exists for). Same truthy parser, same dependency: the dynamic release
+  # shapes FCA11 braking, so it is inert without HyundaiFca11Brake. OFF (the default, and every CP_SP built by an older
+  # libparams) = the deployed law plus only the three UNCONDITIONAL 18x rules. Next ignition to take effect.
+  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11DynamicBrakes")) and not shadow:
+    CP_SP.fca11DynamicBrakes = True
+  # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0"). A bitfield:
+  # 1 = grace window after hyundai_init, 2 = N consecutive fault frames, 3 = both; 0 = the deployed fail-closed rule.
+  # Written HERE because the car layer only READS CP_SP.fca11PedalGuard - without this writer the key would be a no-op
+  # in every build (the 0043/0044 unreachable-key class the reachability guard exists for). Same dependency as the
+  # siblings: the guard only shapes FCA11-long, so it is inert without HyundaiFca11Brake (and in Shadow, whose wire is
+  # the OLD-LAW). Junk / missing key / any bit outside the mask -> 0, never raises. Each enabled bit also sets its panda
+  # safetyParam mirror bit, so the two layers cannot disagree about whether a guard is in force. Next ignition to apply.
+  if CP_SP.fca11Brake and not shadow:
+    guard = _param_int(params_dict.get("HyundaiFca11PedalGuard")) & HYUNDAI_FCA11_PEDAL_GUARD_MASK
+    CP_SP.fca11PedalGuard = guard
+    if guard & HYUNDAI_FCA11_PEDAL_GUARD_GRACE:
+      CP_SP.safetyParam |= HyundaiSafetyFlagsSP.PEDAL_FAULT_GRACE
+    if guard & HYUNDAI_FCA11_PEDAL_GUARD_FRAMES:
+      CP_SP.safetyParam |= HyundaiSafetyFlagsSP.PEDAL_FAULT_FRAMES
+  # 17c DELIVERY (HyundaiPedalDeliveryLaw, PERSISTENT BOOL, default "0" = OFF): the measured-inverse law for NEGATIVE
+  # accel asks (the car's pedal has a dead band the linear law is 2.5-3x too weak on, so shallow braking asks ran away
+  # at +0.06..+0.13 m/s^2) plus a one-sided filter on the pedal path so the plan's 2-4 Hz ask dither cannot reach the
+  # pedal. Same truthy parser and same "missing key on a stale libparams -> OFF" rule as the sibling Hyundai keys; it
+  # additionally rides the pedal feature (this whole function only runs with HyundaiGasInterceptor armed). Read at
+  # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
+  if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
+    CP_SP.pedalDeliveryLaw = True
+  # 0042-Z RISE-LAG (HyundaiGasRiseLag, PERSISTENT BOOL, default "0" = OFF): a first-order lag on the accel ask applied
+  # to RISES ONLY, ahead of the pedal law (gas_interceptor.filter_gas_rise). Lane Y measured the small NORMAL-mode gas
+  # moves as real 1.3-2 s planner requests, not pedal artefacts, so the ask is the only lever; the lag slows a rise
+  # (tau 0.45 s) and never delays a fall. It is not a flat percentage cut: on lane Z's own 5 worst blips the swing
+  # goes +6 / -6 / -25 / +38 / -6 % at 0.45 s - one of the five GROWS - so the claim is the census (route 198 19 -> 10,
+  # drive 197 40 -> 32 blips), not a per-window reduction. Same truthy parser and same "missing key on a stale libparams
+  # -> OFF" rule as the sibling Hyundai keys; it rides the pedal feature (this function only runs with the pedal
+  # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
+  if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
+    CP_SP.gasRiseLag = True
+
+
+def _param_truthy(raw) -> bool:
+  """The fork's BOOL-param truthiness, EXACTLY the 0018 HyundaiFca11Brake expression (factored out by 0044 so the two
+  FCA11 keys can never parse differently): bytes are decoded, then `raw is True or str(raw or "0").strip() == "1"`.
+  Params.get() returns a python bool for a BOOL key; the raw libparams value is the string "1"/"0". True / "1" / b"1"
+  are ON; None (missing key on a stale libparams), False, "0", junk are OFF. Never raises."""
+  if isinstance(raw, bytes):
+    raw = raw.decode(errors="ignore")
+  return bool(raw is True or str(raw or "0").strip() == "1")
+
+
+def _param_int(raw, default: int = 0) -> int:
+  """0045: the fork's INT-param parser, same never-raise rule as _param_truthy. Params.get() can hand back an int, a
+  str or bytes for an INT key; None (missing key on a stale libparams), junk and negatives are the default. Used by the
+  pedal-fault guard mode (HyundaiFca11PedalGuard); the car layer masks the value, so an unknown bit is inert."""
+  if isinstance(raw, bytes):
+    raw = raw.decode(errors="ignore")
+  try:
+    return max(default, int(str(raw).strip()))
+  except (TypeError, ValueError):
+    return default
+
+
+def _select_hyundai_gas_interceptor_remapped(CP_SP: structs.CarParamsSP, id_set) -> bool | None:
+  """-> False = standard IDs, True = remapped IDs, None = no usable pedal"""
+  standard_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_DETECTED)
+  remapped_seen = bool(CP_SP.flags & HyundaiFlagsSP.GAS_INTERCEPTOR_REMAPPED_DETECTED)
+  if isinstance(id_set, bytes):
+    id_set = id_set.decode(errors="ignore")
+  id_set = str(id_set or "auto").strip().lower()
+
+  if id_set == "standard":
+    return False if standard_seen else None
+  if id_set == "remapped":
+    return True if remapped_seen else None
+  # "auto" and anything unrecognized
+  if standard_seen:
+    return False
+  if remapped_seen:
+    return True
+  return None
 
 
 def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,

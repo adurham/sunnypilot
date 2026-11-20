@@ -1,0 +1,331 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -365,6 +365,30 @@
+ FCA11_SHAPE_HOLD_BAND_KPH = 3.0    # ENTER the stop/hold band at/below this (or CarState.standstill): floor at the tier cap
+ FCA11_SHAPE_HOLD_EXIT_KPH = 5.0    # 0043 v2: EXIT the band only at/above this (hysteresis) - no cap<->level step chatter at 3 km/h
+ FCA11_SHAPE_SENT_DT = 0.02         # seconds per SENT (50 Hz) frame: the jerk slew is per SENT frame
++# *** 2026-11-03 (work item 3, owner + reviewer ruling): the jump to the hold cap waits for CONFIRMED STANDSTILL ***
++# MEASURED (routes 18a/190, every shaped-law stop on disk): band entry at 3 km/h (v = 0.81-0.82 m/s, 0.68-0.78 s before
++# CarState.standstill) stepped the command 5 -> 9 -> 13 -> 17 -> 20 in 60 ms while the car was still rolling; the logged
++# aEgo then dug 1.15 -> 1.55 m/s^2 (jerk -4.1..-4.5 at -0.5 s) and the car arrived at the stop on ~1.5 m/s^2.
++# THE RULE (the 3 km/h edge is NOT moved - the reviewer rejected 1 km/h): the band is kept, but while the car is still
++# ROLLING in it (no CarState.standstill) it only applies the CREEP FLOOR: the shaped moving level, floored at
++# max(the level held at band entry, FCA11_CRAWL_MIN_LSB = 7, the measured clutch-open level), never above the tier cap.
++# The tier cap itself is reached only on:
++#   * CarState.standstill -> the cap at the panda's +RATE_STEP (the deployed take-up). At a standstill the extra LSB are hold
++#     force, not felt decel, and a slower take-up lets the DCT creep the car (the 17c finding);
++#   * a HARD ask (<= FCA11_ONSET_BYPASS_ACCEL) -> the cap at +RATE_STEP, as before (an emergency at walking pace);
++#   * the TIMEOUT: v <= 3 km/h continuously for FCA11_SHAPE_BAND_SS_TIMEOUT_S with no standstill (a car that will not stop -
++#     the creep case the band exists for) -> a LINEAR ramp from the current level to the cap over
++#     FCA11_SHAPE_BAND_TIMEOUT_RAMP_S (no step).
++# All three LATCH until the band EXIT (>= FCA11_SHAPE_HOLD_EXIT_KPH) / an episode (re)open, so a standstill flag that drops
++# False while the car creeps (17c specimen) cannot pull the hold back down.
++# WHAT THIS DOES NOT FIX (replay, wi3): the last-0.2 s stop jerk is the arrival decel unloading at v -> 0, not the cap step
++# (the step was 0.7 s earlier). Gating the cap lowers the arrival decel from the 20 LSB plateau (~1.55) to the creep-floor
++# plateau (~1.25-1.35 m/s^2 at arrival on the measured curve + lag), so the jerk drops only ~15 %; <2 m/s^3 would need an
++# arrival decel of ~0.65 m/s^2, below what any actuating level delivers (4 LSB -> 1.14). See the wi3 report.
++FCA11_SHAPE_BAND_SS_TIMEOUT_S = 1.5        # s at/below 3 km/h without standstill before the cap ramp starts
++FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES = 150   # == FCA11_SHAPE_BAND_SS_TIMEOUT_S at 100 Hz (pinned by a test)
++FCA11_SHAPE_BAND_TIMEOUT_RAMP_S = 0.5      # s for the timeout's linear ramp from the current level to the tier cap
++FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES = 50  # == FCA11_SHAPE_BAND_TIMEOUT_RAMP_S at 100 Hz (pinned by a test)
+ 
+ 
+ def shape_dec_cmd_from_extra(extra: float, cap: int = 30) -> int:
+@@ -2070,7 +2094,52 @@
+     self._shape_acc = float(FCA11_SHAPE_FLOOR_LSB)
+     self._shape_sent_n = 0
+     self._shape_in_hold_band = False
++    self._shape_band_clear()
++
++  def _shape_band_clear(self) -> None:
++    """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
++    self._shape_band_entry_lsb: int | None = None   # the level held at band entry (None = not in the band yet)
++    self._shape_band_capped = False                  # latched: standstill / hard ask / timeout ramp done -> tier cap
++    self._shape_band_low_since: int | None = None    # controller frame the current continuous <= 3 km/h run began
++    self._shape_band_ramp_n: int | None = None       # frames since the timeout ramp started (None = no ramp)
++    self._shape_band_ramp_frame = 0                  # controller frame the timeout ramp started
++    self._shape_band_ramp_from = float(FCA11_SHAPE_FLOOR_LSB)
+ 
++  def _shape_band_target(self, cap: int, shaped: int, v_kph: float, standstill: bool, hard: bool, frame: int) -> int:
++    """WI3: the hold band's level target, called on EVERY frame while in the band (see the FCA11_SHAPE_BAND_* block).
++
++    The tier cap once the car is confirmed stopped (or a hard ask / the timeout ramp has finished); while still rolling,
++    the creep floor only: the shaped level floored at max(band-entry level, FCA11_CRAWL_MIN_LSB), <= cap; after
++    FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES at/below 3 km/h without standstill, a linear ramp to the cap over
++    FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES starting from the level then held."""
++    if self._shape_band_entry_lsb is None:
++      self._shape_band_entry_lsb = int(min(cap, max(FCA11_SHAPE_FLOOR_LSB, int(self._shape_acc))))
++    if standstill or hard:
++      self._shape_band_capped = True
++    if self._shape_band_capped:
++      return cap
++    creep = int(min(cap, max(shaped, self._shape_band_entry_lsb, FCA11_CRAWL_MIN_LSB)))
++    # the timeout counts CONTINUOUS time at/below the 3 km/h edge in controller frames (100 Hz; frame numbers, so it is
++    # real time whatever the call cadence). A creep back above 3 km/h inside the 3-5 km/h exit hysteresis restarts it.
++    if self._shape_band_ramp_n is None:
++      if v_kph > FCA11_SHAPE_HOLD_BAND_KPH:
++        self._shape_band_low_since = None
++      elif self._shape_band_low_since is None:
++        self._shape_band_low_since = int(frame)
++      if self._shape_band_low_since is not None and \
++          frame - self._shape_band_low_since >= FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES:
++        self._shape_band_ramp_n = 0
++        self._shape_band_ramp_frame = int(frame)
++        self._shape_band_ramp_from = float(max(creep, int(self._shape_acc)))
++    if self._shape_band_ramp_n is None:
++      return creep
++    self._shape_band_ramp_n = max(0, int(frame) - self._shape_band_ramp_frame)
++    frac = min(1.0, self._shape_band_ramp_n / FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES)
++    if frac >= 1.0:
++      self._shape_band_capped = True
++    ramp = self._shape_band_ramp_from + (cap - self._shape_band_ramp_from) * frac
++    return int(min(cap, max(creep, int(ramp))))
++
+   def _shape_level(self, accel_ask: float, v_kph: float, CS, frame: int,
+                    personality=PERSONALITY_STANDARD) -> int:
+     """0043: the raw CR_VSM_DecCmd the SHAPED law requests for one 100 Hz frame (ON path).
+@@ -2093,15 +2162,23 @@
+     elif v_kph >= FCA11_SHAPE_HOLD_EXIT_KPH:
+       self._shape_in_hold_band = False
+     in_hold_band = self._shape_in_hold_band
+-    # level-law target (integer LSB): the tier cap in the stop/hold band, else the shaped inverse of the demand.
+-    target = cap if in_hold_band else shape_dec_cmd_from_extra(want, cap)
++    hard = bool(accel_ask <= FCA11_ONSET_BYPASS_ACCEL)
++    # level-law target (integer LSB): the shaped inverse of the demand; in the stop/hold band (WI3) the tier cap only
++    # once the car is confirmed stopped / a hard ask / the timeout ramp, else the creep floor. The band state is stepped
++    # on EVERY frame (above the send-slot return) so the 1.5 s timeout is counted in real time.
++    target = shape_dec_cmd_from_extra(want, cap)
++    if in_hold_band:
++      target = self._shape_band_target(cap, target, v_kph, standstill, hard, frame)
++    else:
++      self._shape_band_clear()
+     if frame % FCA11_SEND_EVERY != 0:
+       return int(self._shape_acc)
+-    hard = bool(accel_ask <= FCA11_ONSET_BYPASS_ACCEL)
+     # 0043 v2: a HARD ask is an EMERGENCY. It bypasses the onset hold AND the comfort jerk slew: its growth runs at
+     # up to the panda ceiling, the SAME +RATE_STEP/sent-frame rate the (pre-shaping) fast ramp uses, so a hard demand
+     # reaches the tier cap in a few sent frames (~0.1 s) instead of seconds. The shaped LEVEL target is kept (an
+-    # honest inverse level once reached). The hold band is exempt for the same reason (a stop wants the cap promptly).
++    # honest inverse level once reached). The hold band is exempt for the same reason (a stop wants the cap promptly);
++    # WI3: inside the band the target itself is now gated (creep floor / standstill cap / linear timeout ramp), so the
++    # fast lane's +RATE_STEP only governs the creep-floor take-up (<= +3 LSB at entry) and the standstill cap take-up.
+     fast = bool(hard or in_hold_band)
+     prev = self._shape_acc
+     if (not in_hold_band) and (not hard) and self._shape_sent_n < FCA11_SHAPE_ONSET_HOLD_SENT:
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -2388,15 +2388,19 @@
+     self.assertLess(max(decs), fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE])
+ 
+   def test_shaped_hold_band_edge_is_three_kph(self):
+-    """Band edge: v <= FCA11_SHAPE_HOLD_BAND_KPH (3 km/h), or CarState.standstill, floors at the tier cap; just above
+-    it the shaped moving level applies."""
++    """Band edge: v <= FCA11_SHAPE_HOLD_BAND_KPH (3 km/h) applies the creep floor (WI3: the tier cap only at standstill
++    or after the 1.5 s timeout ramp); just above it the shaped moving level applies."""
+     b = self._brake(True)
+     decs = []
+     for f in range(0, 160, 2):
+       for s in b.update(self._cc(-0.73), _CS(v_ego=2.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
+         decs.append(fl._get_bits(s.dat, 8, 8))
+-    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE], max(decs),
+-                     "creeping (2 km/h <= 3) keeps the tier-cap floor")
++    self.assertEqual(fl.FCA11_CRAWL_MIN_LSB, max(decs), "creeping (2 km/h <= 3) without standstill: the creep floor")
++    for f in range(160, 260, 2):
++      for s in b.update(self._cc(-0.73), _CS(v_ego=2.0 / 3.6, cam=_cam()), f, fl.PERSONALITY_AGGRESSIVE):
++        decs.append(fl._get_bits(s.dat, 8, 8))
++    self.assertEqual(fl.PERSONALITY_MAX_DEC[fl.PERSONALITY_AGGRESSIVE], decs[-1],
++                     "still creeping after the timeout: the ramp reaches the tier cap")
+     b2 = self._brake(True)
+     decs2 = []
+     for f in range(0, 900, 2):
+@@ -2771,10 +2775,13 @@
+       self.assertLessEqual(idx, 8, (p, decs))
+ 
+   def test_hold_band_creep_is_floored_just_above_it_is_not(self):
+-    # 3 km/h band edge (no standstill flag): cap at <=3, shaped moving level just above
++    # 3 km/h band edge (no standstill flag): WI3 - the creep floor at <=3 (the cap only via the 1.5 s timeout ramp),
++    # shaped moving level just above
+     b = self._brake(True)
+     creep = [d for _, d in self._sent(b, -0.73, 160, cs=_CS(v_ego=2.0 / 3.6, cam=_cam()))]
+-    self.assertEqual(30, max(creep))
++    self.assertEqual(fl.FCA11_CRAWL_MIN_LSB, max(creep))
++    creep += [d for _, d in self._sent(b, -0.73, 100, cs=_CS(v_ego=2.0 / 3.6, cam=_cam()), start=160)]
++    self.assertEqual(30, creep[-1])
+     b2 = self._brake(True)
+     mover = [d for _, d in self._sent(b2, -0.73, 900, cs=_CS(v_ego=10.0 / 3.6, cam=_cam()))]
+     self.assertEqual(6, max(mover))
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_stop_gate.py
+@@ -0,0 +1,172 @@
++"""WI3: the shaped law's jump to the hold cap waits for CONFIRMED STANDSTILL (FCA11_SHAPE_BAND_* block in fca11_long.py).
++
++Every test drives the real controller update path (Fca11LongBrake.update with a CarState double), on the shaped (ON,
++HyundaiFca11AffineGain) instance - the law the logged stops on routes 18a/190 ran.
++"""
++import os
++import unittest
++
++from opendbc.car import structs
++import opendbc.sunnypilot.car.hyundai.fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam
++
++AGG = fl.PERSONALITY_AGGRESSIVE
++STD = fl.PERSONALITY_STANDARD
++
++
++def _brake():
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = True
++  cp_sp.enableGasInterceptor = True
++  cp_sp.fca11AffineGain = True
++  return fl.Fca11LongBrake(structs.CarParams(), cp_sp)
++
++
++def _cc(accel):
++  cc = structs.CarControl()
++  cc.enabled = True
++  cc.longActive = True
++  cc.actuators.accel = accel
++  return cc
++
++
++class _Drive:
++  """Feeds frames one at a time and records every SENT 0x38D level as (frame, dec)."""
++  def __init__(self, personality=AGG):
++    self.b = _brake()
++    self.f = 0
++    self.p = personality
++    self.sent = []
++
++  def run(self, n, accel, kph, standstill=False):
++    for _ in range(n):
++      for s in self.b.update(_cc(accel), _CS(v_ego=kph / 3.6, cam=_cam(), standstill=standstill), self.f, self.p):
++        self.sent.append((self.f, fl._get_bits(s.dat, 8, 8)))
++      self.f += 1
++    return self
++
++  def levels(self, since=0):
++    return [d for f, d in self.sent if f >= since]
++
++
++class TestStopGate(unittest.TestCase):
++
++  def setUp(self):
++    self._env_prev = os.environ.pop("FCA11_AFFINE", None)
++
++  def tearDown(self):
++    if self._env_prev is not None:
++      os.environ["FCA11_AFFINE"] = self._env_prev
++
++  def test_constants_pinned(self):
++    self.assertEqual(3.0, fl.FCA11_SHAPE_HOLD_BAND_KPH, "the 3 km/h band edge is NOT moved (reviewer ruling)")
++    self.assertEqual(1.5, fl.FCA11_SHAPE_BAND_SS_TIMEOUT_S)
++    self.assertEqual(150, fl.FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES)
++    self.assertEqual(0.5, fl.FCA11_SHAPE_BAND_TIMEOUT_RAMP_S)
++    self.assertEqual(50, fl.FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES)
++
++  def test_no_jump_to_the_cap_while_rolling_below_3kph_within_the_timeout(self):
++    """A stop approaching at 6 km/h then rolling at <= 3 km/h without standstill for just under 1.5 s: the command never
++    reaches the cap and never steps by more than the creep-floor take-up."""
++    for pers in (AGG, STD):
++      cap = fl.personality_max_dec(pers)
++      d = _Drive(pers).run(200, -0.73, 6.0)
++      pre = d.levels()[-1]
++      t0 = d.f
++      for kph in (2.9, 2.5, 2.0, 1.5, 1.0, 0.8):
++        d.run(24, -0.73, kph)                                      # 6 x 24 = 144 frames < 150
++      band = d.levels(t0)
++      self.assertTrue(band)
++      self.assertLess(max(band), cap, (pers, band))
++      self.assertEqual(max(pre, fl.FCA11_CRAWL_MIN_LSB), max(band), (pers, pre, band))
++      for a, c in zip([pre] + band, band):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (pers, band))
++
++  def test_cap_at_standstill(self):
++    """At CarState.standstill the cap is taken up at the panda's +RATE_STEP (the deployed take-up) and latched: a
++    standstill flag dropping False while still in the band does not pull the hold down."""
++    for pers in (AGG, STD):
++      cap = fl.personality_max_dec(pers)
++      d = _Drive(pers).run(200, -0.73, 6.0).run(40, -0.73, 2.0)
++      before = d.levels()[-1]
++      self.assertLess(before, cap)
++      t0 = d.f
++      d.run(40, -0.73, 0.0, standstill=True)
++      held = d.levels(t0)
++      self.assertEqual(cap, held[-1], (pers, held))
++      n = -(-(cap - before) // fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++      self.assertEqual(cap, held[n - 1], (pers, held))                 # +RATE_STEP per sent frame, no slower
++      for a, c in zip([before] + held, held):
++        self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++      # 17c: standstill flips False for 0.8 s mid-creep (still in the band) -> the cap holds
++      t1 = d.f
++      d.run(80, -0.73, 0.3, standstill=False)
++      self.assertEqual({cap}, set(d.levels(t1)), pers)
++
++  def test_cap_at_standstill_from_rest(self):
++    """An episode that opens AT standstill (held at a light) still ramps straight to the cap."""
++    d = _Drive(AGG).run(60, -0.73, 0.0, standstill=True)
++    self.assertEqual(fl.HYUNDAI_FCA11_LONG_RATE_STEP, d.levels()[0])
++    self.assertEqual(30, d.levels()[-1])
++
++  def test_timeout_ramp_starts_after_1p5s_and_reaches_the_cap_in_0p5s(self):
++    for pers in (AGG, STD):
++      cap = fl.personality_max_dec(pers)
++      d = _Drive(pers).run(200, -0.73, 6.0)
++      t_in = d.f                                                     # first frame at/below 3 km/h
++      d.run(400, -0.73, 2.0)
++      sent = [(f - t_in, x) for f, x in d.sent if f >= t_in]
++      creep = sent[0][1]
++      # nothing above the creep level up to 1.5 s
++      self.assertEqual({creep}, {x for t, x in sent if t <= fl.FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES}, pers)
++      first_up = next(t for t, x in sent if x > creep)
++      at_cap = next(t for t, x in sent if x >= cap)
++      self.assertGreater(first_up, fl.FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES, pers)
++      self.assertLessEqual(first_up, fl.FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES + 6, pers)
++      ramp_frames = at_cap - fl.FCA11_SHAPE_BAND_SS_TIMEOUT_FRAMES
++      self.assertGreaterEqual(ramp_frames, fl.FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES - 4, (pers, ramp_frames))
++      self.assertLessEqual(ramp_frames, fl.FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES + 4, (pers, ramp_frames))
++      # linear, no step: per SENT frame (2 controller frames) <= ceil(2 * (cap - creep) / 50) + 1 LSB
++      bound = -(-2 * (cap - creep) // fl.FCA11_SHAPE_BAND_TIMEOUT_RAMP_FRAMES) + 1
++      levels = [x for _, x in sent]
++      steps = [c - a for a, c in zip(levels, levels[1:])]
++      self.assertLessEqual(max(steps), bound, (pers, levels))
++      self.assertGreaterEqual(min(steps), 0, (pers, levels))
++      self.assertEqual(cap, levels[-1])
++
++  def test_timeout_counts_continuous_time_below_3kph(self):
++    """Creeping back above 3 km/h (inside the 3-5 km/h exit hysteresis) restarts the 1.5 s count."""
++    d = _Drive(AGG).run(200, -0.73, 6.0)
++    d.run(120, -0.73, 2.0).run(20, -0.73, 3.5).run(120, -0.73, 2.0)   # 1.2 + 1.2 s below, split by 0.2 s at 3.5
++    self.assertLess(max(d.levels(200)), 30)
++    d.run(60, -0.73, 2.0)                                            # now 1.8 s continuous -> ramping
++    self.assertGreater(d.levels()[-1], fl.FCA11_CRAWL_MIN_LSB)
++
++  def test_creep_floor_applies_in_the_band(self):
++    """The 3 km/h band still applies the creep floor while rolling: a soft ask whose moving level is 4-6 LSB commands
++    at least FCA11_CRAWL_MIN_LSB (the clutch-open level) inside the band, and the plain moving level just above it."""
++    for ask in (-0.5, -0.6, -0.73):
++      above = _Drive(AGG).run(400, ask, 3.5)                       # 3.5 km/h: not in the band (entry is <= 3)
++      lvl_above = above.levels()[-1]
++      self.assertLess(lvl_above, fl.FCA11_CRAWL_MIN_LSB, ask)
++      inb = _Drive(AGG).run(140, ask, 2.5)
++      self.assertEqual(fl.FCA11_CRAWL_MIN_LSB, inb.levels()[-1], ask)
++      self.assertEqual(fl.FCA11_CRAWL_MIN_LSB, max(inb.levels()), ask)
++
++  def test_hard_ask_in_the_band_still_gets_the_cap(self):
++    d = _Drive(AGG).run(200, -0.73, 6.0).run(20, -0.73, 2.0)
++    t0 = d.f
++    d.run(30, -2.5, 2.0)
++    self.assertEqual(30, d.levels(t0)[-1])
++
++  def test_band_exit_clears_the_latch(self):
++    d = _Drive(AGG).run(200, -0.73, 6.0).run(40, -0.73, 0.0, standstill=True)
++    self.assertEqual(30, d.levels()[-1])
++    d.run(20, -0.73, 6.0)                                            # >= 5 km/h exit
++    t0 = d.f
++    d.run(20, -0.73, 2.0)                                            # re-entry while rolling: creep floor again
++    self.assertLess(max(d.levels(t0)), 30)
++
++
++if __name__ == "__main__":
++  unittest.main()

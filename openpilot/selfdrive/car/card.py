@@ -22,8 +22,12 @@ from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
 
+from openpilot.sunnypilot.fork.fca11_shadow_hook import fca11_shadow_post_send
+from openpilot.sunnypilot.fork.driver_mark_hook import DriverMarkHook
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
+from openpilot.sunnypilot.fork.esc_diag import run_from_card as run_esc_diag_from_card
+from openpilot.sunnypilot.fork.esc_probe_0027 import run_from_card as run_esc_probe_0027_from_card
 
 REPLAY = "REPLAY" in os.environ
 
@@ -71,7 +75,8 @@ class Car:
 
   def __init__(self, CI=None, RI=None) -> None:
     self.can_sock = messaging.sub_sock('can', timeout=20)
-    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'])
+    self.sm = messaging.SubMaster(['pandaStates', 'carControl', 'onroadEvents'] + ['carControlSP', 'longitudinalPlanSP'] +
+                                  ['userBookmark', 'bookmarkButton'])
     self.pm = messaging.PubMaster(['sendcan', 'carState', 'carParams', 'carOutput', 'radarTracks'] + ['carParamsSP', 'carStateSP'])
 
     self.can_rcv_cum_timeout_counter = 0
@@ -115,6 +120,11 @@ class Car:
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP, self.CI.CP_SP)
       self.CP = self.CI.CP
       self.CP_SP = self.CI.CP_SP
+
+      # fork: read-only ESC UDS read while the panda is still in the fingerprint (ELM327) window (fork/esc_diag.py)
+      run_esc_diag_from_card(self.CP, self.can_callbacks, obd_callback(self.params))
+      # fork: ESC 0x27 probe (request seed + no-op 0x2E write of the current 0x0103), same window (fork/esc_probe_0027.py)
+      run_esc_probe_0027_from_card(self.CP, self.can_callbacks, obd_callback(self.params))
 
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)
@@ -183,6 +193,10 @@ class Car:
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
+    # 17c FEEDBACK: the driver's bookmark verdict (k="m"). Inert until a bookmark press is seen; the record is written
+    # by the FCA11 law (one writer per path) and the 2 s confirmation rides CarStateSP.driverMark.
+    self.driver_mark_hook = DriverMarkHook()
+
   def state_update(self) -> tuple[car.CarState, custom.CarStateSP, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
 
@@ -206,6 +220,11 @@ class Car:
 
     if can_rcv_valid and REPLAY:
       self.can_log_mono_time = messaging.log_from_bytes(can_strs[0]).logMonoTime
+
+    # 17c FEEDBACK: type any bookmark press of this tick (the UI publishes one PAIR per press) and write the verdict
+    # record at burst close. Two dict lookups per frame when nothing is pressed; the record path is the law's.
+    now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
+    self.driver_mark_hook.step(self.sm, self.CI, CS, now_nanos)
 
     self.v_cruise_helper.update_speed_limit_assist(self.is_metric, self.sm['longitudinalPlanSP'])
     self.v_cruise_helper.update_v_cruise(CS, self.sm['carControl'].enabled, self.is_metric)
@@ -276,6 +295,9 @@ class Car:
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
+      # fork (0045): FCA11 SHADOW - compute + log V3 for this frame AFTER sendcan is published, so V3 can never delay or
+      # alter the OLD-LAW frames already sent. No-op unless Shadow; never raises.
+      fca11_shadow_post_send(self.CI)
 
       self.CC_prev = CC
 

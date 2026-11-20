@@ -1,0 +1,412 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 87428b0..7018b3e 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -1207,6 +1207,19 @@ FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+ FCA11_GAS_WINDOW_HOLD_S = 0.10             # == the panda's BRAKE_THROTTLE_EXCL_US
+ FCA11_GAS_WINDOW_HOLD_FRAMES = 10          # controller frames at 100 Hz
+ 
++# *** 0038-excl (lane F): the WIRE-side window counter ***
++# Same window, but keyed on the level that is ACTUALLY ON THE WIRE instead of on the law's `_actuating` flag, and with
++# one frame of margin. Why both:
++#   * `_actuating` is a LAW flag. With a sub-bite level withheld from the wire (sub_bite_gate: 1-3 LSB never goes out
++#     while the frame commands throttle) the law is actuating but the panda's window was never armed - holding gas on
++#     that flag is exactly the 5.2 % -> 0 -> 5.2 % dip M1 removed. So the hold must follow the WIRE.
++#   * MARGIN: the panda refuses while `elapsed <= BRAKE_THROTTLE_EXCL_US` (100 ms exactly), and it arms the window when
++#     it judges OUR brake frame - which is the frame BEFORE this counter is decremented for the next 100 Hz frame. A
++#     10-frame hold therefore lands one gas frame exactly ON the 100 ms edge, and the harness shows that frame refused
++#     (lane-F/cp1_after.txt, first run). 11 frames = 110 ms is strictly conservative; the cost is 10 ms of throttle
++#     resumption, and it can never be felt because a refused frame resumes nothing.
++FCA11_WIRE_WINDOW_FRAMES = 11
++
+ # *** 18x: DYNAMIC BRAKES (param HyundaiFca11DynamicBrakes -> CP_SP.fca11DynamicBrakes, DEFAULT OFF) ***
+ # ONE switch for the owner's "brakes need to be dynamic, gradual increase and decrease", minus the calibration drive
+ # (the owner's ruling: no scripted calibration drives, the car cannot be forced). ON does five things, all on the FEEL
+@@ -1834,6 +1847,12 @@ class Fca11LongBrake:
+     self.stop_hold_clutch = self.enabled and (not self._core) and stop_hold_enabled(CP_SP)
+     self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
+     self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
++    # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
++    # throttle (see sub_bite_gate). A counter only - it never feeds the law.
++    self.sub_bite_muted = 0
++    # 0038-excl (lane F): controller frames left in the host's mirror of the panda's 100 ms throttle-exclusion window,
++    # armed by every frame we actually SEND with a level (see FCA11_WIRE_WINDOW_FRAMES / _wire_arm).
++    self._wire_arm_left = 0
+     # 0036: once the pair has been on the wire during a standstill and then drops while the car is STILL stopped (the ESC
+     # stopped acknowledging, the level fell under the hold), it stays off until the car moves again - no on/off flapping
+     # at the light. Reset only by leaving standstill.
+@@ -1962,16 +1981,37 @@ class Fca11LongBrake:
+ 
+   @property
+   def gas_hold(self) -> bool:
+-    """0037/M1: True -> the throttle must be commanded to EXACTLY 0 this frame because the brake is really biting.
+-
+-    `braking` alone is NOT enough. The continuous law opens an episode at 1 LSB (the phantom bound), and a >= 0.25 s
+-    vision phantom reaches 1-3 LSB; keying the pedal's forced zero on `braking` then produced a 5.2 % -> 0 -> 5.2 %
+-    pedal dip in ~0.7 s per ghost - owner complaint #4 (throttle blips) reintroduced, and pre-0037 that phantom did
+-    nothing on either wire (probe: lane-E/gas_probe_*.txt). The first level on this plant that MEASURABLY bites is
+-    FCA11_FEEL_FIRST_LSB = 4 LSB (1.00 m/s^2 net, the ESC's measured cliff), so the gas side follows the brake only
+-    from there. Below it the 1-3 LSB levels are still SENT - they just do not zero the throttle.
++    """0038-excl: True -> the throttle must be commanded to EXACTLY 0 this frame.
++
++    The predicate is now the PANDA'S OWN WINDOW, read off the WIRE: a non-zero ``GAS_COMMAND`` is refused for
++    ``HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US`` (100 ms) after any actuating 0x38D, i.e. after any frame that
++    carried a level >= 1 LSB. ``_wire_arm_left`` is armed by exactly those frames (and only by frames actually sent, so
++    a sub-bite level withheld by ``sub_bite_gate`` does NOT arm it). So the pedal is at zero exactly when - and only
++    when - a non-zero frame would be stripped, which is what keeps the 0x700 stream gap-free.
++
++    This replaces the 0037/M1 form (``braking and _dec_last_sent >= FCA11_FEEL_FIRST_LSB``): that one was right about
++    the ONSET (a 1-3 LSB phantom must not cut the throttle - the 5.2 % -> 0 -> 5.2 % dip the owner calls flutter) but
++    it let the throttle resume while the panda's window was still open, from the last >= 4 LSB frame of a RELEASE and
++    from the clear frame that re-arms it while the pedal is faulted. Measured through the real filter: 10 refused
++    pedal frames on a 500 ms phantom (lane-F/cp1_after.txt, first run) - gone with this one.
++
++    It cannot change the pedal's OUTPUT anywhere: a frame that arms the window is only ever sent on a frame that
++    commands exactly zero gas (>= 4 LSB -> gas_hold; 1-3 LSB -> sub_bite_gate only sends it when the pedal is at zero),
++    so at the moment the window opens the pedal's last applied command is already 0. Holding it for 110 ms instead of
++    letting it be refused changes the wire, not the pedal.
++
++    OFF PATH (`FCA11_CONT_ENABLED` False, the pre-0037 law) keeps the deployed 0037/M1 form byte-for-byte: the OFF law
++    can only ever send >= 4 LSB frames (its own moving floor), so nothing there needs the wire-side window.
+     """
+-    return bool(self.braking and int(self._dec_last_sent) >= FCA11_FEEL_FIRST_LSB)
++    if not getattr(self, "cont_law", False):
++      return bool(self.braking and int(self._dec_last_sent) >= FCA11_FEEL_FIRST_LSB)
++    return bool(self._wire_arm_left > 0)
++
++  def _wire_arm(self, level: int) -> None:
++    """0038-excl: arm the host's mirror of the panda's throttle-exclusion window for a frame that carries `level` on the
++    WIRE. Never clears it (a passive frame does not clear the panda's window either)."""
++    if int(level) > 0:
++      self._wire_arm_left = FCA11_WIRE_WINDOW_FRAMES
+ 
+   def cont_coast(self, accel: float, v_ego_mps: float) -> bool:
+     """0037: True -> the gas must be at its TRUE ZERO (0x700 ENABLE=0 pass-through) this frame.
+@@ -2434,6 +2474,55 @@ class Fca11LongBrake:
+     m = Fca11MirrorFrame(dec_cmd=0, prefill=False, warn=0, cmd_act=False, dec_cmd_act=False)
+     return [CanData(FCA11_ADDR, build_fca11_frame(dat, (cam_alive + 1) & 0xF, m), 0)]
+ 
++  def sub_bite_gate(self, brake_sends: list[CanData], CS, frame: int, gas_on_wire: float) -> list[CanData]:
++    """0038-excl (lane F): a SUB-BITE actuating frame is never SENT while this same frame commands throttle.
++
++    THE CONSTRAINT IS PHYSICAL, so the host's law has to be consistent with it (owner rule: only physical/safety
++    distinctions are allowed - this is one). opendbc/safety/modes/hyundai.h l.1152-1157 arms
++    ``host_brake_active_ts`` on ANY actuating 0x38D - ``CR_VSM_DecCmd != 0 || FCA_CmdAct || CF_VSM_DecCmdAct ||
++    CF_VSM_Prefill``, i.e. from 1 LSB - and l.1356-1361 then refuses every NON-ZERO ``GAS_COMMAND`` for the next
++    ``HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US`` = 100 ms. The pedal stream and the brake stream both run on the
++    same 50 Hz slot and the pedal frame is appended FIRST (gas_interceptor.create_gas_command l.832-836), so every
++    actuating frame is followed by a refused pedal frame 20 ms later. A 1-3 LSB episode is below the measured first
++    bite (FCA11_FEEL_FIRST_LSB = 4 LSB = 1.00 m/s^2), so it does nothing physical while the throttle is HELD - but
++    the panda still strips the throttle for it, and the comma pedal then times out (102 ms without an applied frame)
++    into pass-through, i.e. the driver-felt dip the owner calls flutter. Measured through the real filter
++    (lane-F/cp1_before.txt): a 250 ms / 3 LSB phantom refuses 17 pedal frames and drops the pedal output to exactly
++    0 for 320 ms.
++
++    So: below the bite, the brake rides on the COAST only (the engine-braking-first principle this law is built on).
++    With the pedal at true zero the frame goes out unchanged (light braking over coast is untouched); with the pedal
++    commanding gas the same slot carries the PASSIVE shape instead - level 0 on the wire, which does not arm the
++    panda's window at all, so the throttle keeps flowing and NOTHING is refused. The law's own level, episode, trim
++    and ramp state are untouched: only the wire frame differs, and ``_dec_last_sent`` is set to what the wire carries
++    (0) so the next frame's +RATE_STEP clamp still matches the panda's reference.
++
++    At/above the bite this is a no-op: ``gas_hold`` already forces the pedal to exactly 0 on those frames, so there
++    is no throttle to refuse (a >= 4 LSB episode cuts the throttle exactly as before).
++    """
++    if not getattr(self, "cont_law", False) or not brake_sends or int(frame) != int(self._frame_last):
++      return brake_sends
++    level = int(self._dec_last_sent)
++    if level <= 0 or level >= FCA11_FEEL_FIRST_LSB:
++      return brake_sends
++    if not (float(gas_on_wire) > 0.):
++      self._wire_arm(level)     # the frame goes out at 1-3 LSB: the panda's throttle window is armed by it
++      return brake_sends
++    passive = self._passive_frame(CS, frame)
++    if not passive:
++      # no fresh camera frame in hand: an episode cannot be open without one (ok requires it), so this is unreachable;
++      # refuse to guess and leave the actuating frame as it is.
++      return brake_sends
++    self._dec_last_sent = 0     # the panda's rate reference is this PASSIVE frame now, not the level
++    # the wire carried no level: keep the 17c level window and the PLATEAU tracker on the WIRE (a plateau sample at
++    # lsb 0 closes the open window and does not qualify - fca11_log.PlateauTracker.sample), so a withheld sub-bite frame
++    # can never be logged as a delivered 1-3 LSB plateau.
++    self._note_sent_level(frame, 0)
++    if 0 < level <= 3:
++      self.cont_low_lsb_frames = max(0, self.cont_low_lsb_frames - 1)   # that frame carried 0 on the wire, not 1-3 LSB
++    self.sub_bite_muted += 1
++    return passive
++
+   def _shape_reset(self) -> None:
+     """0043: arm a fresh shaped episode - the float LSB accumulator starts at the floor, the onset-hold
+     sent-frame counter and the hold-band latch are cleared. Called on every (re)open, on disable, on the
+@@ -2595,8 +2684,9 @@ class Fca11LongBrake:
+         # cannot be quoted next to one episode's plateaus in episodes.jsonl).
+         self.cont_low_lsb_frames = 0
+       self._shape_sent_n += 1     # SENT frames that carried a level (the trim's 0.5 s delay is real braking time)
+-    if 0 < dec <= 3:
+-      self.cont_low_lsb_frames += 1   # 1-3 LSB: sent, delivered decel UNMEASURED on this plant (harvest from the wire log)
++    # 0038-excl: `cont_low_lsb_frames` (a SENT frame at 1-3 LSB) is counted at the SEND SITE below, not here - a
++    # sub-bite level withheld from the wire (throttle held) is not a sent 1-3 LSB frame and must not inflate the
++    # first-drive harvest of what 1-3 LSB actually delivers.
+     return dec
+ 
+   def _shape_band_clear(self) -> None:
+@@ -3380,6 +3470,9 @@ class Fca11LongBrake:
+     # longActive off): it is a fact about the panda's BRAKE_THROTTLE_EXCL_US, not about our episode.
+     if self._gas_guard_left > 0:
+       self._gas_guard_left -= 1
++    # 0038-excl (lane F): same ageing for the WIRE-side window mirror (gas_hold reads this one)
++    if self._wire_arm_left > 0:
++      self._wire_arm_left -= 1
+     # 18x: this frame's release-ramp state (only ever read by _alerts, so a ramp in progress cannot be mistaken for a
+     # LOST hold - see arm_now there). Set by the else branch below.
+     self._in_rel_ramp = False
+@@ -3793,6 +3886,15 @@ class Fca11LongBrake:
+         # +2*RATE_STEP, so the panda refused every actuating frame after the first. The reference must
+         # advance ONLY on frames actually sent (the panda's last-accepted frame).
+         self._dec_last_sent = dec_cmd
++        if 0 < dec_cmd <= 3:
++          # 0038-excl: a SENT frame that really carried a 1-3 LSB level (see sub_bite_gate, which decrements it again
++          # on the frames it withholds from the wire)
++          self.cont_low_lsb_frames += 1
++        # 0038-excl: the panda's throttle window is armed by ANY level on the wire (>= 1 LSB). Only a >= bite frame is
++        # armed HERE (it is never muted: gas_hold forces its pedal to exactly 0) - a 1-3 LSB frame may still be
++        # withheld from the wire by sub_bite_gate, which arms the window itself on the frames it does send.
++        if dec_cmd >= FCA11_FEEL_FIRST_LSB:
++          self._wire_arm(dec_cmd)
+       self._actuating = True
+       self._gas_guard_left = 0          # 18x: an actuating frame re-arms the panda's window; the guard restarts at the edge
+       self._sent_this_episode = True
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 1973134..b4a4857 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -734,8 +734,11 @@ class GasInterceptorCarController:
+     # measured coast at this speed already delivers: the pedal then goes to EXACTLY 0 (ENABLE=0, pass-through) instead of
+     # holding the car's speed on hold_cmd(v). It is the same coast(v) curve the brake law hands over at, so gas and brake
+     # meet at one point (DESIGN.md lane-E §3). False on every non-continuous instance and every ask >= 0.
+-    # M1: the brake's own forced zero is `gas_hold`, not `braking` - a 1-3 LSB episode (a vision phantom) must not cut
+-    # the throttle; only a level that has reached the measured first bite (4 LSB) does. See Fca11LongBrake.gas_hold.
++    # 0038-excl (lane F): the brake's own forced zero is the PANDA'S OWN WINDOW, mirrored off the wire - a non-zero
++    # GAS_COMMAND is refused for 100 ms after any actuating 0x38D, so the pedal is commanded to exactly 0 for exactly
++    # that window and no frame is ever stripped. A sub-bite level (1-3 LSB) never arms the window because it is never
++    # SENT alongside throttle (Fca11LongBrake.sub_bite_gate), so a vision phantom still does not cut the throttle.
++    # See Fca11LongBrake.gas_hold.
+     # M5: the coast cliff is a QUANTIZED level, not a timer - see _coast_zero().
+     coast_zero = bool(active) and self._coast_zero(CC.actuators.accel, CS.out.vEgo)
+     if self.fca11_brake.cam_brake or coast_zero:
+@@ -833,6 +836,12 @@ class GasInterceptorCarController:
+       can_sends.append(create_gas_interceptor_command(self.interceptor_packer, 0. if clear else self.gas, frame // 2,
+                                                      self.interceptor_ids.command_msg))
+ 
++    # 0038-excl (lane F): a SUB-BITE brake frame is never offered alongside throttle. The pedal frame above is what the
++    # panda judges first, so the value it will carry is already known here: if this slot commands gas and the brake
++    # frame is below the measured bite (1-3 LSB), that frame goes out as the PASSIVE shape instead, which does not arm
++    # the panda's 100 ms throttle exclusion at all. With the pedal at exactly 0 (a coast) nothing is substituted.
++    brake_sends = self.fca11_brake.sub_bite_gate(brake_sends, CS, frame,
++                                                 0. if (clear or not send_slot) else self.gas)
+     can_sends.extend(brake_sends)
+     # 185 HAND-OVER: remember whether this frame was active, so the NEXT frame can tell an engagement's first frame.
+     # Set on every call (including the inactive frames that reset the episode), after all command paths above.
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py
+new file mode 100644
+index 0000000..eb59f8d
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_sub_bite_exclusion.py
+@@ -0,0 +1,197 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++0038-excl (lane F): the SUB-BITE brake frame must never be SENT alongside throttle.
++
++opendbc/safety/modes/hyundai.h arms `host_brake_active_ts` on ANY actuating 0x38D (`CR_VSM_DecCmd != 0 || FCA_CmdAct
++|| CF_VSM_DecCmdAct || CF_VSM_Prefill`, i.e. from 1 LSB) and refuses every non-zero GAS_COMMAND for the next
++HYUNDAI_FCA11_LONG_BRAKE_THROTTLE_EXCL_US (100 ms). The pedal frame and the brake frame share the 50 Hz slot and the
++pedal frame is appended first, so every actuating frame costs the pedal stream the frame 20 ms later. Below the
++measured 4 LSB bite the brake does nothing physical while the throttle is held, and the comma pedal turns the missing
++frames into a full lift-off: 102 ms without an applied frame -> FAULT_TIMEOUT -> DAC = the DRIVER's pedal only, latched
++until an ENABLE=0 all-zero frame. That is the dip the owner calls flutter.
++
++These tests drive the REAL host car layer (Elantra-N non-SCC, gas interceptor + FCA11 long) into the REAL panda TX hook
++(libsafety, the same `TestHyundaiFca11LongSafety` fixture the safety tests use) and assert, per scenario, what the
++0x38D stream carries, what the panda accepts, and whether the pedal command dips.
++"""
++import unittest
++
++from opendbc.car import structs
++from opendbc.car.car_helpers import interfaces
++from opendbc.car.hyundai.values import CAR
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai import gas_interceptor as gi
++from opendbc.sunnypilot.car.interfaces import setup_interfaces
++from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import (BASE_FINGERPRINT, STD, _Fca11CS,
++                                                                       _fca11_cam_frame)
++
++CAR_UNDER_TEST = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++DT_US = 10_000          # 100 Hz controller frame
++GHOST = (30.0, -25.0)   # a vision ghost: 30 m ahead, closing at 25 m/s
++
++
++def _ci(cont: bool = True, fca11: bool = True):
++  """The car layer this car runs: gas interceptor + FCA11 long + affine gain + dynamic brakes."""
++  fl.FCA11_CONT_ENABLED = cont          # module constant, read once at construction (this is the ON/OFF switch)
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **STD}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
++                                     docs=False)
++  setup_interfaces(CarInterface, CP, CP_SP, [
++    {"HyundaiGasInterceptor": True}, {"HyundaiFca11Brake": fca11},
++    {"HyundaiFca11AffineGain": True}, {"HyundaiFca11DynamicBrakes": True},
++  ])
++  return CarInterface(CP, CP_SP)
++
++
++def _cc(accel):
++  c = structs.CarControl()
++  c.enabled = c.latActive = c.longActive = True
++  c.actuators.accel = accel
++  return c
++
++
++class _Replay:
++  """The host at 100 Hz into the real panda TX hook, frame by frame, in the order the host appends the frames."""
++
++  def __init__(self, cont: bool = True, v: float = 20.0):
++    self.ci = _ci(cont)
++    import opendbc.safety.tests.test_hyundai as th
++    self.tc = th.TestHyundaiFca11LongSafety_0("test_needs_controls_and_heartbeat")
++    self.tc.setUp()
++    self.cs = _Fca11CS(v_ego=v, cam=(0, _fca11_cam_frame(alive=5)))
++    self.t = 0
++    self.cmd_addr = int(self.ci.CC.interceptor_ids.command_addr)
++    self.tc._open_window()
++
++  def _refresh(self):
++    tc = self.tc
++    tc._rx(tc._user_brake_msg(False))
++    tc._rx(tc._user_gas_msg(0))
++    tc._rx(tc._interceptor_user_gas(0))
++    tc._rx(tc._gear_msg(5))
++    tc._rx(tc._wheel_msg(tc.IN_WINDOW_RAW))
++
++  def run(self, ask: float, lead_frames, frames_before: int = 40, driver_brake_at: int | None = None):
++    from opendbc.safety.tests.libsafety import libsafety_py
++    rows = []
++    plan = [None] * frames_before + list(lead_frames) + [None] * 40
++    for f, lead in enumerate(plan):
++      self.cs.fca11_lead_drel_m, self.cs.fca11_lead_vrel_mps = lead if lead is not None else (None, None)
++      self.cs.fca11_lead_one = object() if lead is not None else None
++      self.cs.fca11_now_nanos = f * DT_US * 1000
++      self.cs.interceptor_state = 0
++      sends = self.ci.CC.create_gas_command(_cc(ask), self.cs, f, 0)
++      gas = next((bytes(d) for a, d, _s in sends if a == self.cmd_addr), None)
++      brake = [bytes(d) for a, d, _s in sends if a == fl.FCA11_ADDR]
++      self.t += DT_US
++      self.tc.safety.set_timer(2_000_000 + self.t)
++      self._refresh()
++      if driver_brake_at is not None and f == driver_brake_at:
++        self.tc._rx(self.tc._user_brake_msg(True))
++      gas_ok = None if gas is None else bool(self.tc._tx(libsafety_py.make_CANPacket(self.cmd_addr, 0, gas)))
++      brake_ok = [bool(self.tc._tx(libsafety_py.make_CANPacket(fl.FCA11_ADDR, 0, d))) for d in brake]
++      rows.append(dict(f=f, gas=float(self.ci.CC.gas),
++                       gas_en=bool((gas[4] >> 7) & 1) if gas is not None else None,
++                       gas_word=((gas[0] << 8) | gas[1]) if gas is not None else None,
++                       gas_sent=gas is not None, gas_ok=gas_ok,
++                       lvl=brake[0][1] if brake else 0, brake_ok=brake_ok[0] if brake_ok else None,
++                       muted=int(getattr(self.ci.CC.fca11_brake, "sub_bite_muted", 0)),
++                       hold=bool(getattr(self.ci.CC.fca11_brake, "gas_hold", False))))
++    return rows
++
++
++def _refused(rows):
++  return [(r["f"], r["lvl"]) for r in rows if r["gas_sent"] and not r["gas_ok"]]
++
++
++def _actuating(rows, lo=1, hi=3):
++  return [r for r in rows if r["lvl"] and lo <= r["lvl"] <= hi]
++
++
++class TestSubBiteNeverRidesWithThrottle(unittest.TestCase):
++  """The law's side: below the bite the frame is withheld; at/above the bite nothing changed; OFF is inert."""
++
++  def tearDown(self):
++    fl.FCA11_CONT_ENABLED = True
++
++  def test_sub_bite_frame_is_withheld_while_the_pedal_commands_gas(self):
++    for mf in (1, 2, 3, 5):
++      with self.subTest(model_frames=mf):
++        rows = _Replay().run(-0.20, [GHOST] * (5 * mf))
++        # the ghost really did open an episode below the bite (otherwise the test proves nothing)
++        self.assertGreater(rows[-1]["muted"], 0, "no sub-bite frame was ever withheld - the scenario missed the bite")
++        # every frame that went out with a level carried exactly zero throttle
++        for r in rows:
++          if r["gas_sent"] and r["gas"] > 0.:
++            self.assertEqual(0, r["lvl"], f"frame {r['f']}: level {r['lvl']} sent with gas {r['gas']:.3f}")
++        # and the pedal command never dipped: a vision phantom must not touch the throttle
++        self.assertGreater(min(r["gas"] for r in rows), 0., "the phantom cut the pedal")
++
++  def test_sub_bite_frame_is_kept_when_the_pedal_is_at_true_zero(self):
++    # a light brake that rides the coast: at 20 m/s the -0.65 ask is just past coast(20) = 0.349 m/s^2, so the law
++    # sends 2-3 LSB and the pedal is ENABLE=0 exactly (true coast) - the one regime where a sub-bite frame is legal
++    rows = _Replay().run(-0.65, [None] * 25)
++    sub = _actuating(rows)
++    self.assertTrue(sub, "no 1-3 LSB frame went out over the coast - the coast case is not exercised")
++    self.assertTrue(all(not r["gas_en"] for r in rows if r["gas_sent"]), "the pedal was not at true zero on a coast")
++    self.assertEqual(0, rows[-1]["muted"], "a coast frame was withheld - light braking over coast must be untouched")
++
++  def test_a_real_bite_still_cuts_the_throttle(self):
++    rows = _Replay().run(-0.20, [GHOST] * 50)
++    bite = [r for r in rows if r["lvl"] >= fl.FCA11_FEEL_FIRST_LSB]
++    self.assertTrue(bite, "the 500 ms phantom never reached the measured bite")
++    self.assertTrue(all(r["gas"] == 0. for r in bite), "a >= 4 LSB frame did not force the throttle to exactly 0")
++
++  def test_off_path_never_withholds_a_frame(self):
++    rows = _Replay(cont=False).run(-0.20, [GHOST] * 25)
++    self.assertEqual(0, rows[-1]["muted"], "the OFF path withheld a frame")
++    self.assertTrue(all(r["lvl"] == 0 or r["gas"] == 0. for r in rows))
++
++
++class TestNoPedalFrameIsRefused(unittest.TestCase):
++  """The panda's side, through the real TX hook: the refused-frame storm is gone and the pedal never dips."""
++
++  def tearDown(self):
++    fl.FCA11_CONT_ENABLED = True
++
++  def test_phantom_refuses_no_pedal_frame(self):
++    for mf in (1, 2, 3, 5, 10):
++      with self.subTest(model_frames=mf):
++        rows = _Replay().run(-0.20, [GHOST] * (5 * mf))
++        self.assertEqual([], _refused(rows), f"{mf} model frames: the panda refused pedal frames")
++        self.assertTrue(all(r["brake_ok"] for r in rows if r["brake_ok"] is not None), "a 0x38D frame was refused")
++
++  def test_closing_lead_with_the_planner_at_zero_refuses_no_pedal_frame(self):
++    rows = _Replay().run(-0.02, [GHOST] * 25)
++    self.assertEqual([], _refused(rows), "a closing-lead sub-bite brake refused pedal frames")
++    self.assertGreater(min(r["gas"] for r in rows), 0., "the closing-lead brake cut the pedal")
++
++  def test_light_brake_over_the_coast_refuses_no_pedal_frame(self):
++    rows = _Replay().run(-0.65, [None] * 25)
++    self.assertTrue(_actuating(rows), "the coast case sent no 1-3 LSB frame - nothing to compare")
++    self.assertEqual([], _refused(rows))
++    self.assertTrue(all(r["brake_ok"] for r in rows if r["brake_ok"] is not None))
++
++  def test_a_real_bite_is_accepted_and_cuts_the_pedal(self):
++    rows = _Replay().run(-0.20, [GHOST] * 50)
++    self.assertEqual([], _refused(rows), "a real bite refuses pedal frames - it must cut them by COMMAND, not refusal")
++    self.assertTrue(any(r["lvl"] >= fl.FCA11_FEEL_FIRST_LSB and r["gas"] == 0. for r in rows))
++
++  def test_the_panda_window_mirror_is_armed_only_by_frames_that_went_out(self):
++    # a sub-bite phantom arms nothing (no refusal possible), a >= 4 LSB frame arms 110 ms (> the panda's 100 ms)
++    re_ = _Replay()
++    rows = re_.run(-0.20, [GHOST] * 50)
++    arm = [r["f"] for r in rows if r["hold"]]
++    self.assertTrue(arm, "the bite never armed the gas window")
++    self.assertGreaterEqual(max(arm) - min(arm), 10, "the armed window is shorter than the panda's exclusion window")
++
++
++if __name__ == "__main__":
++  unittest.main()

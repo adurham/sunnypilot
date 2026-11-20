@@ -1,0 +1,26 @@
+{
+  "pkl": "/Users/adam.durham/repos/sunnypilot-offload/openpilot/offload/models/driving_supercombo_fork_metal.pkl",
+  "n_iters": 25,
+  "devices": {
+    "run1": {
+      "DEV": "METAL",
+      "WARP_DEV": "METAL",
+      "QUEUE_DEV": "METAL",
+      "lat_delay": 0.1,
+      "combined_model_type": "supercombo",
+      "frame_skip": 4,
+      "n_vision_input_names": 2
+    },
+    "run2": {
+      "DEV": "METAL"
+    }
+  },
+  "all_finite": true,
+  "mean_nonzero_fraction": 0.9878787878787879,
+  "plan_shape": [
+    495
+  ],
+  "plan_absmax_run1": 58.15625,
+  "max_rel_diff_two_runs": 0.0,
+  "deterministic_rel_le_1e-6": true
+}

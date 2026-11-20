@@ -1,0 +1,124 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -221,7 +221,7 @@
+ # PID accel bound the interface hands the planner above the floor: 0.30 g cap x the measured
+ # delivered/commanded ratio (FCA11_BRAKE_GAIN) + margin. A -2.0 request commands 0.30 g raw
+ # (clamped). See the FCA11_BRAKE_GAIN block below for what that ratio is and is NOT.
+-FCA11_A_MAX_MSS2 = 3.5
++FCA11_A_MAX_MSS2 = 5.0
+ 
+ # *** FCA11_BRAKE_GAIN — ONE provenance block (the single source of truth for this constant) ***
+ #
+@@ -878,6 +878,21 @@
+ # any host 0x38D with either set. A lane that set them (patch 0024) never actuated and has been REMOVED; panda safety is
+ # deliberately not relaxed. build_fca11_frame copies both fields from the camera (always 0 here), so they are never ours.
+ 
++# *** 2026-11-03 (route 191, owner: "braking feels binary; if the initial force isn't enough nothing more happens") ***
++# THE MEASUREMENT that explains it: over 1,568 engaged plan frames on route 191 the planner's own aTarget went below
++# -2.0 m/s^2 on EIGHT frames, below -2.4 on ONE, and never below -3.0 - while the driver's pedal hit -2.4..-3.2 in the
++# same drive. openpilot's MPC plans a comfortable decel and does not escalate, so raising the LAW's ceiling (0022/0023)
++# changes nothing: the ask never arrives. Route 190/191's two near-misses are that gap.
++# THE FIX: the law computes its OWN closing demand from the lead it already receives every controller frame
++# (CS.fca11_lead_drel_m / fca11_lead_vrel_mps) and takes the harder of that and the planner's ask. Physics, not tuning:
++# to stop short of a lead at distance d with closing speed c you need c^2 / (2 * (d - gap)). It only ever ADDS braking,
++# only when the car is genuinely closing (c >= 1.0 m/s), only with a lead inside 40 m, and it is capped by the wire gate.
++FCA11_AEB_MIN_CLOSING_MPS = 1.0      # m/s: below this the car is following, not closing - never add braking
++FCA11_AEB_GAP_M = 4.0                # m: the standstill gap it defends (lead distance minus this is the room it has)
++FCA11_AEB_MAX_MSS2 = 4.9             # m/s^2: ~46 LSB, the raised wire gate - the only ceiling on this demand
++FCA11_AEB_MAX_RANGE_M = 40.0         # m: a lead beyond this is not an imminent stopping problem
++
++
+ FCA11_CRAWL_RELEASE_HOLDOFF_S = 0.5       # s: a crawl release stays a release (no re-application chatter at 6-7 LSB)
+ FCA11_CRAWL_RELEASE_HOLDOFF_FRAMES = 50   # controller frames at 100 Hz
+ 
+@@ -2657,7 +2672,31 @@
+       if self.shadow_log is not None:
+         self.shadow_log.epilogue(ep)
+       self._sh_ep = None
++
++  def _closing_demand(self, CS, accel: float) -> float:
++    """The law's OWN closing-lead demand, or ``accel`` unchanged.
+ 
++    To stop short of a lead at distance d while closing at c: a = -c^2 / (2 * (d - gap)). Takes the harder of that and
++    the planner's ask, never softens it, only ever runs on the dynamic-brakes instance, and is capped by the wire gate.
++    A missing lead, a lead beyond range, or any non-closing state leaves the ask exactly as the planner sent it.
++    """
++    if not getattr(self, "dynamic_brakes", False):
++      return accel
++    try:
++      d = float(getattr(CS, "fca11_lead_drel_m", None))
++      vr = float(getattr(CS, "fca11_lead_vrel_mps", None))
++    except (TypeError, ValueError):
++      return accel
++    if not (0.0 < d <= FCA11_AEB_MAX_RANGE_M):
++      return accel
++    closing = -vr                       # vRel is v_lead - v_ego, so closing is its negative
++    if closing < FCA11_AEB_MIN_CLOSING_MPS:
++      return accel
++    room = max(d - FCA11_AEB_GAP_M, 1.0)
++    a_req = -(closing * closing) / (2.0 * room)
++    a_req = max(a_req, -FCA11_AEB_MAX_MSS2)
++    return min(float(accel), a_req)
++
+   def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
+     """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
+     sends: list[CanData] = []
+@@ -2821,7 +2860,7 @@
+       self._log_tick(CS, frame, 0)           # 0040: close the episode, if one was open
+       return sends
+ 
+-    accel = float(CC.actuators.accel)
++    accel = self._closing_demand(CS, float(CC.actuators.accel))
+     ok, _why = self.fca11_ok(CS, frame)
+     self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
+ 
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -4554,3 +4554,47 @@
+           lane[byte] |= mask
+           lane[7] = hyundai_checksum(bytes(lane[:7]))
+           self.assertEqual([False], self._verdicts(tc, [(f, bytes(lane))], lambda x: x), name)
++
++class TestClosingDemand(unittest.TestCase):
++  """2026-11-03 (route 191): over 1,568 engaged plan frames the planner's aTarget sat below -2.0 m/s^2 on EIGHT frames and
++  never below -3.0, while the driver's own pedal hit -2.4..-3.2 in the same drive. Raising the law's ceiling does nothing
++  when the ask never arrives, so the law now computes its own closing-lead demand: a = -c^2 / (2 * (d - gap))."""
++
++  def _law(self, dynamic=True):
++    b = object.__new__(fl.Fca11LongBrake)
++    b.dynamic_brakes = dynamic
++    return b
++
++  def _cs(self, d, vr):
++    class CS:
++      pass
++    cs = CS()
++    cs.fca11_lead_drel_m = d
++    cs.fca11_lead_vrel_mps = vr
++    return cs
++
++  def test_no_lead_or_not_closing_leaves_the_ask_alone(self):
++    law = self._law()
++    self.assertEqual(-1.0, law._closing_demand(self._cs(None, None), -1.0))
++    self.assertEqual(-1.0, law._closing_demand(self._cs(20.0, 2.0), -1.0), "lead pulling away")
++    self.assertEqual(-1.0, law._closing_demand(self._cs(20.0, -0.5), -1.0), "following, not closing")
++
++  def test_physics_of_the_demand(self):
++    law = self._law()
++    # 5 m/s closing at 20 m with a 4 m gap -> 25 / (2 * 16) = 0.78 m/s^2
++    self.assertAlmostEqual(-0.781, law._closing_demand(self._cs(20.0, -5.0), -0.2), places=2)
++    # 10 m/s closing at 20 m -> 100 / 32 = 3.13
++    self.assertAlmostEqual(-3.125, law._closing_demand(self._cs(20.0, -10.0), -0.2), places=2)
++    # it never softens a harder planner ask
++    self.assertEqual(-3.5, law._closing_demand(self._cs(20.0, -5.0), -3.5))
++
++  def test_it_is_capped_by_the_wire_gate(self):
++    law = self._law()
++    self.assertEqual(-fl.FCA11_AEB_MAX_MSS2, law._closing_demand(self._cs(8.0, -30.0), 0.0))
++
++  def test_only_the_dynamic_instance_computes_it(self):
++    self.assertEqual(-0.2, self._law(False)._closing_demand(self._cs(20.0, -10.0), -0.2))
++
++  def test_beyond_range_is_not_a_stopping_problem(self):
++    law = self._law()
++    self.assertEqual(-0.2, law._closing_demand(self._cs(45.0, -10.0), -0.2))

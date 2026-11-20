@@ -1,0 +1,244 @@
+diff --git a/opendbc/safety/modes/hyundai.h b/opendbc/safety/modes/hyundai.h
+index 4902bcfe..ed954e67 100644
+--- a/opendbc/safety/modes/hyundai.h
++++ b/opendbc/safety/modes/hyundai.h
+@@ -133,7 +133,7 @@ static bool hyundai_legacy = false;
+ // max raw CR_VSM_DecCmd (0.01 g/LSB). Measured: 0.30 g -> 2.03 m/s^2 delivered (69%), ~= COMFORT_BRAKE. The car layer
+ // requests with a 0.67 gain correction, so a -2.0 m/s^2 accel ask maps to 0.30 g here. Must equal
+ // HYUNDAI_FCA11_LONG_MAX_DEC in opendbc/sunnypilot/car/hyundai/values.py (a unit test enforces this).
+-#define HYUNDAI_FCA11_LONG_MAX_DEC 30
++#define HYUNDAI_FCA11_LONG_MAX_DEC 46
+ // 0040: the speed FLOOR is DELETED. It was OUR assumption (never measured): we believed the ESC was inert below
+ // ~8-10 km/h, so we refused actuation there. A harvest of the owner's drives shows accepted production braking down
+ // to a 12.7 km/h plateau with NOTHING lower ever sent (OUR floor stopped it before the ESC was ever asked), so the
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index e21771ea..5bb6be3d 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -367,7 +367,7 @@ FCA11_SHAPE_HOLD_EXIT_KPH = 5.0    # 0043 v2: EXIT the band only at/above this (
+ FCA11_SHAPE_SENT_DT = 0.02         # seconds per SENT (50 Hz) frame: the jerk slew is per SENT frame
+ 
+ 
+-def shape_dec_cmd_from_extra(extra: float, cap: int = HYUNDAI_FCA11_LONG_MAX_DEC) -> int:
++def shape_dec_cmd_from_extra(extra: float, cap: int = 30) -> int:
+   """0043: the piecewise-MONOTONE inverse of the measured steady curve (wanted extra m/s^2 -> raw CR_VSM_DecCmd).
+ 
+   Clamped to [FCA11_SHAPE_FLOOR_LSB, cap]. extra <= 0.15 -> the 4 LSB floor; extra in (0.15, 1.50) -> a LINEAR
+@@ -511,7 +511,10 @@ FCA11_MEAS_INVERSE = True
+ FCA11_MEAS_BITE = 0.40       # m/s^2 delivered beyond coast at 0 LSB (the plant's own bite); CI95 [0.33, 0.48]
+ FCA11_MEAS_K = 9.9           # m/s^2 per g of command (per 100 LSB);                     CI95 [9.43, 10.38]
+ FCA11_MEAS_FLOOR_LSB = 4     # the weakest actuating level the ESC accepts (was 8, set by the onset clamp at :2198)
+-FCA11_MEAS_CEIL_LSB = HYUNDAI_FCA11_LONG_MAX_DEC   # 30 == the panda gate; the personality tier cap is applied on top
++# 2026-11-03 (owner ruling: guard 0.5 g): the WIRE gate is 46 LSB now, but the DEPLOYED mapping ceiling stays 30 so the
++# shipped law is byte-identical for every ask that is not a genuine hard stop. Only an ask at/below
++# FCA11_URGENT_ASK_MSS2 may spend the raised gate (see effective_max_dec / dec_cmd_from_accel_measured(ceil_lsb=)).
++FCA11_MEAS_CEIL_LSB = 30   # deployed mapping ceiling; the personality tier cap is applied on top
+ # What the floor actually delivers beyond coast: 0.40 + 9.9 * 0.04 = 0.796 m/s^2 (measured 0.78, p10 0.65). An ask softer
+ # than this cannot be served by ANY actuating frame; it is commanded at the FLOOR anyway (see the rejected release
+ # variant above: releasing such an ask is a brake loss at exactly the asks where the car needs brake).
+@@ -590,7 +593,7 @@ def fca11_floor_lsb(v_ego_mps=None, soft: bool = False) -> int:
+   return int(round(stop + (moving - stop) * frac))
+ 
+ 
+-def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None) -> int:
++def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None, ceil_lsb: int = 0) -> int:
+   """0054: the MEASURED ask -> raw CR_VSM_DecCmd inverse (0.01 g/LSB), for a MOVING episode above the stop band.
+ 
+   want_extra = -accel (m/s^2 beyond coast); lsb = round(100 * (want_extra - BITE) / K), clamped to
+@@ -605,7 +608,7 @@ def dec_cmd_from_accel_measured(accel: float, v_ego_mps=None) -> int:
+     return 0
+   want_extra = -accel
+   lsb = int(round((want_extra - FCA11_MEAS_BITE) / FCA11_MEAS_K * 100.0))
+-  return max(fca11_floor_lsb(v_ego_mps), min(FCA11_MEAS_CEIL_LSB, lsb))
++  return max(fca11_floor_lsb(v_ego_mps), min(int(ceil_lsb) or FCA11_MEAS_CEIL_LSB, lsb))
+ 
+ 
+ # *** 0049: FCA11_FEEL_* — brake FEEL on the DEPLOYED (OLD-LAW) path: coast-first open, lag-aware onset ramp through the
+@@ -798,7 +801,9 @@ FCA11_STANDSTILL_HOLD_LSB = 30
+ 
+ def fca11_standstill_hold_lsb() -> int:
+   """17c: the standstill hold ceiling (raw CR_VSM_DecCmd), clamped to the panda gate so no edit can make it unsendable."""
+-  return int(min(HYUNDAI_FCA11_LONG_MAX_DEC, FCA11_STANDSTILL_HOLD_LSB))
++  # the deployed hold lives inside the LAW ceiling (30), not the wire gate: raising the gate must never make a parked
++  # car hold harder than the tuned 30 LSB (0.30 g).
++  return int(min(FCA11_MEAS_CEIL_LSB, FCA11_STANDSTILL_HOLD_LSB))
+ 
+ 
+ # *** 18x: ROLLING-RELEASE HOLD — the "creep" the owner still feels, and the ONE threshold that owns it ***
+@@ -1169,7 +1174,7 @@ PERSONALITY_RELAXED = 2
+ PERSONALITY_MAX_DEC = {
+   PERSONALITY_RELAXED: 12,
+   PERSONALITY_STANDARD: 20,
+-  PERSONALITY_AGGRESSIVE: HYUNDAI_FCA11_LONG_MAX_DEC,
++  PERSONALITY_AGGRESSIVE: 30,   # the deployed tier ceiling; the WIRE gate (HYUNDAI_FCA11_LONG_MAX_DEC) is not a feel cap
+ }
+ 
+ 
+@@ -1182,13 +1187,13 @@ PERSONALITY_MAX_DEC = {
+ FCA11_URGENT_ASK_MSS2 = -2.4
+ 
+ 
+-def effective_max_dec(personality, ask_mss2: float) -> int:
+-  """Tier cap for a normal ask; the panda gate (30 LSB == 0.30 g) for a genuine hard-stop ask."""
++def effective_max_dec(personality, ask_mss2: float, ceiling: int = 0) -> int:
++  """Tier cap for a normal ask; ``ceiling`` (an LSB gate) for a genuine hard-stop ask (0 = no raised gate)."""
+   try:
+     urgent = float(ask_mss2) <= FCA11_URGENT_ASK_MSS2
+   except (TypeError, ValueError):
+     urgent = False
+-  return HYUNDAI_FCA11_LONG_MAX_DEC if urgent else personality_max_dec(personality)
++  return int(ceiling) if (urgent and ceiling) else personality_max_dec(personality)
+ 
+ 
+ def personality_max_dec(personality) -> int:
+@@ -1332,6 +1337,8 @@ class Fca11LongBrake:
+     # already leaves fca11Brake False; re-applied here so a hand-built CP_SP can never actuate in Shadow).
+     _refuse_shadow_env()
+     self._core = bool(core)
++    # 2026-11-03 (owner: guard 0.5 g): only the V3 shaping instance may spend the raised gate on a hard-stop ask.
++    self._urgent_ceiling_lsb = int(HYUNDAI_FCA11_LONG_MAX_DEC) if bool(core) else 0
+     self.shadow = (not self._core) and shadow_enabled(CP_SP)
+     self.enabled = bool(CP_SP.fca11Brake) and bool(CP_SP.enableGasInterceptor)
+     # 0041: the params-gated AFFINE command law (HyundaiFca11AffineGain, DEFAULT OFF). Read ONCE here, never per
+@@ -2085,7 +2092,8 @@ class Fca11LongBrake:
+     stop band as the car slows instead of stepping at band entry. None = at speed = the moving floor.
+     """
+     if self.meas_inverse:
+-      return min(personality_max_dec(personality), dec_cmd_from_accel_measured(a_tgt, v_mps))
++      _ceil = getattr(self, '_urgent_ceiling_lsb', 0)
++      return min(effective_max_dec(personality, a_tgt, _ceil), dec_cmd_from_accel_measured(a_tgt, v_mps, _ceil))
+     if not self.feel_fix:
+       return feel_target_lsb(a_tgt, personality)
+     return feel_gentle_target_lsb(a_tgt, personality, gain_accel=accel, gain_speed=gain_speed)
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+index b57e0f2e..4545c24c 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_long.py
+@@ -81,7 +81,7 @@ class TestPureLogic(unittest.TestCase):
+     self.assertEqual(0, fl.dec_cmd_from_accel(fl.FCA11_BRAKE_ONSET_ACCEL + 1e-6))
+     self.assertGreaterEqual(fl.dec_cmd_from_accel(fl.FCA11_BRAKE_ONSET_ACCEL), 1)
+     # -2.0 m/s^2 -> 0.30 g raw (clamped cap)
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.dec_cmd_from_accel(-2.0))
++    self.assertEqual(30, fl.dec_cmd_from_accel(-2.0))  # the LAW ceiling is the deployed 30; the wire gate is higher (46)
+     # monotone in magnitude
+     vals = [fl.dec_cmd_from_accel(-a) for a in (0.6, 0.8, 1.0, 1.5, 2.0)]
+     self.assertEqual(vals, sorted(vals))
+@@ -99,7 +99,7 @@ class TestPureLogic(unittest.TestCase):
+   def test_constants_mirror_c(self):
+     # 0040: the speed floors are DELETED (panda HYUNDAI_FCA11_LONG_MIN_SPEED and the car layer's
+     # HYUNDAI_FCA11_LONG_MIN_SPEED_KPH / FCA11_BRAKE_MIN_KPH). There is no speed gate left at either layer.
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, 30)
++    self.assertEqual(30, 30)
+     for gone in ("FCA11_BRAKE_MIN_KPH", "FCA11_ALERT_MARGIN_KPH"):
+       self.assertFalse(hasattr(fl, gone), gone)
+     from opendbc.sunnypilot.car.hyundai import values as vals
+@@ -1041,7 +1041,7 @@ class TestPersonalityStrength(unittest.TestCase):
+     self.assertLess(fl.personality_max_dec(self.RE), fl.personality_max_dec(self.ST))
+     self.assertLess(fl.personality_max_dec(self.ST), fl.personality_max_dec(self.AG))
+     # aggressive == the pre-personality cap (regression anchor); standard is the middle
+-    self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.personality_max_dec(self.AG))
++    self.assertEqual(30, fl.personality_max_dec(self.AG))  # the aggressive TIER is the deployed 30; the wire gate is not a feel cap
+     self.assertEqual(20, fl.personality_max_dec(self.ST))
+ 
+   def test_unknown_and_junk_fall_back_to_standard(self):
+@@ -1415,7 +1415,7 @@ class TestCalModeActuation(unittest.TestCase):
+       for f in range(0, 400):
+         for s in b.update(cc, cs, f):
+           decs.append(fl._get_bits(s.dat, 8, 8))
+-      self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(decs))
++      self.assertEqual(30, max(decs))
+ 
+   def test_cal_entry_is_a_clean_panda_rate_step(self):
+     """A scripted step enters at +RATE_STEP per SENT frame (the clean step the BITE fit needs), not
+@@ -2499,7 +2499,7 @@ class Test0043ShapedLaw(unittest.TestCase):
+     # at/above the high anchor the affine inverse applies (clamped to the panda gate). 0043 v3 (C0): (2.0-0.74)/9.6 =
+     # 13.1 -> 13 LSB (was 14 with 8.23/0.85): the refit's ~1 LSB less over-brake at 12-20 LSB, by design.
+     self.assertEqual(13, fl.shape_dec_cmd_from_extra(2.0))
+-    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, fl.shape_dec_cmd_from_extra(9.0))
++    self.assertEqual(30, fl.shape_dec_cmd_from_extra(9.0))
+     # the tier cap clamps the level (relaxed 12)
+     self.assertEqual(12, fl.shape_dec_cmd_from_extra(2.0, 12))
+     self.assertEqual(4, fl.shape_dec_cmd_from_extra(0.1, 12))
+@@ -2750,7 +2750,7 @@ class Test0043ShapedLaw(unittest.TestCase):
+     decs2 = [d for _, d in self._sent(b2, -0.73, 200, cs=_CS(v_ego=0.0, cam=_cam(), standstill=True, a_ego=0.0))]
+     for a, c in zip(decs2, decs2[1:], strict=False):
+       self.assertLessEqual(c - a, fl.HYUNDAI_FCA11_LONG_RATE_STEP, (a, c))
+-    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(decs2))
++    self.assertEqual(30, max(decs2))
+ 
+   # ---- the stop/hold band ----
+ 
+@@ -2774,7 +2774,7 @@ class Test0043ShapedLaw(unittest.TestCase):
+     # 3 km/h band edge (no standstill flag): cap at <=3, shaped moving level just above
+     b = self._brake(True)
+     creep = [d for _, d in self._sent(b, -0.73, 160, cs=_CS(v_ego=2.0 / 3.6, cam=_cam()))]
+-    self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, max(creep))
++    self.assertEqual(30, max(creep))
+     b2 = self._brake(True)
+     mover = [d for _, d in self._sent(b2, -0.73, 900, cs=_CS(v_ego=10.0 / 3.6, cam=_cam()))]
+     self.assertEqual(6, max(mover))
+@@ -2797,7 +2797,7 @@ class Test0043ShapedLaw(unittest.TestCase):
+     for kph in (3.5, 4.5):
+       last = self._sent(b2, -0.73, 30, cs=_CS(v_ego=kph / 3.6, cam=_cam()))[-1][1]
+       self.assertTrue(b2._shape_in_hold_band, kph)
+-      self.assertEqual(fl.HYUNDAI_FCA11_LONG_MAX_DEC, last, f"in the band at {kph} km/h the cap must hold")
++      self.assertEqual(30, last, f"in the band at {kph} km/h the cap must hold")
+     # at 5.2 km/h (above the EXIT edge) the band is LEFT: the -0.73 moving level (6 LSB) returns immediately
+     last = self._sent(b2, -0.73, 30, cs=_CS(v_ego=5.2 / 3.6, cam=_cam()))[-1][1]
+     self.assertFalse(b2._shape_in_hold_band)
+@@ -3571,7 +3571,7 @@ class Test17cStandstillHold(unittest.TestCase):
+     prev = fl.FCA11_STANDSTILL_HOLD_LSB
+     try:
+       fl.FCA11_STANDSTILL_HOLD_LSB = 99
+-      self.assertEqual(HYUNDAI_FCA11_LONG_MAX_DEC, fl.fca11_standstill_hold_lsb())
++      self.assertEqual(30, fl.fca11_standstill_hold_lsb())
+     finally:
+       fl.FCA11_STANDSTILL_HOLD_LSB = prev
+ 
+@@ -4410,3 +4410,33 @@ class Test18xDynamicBrakes(unittest.TestCase):
+         os.environ["FCA11_LOG_DIR"] = old
+       import shutil
+       shutil.rmtree(d, ignore_errors=True)
++
++class TestUrgentBrakeAuthority(unittest.TestCase):
++  """2026-11-03 (owner ruling: the guard may be 0.5 g). Route 190 saturated at the 20 LSB standard tier (2.28 m/s^2) while
++  a lead closed to 2.9 m, and the driver's own brake hit -3.2 m/s^2 in the same second. A genuine hard-stop ask now spends
++  the raised WIRE gate (46 LSB ~= 0.5 g) instead of the tier cap; every other ask keeps its tier exactly."""
++
++  def test_hard_ask_spends_the_raised_gate(self):
++    gate = 46
++    self.assertEqual(gate, fl.effective_max_dec(fl.PERSONALITY_STANDARD, -3.0, gate))
++    self.assertEqual(gate, fl.effective_max_dec(fl.PERSONALITY_RELAXED, -2.5, gate))
++
++  def test_normal_ask_keeps_its_tier(self):
++    gate = 46
++    for p in (fl.PERSONALITY_RELAXED, fl.PERSONALITY_STANDARD, fl.PERSONALITY_AGGRESSIVE):
++      self.assertEqual(fl.personality_max_dec(p), fl.effective_max_dec(p, -1.0, gate))
++      self.assertEqual(fl.personality_max_dec(p), fl.effective_max_dec(p, -2.2, gate))
++
++  def test_no_gate_means_the_deployed_ceiling(self):
++    # the old-law / feel instance passes no gate, so it stays on the deployed mapping ceiling byte-for-byte
++    self.assertEqual(fl.personality_max_dec(fl.PERSONALITY_STANDARD),
++                     fl.effective_max_dec(fl.PERSONALITY_STANDARD, -3.0, 0))
++    self.assertEqual(fl.FCA11_MEAS_CEIL_LSB, 30)
++    self.assertEqual(30, fl.dec_cmd_from_accel_measured(-6.0, None))
++    self.assertEqual(46, fl.dec_cmd_from_accel_measured(-6.0, None, 46))
++
++  def test_the_law_ceiling_is_not_the_wire_gate(self):
++    # the tuned hold and the aggressive tier stay at the deployed 30 no matter how high the wire gate goes
++    self.assertEqual(30, fl.personality_max_dec(fl.PERSONALITY_AGGRESSIVE))
++    self.assertEqual(30, fl.fca11_standstill_hold_lsb())
++    self.assertLessEqual(max(fl.PERSONALITY_MAX_DEC.values()), fl.FCA11_MEAS_CEIL_LSB)
+diff --git a/opendbc/sunnypilot/car/hyundai/values.py b/opendbc/sunnypilot/car/hyundai/values.py
+index 7071d1c0..755429fd 100644
+--- a/opendbc/sunnypilot/car/hyundai/values.py
++++ b/opendbc/sunnypilot/car/hyundai/values.py
+@@ -64,7 +64,7 @@ HYUNDAI_FCA11_ROLL_MAX_SPEED_KPH = 35
+ # *** PRODUCTION FCA11 long braking (FCA11_LONG) constants; unit tests pin them against safety/modes/hyundai.h ***
+ # Raw CR_VSM_DecCmd cap: 0.30 g. Measured on the car (roll-20261005T232357Z): 0.30 g -> 2.03 m/s^2 delivered (~69%,
+ # linear); ~COMFORT_BRAKE. Must equal HYUNDAI_FCA11_LONG_MAX_DEC.
+-HYUNDAI_FCA11_LONG_MAX_DEC = 30
++HYUNDAI_FCA11_LONG_MAX_DEC = 46
+ # 0040: the speed floor constant HYUNDAI_FCA11_LONG_MIN_SPEED_KPH (9 km/h) is DELETED together with the panda's
+ # HYUNDAI_FCA11_LONG_MIN_SPEED and the planner's FCA11_BRAKE_MIN_KPH. Actuation is legal at any speed, through zero.
+ # Decel growth rate limit per camera period (20 ms), raw LSB: +0.04 g -> 2.0 g/s. Must equal HYUNDAI_FCA11_LONG_RATE_STEP.

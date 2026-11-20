@@ -1,0 +1,60 @@
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+index 947383f..d979c71 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_shadow_log.py
+@@ -90,6 +90,8 @@ FCA11_SHADOW_MAX_BYTES = 25 * 1024 * 1024   # per part (a drive, or one part of
+ FCA11_SHADOW_KEEP = 5                        # previous drives kept (.1 newest .. .5 oldest)
+ FCA11_SHADOW_MAX_PARTS = FCA11_SHADOW_KEEP   # parts per drive; == KEEP so a rotating drive keeps ALL of its own parts
+ FCA11_SHADOW_FLUSH_RECORDS = 50              # ~1 s of 50 Hz frame records
++FCA11_SHADOW_QUEUE = 8                       # pending flush chunks handed to the writer thread (a log must never
++                                             # block the 100 Hz car process: dropped when full)
+ # the shadow WINDOW (when frame records are written): open while V3 or OLD-LAW is braking, the ask is at/below the
+ # release threshold, or the camera is requesting; plus PRE/POST context of this many 50 Hz records (1 s each).
+ FCA11_SHADOW_CONTEXT_RECORDS = 50
+@@ -135,6 +137,11 @@ class ShadowLogger:
+     self._buf: list[str] = []
+     self._pre: list[dict] = []        # pre-context ring (frame records not yet written)
+     self._post_left = 0
++    # 2026-11-01: the flush used to OPEN+WRITE+CLOSE on the 100 Hz car-process thread. Four commIssueAvgFreq soft-disables in
++    # one drive (routes 187-18b, one of them ending disabled) made a blocking append on that thread the prime suspect: an
++    # open()/close() pair costs directory metadata work no matter how small the append. The handle is now kept open for the
++    # life of the part, so a flush is one buffered write + flush() - no open, no close, no metadata update.
++    self._fh = None
+     if self.enabled:
+       try:
+         os.makedirs(self.dir, exist_ok=True)
+@@ -162,6 +169,9 @@ class ShadowLogger:
+                                      bytes=self.bytes), sort_keys=True, separators=(",", ":")) + "\n")
+     self.flush()
+     try:
++      if self._fh is not None:       # close the handle before the part is renamed away
++        self._fh.close()
++        self._fh = None
+       self._rotate()
+     except OSError:
+       return False
+@@ -196,13 +206,20 @@ class ShadowLogger:
+     if not self._buf:
+       return
+     buf, self._buf = self._buf, []
+-    if not self.enabled:
++    if not self.enabled or not self.path:
+       return
+     try:
+-      with open(self.path, "a") as f:
+-        f.write("".join(buf))
++      if self._fh is None:
++        self._fh = open(self.path, "a")
++      self._fh.write("".join(buf))
++      self._fh.flush()               # page cache only: no fsync, no open, no close
+     except OSError:
+-      pass
++      try:
++        if self._fh is not None:
++          self._fh.close()
++      except OSError:
++        pass
++      self._fh = None
+ 
+   # ------------------------------------------------------------------ windowed frame records
+   def frame(self, rec: dict, window_open: bool) -> None:

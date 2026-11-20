@@ -12,6 +12,11 @@ MEMORY_TEMP_LIMIT = 95.
 TEMP_HYSTERESIS = 5.
 
 
+def chestnut_big_model_on_disk() -> bool:
+  # stats files under /data/openpilot: hardwared refreshes this off its publish thread (ParamsWorker probe)
+  return (MODELS_DIR / 'big_driving_supercombo.onnx').is_file() or chestnut_compiled()
+
+
 class ChestnutStatus:
   def __init__(self):
     self.started = time.monotonic()
@@ -30,7 +35,8 @@ class ChestnutStatus:
     self.usb_failed = False
 
   def update(self, offroad: bool, branch: str, usb_state: list[dict], firmware_failed: bool,
-             model_loading: bool, model_active: bool | None, state, set_alert) -> None:
+             model_loading: bool, model_active: bool | None, state, set_alert,
+             channel: str | None = None, big_model_available: bool | None = None) -> None:
     detected = [d for d in usb_state if is_chestnut_usb_id(d["vendorId"], d["productId"], include_bootloader=True)]
     devices = [d for d in detected if is_chestnut_usb_id(d["vendorId"], d["productId"])]
     firmware_ok = len(devices) == 1 and devices[0]["product"] == CHESTNUT_USB_PRODUCT
@@ -87,8 +93,10 @@ class ChestnutStatus:
     release = branch in CHESTNUT_RELEASE_BRANCHES
     missing = self.usb_failed or (offroad and release and time.monotonic() - self.started > 10. and len(detected) != 1)
     slow_usb = offroad and len(devices) == 1 and devices[0]["speedMbps"] < 5000
-    big_model_available = (MODELS_DIR / 'big_driving_supercombo.onnx').is_file() or chestnut_compiled()
-    current_channel = get_build_metadata().channel
+    # hardwared passes both precomputed; get_build_metadata() is uncached file I/O on /data
+    if big_model_available is None:
+      big_model_available = chestnut_big_model_on_disk()
+    current_channel = channel if channel is not None else get_build_metadata().channel
     chestnut_target = CHESTNUT_BRANCHES.get(current_channel)
     chestnut_needs_switch = len(devices) == 1 and not big_model_available and chestnut_target is not None
     set_alert("Offroad_ChestnutBranch", chestnut_needs_switch, chestnut_target if chestnut_needs_switch else None)

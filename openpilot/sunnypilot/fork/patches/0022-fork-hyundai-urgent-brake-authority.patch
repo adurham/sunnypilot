@@ -1,0 +1,68 @@
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -221,7 +221,7 @@
+ # PID accel bound the interface hands the planner above the floor: 0.30 g cap x the measured
+ # delivered/commanded ratio (FCA11_BRAKE_GAIN) + margin. A -2.0 request commands 0.30 g raw
+ # (clamped). See the FCA11_BRAKE_GAIN block below for what that ratio is and is NOT.
+-FCA11_A_MAX_MSS2 = 2.0
++FCA11_A_MAX_MSS2 = 3.5
+ 
+ # *** FCA11_BRAKE_GAIN — ONE provenance block (the single source of truth for this constant) ***
+ #
+@@ -1171,6 +1171,24 @@
+   PERSONALITY_STANDARD: 20,
+   PERSONALITY_AGGRESSIVE: HYUNDAI_FCA11_LONG_MAX_DEC,
+ }
++
++
++# 2026-11-03 (route 190): the tier cap is a FEEL dial, but it was also capping SAFETY. Measured: closing a lead at
++# 3.7-8.8 m/s the planner ask sat at the -2.0 request clip, the command at the 20 LSB standard ceiling (2.28 m/s^2), the
++# car delivered -1.5..-2.0 and the gap closed to 2.9 m; one stop episode released at 1.1 km/h instead of finishing. The
++# car itself reaches 3.6 m/s^2 at the panda gate (30 LSB) and the driver's own brake hit -3.2 in the same window, so the
++# authority exists and was simply not given. A GENUINE hard-stop ask (planner at or below FCA11_URGENT_ASK_MSS2) now
++# gets the panda gate regardless of tier; every normal follow ask keeps its tier cap byte-for-byte.
++FCA11_URGENT_ASK_MSS2 = -2.4
++
++
++def effective_max_dec(personality, ask_mss2: float) -> int:
++  """Tier cap for a normal ask; the panda gate (30 LSB == 0.30 g) for a genuine hard-stop ask."""
++  try:
++    urgent = float(ask_mss2) <= FCA11_URGENT_ASK_MSS2
++  except (TypeError, ValueError):
++    urgent = False
++  return HYUNDAI_FCA11_LONG_MAX_DEC if urgent else personality_max_dec(personality)
+ 
+ 
+ def personality_max_dec(personality) -> int:
+@@ -2963,7 +2981,7 @@
+         # law the command may legitimately taper to 0 (no honest request), so the floor is the honest level, not the
+         # fixed 1 the through-origin law uses; OFF keeps the 0040 clamp exactly (raw CR_VSM_DecCmd >= 1).
+         if self.affine_gain:
+-          dec_cmd = min(dec_cmd, personality_max_dec(personality))
++          dec_cmd = min(dec_cmd, effective_max_dec(personality, _ask_for_law))
+         else:
+           dec_cmd = clamp_dec_cmd(dec_cmd, personality)
+         # 0041 (low-speed refusal fix): the affine hold/release floor is applied to the REQUEST here, BEFORE the
+@@ -2976,7 +2994,7 @@
+         if self.affine_gain and not cal_on and dec_cmd > 0:
+           in_hold_band = bool(v_kph_now <= FCA11_AFFINE_STOP_BAND_KPH or getattr(CS.out, "standstill", False))
+           dec_cmd = max(dec_cmd, FCA11_AFFINE_HOLD_LSB if in_hold_band else FCA11_AFFINE_RELEASE_LSB)
+-          dec_cmd = min(dec_cmd, personality_max_dec(personality))
++          dec_cmd = min(dec_cmd, effective_max_dec(personality, _ask_for_law))
+         if cal_on:
+           # 0029 CAL: the scripted level is a FLOOR that can only ADD braking -- never silence the
+           # planner. max() with the scripted level means: planner coasting -> the cal level (the
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_shadow.py
+@@ -523,7 +523,10 @@
+     for r in (r for r in recs if r["k"] == "ep"):
+       assert set(shlog.EPILOGUE_FIELDS) <= set(r), set(shlog.EPILOGUE_FIELDS) - set(r)
+     hard = [r for r in frames if r["ask_mps2"] == -2.6]
+-    assert hard and all(r["ask_law_mps2"] == -fl.FCA11_A_MAX_MSS2 for r in hard)
++    # 2026-11-03: the request clip is 3.5 now, so a -2.6 ask passes through instead of saturating; the invariant is that
++    # the recorded law ask is the raw ask clipped to -FCA11_A_MAX_MSS2 (whatever that constant is).
++    assert hard and all(r["ask_law_mps2"] == max(r["ask_mps2"], -fl.FCA11_A_MAX_MSS2) for r in hard)
++
+     assert any(r["v3_wouldbe_lsb"] > 0 for r in frames) and any(r["oldlaw_cmd_lsb"] > 0 for r in frames)
+     assert any(r["camera_requesting"] for r in frames)
+     assert all(r["camera_request_level"] is not None for r in frames)

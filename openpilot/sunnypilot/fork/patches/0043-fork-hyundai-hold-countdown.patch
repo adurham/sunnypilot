@@ -1,0 +1,1331 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index 5b5f66b4..2ba833aa 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -222,6 +222,12 @@ class CarStateSP:
+   superviseStop: bool = auto_field()
+   stopComplete: bool = auto_field()
+   brakeNow: bool = auto_field()
++  # 0043-CD: the standstill hold countdown, 0 none / 1 soft (>= 3000 sent frames = 60 s) / 2 loud (4500 = 90 s) /
++  # 3 final (5500 = 110 s) / 4 EXPIRED (6000 = 120 s, a STICKY latch that survives the counter reset and clears only on
++  # the driver's brake press; it is what makes the superproject disengage and release the brakes). Written by the
++  # controller from Fca11LongBrake.hold_nag (a pure observer of the SENT level - the wire is untouched) and read by
++  # car_specific.py -> events.py. Coupled with custom.capnp CarStateSP.holdNag (@21).
++  holdNag: int = auto_field()
+   # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
+   # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
+   # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
+diff --git a/opendbc/sunnypilot/car/hyundai/carstate_ext.py b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+index 85026c2c..f54f4716 100644
+--- a/opendbc/sunnypilot/car/hyundai/carstate_ext.py
++++ b/opendbc/sunnypilot/car/hyundai/carstate_ext.py
+@@ -298,6 +298,10 @@ class CarStateExt:
+     ret_sp.superviseStop = bool(armed and getattr(self, "fca11_supervise_stop", False))
+     ret_sp.stopComplete = bool(armed and getattr(self, "fca11_stop_complete", False))
+     ret_sp.brakeNow = bool(armed and getattr(self, "fca11_brake_now", False))
++    # 0043 (four tiers, replaces 0041-N's two): the standstill hold countdown, 0 none / 1 soft (60 s) / 2 loud (90 s) /
++    # 3 final (110 s) / 4 EXPIRED (120 s, a sticky latch). Same 1-frame pattern and same `armed` gate, so the field is
++    # exactly "this state is up right now"; car_specific.py raises the three tier alerts and the expiry.
++    ret_sp.holdNag = int(getattr(self, "fca11_hold_nag", 0)) if armed else 0
+     # 17c FEEDBACK: the transient driver-mark confirmation (0 none / 1 "marked GOOD" / 2 "marked BAD"), written by the
+     # controller each frame from Fca11LongBrake.mark_alert_code (same 1-frame pattern). Not gated on `armed`: the code
+     # can only be non-zero when a mark was just typed, and a mark cannot be typed without the law.
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 3740cee1..2b412e11 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -978,6 +978,94 @@ FCA11_STOP_HOLD_V_MAX_MPS = 0.2                 # m/s vEgo (0.72 km/h): margin u
+ FCA11_STOP_HOLD_WHEEL_MAX_KPH = 0.75            # km/h, FASTEST wheel (CS.fca11_wheel_max_kph); panda bound is 1.0
+ FCA11_STOP_HOLD_HBA = 1                         # CF_VSM_HBACmd value of the pair (== HYUNDAI_FCA11_LONG_STOP_HOLD_HBA)
+ 
++# *** 0043-CD: STANDSTILL HOLD COUNTDOWN v2 + RELEASE ON EXPIRY (owner decision, 2026-11-06) ***
++# Owner's words: "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 / release the
++# brakes after 2 mins". This REVERSES 0041-N ("never release on expiry") and keeps the same shape: a pure
++# OBSERVER of the sent level that writes one counter and one published state, never the level, the cap, the rate
++# gate, the ramp or any other law state - so the wire bytes are unchanged by construction (proved in the tests).
++# The clutch cannot be opened without the owner's foot, so a standstill hold is openpilot holding the car with ESC
++# pressure + a live clutch torque. That is safe but it is NOT a parking brake: at 2 min the hold is handed back.
++# MEASURED (parent, drives 195-197): the longest real hold is 97.88 s - nothing here fires on the recorded data.
++# FOUR TIERS, in SENT frames (20 ms each: controller 100 Hz / FCA11_SEND_EVERY == 2), NOT wall clock:
++#   1 soft     3000 frames =  60 s  "Stopped - press the brake" banner, LOW, silent;
++#   2 loud     4500 frames =  90 s  HIGH + AudibleAlert.warningSoft, and CONTINUOUS: the alert is asserted every
++#                                   frame, and soundd loops warningSoft for as long as an alert is asserted
++#                                   (sound_list[warningSoft] has num_loops None), so the old 30 s repeat / 3 s
++#                                   pulse logic is GONE - there is nothing left to re-chime;
++#   3 final    5500 frames = 110 s  HIGHEST + AudibleAlert.warningImmediate ("the brakes are about to release");
++#   4 expired  6000 frames = 120 s  STICKY. at 2:00 LONGITUDINAL control disengages and the brakes release; LATERAL
++#                                   (MADS) stays engaged by design (owner decision, Opus review D1 - the MADS state
++#                                   machine never sees the disengage: mads.py l.205 strips `pcmDisable` inside
++#                                   update_events, before its own state machine runs). The DEPLOYED driver-disengage
++#                                   release takes the brakes off: this car sends NOTHING on 0x38D after the disengage
++#                                   and the panda hands 0x38D back to the camera's idle frame at +90 ms (compiled
++#                                   libsafety, lane-X3/proof_release_compiled.py). There is NO host release ramp here
++#                                   (`dynamic_brakes` is False on the shaped instance). A DRIVER-BRAKE release is the
++#                                   one path that emits a host passive frame: exactly one, at level 0.
++# The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition).
++# THE LAW IS NOT TOUCHED BY ANY OF IT. The disengage is raised in the superproject from CarStateSP.holdNag == 4, and
++# the law releases because `longActive` goes False, exactly as on any driver disengage. This block only counts.
++# COUNTING UNIT: SENT frames, not wall clock - the sent stream is exactly what the ESC is holding on, it is
++# reproducible frame-for-frame in a replay (this class's other timers use time.monotonic(), which no replay can age),
++# and a frame that was never sent cannot age the hold.
++FCA11_HOLD_NAG_SENT_HZ = 50.0        # SENT frames per second (controller 100 Hz, one sent frame per FCA11_SEND_EVERY)
++FCA11_HOLD_NAG_MIN_LSB = 20          # LSB: the hold level that arms the countdown (~0.20 g of held pressure)
++# CD3 (owner, 2026-11-06): the countdown starts at a DEAD STOP - no motion at all - not at "the two wheels openpilot
++# reads say stopped". CS.out.standstill is FL and RR only (opendbc/car/hyundai/carstate.py:117), so a car dragging a
++# front-right or rear-left wheel counted as stopped. The strict gate is the FASTEST of all four wheels
++# (`CS.fca11_wheel_max_kph`, carstate.py:127), against the same 12 * 0.03125 km/h threshold carstate.py:24 uses.
++# MEASURED on the recorded drives (lane-X3/census_strict_gate.py): standstill -> all four at rest lags by at most
++# 0.175 s (197, median 0.017) and 0.087 s (198), and 43 frames INSIDE the 13 openpilot holds on 197 had standstill True
++# with the fastest wheel above the threshold (the same count over the whole drive, probe_tcs13_agreement.py, is 55 -
++# two different windows, both real; the hold-window figure is the one that matters here). The strict gate changes no
++# hold length (197 longest 97.88 s either way). TCS13 StandStill is
++# DELIBERATELY NOT part of the gate: it agrees within 0.026 s (so it adds no information) and it is False on 134 frames
++# INSIDE openpilot holds on 198-19c, which would have reset a running countdown to zero mid-hold.
++FCA11_HOLD_NAG_STILL_KPH = 12 * 0.03125   # == carstate.py:24 STANDSTILL_THRESHOLD (pinned equal by test)
++# Thresholds are FRAMES (integers) on purpose: 60 s * 50 Hz is exactly 3000, and an integer comparison cannot be
++# off by one float rounding at the boundary. Edges are pinned by test: 2999/3000, 4499/4500, 5499/5500, 5999/6000.
++FCA11_HOLD_NAG_SOFT_FRAMES = 3000    # 60.0 s: the silent banner
++FCA11_HOLD_NAG_LOUD_FRAMES = 4500    # 90.0 s: audible and continuous
++FCA11_HOLD_NAG_FINAL_FRAMES = 5500   # 110.0 s: warningImmediate
++FCA11_HOLD_NAG_EXPIRE_FRAMES = 6000  # 120.0 s: latch + LONGITUDINAL disengage + brake release (lateral stays)
++
++# The five published states (CarStateSP.holdNag -> car_specific.py -> EventNameSP.fca11HoldNagSoft/Loud/Final and
++# fca11HoldExpired). 4 is a LATCH, not a tier: it is not derived from the counter (the counter resets on the frame
++# openpilot disengages) and it clears on the driver's brake press OR on a car DRIVEN AWAY ON THE GAS (below).
++FCA11_HOLD_NAG_NONE = 0
++FCA11_HOLD_NAG_SOFT = 1
++FCA11_HOLD_NAG_LOUD = 2
++FCA11_HOLD_NAG_FINAL = 3
++FCA11_HOLD_NAG_EXPIRED = 4
++
++# CD6: the latch's SECOND clear - the driver who wakes at "BRAKES RELEASED" and drives off ON THE GAS. The red alert
++# asks for the brake pedal, and the brake is still the only thing that clears a LATCHED, STOPPED car; but a driver who
++# instead accelerates must not carry a PERMANENT full-screen red alert (and the engage strip that goes with it) for
++# the rest of the drive. The clear is `gasPressed AND vEgo > this value`, never speed alone: a latched car with nobody
++# in it can ROLL to 3 m/s in about 6 s (down a grade, or BACKWARD - the wheel speeds are unsigned, so a backward roll
++# reads exactly like a forward one), and one bad wheel-speed frame reaches it at a standstill too, so speed is not
++# evidence that a driver is there. 3.0 m/s = 10.8 km/h: creep on this car is estimated at <= 1.5 m/s, so creep with no
++# gas pedal can never clear it. Strict `>` and a FINITE value only (fail closed: a missing or NaN vEgo, or a missing
++# gasPressed, is not evidence that the driver has taken over).
++FCA11_HOLD_NAG_CLEAR_V_MS = 3.0
++
++
++def hold_nag_level(frames: int) -> int:
++  """0043-CD: the pure tier for ``frames`` CONTINUOUS sent frames of a >= FCA11_HOLD_NAG_MIN_LSB hold.
++
++  0 below FCA11_HOLD_NAG_SOFT_FRAMES, 1 from there, 2 from FCA11_HOLD_NAG_LOUD_FRAMES, 3 from
++  FCA11_HOLD_NAG_FINAL_FRAMES. It stops at 3: EXPIRED is not a tier of this function but a sticky flag in
++  `_hold_nag_step` (it has to survive the counter reset). Pure: no state, so the escalation is testable on its own
++  and cannot drift from the counter.
++  """
++  n = max(0, int(frames))
++  if n < FCA11_HOLD_NAG_SOFT_FRAMES:
++    return FCA11_HOLD_NAG_NONE
++  if n < FCA11_HOLD_NAG_LOUD_FRAMES:
++    return FCA11_HOLD_NAG_SOFT
++  return FCA11_HOLD_NAG_LOUD if n < FCA11_HOLD_NAG_FINAL_FRAMES else FCA11_HOLD_NAG_FINAL
++
++
+ 
+ def stop_hold_enabled(CP_SP) -> bool:
+   """0034: the stop-hold clutch lane switch, read from CP_SP only (getattr: an un-wired CP_SP is OFF)."""
+@@ -1897,6 +1985,15 @@ class Fca11LongBrake:
+     self.stop_hold_frames = 0          # 0034: SENT frames that carried the pair (diagnostics only, never read by the law)
+     # 0039: per-episode census of WHY a SENT frame did not carry the pair (see _stop_hold_blocker). Diagnostics only.
+     self.stop_hold_blockers: dict[str, int] = {}
++    # 0043-CD: the standstill hold countdown. `_nag_frames` counts CONTINUOUS SENT frames that put a level
++    # >= FCA11_HOLD_NAG_MIN_LSB on the wire while the car is held at standstill; `hold_nag` is the published state
++    # (0 none / 1 soft / 2 loud / 3 final / 4 EXPIRED-LATCH) the superproject turns into an alert. Neither is ever
++    # read by the law.
++    self._nag_frames = 0
++    self._hold_expired = False         # 0043-CD: the sticky latch (hold_nag == 4). Cleared by the driver's brake press
++    #                                    or by a car DRIVEN AWAY ON THE GAS (> 3 m/s); never by gas alone, gear, the
++    #                                    disengage or time.
++    self.hold_nag = FCA11_HOLD_NAG_NONE
+     self.cont_low_lsb_frames = 0       # 0037: SENT frames at 1-3 LSB (their delivered decel is unmeasured - diagnostics)
+     # 0038-excl (lane F): SENT slots whose SUB-BITE level was withheld from the wire because the same frame commanded
+     # throttle (see sub_bite_gate). A counter only - it never feeds the law.
+@@ -2153,6 +2250,7 @@ class Fca11LongBrake:
+       self._noresp_cmd_since = None
+       self._hold_lost_armed = False
+       self._brake_now_clear_since = None
++      self._hold_nag_step(CS, frame, 0)   # 0043: a disabled law holds nothing, so the countdown is not running
+       return
+     now_us = time.monotonic() * 1e6
+     gas = bool(CS.out.gasPressed)
+@@ -2242,6 +2340,10 @@ class Fca11LongBrake:
+       self.brake_now = False
+       self.brake_now_reason = ""
+       self.low_speed_alert = False
++    # 0043: the hold countdown (60 / 90 / 110 s alerts, 120 s expiry). LAST, so it sees this frame's published level
++    # and the final availability state; it only writes `_nag_frames` / `hold_nag` - the level, the cap and the
++    # release paths above are already decided.
++    self._hold_nag_step(CS, frame, dec_cmd)
+ 
+   def _log_tick(self, CS, frame: int, dec_cmd: int) -> None:
+     """0040: feed the per-episode logger. ``dec_cmd`` >= 1 means we COMMANDED an actuating frame this frame.
+@@ -2531,6 +2633,117 @@ class Fca11LongBrake:
+       self.stop_hold_blockers[why] = self.stop_hold_blockers.get(why, 0) + 1
+     return want
+ 
++  def _hold_nag_still(self, CS) -> bool:
++    """CD3: a DEAD STOP - openpilot's standstill bit AND every one of the four wheels at rest.
++
++    `CS.out.standstill` is only FL and RR (carstate.py:117). The strict signal is `CS.fca11_wheel_max_kph`, the FASTEST
++    of the four wheels (carstate.py:127), which the real CarState populates whenever CP_SP.fca11Brake is on - the only
++    case this countdown can run in. A double (or a CarState without the signal) returns False here rather than raising,
++    and a fail-closed gate can only ever keep the countdown from starting, never start it early.
++    """
++    if not bool(getattr(CS.out, "standstill", False)):
++      return False
++    wheel_max = getattr(CS, "fca11_wheel_max_kph", None)
++    if wheel_max is None:
++      return False
++    return float(wheel_max) <= FCA11_HOLD_NAG_STILL_KPH
++
++  def _hold_nag_driven_away(self, CS) -> bool:
++    """CD6: the latch's second clear - the DRIVER has driven the car away, on the gas, above 3 m/s.
++
++    The red alert asks for the brake pedal, and the brake is what clears a latched car that is still stopped. A driver
++    who wakes at "BRAKES RELEASED" and presses the GAS instead would otherwise drive off at speed under a PERMANENT
++    red full-screen alert - and under the engage strip - until their next brake press.
++
++    SPEED ALONE IS NOT EVIDENCE THAT A DRIVER IS THERE. A latched car with nobody in it gains speed on its own: a
++    roll-away down a grade reaches FCA11_HOLD_NAG_CLEAR_V_MS in about 6 s at 0.5 m/s^2, and a backward roll reads
++    EXACTLY like a forward one because the wheel speeds are unsigned (WHL_SPD11 is `@1+`). One bad wheel-speed frame
++    reaches it too: the speed filter jumps to the raw mean on any change above 2 m/s, so a single frame of one wheel
++    at 43.3 km/h at a standstill is vEgo 3.01 - and this latch is permanent, so one frame would end the alarm for
++    good. Ending the alarm exactly while an unattended car is gaining speed is the worst possible moment. So the gas
++    pedal is required as well: `gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS`, which is a driver who is driving.
++
++    WHY THE GAS PEDAL CANNOT BE OPENPILOT'S OWN COMMAND (this car runs the interceptor): `gasPressed` is the
++    GAS_SENSOR (0x201/0x701) ADC of the DRIVER's pedal, assigned after carstate.py's EMS16 value and replacing it
++    (carstate_ext.py:194-200). The pedal applies max(driver, openpilot) only at its DAC output, never on GAS_SENSOR
++    (gas_interceptor.py:80-83), and while latched the car is disengaged so openpilot commands no throttle at all.
++    The threshold is 420 raw counts against a measured foot-off rest of 353 +/- 12, i.e. ~4 % of travel - a foot
++    actually on the pedal.
++
++    On the recorded drives (2026-11-06, re-run by CD7 with the CORRECT per-extract column layout): 38 manual
++    dead-stop launches cross 3.0 m/s on 195, 196, 197, 198, 199, 19b and 19c, and 38/38 have the gas pedal down at
++    the crossing - 0 brake-only, 0 with neither pedal - so requiring the pedal costs 0 of the 38. Every gas launch
++    held the gas for at least 98 consecutive frames past the crossing (min 98, max 2533). This was checked against
++    the raw pedal signal itself (GAS_SENSOR 0x201/0x701, `(A+B)//2 > 420`): the gas column agrees with the raw ADC on
++    99.9-100 % of carState frames on all six drives tested.
++    (The earlier "24 launches - 14 with the gas, 10 with the brake" was a COLUMN SWAP, not a measurement: the two
++    extractors store carState in opposite orders - `extract_seg.py` writes t, vEgo, aEgo, gasPressed, brakePressed,
++    standstill (gas col 3) while `lane-R/extract197.py` writes t, vEgo, standstill, brakePressed, gasPressed, brake,
++    gas (gas col 4) - and the first census read gas/brake from columns 3/4 on BOTH, i.e. brakePressed as the gas on
++    the 197/198/199/19b/19c sets. With the right columns those 10 are gas launches too, and the count is 38 because
++    the 197 set was never loaded.)
++
++    FAIL CLOSED: a missing gasPressed, or a missing/non-numeric/non-finite vEgo, returns False. A signal we cannot
++    read is not evidence that the driver has taken over, and this latch must never be released on a guess.
++    """
++    # the pedal FIRST: it is the "a driver is in the car" term, and an unreadable one must never count as pressed
++    if not bool(getattr(CS.out, "gasPressed", False)):
++      return False
++    v = getattr(CS.out, "vEgo", None)
++    if v is None:
++      return False
++    try:
++      v = float(v)
++    except (TypeError, ValueError):
++      return False
++    return math.isfinite(v) and v > FCA11_HOLD_NAG_CLEAR_V_MS
++
++  def _hold_nag_step(self, CS, frame: int, dec_cmd: int) -> int:
++    """0043-CD: the standstill hold countdown. Called on EVERY controller frame from _alerts() with the frame index and
++    the level the law commanded this frame.
++
++    Advance the clock only on a SENT frame (`frame % FCA11_SEND_EVERY == 0` - the only slot the law puts 0x38D on the
++    wire) at >= FCA11_HOLD_NAG_MIN_LSB while we are holding the car at a DEAD STOP (CD3: all four wheels at rest, see
++    `_hold_nag_still`); a SENT frame below the level does not advance it and does not reset it (a dip from 30 to 7
++    mid-hold is still the same hold). Reset the COUNT on anything that ends the hold the timer is about: the car moves
++    (any wheel) / standstill is lost, gear leaves D, driver gas, the panda marks the law unavailable, or we stop
++    actuating (a released hold is not a hold - and the next one is a new episode with a new countdown).
++
++    THE LATCH IS NOT PART OF THAT RESET. Once the count reaches FCA11_HOLD_NAG_EXPIRE_FRAMES the hold has expired:
++    `_hold_expired` goes True and `hold_nag` becomes FCA11_HOLD_NAG_EXPIRED (4) for as long as the latch lasts, which
++    is what makes the superproject disengage and the release path take the brakes off. The counter resets on the very
++    frame openpilot disengages (we stop actuating) and the latch has to survive exactly that, so it is stored
++    separately and is cleared ONLY by `CS.out.brakePressed` - not by gas alone, not by gear, not by the disengage, not
++    by re-engaging and not by time - or (CD6) by the car being DRIVEN AWAY: the driver's gas pedal down AND
++    `CS.out.vEgo` above FCA11_HOLD_NAG_CLEAR_V_MS, which is what takes the permanent red alert off a driver who
++    accelerates instead of braking. A new ignition is a new instance (`__init__`).
++
++    NOTHING here touches the level: the wire is identical with and without this function (pinned by test).
++    """
++    if not self.enabled:
++      self._nag_frames = 0
++      self._hold_expired = False
++      self.hold_nag = FCA11_HOLD_NAG_NONE
++      return FCA11_HOLD_NAG_NONE
++    if bool(CS.out.brakePressed) or self._hold_nag_driven_away(CS):
++      # the two clears: the driver's brake (what the red alert asks for), and a DRIVER who has driven away on the gas
++      # above 3.0 m/s (`_hold_nag_driven_away`: gasPressed AND vEgo > FCA11_HOLD_NAG_CLEAR_V_MS - speed alone is not
++      # a driver, a roll-away and a single wheel glitch reach 3 m/s too).
++      self._hold_expired = False
++    holding = bool(self._actuating and self._hold_nag_still(CS) and
++                   not bool(CS.out.brakePressed) and not bool(CS.out.gasPressed) and
++                   CS.out.gearShifter == structs.CarState.GearShifter.drive and not self.fca11_unavailable)
++    if not holding:
++      self._nag_frames = 0
++      # THE LATCH IS DELIBERATELY NOT CLEARED HERE. This branch is what runs on the very frame the superproject
++      # disengages (we stop actuating), which is exactly the reset the latch has to survive - see the docstring.
++    elif frame % FCA11_SEND_EVERY == 0 and dec_cmd >= FCA11_HOLD_NAG_MIN_LSB:
++      self._nag_frames += 1
++      if self._nag_frames >= FCA11_HOLD_NAG_EXPIRE_FRAMES:
++        self._hold_expired = True
++    self.hold_nag = FCA11_HOLD_NAG_EXPIRED if self._hold_expired else hold_nag_level(self._nag_frames)
++    return self.hold_nag
++
+   def _passive_frame(self, CS, frame: int) -> list[CanData]:
+     """One PASSIVE mirror frame (the camera's own idle shape: DecCmd 0, Prefill 0, Warn 0, CmdAct 0,
+     DecCmdAct 0, fresh alive + CRC, every other byte the camera's).
+@@ -3629,6 +3842,9 @@ class Fca11LongBrake:
+       # 0041: and the gating timers, so a disable is a clean start.
+       self._noresp_cmd_since = None
+       self._brake_now_clear_since = None
++      # 0043: and the hold countdown - a disabled law holds nothing.
++      self._nag_frames = 0
++      self.hold_nag = FCA11_HOLD_NAG_NONE
+       self.log.flush(frame, "disabled", FCA11_STOP_KPH, self.cont_low_lsb_frames,
+                      self.stop_hold_frames, self.stop_hold_blockers)
+       self.stop_hold_blockers = {}
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 36290701..734909d9 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -791,6 +791,12 @@ class GasInterceptorCarController:
+     CS.fca11_supervise_stop = bool(self.fca11_brake.supervise_stop)
+     CS.fca11_stop_complete = bool(self.fca11_brake.stop_complete)
+     CS.fca11_brake_now = bool(self.fca11_brake.brake_now)
++    # 0043-CD: publish the standstill hold countdown (0 none / 1 soft / 2 loud / 3 final / 4 expired). A pure observer
++    # of the SENT level - it never changes a byte on the wire; CarStateExt copies it into CarStateSP.holdNag and
++    # car_specific.py raises the four alerts (and, at 4, the LONGITUDINAL disengage - lateral (MADS) stays engaged by
++    # design). 0 on every frame of a drive whose holds are
++    # shorter than FCA11_HOLD_NAG_SOFT_FRAMES (60 s).
++    CS.fca11_hold_nag = int(self.fca11_brake.hold_nag)
+     # 0029 CAL: publish the cal-hold state for this frame (read by CarStateExt.gasPressed on the NEXT
+     # CarState update -- a <= 10 ms / 1-frame lag, documented in DESIGN.md). The owner's foot must be
+     # off the pedal for a cal hold to be active (the production pedal-clear window), so this can only
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+new file mode 100644
+index 00000000..fd8efc32
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_hold_nag.py
+@@ -0,0 +1,1014 @@
++"""
++0043-CD: the standstill HOLD COUNTDOWN v2 - 60 s silent, 90 s audible, 110 s immediate, 120 s RELEASE.
++
++Owner's spec (2026-11-06): "move it to 2 mins / a silent banner after 1 min / an audio alert after 1:30 seconds /
++release the brakes after 2 mins". This REPLACES 0041-N, whose rule was the opposite ("the hold is never released").
++
++Four tiers, counted in SENT 0x38D frames at 50 Hz (controller 100 Hz / FCA11_SEND_EVERY == 2):
++  1 soft     3000 frames =  60 s   silent banner
++  2 loud     4500 frames =  90 s   audible and CONTINUOUS (no repeat/pulse logic any more)
++  3 final    5500 frames = 110 s   warningImmediate
++  4 EXPIRED  6000 frames = 120 s   a STICKY latch: at 2:00 longitudinal control disengages and the brakes release;
++                                   lateral (MADS) stays engaged by design. The law stops sending and the ESC is
++                                   released (the panda hands FCA11 back to the camera's idle frame at +90 ms,
++                                   compiled libsafety - lane-X3/proof_release_compiled.py). The latch survives the
++                                   counter reset that the disengage itself causes and clears on the driver's brake
++                                   press OR once the car is DRIVEN AWAY ON THE GAS (gasPressed AND vEgo >
++                                   FCA11_HOLD_NAG_CLEAR_V_MS = 3.0 m/s, CD6): a driver who pulls away on the gas is
++                                   not left under a permanent red alert, while speed ALONE is not evidence that a
++                                   driver is there (an unattended roll, forward or backward, reaches 3 m/s, and one bad
++                                   wheel-speed frame does too). Gas alone, gear, the disengage and creep still do not
++                                   clear it.
++The clock starts at a DEAD STOP - all four wheels at rest - not when the braking began (CD3, owner definition), and
++EVERY proof that says "deployed" runs the CAR'S CarParamsSP (continuous brake law ON, see _cp_sp_deployed), not the
++Brake-only arm; both arms are in the matrix.
++The law is UNTOUCHED: this block is a pure observer of the sent level and never writes it. The tests below prove the
++wire is byte-identical to the tree without the countdown, including through a disengage at 5999/6000/6001 sent frames.
++
++Every stream test drives the REAL controller (Fca11LongBrake.update) with a CarState double, exactly as the stop-hold
++lane's tests do, and reads the state the superproject publishes (CarStateSP.holdNag) plus what actually went out.
++Every behavioural test asserts an ACTIVITY bound first: a leg that sends no frames would pass any assertion about
++what it sends.
++"""
++import hashlib
++import unittest
++from types import SimpleNamespace
++
++from opendbc.car import structs
++from opendbc.sunnypilot.car.hyundai import fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cc, _real_camera_frame
++
++CAM = _real_camera_frame(alive=3)
++# read defensively, so a run against a tree WITHOUT the countdown fails on its claims (the nag never runs), not on an
++# AttributeError - the same rule lane V was reviewed against.
++NONE = int(getattr(fl, "FCA11_HOLD_NAG_NONE", 0))
++SOFT = int(getattr(fl, "FCA11_HOLD_NAG_SOFT", 1))
++LOUD = int(getattr(fl, "FCA11_HOLD_NAG_LOUD", 2))
++FINAL = int(getattr(fl, "FCA11_HOLD_NAG_FINAL", 3))
++EXPIRED = int(getattr(fl, "FCA11_HOLD_NAG_EXPIRED", 4))
++ARM_LSB = int(getattr(fl, "FCA11_HOLD_NAG_MIN_LSB", 20))
++SOFT_F = int(getattr(fl, "FCA11_HOLD_NAG_SOFT_FRAMES", 3000))
++LOUD_F = int(getattr(fl, "FCA11_HOLD_NAG_LOUD_FRAMES", 4500))
++FINAL_F = int(getattr(fl, "FCA11_HOLD_NAG_FINAL_FRAMES", 5500))
++EXPIRE_F = int(getattr(fl, "FCA11_HOLD_NAG_EXPIRE_FRAMES", 6000))
++
++
++def _cp_sp(fca11=True):
++  cp_sp = structs.CarParamsSP()
++  cp_sp.fca11Brake = fca11
++  cp_sp.enableGasInterceptor = True
++  return cp_sp
++
++
++# *** THE CAR'S DEPLOYED CONFIGURATION (device snapshot 2026-11-06 12:00) ***
++# Every CP_SP field the car has ON at runtime, by its STRUCT name (opendbc/car/structs.py CarParamsSP), not by the
++# params key that writes it:
++#   HyundaiFca11Brake=1          -> fca11Brake
++#   HyundaiFca11AffineGain=1     -> fca11AffineGain
++#   HyundaiFca11DynamicBrakes=1  -> fca11DynamicBrakes
++#   HyundaiPedalDeliveryLaw=1    -> pedalDeliveryLaw
++#   HyundaiGasRiseLag=1          -> gasRiseLag
++#   HyundaiGasInterceptor=1      -> enableGasInterceptor
++#   HyundaiFca11Shadow=0         -> fca11Shadow          (OFF)
++#   HyundaiFca11StopHoldClutch=0 -> fca11StopHoldClutch  (OFF)
++# The countdown proofs used to be built with `_cp_sp()` (Brake + interceptor only), which leaves the CONTINUOUS brake
++# law OFF - so they measured a configuration the car does not run. Everything that says "deployed" below uses this.
++DEPLOYED_ON = ("fca11Brake", "fca11AffineGain", "fca11DynamicBrakes", "pedalDeliveryLaw", "gasRiseLag",
++               "enableGasInterceptor")
++DEPLOYED_OFF = ("fca11Shadow", "fca11StopHoldClutch")
++
++
++def _cp_sp_deployed():
++  """CarParamsSP exactly as the car builds it (see DEPLOYED_ON / DEPLOYED_OFF)."""
++  cp_sp = structs.CarParamsSP()
++  for name in DEPLOYED_ON:
++    setattr(cp_sp, name, True)
++  for name in DEPLOYED_OFF:
++    setattr(cp_sp, name, False)
++  return cp_sp
++
++
++def _assert_deployed(brake):
++  """Fail LOUDLY if the harness is not really running the car's configuration.
++
++  The instance attributes are the law's own resolution of CP_SP (Fca11LongBrake.__init__), so this catches a
++  mis-built struct rather than re-asserting the fields back at itself. Measured on this tree:
++    cont_law      True   <- FCA11_CONT_ENABLED and shape_track (the continuous law the car runs)
++    shape_track   True   <- affine_gain AND fca11DynamicBrakes AND not shadow/core
++    affine_gain   True   <- fca11AffineGain AND fca11Brake AND not shadow
++    feel          False  <- the 0049 feel layer is OLD-LAW-instance only (`and not self.affine_gain`)
++    dynamic_brakes False <- scoped to the feel path, so it is False on the shaped/continuous instance even with
++                            CP_SP.fca11DynamicBrakes True. The release RAMP is a feel-path feature and therefore
++                            does NOT run on the car; the passive close frame (_release_pending) does.
++  """
++  assert brake.enabled, "deployed config must actuate (fca11Brake AND the gas interceptor)"
++  assert brake.affine_gain, "deployed config must resolve affine_gain"
++  assert brake.shape_track, "deployed config must resolve shape_track (affine AND fca11DynamicBrakes AND not shadow)"
++  assert brake.cont_law, "deployed config must resolve cont_law - the continuous brake law the car runs"
++  assert not brake.shadow, "the car runs Shadow OFF"
++  assert not brake.feel, "affine_gain supersedes the feel layer - feel must be False on the deployed instance"
++  assert not brake.dynamic_brakes, "the release ramp is feel-path only: dynamic_brakes is False on the shaped instance"
++  assert not brake.standstill_hold, "standstill_hold is feel-path only"
++
++
++def _assert_brake_only(brake):
++  """The OTHER arm of the matrix: Brake + interceptor only, i.e. the pre-0043 continuous law OFF."""
++  assert brake.enabled and brake.feel
++  assert not brake.affine_gain and not brake.shape_track and not brake.cont_law
++
++
++def _hold(brake, n, ask=-2.0, v=0.0, standstill=True, brake_pressed=False, gear=None, start=0, record=None,
++          engaged=True, long_active=True, wheel_max_kph=None, gas=False):
++  """Run n controller frames of a steady standstill hold. Returns [(frame, sends, hold_nag)] for every frame.
++
++  `ask` is the planner ask; at a standstill a firm one (-2.0) holds the 30 LSB ceiling the wire allows, which is the
++  regime the countdown is about. `wheel_max_kph` is the FASTEST of the four wheels (CD3: the strict dead-stop gate);
++  None means "the car is doing v", i.e. v * 3.6, so a rolling leg and a dead stop are independent knobs.
++  The camera is fresh on every frame.
++  """
++  if record is None:
++    record = []
++  for f in range(start, start + n):
++    cs = _CS(v_ego=v, cam=(0, CAM), standstill=standstill, a_ego=-1.5 if ask < 0 else 0.3,
++             brake=brake_pressed, gear=gear or structs.CarState.GearShifter.drive)
++    cs.out.gasPressed = gas
++    cs.fca11_wheel_max_kph = v * 3.6 if wheel_max_kph is None else wheel_max_kph
++    sends = brake.update(_cc(ask, engaged=engaged, long_active=long_active), cs, f)
++    record.append((f, sends, int(getattr(brake, "hold_nag", NONE))))
++  return record
++
++
++def _wire(record):
++  """[(frame, bytes)] of every 0x38D actually sent, in order."""
++  out = []
++  for f, sends, _nag in record:
++    out.extend((f, bytes(s.dat)) for s in sends if s.address == fl.FCA11_ADDR)
++  return out
++
++
++def _levels(record):
++  return [(f, fl._get_bits(dat, 8, 8)) for f, dat in _wire(record)]
++
++
++def _armed(record):
++  """Every SENT frame at or above the arming level - the frames the countdown counts."""
++  return [(f, lv) for f, lv in _levels(record) if lv >= ARM_LSB]
++
++
++def _hold_until_armed(brake, n_armed, start=0, **kw):
++  """Feed one controller frame at a time until exactly n_armed armed SENT frames have gone out.
++
++  The first sent frames of an episode are below the arming level (the onset ramp), so "119.98 s" is NOT "5999 armed
++  frames" - the boundary tests have to be built on the armed count itself.
++  """
++  rec = []
++  f = start
++  while len(_armed(rec)) < n_armed:
++    rec.extend(_hold(brake, 1, start=f, **kw))
++    f += 1
++    if f - start > 40 * n_armed:
++      raise AssertionError("the hold never reached the armed count")
++  return rec, f
++
++
++def _first_nag(record, want):
++  for f, _sends, nag in record:
++    if nag == want:
++      return f
++  return None
++
++
++def _nag_at(record, want):
++  """The count of SENT-armed frames at the moment the state first became ``want``."""
++  armed = _armed(record)
++  f_want = _first_nag(record, want)
++  if f_want is None:
++    return None
++  return sum(1 for f, _lv in armed if f <= f_want)
++
++
++class TestTierShape(unittest.TestCase):
++  """The pure four-tier escalation, in SENT frames."""
++
++  def test_named_constants(self):
++    self.assertEqual(3000, fl.FCA11_HOLD_NAG_SOFT_FRAMES)
++    self.assertEqual(4500, fl.FCA11_HOLD_NAG_LOUD_FRAMES)
++    self.assertEqual(5500, fl.FCA11_HOLD_NAG_FINAL_FRAMES)
++    self.assertEqual(6000, fl.FCA11_HOLD_NAG_EXPIRE_FRAMES)
++    self.assertEqual(20, fl.FCA11_HOLD_NAG_MIN_LSB)
++    self.assertEqual((0, 1, 2, 3, 4), (NONE, SOFT, LOUD, FINAL, EXPIRED))
++    # the 0041-N repeat/pulse machinery is GONE: an asserted alert loops in soundd, so there is nothing to re-chime
++    for gone in ("FCA11_HOLD_NAG_REPEAT_S", "FCA11_HOLD_NAG_LOUD_PULSE_S",
++                 "FCA11_HOLD_NAG_SOFT_S", "FCA11_HOLD_NAG_LOUD_S"):
++      self.assertFalse(hasattr(fl, gone), f"{gone} must be gone in v2")
++
++  def test_tier_edges_by_value(self):
++    """Both sides of every edge, by value: the counter is compared as FRAMES, never as seconds."""
++    # LITERALS on purpose (60/90/110 s at 50 sent Hz): an expectation derived from the constant would move with a
++    # mutation of that constant and prove nothing. These are the owner's times, not a restatement of the code.
++    self.assertEqual(NONE, fl.hold_nag_level(0))
++    self.assertEqual(NONE, fl.hold_nag_level(3000 - 1))
++    self.assertEqual(SOFT, fl.hold_nag_level(3000))
++    self.assertEqual(SOFT, fl.hold_nag_level(4500 - 1))
++    self.assertEqual(LOUD, fl.hold_nag_level(4500))
++    self.assertEqual(LOUD, fl.hold_nag_level(5500 - 1))
++    self.assertEqual(FINAL, fl.hold_nag_level(5500))
++    self.assertEqual(NONE, fl.hold_nag_level(-5), "never negative")
++    # and the module constants ARE those numbers (a shift here is a behaviour change, caught by test_b as well)
++    self.assertEqual((3000, 4500, 5500, 6000),
++                     (fl.FCA11_HOLD_NAG_SOFT_FRAMES, fl.FCA11_HOLD_NAG_LOUD_FRAMES,
++                      fl.FCA11_HOLD_NAG_FINAL_FRAMES, fl.FCA11_HOLD_NAG_EXPIRE_FRAMES))
++
++  def test_expired_is_not_a_tier(self):
++    """hold_nag_level stops at 3: EXPIRED is a latch that has to survive the counter reset, so it cannot be a value of
++    the pure function (a counter-derived 4 would drop back to 0 on the disengage frame - the bug this pins)."""
++    self.assertEqual(FINAL, fl.hold_nag_level(EXPIRE_F - 1))
++    self.assertEqual(FINAL, fl.hold_nag_level(EXPIRE_F))
++    self.assertEqual(FINAL, fl.hold_nag_level(10 * EXPIRE_F))
++
++
++class TestCountdownOnTheRealClass(unittest.TestCase):
++  """The counter is armed by the SENT level, tiered at 60/90/110/120 s, and latches at 120 s."""
++
++  def test_a_the_lsb_arming_gate_is_what_starts_the_clock(self):
++    """The SAME 61 s standstill hold never nags when the arming level is above what the law sends, and reaches soft
++    when it is at or below it: the clock is armed by the SENT level, not by "we are stopped"."""
++    real = fl.FCA11_HOLD_NAG_MIN_LSB
++    try:
++      fl.FCA11_HOLD_NAG_MIN_LSB = 31          # one LSB above the 30 LSB ceiling the wire allows
++      rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(61 * 100))
++      levels = [lv for _f, lv in _levels(rec)]
++      self.assertGreaterEqual(len(levels), 2900, "the law must still be holding (activity bound)")
++      self.assertEqual(30, max(levels))
++      self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++
++      fl.FCA11_HOLD_NAG_MIN_LSB = 30          # the level it actually sends
++      rec2 = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(61 * 100))
++      self.assertGreaterEqual(len(_armed(rec2)), SOFT_F, "activity: 61 s must produce >= 3000 armed sent frames")
++      self.assertEqual(SOFT, rec2[-1][2])
++    finally:
++      fl.FCA11_HOLD_NAG_MIN_LSB = real
++
++  def test_b_the_four_tiers_land_on_the_sent_clock(self):
++    """The real class, 125 s at 30 LSB: soft on the 3000th armed SENT frame, loud on the 4500th, final on the 5500th,
++    EXPIRED on the 6000th - and 4 from then on. It is the SENT count, not a wall clock (the frames are fed in a loop)."""
++    rec = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(125 * 100))
++    armed = _armed(rec)
++    self.assertGreaterEqual(len(armed), 6000, "activity: the hold must reach 6000 armed sent frames")
++    self.assertEqual(30, max(lv for _f, lv in _levels(rec)))
++    # LITERALS again: 3000 / 4500 / 5500 / 6000 armed SENT frames == 60 / 90 / 110 / 120 s at 50 Hz
++    self.assertEqual(3000, _nag_at(rec, SOFT), "soft must land on the 3000th armed sent frame")
++    self.assertEqual(4500, _nag_at(rec, LOUD), "loud must land on the 4500th")
++    self.assertEqual(5500, _nag_at(rec, FINAL), "final must land on the 5500th")
++    self.assertEqual(6000, _nag_at(rec, EXPIRED), "expiry must land on the 6000th")
++    self.assertEqual(EXPIRED, rec[-1][2], "and the latch must still be up at the end of the hold")
++
++  def test_c_motion_before_the_tier_restarts_the_clock(self):
++    """59 s of hold (no tier), then the car MOVES: the nag is 0 again and the clock restarts from zero, so a further
++    59 s of hold cannot reach soft. This is a reset, not a pause."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(59 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), 2900, "activity: 59 s must arm the clock")
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    for f in range(5900, 5940):
++      cs = _CS(v_ego=2.0, cam=(0, CAM), standstill=False, a_ego=-1.0)
++      cs.fca11_wheel_max_kph = 7.2
++      brake.update(_cc(-0.31), cs, f)
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    rec2 = _hold(brake, int(59 * 100), start=6000)
++    self.assertGreaterEqual(len(_armed(rec2)), 2900, "activity: the second leg must also be on the wire")
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec2}, "a motion reset must restart the count at 0")
++
++  def test_d_gas_at_5999_never_latches(self):
++    """One armed sent frame short of expiry, the driver presses the gas: the count resets, the latch must NOT set, and
++    the hold is back to 0. (A latch here would disengage the car on a hold that never expired.)"""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), EXPIRE_F, "activity: the hold must reach the threshold")
++    self.assertEqual(EXPIRED, rec[-1][2], "the control leg must actually expire")
++    brake2 = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec2, f_gas = _hold_until_armed(brake2, EXPIRE_F - 1)     # one armed sent frame short of expiry
++    self.assertEqual(EXPIRE_F - 1, len(_armed(rec2)), "activity: exactly one frame short")
++    self.assertEqual(FINAL, rec2[-1][2])
++    for f in range(f_gas, f_gas + 20):
++      cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++      cs.out.gasPressed = True
++      cs.fca11_wheel_max_kph = 0.0
++      brake2.update(_cc(-2.0), cs, f)
++    self.assertFalse(bool(getattr(brake2, "_hold_expired", True)), "a gas press at 5999 must not latch")
++    self.assertEqual(0, int(getattr(brake2, "_nag_frames", 0)))
++    self.assertEqual(NONE, int(getattr(brake2, "hold_nag", NONE)))
++
++  def test_e_gear_and_unavailable_at_5999_never_latch(self):
++    """Gear leaving D, and the panda marking the law unavailable, both reset the count one frame short of expiry and
++    must not latch it."""
++    for kw in ({"gear": structs.CarState.GearShifter.neutral}, {"pedal_cut": True}):
++      brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++      rec, f_reset = _hold_until_armed(brake, EXPIRE_F - 1)
++      self.assertEqual(EXPIRE_F - 1, len(_armed(rec)), "activity: exactly one frame short")
++      for f in range(f_reset, f_reset + 20):
++        cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5,
++                 gear=kw.get("gear", structs.CarState.GearShifter.drive))
++        cs.fca11_wheel_max_kph = 0.0
++        if kw.get("pedal_cut"):
++          # the panda's pedal-fault cut, as the law sees it. `fca11_unavailable` is RECOMPUTED every frame from these
++          # latches (fca11_long.py: `self.fca11_unavailable = bool(self.enabled and (self._pedal_cut or ...))`), so
++          # forcing the published flag would be overwritten - set the latch the law actually reads.
++          brake._pedal_cut = True
++        brake.update(_cc(-2.0), cs, f)
++      self.assertFalse(bool(getattr(brake, "_hold_expired", True)), f"{kw} at 5999 must not latch")
++      self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++
++  def test_e2_the_drivers_brake_at_5999_never_latches(self):
++    """The fourth reset the brief names: one armed sent frame short of expiry the driver presses the BRAKE. That is the
++    same input that CLEARS the latch once it is set, so this pins the other direction: it must not be able to set one.
++    The count resets, the latch stays False and the published state is 0 - the driver has the car, nothing to nag."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec, f_brake = _hold_until_armed(brake, EXPIRE_F - 1)
++    self.assertEqual(EXPIRE_F - 1, len(_armed(rec)), "activity: exactly one frame short")
++    self.assertEqual(FINAL, rec[-1][2])
++    for f in range(f_brake, f_brake + 40):
++      cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5, brake=True)
++      cs.fca11_wheel_max_kph = 0.0
++      brake.update(_cc(-2.0), cs, f)
++    self.assertFalse(bool(getattr(brake, "_hold_expired", True)), "a brake press at 5999 must not latch")
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)), "and the count must be back at 0")
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++
++  def test_f_the_latch_outlives_the_disengage_and_every_reset_but_the_brake(self):
++    """THE point of the latch. At expiry the superproject disengages: the law stops actuating, so the counter RESETS on
++    that very frame - and 4 has to survive it, or the alert would vanish exactly when the brakes come off. Then it must
++    survive gas, gear N, a re-engage and a second disengage, and clear ONLY on the brake press."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    rec = _hold(brake, int(121 * 100))
++    self.assertGreaterEqual(len(_armed(rec)), EXPIRE_F, "activity: the leg must reach expiry")
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)))
++    # the disengage the superproject performs on holdNag == 4
++    dis = _hold(brake, 100, start=12100, engaged=False, long_active=False)
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)), "the disengage must reset the counter")
++    self.assertEqual([], _wire(dis), "a disengaged law puts nothing on 0x38D (the ESC is handed back)")
++    self.assertEqual({EXPIRED}, {nag for _f, _s, nag in dis}, "the latch must survive the counter reset")
++    # gas
++    _hold(brake, 10, start=12200)
++    for f in range(12210, 12230):
++      cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++      cs.out.gasPressed = True
++      cs.fca11_wheel_max_kph = 0.0
++      brake.update(_cc(-2.0), cs, f)
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "gas must not clear the latch")
++    # gear N
++    _hold(brake, 10, start=12230, gear=structs.CarState.GearShifter.neutral)
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "gear must not clear the latch")
++    # re-engage (the resume edge the driver makes) and hold again: still latched, and the count starts from zero
++    # underneath it. The edge is delivered as a disengaged->engaged pair: the gear-N leg latches `_driver_cut`, and
++    # NOTHING but a CC.enabled rising edge on a clean frame clears it (fca11_long.py update()).
++    _hold(brake, 2, start=12240, engaged=False, long_active=False)
++    re_hold = _hold(brake, int(5 * 100), start=12242)
++    self.assertGreaterEqual(len(_re_sent(re_hold)), 200, "activity: the re-engaged hold must be on the wire")
++    self.assertEqual(EXPIRED, int(getattr(brake, "hold_nag", NONE)), "re-engaging must not clear the latch")
++    self.assertLess(int(getattr(brake, "_nag_frames", 0)), SOFT_F)
++    # the brake - the ONLY clear
++    b = _hold(brake, 2, start=12740, brake_pressed=True)
++    self.assertGreaterEqual(len(b), 2)
++    self.assertFalse(bool(getattr(brake, "_hold_expired", True)), "the brake press must clear the latch")
++    self.assertEqual(NONE, int(getattr(brake, "hold_nag", NONE)))
++
++  def test_g_the_nag_changes_no_wire_byte(self):
++    """Golden stream, LOCAL: the same 240 s hold run twice through the REAL class, once with the escalation neutralised
++    (hold_nag_level pinned to 0 and the latch forced off). Every 0x38D byte and every frame number must be identical -
++    the observer cannot reach the law. The CROSS-TREE pin is test_j/test_k below."""
++    real = fl.hold_nag_level
++    try:
++      normal = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++      fl.hold_nag_level = lambda _frames: 0
++      neutral = _hold(fl.Fca11LongBrake(structs.CarParams(), _cp_sp()), int(240 * 100))
++    finally:
++      fl.hold_nag_level = real
++    self.assertEqual(_wire(normal), _wire(neutral))
++    self.assertGreaterEqual(len(_wire(normal)), 11900, "activity: the stream must be a real hold")
++    self.assertEqual({SOFT, LOUD, FINAL, EXPIRED}, {nag for _f, _s, nag in normal} - {NONE},
++                     "and the countdown really ran (all four states seen)")
++
++  def test_h_disabled_feature_publishes_nothing(self):
++    """OFF is the deployed path: with fca11Brake off the law never actuates and the published state stays 0."""
++    brake = fl.Fca11LongBrake(structs.CarParams(), _cp_sp(fca11=False))
++    rec = _hold(brake, 400)
++    self.assertEqual(400, len(rec))
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    self.assertEqual(0, int(getattr(brake, "_nag_frames", 0)))
++    self.assertEqual([], _wire(rec))
++
++
++def _re_sent(record):
++  return _wire(record)
++
++
++# *** The GOLDEN, taken from the tree WITHOUT the countdown (the 0040 base + 0042). ***
++# The two streams above run in THIS tree, so a side effect _hold_nag_step had on the law would appear in both runs and
++# cancel out. These pins cannot: they were taken by running the SAME script through the base class (/tmp/CD-base =
++# aa9bff6f + patches 0001..0040 + 0042, no countdown at all). The whole stream - frame number + every 0x38D byte - is
++# byte-for-byte what that tree puts on the wire.
++# RE-PIN RULE: if the law changes, re-run this file's `_scenario_streams()` against the base tree and take its hashes;
++# do NOT re-pin from this tree (that is how a wire regression becomes invisible).
++# WHICH writes it catches (measured, not argued): the hold CEILING (FCA11_STANDSTILL_HOLD_LSB written down to 20), the
++# actuation GATE (self._actuating = False) and the panda's rate REFERENCE (self._dec_last_sent = 0) each change the
++# sha256 or the sent count and fail this test.
++GOLDEN_BASE_SHA256 = "133319d868752ebf419a9a1e181590b74ca44e8828c74f1cf4643dce490db0de"
++GOLDEN_BASE_SENT_FRAMES = 35753
++# 722 s: approach 5 s; hold 130 s; brake tap; re-engage; hold 200 s; gas; N; re-engage; hold 190 s; disengage; hold
++# 190 s; launch. 72 200 controller frames at 100 Hz.
++GOLDEN_SCRIPT = (
++  (5, {"v": 3.0, "ss": False, "ask": -1.5}),
++  (130, {}),
++  (0.3, {"brake": True}),
++  (0.1, {"eng": False, "long": False}),
++  (200, {}),
++  (0.5, {"gas": True}),
++  (2, {"gear": structs.CarState.GearShifter.neutral}),
++  (0.1, {"eng": False, "long": False}),
++  (190, {}),
++  (1, {"long": False, "eng": False}),
++  (190, {}),
++  (3, {"v": 2.0, "ss": False, "ask": 0.5}),
++)
++
++
++def _scenario_streams(cp_sp=None, check=None):
++  """Run GOLDEN_SCRIPT through the REAL class.
++
++  `cp_sp` selects the configuration (default: the Brake-only harness arm) and `check` is called with the built
++  instance so a caller can ASSERT the configuration really resolved (see _assert_deployed).
++  Returns (sha256, sent_frames, armed_frames, nag-per-frame, [(frame, level)] of every sent frame).
++  """
++  brake = fl.Fca11LongBrake(structs.CarParams(), cp_sp if cp_sp is not None else _cp_sp())
++  if check is not None:
++    check(brake)
++  brake._dyn_log = None
++  brake._mark_log = None
++  h = hashlib.sha256()
++  sent = armed = 0
++  frame = 0
++  nag, levels = [], []
++  for dur, kw in GOLDEN_SCRIPT:
++    for _ in range(int(dur * 100)):
++      v = kw.get("v", 0.0)
++      cs = _CS(v_ego=v, cam=(0, CAM), standstill=kw.get("ss", True),
++               a_ego=-1.5 if kw.get("ask", -2.0) < 0 else 0.3,
++               brake=kw.get("brake", False), gear=kw.get("gear", structs.CarState.GearShifter.drive))
++      cs.out.gasPressed = kw.get("gas", False)
++      cs.fca11_wheel_max_kph = v * 3.6
++      cc = _cc(kw.get("ask", -2.0))
++      cc.longActive = kw.get("long", True)
++      cc.enabled = kw.get("eng", True)
++      for s in brake.update(cc, cs, frame):
++        if s.address == fl.FCA11_ADDR:
++          h.update(frame.to_bytes(4, "little") + bytes(s.dat))
++          sent += 1
++          lv = fl._get_bits(s.dat, 8, 8)
++          armed += lv >= ARM_LSB
++          levels.append((frame, lv))
++      nag.append(int(getattr(brake, "hold_nag", NONE)))
++      frame += 1
++  return h.hexdigest(), sent, armed, nag, levels
++
++
++class TestGoldenStreamOnTheBase(unittest.TestCase):
++  """The CROSS-TREE golden: a 722 s scripted drive with every reset event, hashed against the tree without the
++  countdown."""
++
++  def test_j_a_722_s_scripted_hold_reproduces_the_base_bytes(self):
++    sha, sent, armed, nag, levels = _scenario_streams()
++    self.assertEqual(GOLDEN_BASE_SENT_FRAMES, sent)
++    self.assertEqual(GOLDEN_BASE_SHA256, sha, "the countdown must not change ONE byte of the base stream")
++    # the stream IS a real hold (>= 20 LSB on 99 % of sent frames), so the identity above means something
++    self.assertGreaterEqual(armed, int(0.99 * sent))
++    # and the countdown really ran across that stream: every tier was reached in the first 130 s hold, and each tier
++    # landed on its own ARMED SENT FRAME count (3000 / 4500 / 5500 / 6000), not on wall time
++    armed_frames = [f for f, lv in levels if lv >= ARM_LSB]
++    self.assertGreaterEqual(len(armed_frames), EXPIRE_F, "activity: the first hold must reach expiry")
++    for want, threshold in ((SOFT, SOFT_F), (LOUD, LOUD_F), (FINAL, FINAL_F), (EXPIRED, EXPIRE_F)):
++      f_want = nag.index(want)
++      self.assertEqual(threshold, sum(1 for f in armed_frames if f <= f_want),
++                       f"tier {want} must land on armed sent frame {threshold}")
++    ends, stop = [], 0
++    for dur, _kw in GOLDEN_SCRIPT:
++      stop += int(dur * 100)
++      ends.append(nag[stop - 1])
++    # brake / gas / N / disengage: the two holds both expire, so 4 survives every phase end after them - the brake
++    # tap at 135 s is the ONE thing that drops it back to 0, and nothing after it (gas, N, disengage, moving) clears it
++    self.assertEqual([0, EXPIRED, NONE, NONE, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED, EXPIRED],
++                     ends)
++
++  def test_k_a_disengage_at_the_expiry_boundary_is_byte_identical_to_the_base(self):
++    """P1(b): the same hold, disengaged one armed sent frame before expiry (5999), exactly at it (6000) and one after
++    (6001), plus a 130 s hold that is never disengaged. Every one must hash to what the BASE tree produces for that
++    exact stream: the observer cannot change a byte, not even on the frame it expires on."""
++    for n in (5999, 6000, 6001):
++      sha, sent, armed, nag = _disengage_stream(n_armed=n)
++      self.assertEqual(n, armed, "activity: exactly n armed sent frames before the disengage")
++      self.assertEqual(BASE_DISENGAGE_SHA[("armed", n)], sha, f"disengage at armed sent frame {n}")
++      # the nag is non-decreasing up to the disengage and drops to 0 the frame the counter resets, unless the latch
++      # caught it - so max() is the state the disengage arrived in
++      self.assertEqual(EXPIRED if n >= EXPIRE_F else FINAL, max(nag),
++                       f"the latch state when the disengage lands {n} armed frames in")
++    # the brief words this as "sent frame N": same measurement, and it lands 4 armed frames short of the boundary
++    # because the onset ramp is below the arming level. The wire is identical either way; the latch is not.
++    sha, sent, armed, nag = _disengage_stream(n_sent=6000)
++    self.assertEqual(6000, sent)
++    self.assertEqual(5996, armed)
++    self.assertEqual(BASE_DISENGAGE_SHA[("sent", 6000)], sha, "disengage at the 6000th SENT frame")
++    self.assertEqual(FINAL, max(nag), "4 armed frames short of expiry is not expiry")
++    self.assertEqual(NONE, nag[-1], "and with no latch the counter reset takes the banner away")
++    # and a plain 130 s hold that is never disengaged
++    sha, sent, armed, nag = _disengage_stream(None, hold_frames=13000)
++    self.assertEqual(6500, sent)
++    self.assertEqual(BASE_130S_SHA, sha, "a 130 s hold")
++    self.assertEqual(EXPIRED, nag[-1])
++def _disengage_stream(n_armed=None, n_sent=None, hold_frames=12600, cp_sp=None, check=None):
++  """Feed a steady standstill hold and drop longActive on the frame the boundary is reached.
++
++  `n_armed` counts SENT frames at or above the arming level (what the countdown counts); `n_sent` counts every SENT
++  0x38D (what P1(b)'s wording says). They are NOT the same number: the first 4 sent frames of an episode are the onset
++  ramp and sit below 20 LSB, so "sent frame 6000" is "armed frame 5996" - which is why BOTH are measured here.
++  Returns (sha256 of frame+bytes over every sent 0x38D, sent count, armed count, nag per controller frame).
++  """
++  brake = fl.Fca11LongBrake(structs.CarParams(), cp_sp if cp_sp is not None else _cp_sp())
++  if check is not None:
++    check(brake)
++  brake._dyn_log = None
++  brake._mark_log = None
++  h = hashlib.sha256()
++  sent = armed = 0
++  nag = []
++  for f in range(hold_frames):
++    long_active = not ((n_armed is not None and armed >= n_armed) or (n_sent is not None and sent >= n_sent))
++    cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++    cs.fca11_wheel_max_kph = 0.0
++    for s in brake.update(_cc(-2.0, engaged=long_active, long_active=long_active), cs, f):
++      if s.address == fl.FCA11_ADDR:
++        h.update(f.to_bytes(4, "little") + bytes(s.dat))
++        sent += 1
++        armed += fl._get_bits(s.dat, 8, 8) >= ARM_LSB
++    nag.append(int(getattr(brake, "hold_nag", NONE)))
++  return h.hexdigest(), sent, armed, nag
++
++
++# Hashes of the same streams produced by the BASE tree (aa9bff6f + 0001..0040 + 0042, no countdown at all), taken by
++# running this file's `_disengage_stream` against it. See the RE-PIN RULE above.
++BASE_DISENGAGE_SHA = {
++  ("armed", 5999): "969c68f3bf5a724f13be8a7d8165bafb6e910b484c597f44c706c3f877ee16c9",
++  ("armed", 6000): "ecbe08bed6cd9d808e8c40d13e10452b99c0d2b72743bd484dd1e76d2961bd69",
++  ("armed", 6001): "7de985a07e05dd90d19f05de52ba8758c02dcb75f322f04eacc50e1d4c3eeae4",
++  ("sent", 6000): "b098e3e8a5fb5adbd90c63108b7b9baca91f55583685583874b9438d33332ef1",
++}
++BASE_130S_SHA = "a3efc997d1302589fc4ff20c14616aa19513ae22733ac12164c4f9167329304c"
++
++
++# *** THE DEPLOYED-CONFIG PINS (CD3). ***
++# Same golden streams, same re-pin rule - but built with _cp_sp_deployed(), i.e. the configuration the CAR runs
++# (continuous brake law ON). Taken FROM /tmp/CD-base with pin_deployed.py; the base publishes no nag at all
++# (max_nag 0 on every stream), so these hashes cannot carry a countdown side effect.
++# MEASURED (CD3): the deployed stream is NOT the brake-only stream - 35 765 sent 0x38D against 35 753, because the
++# continuous law ramps 1..30 LSB instead of stepping 4..30 - so the pins are a separate set, and the Brake-only set stays
++# as the second arm of the matrix.
++DEPLOYED_GOLDEN_SHA256 = "0eb2cf024e7ff9cc3e5ae9e61c4fdd3d3097d97adafdf427d8a7b63df1aeec4f"
++DEPLOYED_GOLDEN_SENT_FRAMES = 35765
++DEPLOYED_DISENGAGE_SHA = {
++  ("armed", 5999): "ac73d663b05074b3e7f03ee579dc48cd4441b3f650f838093946b6c8f8f6813c",
++  ("armed", 6000): "d529b6a94cb8cb012c552634962d1a22b6788878207c4c7900b49a7058a7bec7",
++  ("armed", 6001): "ca64ee24ba9268f45c9f4dc66584e8ebb2ec5193e76faaf0b6cb015379057e96",
++  ("sent", 6000): "d1c9cda9fd0893f4564935fb8fa767b482844adf8b4403f09f65becaf04aa39a",
++}
++DEPLOYED_130S_SHA = "a0b2df95e70df93fbc24a70d312d88c0e1fb5dbdaafa9c1313d94ff1366d7f4f"
++
++
++class TestDeployedConfig(unittest.TestCase):
++  """CD3: the SAME proofs under the configuration the car actually runs.
++
++  The gap this closes: `_cp_sp()` sets fca11Brake + enableGasInterceptor only, so `cont_law` is False in every proof
++  above - the plain Brake-only (feel) law. The car runs affine gain + dynamic brakes, which resolves cont_law True
++  (the continuous brake law, fca11_long.py `self.cont_law = FCA11_CONT_ENABLED and self.shape_track`). Every test here
++  asserts the RESOLVED law attributes first, so a mis-built config fails loudly instead of silently measuring the wrong
++  law.
++  """
++
++  def test_config_resolves_the_continuous_law_and_not_the_brake_only_arm(self):
++    dep = fl.Fca11LongBrake(structs.CarParams(), _cp_sp_deployed())
++    _assert_deployed(dep)          # cont_law/shape_track/affine_gain True; feel/dynamic_brakes/shadow False
++    bo = fl.Fca11LongBrake(structs.CarParams(), _cp_sp())
++    _assert_brake_only(bo)         # feel True; affine/cont_law False
++    # the two arms really are different laws, not a relabelled struct
++    self.assertTrue(dep.cont_law and not bo.cont_law)
++    self.assertTrue(bo.feel and not dep.feel)
++
++  def test_j_deployed_722_s_hold_is_byte_identical_to_the_base(self):
++    """P1(a) under the deployed config: the 722 s scripted drive (every reset event) hashes to what the tree WITHOUT
++    the countdown produces for the same configuration - frame number + every 0x38D byte of 35 765 sent frames."""
++    sha, sent, armed, nag, levels = _scenario_streams(cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(DEPLOYED_GOLDEN_SENT_FRAMES, sent, "activity: the deployed stream must put frames on the wire")
++    self.assertEqual(DEPLOYED_GOLDEN_SHA256, sha, "the countdown must not change ONE byte of the deployed stream")
++    self.assertGreaterEqual(armed, int(0.99 * sent))
++    # the countdown really ran on THIS stream, and each tier landed 3000/4500/5500/6000 ARMED SENT frames after the
++    # stop - the 218 armed frames of the 5 s approach (v = 3 m/s, standstill False) are NOT counted, which is the
++    # dead-stop rule measured on the deployed law.
++    armed_frames = [f for f, lv in levels if lv >= ARM_LSB]
++    stop = 500                                   # the approach is the first 5 s of GOLDEN_SCRIPT
++    self.assertEqual(218, sum(1 for f in armed_frames if f < stop), "activity: the approach must be armed and uncounted")
++    for want, threshold in ((SOFT, SOFT_F), (LOUD, LOUD_F), (FINAL, FINAL_F), (EXPIRED, EXPIRE_F)):
++      self.assertIn(want, nag, f"tier {want} must be reached on the deployed stream")
++      f_want = nag.index(want)
++      self.assertEqual(threshold, sum(1 for f in armed_frames if stop <= f <= f_want),
++                       f"tier {want} must land {threshold} armed sent frames after the stop")
++
++  def test_k_deployed_disengage_at_the_expiry_boundary_is_byte_identical_to_the_base(self):
++    """P1(b) under the deployed config: disengage at armed sent frame 5999 / 6000 / 6001, at the 6000th SENT frame,
++    and a plain 130 s hold. Every hash must equal the base tree's hash for that exact stream, and the latch must still
++    land exactly on the 6000th armed frame (5999 -> FINAL, 6000 -> EXPIRED)."""
++    for n in (5999, 6000, 6001):
++      sha, sent, armed, nag = _disengage_stream(n_armed=n, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++      self.assertEqual(n, armed, "activity: exactly n armed sent frames before the disengage")
++      self.assertEqual(DEPLOYED_DISENGAGE_SHA[("armed", n)], sha, f"disengage at armed sent frame {n}")
++      self.assertEqual(EXPIRED if n >= EXPIRE_F else FINAL, max(nag),
++                       f"the latch state when the disengage lands {n} armed frames in")
++    sha, sent, armed, nag = _disengage_stream(n_sent=6000, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(6000, sent)
++    self.assertEqual(5972, armed)
++    self.assertEqual(DEPLOYED_DISENGAGE_SHA[("sent", 6000)], sha, "disengage at the 6000th SENT frame")
++    self.assertEqual(FINAL, max(nag), "28 armed frames short of expiry is not expiry")
++    sha, sent, armed, nag = _disengage_stream(None, hold_frames=13000, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++    self.assertEqual(6496, sent)
++    self.assertEqual(6468, armed)
++    self.assertEqual(DEPLOYED_130S_SHA, sha, "a 130 s deployed hold")
++    self.assertEqual(EXPIRED, nag[-1])
++
++
++
++
++
++# *** CD3 (owner): the countdown starts at a DEAD STOP - no motion at all - and only there. ***
++# CS.out.standstill is FL and RR only (carstate.py:117). The strict gate is the FASTEST of all four wheels
++# (CS.fca11_wheel_max_kph, carstate.py:127) against 12 * 0.03125 km/h (carstate.py:24, pinned equal to
++# fl.FCA11_HOLD_NAG_STILL_KPH below). MEASURED on the recorded drives (lane-X3/census_strict_gate.py): 43 frames
++# INSIDE the 13 openpilot holds on drive 197 had standstill True with the fastest wheel above the threshold (the same
++# count over the whole drive - lane-X3/probe_tcs13_agreement.py - is 55; two windows, both real, the hold-window figure
++# is the one this gate acts on), the lag to a real dead stop is at most 0.175 s, and the strict gate changes no hold
++# length (197's longest hold is 97.88 s either way).
++class TestDeadStopGate(unittest.TestCase):
++  """Every test here runs the CAR'S configuration (continuous law ON) and asserts it resolved."""
++
++  def _brake(self):
++    b = fl.Fca11LongBrake(structs.CarParams(), _cp_sp_deployed())
++    _assert_deployed(b)
++    b._dyn_log = None
++    b._mark_log = None
++    return b
++
++  def test_the_threshold_is_the_one_carstate_uses(self):
++    from opendbc.car.hyundai import carstate
++    self.assertEqual(12 * 0.03125, fl.FCA11_HOLD_NAG_STILL_KPH)
++    self.assertEqual(carstate.STANDSTILL_THRESHOLD, fl.FCA11_HOLD_NAG_STILL_KPH,
++                     "the countdown's dead-stop threshold must be carstate's STANDSTILL_THRESHOLD")
++
++  def test_the_real_carstate_populates_the_strict_signal(self):
++    """The gate is only usable if the REAL CarState publishes it with fca11Brake on: build the real CarState, the real
++    CAN parsers and real 0x386 / 0x394 frames, then check the two published signals. This is also the end-to-end
++    version of the owner's case: FL and RR at rest (CS.out.standstill True) with the rear-left wheel turning - the
++    countdown's gate must be False while openpilot's standstill bit is True."""
++    from opendbc.can import CANPacker
++    from opendbc.car.car_helpers import interfaces
++    from opendbc.car.hyundai.carstate import CarState
++    from opendbc.car.hyundai.values import CAR
++
++    car = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++    fingerprint = {i: {} for i in range(8)}
++    fingerprint[0] = {0x260: 8, 0x371: 8, 0x386: 8, 0x394: 8, 0x251: 8, 0x4F1: 4, 0x340: 8, 0x201: 6}
++    CP = interfaces[car].get_params(car, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++    CP_SP = _cp_sp_deployed()
++    cs = CarState(CP, CP_SP)
++    parsers = cs.get_can_parsers(CP, CP_SP)
++    packer = CANPacker("hyundai_can_generated")
++
++    def feed(fl_kph, fr_kph, rl_kph, rr_kph, still_bit):
++      whl = packer.make_can_msg("WHL_SPD11", 0, {"WHL_SPD_FL": fl_kph, "WHL_SPD_FR": fr_kph,
++                                                 "WHL_SPD_RL": rl_kph, "WHL_SPD_RR": rr_kph})[1]
++      tcs = packer.make_can_msg("TCS13", 0, {"StandStill": int(still_bit)})[1]
++      for p in parsers.values():
++        p.update([(0.0, [(0x386, whl, 0), (0x394, tcs, 0)])])
++      ret, _ret_sp = cs.update(parsers)
++      return ret
++
++    ret = feed(0.0, 0.0, 0.0, 0.0, True)
++    # the strict signal lives on the CarState READER (carstate.py assigns self.fca11_wheel_max_kph, not ret.*), which
++    # is exactly the object the controller is handed - CS.fca11_wheel_max_kph, with CS.out the struct
++    self.assertEqual(0.0, cs.fca11_wheel_max_kph)
++    self.assertTrue(ret.standstill)
++    # TCS13 StandStill is NOT part of the gate (see the constant's comment): it is decoded here only to show the signal
++    # the drives were measured on exists; the gate itself reads the wheel speeds.
++    self.assertIn(type(cs.fca11_esc_standstill), (bool,))
++    # one wheel turning: openpilot's standstill (FL/RR only) stays True, the strict signal does not
++    ret = feed(0.0, 0.0, 0.9375, 0.0, True)
++    self.assertTrue(ret.standstill, "CS.out.standstill only reads FL and RR - this is the looseness CD3 closes")
++    self.assertAlmostEqual(0.9375, float(cs.fca11_wheel_max_kph), places=6)
++    fake = _CS(v_ego=0.0, cam=(0, CAM), standstill=True, a_ego=-1.5)
++    fake.fca11_wheel_max_kph = cs.fca11_wheel_max_kph
++    b = self._brake()
++    self.assertFalse(b._hold_nag_still(fake), "a turning rear-left wheel is not a dead stop")
++    fake.fca11_wheel_max_kph = 0.0
++    self.assertTrue(b._hold_nag_still(fake))
++
++  def test_rolling_never_advances_the_counter_at_any_speed(self):
++    """Owner: a car rolling at 0.5 / 1 / 2 m/s with a hold-level ask must not advance the clock - and must still be
++    sending (an activity bound: a leg that sends nothing would pass vacuously)."""
++    for v in (0.5, 1.0, 2.0):
++      b = self._brake()
++      rec = _hold(b, 4000, v=v, standstill=False)          # 40 s at a firm ask: the law really brakes
++      levels = [lv for _f, lv in _levels(rec)]
++      self.assertGreater(len(levels), 1000, f"activity at {v} m/s: the law must be braking, got {len(levels)} frames")
++      self.assertGreaterEqual(max(levels), ARM_LSB, f"activity at {v} m/s: the level must be a hold-level ask")
++      self.assertEqual({NONE}, {nag for _f, _s, nag in rec}, f"no tier may appear while rolling at {v} m/s")
++      self.assertEqual(0, b._nag_frames, f"the counter must stay 0 while rolling at {v} m/s")
++
++  def test_one_wheel_turning_never_advances_the_counter(self):
++    """The owner's exact looseness case: FL and RR at 0 (so CS.out.standstill is True) with another wheel above the
++    threshold. Frames keep going out; the count stays 0."""
++    b = self._brake()
++    rec = _hold(b, 4000, v=0.0, standstill=True, wheel_max_kph=0.9375)   # RL turning
++    levels = [lv for _f, lv in _levels(rec)]
++    self.assertGreater(len(levels), 1000, "activity: the law must be sending while it holds")
++    self.assertGreaterEqual(max(levels), ARM_LSB)
++    self.assertEqual({NONE}, {nag for _f, _s, nag in rec})
++    self.assertEqual(0, b._nag_frames)
++    # dropping back to a real dead stop starts the clock - and it starts from ZERO, i.e. the 4000 frames above counted
++    # for nothing: the banner lands 3000 armed frames later, not 3000 frames after the braking began.
++    rec2 = _hold(b, 6200, start=4000)
++    armed2 = [(f, lv) for f, lv in _levels(rec2) if lv >= ARM_LSB]
++    f_soft = _first_nag(rec2, SOFT)
++    self.assertIsNotNone(f_soft, "a real dead stop must eventually banner")
++    self.assertEqual(3000, sum(1 for f, _lv in armed2 if f <= f_soft),
++                     "the 3000 counted frames must all come from the dead stop")
++
++  def test_the_clock_starts_at_the_first_sent_frame_after_all_four_wheels_rest(self):
++    """Owner: "the clock starts at the first SENT frame after standstill goes True, i.e. soft lands on exactly the
++    3000th armed frame counted from the stop, not from the braking start"."""
++    b = self._brake()
++    rolling = _hold(b, 3000, v=1.0, standstill=False)     # 30 s of real braking up to the stop
++    self.assertGreater(len(_levels(rolling)), 1000, "activity: frames must be on the wire before the stop")
++    self.assertEqual(0, b._nag_frames)
++    stop = 3000
++    rec = _hold(b, 6600, start=stop)                       # 66 s at a dead stop
++    armed = [(f, lv) for f, lv in _levels(rec) if lv >= ARM_LSB]
++    self.assertGreater(len(armed), 3000, "activity: the hold must put armed frames on the wire")
++    f_soft = _first_nag(rec, SOFT)
++    self.assertIsNotNone(f_soft)
++    self.assertEqual(3000, sum(1 for f, _lv in armed if f <= f_soft),
++                     "soft must land on the 3000th armed SENT frame counted from the stop")
++
++  def test_a_roll_away_restarts_the_clock_from_the_second_stop(self):
++    """Owner: standstill for 2000 frames, ONE frame of motion, standstill again -> soft must land 3000 armed frames
++    after the SECOND stop, not after the first."""
++    b = self._brake()
++    first = _hold(b, 2000, start=0)
++    self.assertGreater(len(_levels(first)), 900, "activity: the first stop must be a real hold")
++    self.assertGreater(b._nag_frames, 900, "activity: the first stop must have counted")
++    moved = _hold(b, 1, v=1.0, standstill=False, start=2000)
++    self.assertEqual(0, b._nag_frames, "one moving frame must reset the count")
++    self.assertEqual(NONE, moved[-1][2])
++    second = _hold(b, 6600, start=2001)
++    armed = [(f, lv) for f, lv in _levels(second) if lv >= ARM_LSB]
++    f_soft = _first_nag(second, SOFT)
++    self.assertIsNotNone(f_soft)
++    self.assertEqual(3000, sum(1 for f, _lv in armed if f <= f_soft),
++                     "soft must land 3000 armed SENT frames after the SECOND stop")
++    self.assertGreater(f_soft, 2001 + 3000, "that is later than the first stop + 3000 frames")
++
++  # ---- CD3 item 5: the latch mutations, re-aimed at the DEPLOYED configuration ----
++  def test_l_the_latch_survives_gas_gear_disengage_and_re_engage_but_not_the_brake(self):
++    """Deployed config: expire the hold, then drive every reset the observer has. Gas, gear out of D, the disengage
++    and the re-engage must all leave holdNag at 4; only the driver's brake press may clear it."""
++    b = self._brake()
++    hold = _hold(b, 12600)                                   # 126 s -> expiry at 120 s
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    self.assertTrue(b._hold_expired)
++    f = 12600
++    for kw, label in (({"gas": True}, "gas"),
++                      ({"gear": structs.CarState.GearShifter.neutral}, "gear"),
++                      ({"engaged": False, "long_active": False}, "disengage"),
++                      ({"engaged": False, "long_active": False}, "re-engage (fresh episode)"),
++                      ({}, "normal hold frame")):
++      rec = _hold(b, 20, start=f, **kw)
++      f += 20
++      self.assertEqual(EXPIRED, rec[-1][2], f"{label} must NOT clear the latch")
++      self.assertTrue(b._hold_expired, f"{label} must NOT clear the latch")
++    # the brake press does clear it - and only from then on is the banner gone
++    rec = _hold(b, 5, start=f, brake_pressed=True)
++    self.assertEqual(NONE, rec[-1][2], "the brake press must clear the latch")
++    self.assertFalse(b._hold_expired)
++
++  def test_l2_the_brake_clears_the_latch_on_the_FIRST_brake_frame(self):
++    """N2 (Opus re-review, D2): 'clear the latch one frame later' SURVIVED 25/25 - test_f and test_l only look at the
++    state AFTER the press (2 and 5 frames in), so an off-by-one in the clear went unseen.
++
++    The law clears on the very frame `CS.out.brakePressed` goes true (`_hold_nag_step`, the same frame the counter is
++    reset on). One frame at 50 Hz of a PERMANENT red "BRAKES RELEASED / PRESS BRAKE PEDAL" - and of the enable strip
++    that goes with it - while the driver's foot is ALREADY on the brake is one frame of the wrong instruction, so this
++    pins the FIRST frame and nothing later.
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)                                   # 126 s -> expiry at 120 s
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    self.assertTrue(b._hold_expired)
++    # ONE frame with the brake down
++    rec = _hold(b, 1, start=12600, brake_pressed=True)
++    self.assertEqual(1, len(rec), "activity: exactly one frame must be driven")
++    self.assertEqual([12600], [f for f, _s, _n in rec])
++    self.assertEqual(NONE, rec[0][2], "the FIRST brake frame must already read NONE (a one-frame-late clear fails here)")
++    self.assertFalse(b._hold_expired, "the FIRST brake frame must already clear the latch")
++    # and it is cleared for good: the next frames cannot resurrect it off the counter (the count was already 0)
++    for nag in (n for _f, _s, n in _hold(b, 5, start=12601, brake_pressed=True)):
++      self.assertEqual(NONE, nag, "the latch must not come back on the frames after the press")
++
++  def test_l3_a_car_DRIVEN_AWAY_ON_THE_GAS_clears_the_latch_and_speed_alone_does_not(self):
++    """CD6: the latch's second clear. The brake pedal is what the red alert asks for, but a driver who wakes at
++    "BRAKES RELEASED" and accelerates must not drive off under a PERMANENT red full-screen alert (and its engage
++    strip) until their next brake press. `gasPressed AND CS.out.vEgo > FCA11_HOLD_NAG_CLEAR_V_MS` clears it.
++
++    SPEED ALONE DOES NOT (Opus re-review 2, and the reason this test exists in this shape): a latched car with nobody
++    in it ROLLS past 3 m/s in about 6 s on a grade, a backward roll reads the SAME value (the wheel speeds are
++    unsigned), and one bad wheel-speed frame is enough too. Ending a PERMANENT alert in exactly that state is the
++    hazard, so the clear also needs a driver on the gas pedal. Creep, gas alone at 0 m/s, gear and the disengage still
++    do not clear it (M5/M6/M7), and a vEgo or gasPressed we cannot read never does (fail closed).
++
++    Every leg is driven on the DEPLOYED config, after a REAL expiry, with the car disengaged - which is the state the
++    superproject leaves it in at 2:00 - so the wire claim below is about the frames that really follow the release.
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)                                   # 126 s -> expiry at 120 s
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    self.assertTrue(b._hold_expired)
++    f = 12600
++    # (1) CREEP can NEVER clear it, even with the gas down: 1.5 m/s is the top of the estimated creep band, and it is
++    # 40 frames of it (gas alone is not the clear either - the SPEED has to be above the threshold).
++    creep = _hold(b, 40, start=f, v=1.5, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 40
++    self.assertEqual(40, len(creep), "activity: 40 frames driven")
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in creep}, "creep must NOT clear the latch")
++    self.assertTrue(b._hold_expired, "creep must NOT clear the latch")
++    self.assertEqual(0, b._nag_frames, "activity: those frames really reached the observer (motion reset the count)")
++    # (2) GAS ALONE at a dead stop stays latched - the old M5, unchanged by CD6
++    gas0 = _hold(b, 40, start=f, v=0.0, standstill=True, gas=True, engaged=False, long_active=False)
++    f += 40
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in gas0}, "gas at a standstill must NOT clear the latch")
++    # (3) THE ROLL-AWAY (Opus re-review 2, the finding): 3.01 m/s for 300 frames with NO pedal at all. This is the
++    # unattended car, and it is also what one bad wheel-speed frame looks like. The latch must hold on EVERY frame.
++    roll = _hold(b, 300, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 300
++    rolled = [n for _fr, _s, n in roll]
++    self.assertEqual(300, len(rolled), "activity: 300 frames of a real roll")
++    self.assertEqual({EXPIRED}, set(rolled), "a ROLL with no pedal must NOT clear the latch on any frame")
++    self.assertTrue(b._hold_expired, "a roll must leave the latch set, so the alert and the enable strip stay up")
++    # (4) an off-by-one BY VALUE, now on the clear's OTHER term: 2.99 with the gas stays latched, 3.00 exactly stays
++    # latched (strict `>`), 3.01 with the gas clears
++    l299 = _hold(b, 20, start=f, v=2.99, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 20
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in l299}, "2.99 m/s with the gas must NOT clear the latch")
++    l300 = _hold(b, 1, start=f, v=3.0, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(EXPIRED, l300[0][2], "3.00 m/s exactly must NOT clear it - the test is `>`")
++    # (5) FAIL CLOSED: a vEgo that is NaN, or missing, never clears it - even with the gas down. Fed straight into the
++    # observer: the controller path needs a numeric vEgo before it reaches _alerts, and _hold_nag_step is the function
++    # under test.
++    nan_cs = _CS(v_ego=0.0, cam=(0, CAM), standstill=False, a_ego=-1.5)
++    nan_cs.out.vEgo = float("nan")
++    nan_cs.out.gasPressed = True
++    self.assertEqual(EXPIRED, b._hold_nag_step(nan_cs, 12900, 30), "a NaN vEgo must NOT clear the latch")
++    no_vego = SimpleNamespace(out=SimpleNamespace(standstill=False, brakePressed=False, gasPressed=True,
++                                                  gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(EXPIRED, b._hold_nag_step(no_vego, 12902, 30), "a MISSING vEgo must NOT clear the latch")
++    self.assertTrue(b._hold_expired, "fail closed: the latch must survive both unreadable values")
++    # (6) the clear lands on the FIRST frame above the threshold WITH the gas down, and only then
++    l301 = _hold(b, 1, start=f, v=3.01, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(1, len(l301), "activity: exactly one frame is driven")
++    self.assertEqual(NONE, l301[0][2], "3.01 m/s with the gas must clear the latch on THAT frame")
++    self.assertFalse(b._hold_expired, "3.01 m/s with the gas must clear the latch on THAT frame")
++    # (7) the clear cannot move a byte: every frame after the expiry, on every leg above, put nothing on 0x38D (the
++    # disengage already ended the stream - the observer only flips `_hold_expired`, which the level never reads)
++    for label, leg in (("creep", creep), ("gas@0", gas0), ("roll", roll), ("2.99", l299), ("3.00", l300),
++                       ("3.01", l301)):
++      self.assertEqual([], _wire(leg), f"{label}: the law must send nothing after the disengage")
++    # (8) a fresh stop after the clear starts a FRESH count from zero - the whole 2:00 must be earned again
++    _hold(b, 2, start=f, v=0.0, standstill=True, engaged=False, long_active=False)   # the resume edge re-arms the
++    f += 2                                                                          # driver cut (test_d)
++    _hold(b, 2, start=f)
++    f += 2
++    self.assertEqual(0, b._nag_frames, "the fresh stop must start from a zero count")
++    self.assertFalse(b._hold_expired)
++    fresh = _hold(b, 6200, start=f)
++    armed = [(fr, lv) for fr, lv in _levels(fresh) if lv >= ARM_LSB]
++    f_soft = _first_nag(fresh, SOFT)
++    self.assertIsNotNone(f_soft, "a fresh stop after the clear must banner again")
++    self.assertEqual(3000, sum(1 for fr, _lv in armed if fr <= f_soft),
++                     "the fresh count must be 3000 armed SENT frames from the new stop, not a continuation")
++    self.assertEqual({NONE, SOFT}, {n for _fr, _s, n in fresh}, "a 62 s hold cannot reach a tier past SOFT")
++
++  def test_l4_a_WHEEL_GLITCH_at_a_standstill_cannot_clear_the_latch(self):
++    """CD6: the clear must not be reachable by ONE bad wheel-speed frame.
++
++    The mechanism is real on this car, and it is the reason the clear needs a pedal. `vEgo` is a Kalman filter of the
++    MEAN of the four wheel speeds (opendbc/car/interfaces.py:359-361) that RESETS to the raw value on any jump above
++    2.0 m/s (:364-365); WHL_SPD11 is unsigned (`@1+`) and the DBC has no checksum/counter check (can/dbc.py:219-256
++    returns None). So ONE frame of ONE wheel at 43.3 km/h at a standstill is vEgo 3.01 on that frame and 0.00 on the
++    next - and since the latch is permanent, that single frame used to end the alert, the NO_ENTRY and the enable
++    strip for good, i.e. a RES press would then engage with no brake press. Opus measured exactly that on the old tip
++    (probe B: 4 -> 0 and it stays 0).
++
++    Here the spike is fed straight into the observer after a REAL expiry, at a dead stop, with the driver's foot OFF
++    the gas, and the latch must survive it on EVERY following frame - so the value the car layer reads (nag == 4) never
++    leaves 4, and the enable strip / PERMANENT alert stay up (their refusal is pinned in the superproject by
++    test_latched_frames_refuse_engage_requests).
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertGreater(len(_levels(hold)), 6000, "activity: the hold must really reach expiry")
++    self.assertEqual(EXPIRED, hold[-1][2])
++    f = 12600
++    # the glitch frame: the 4-wheel mean is 12 m/s (one wheel would read ~172 km/h) for exactly ONE frame
++    spike = _hold(b, 1, start=f, v=12.0, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(1, len(spike), "activity: the glitch frame really ran")
++    self.assertEqual(EXPIRED, spike[0][2], "ONE bad wheel-speed frame must NOT clear the latch")
++    # ... and the very next frame, back at a dead stop, is still latched: the clear would have been PERMANENT
++    after = _hold(b, 300, start=f, v=0.0, standstill=True, gas=False, engaged=False, long_active=False)
++    f += 300
++    self.assertEqual(300, len(after), "activity: 300 frames after the glitch")
++    self.assertEqual({EXPIRED}, {n for _fr, _s, n in after},
++                     "after the glitch the latch must still read 4 on every frame (so RES stays refused)")
++    self.assertTrue(b._hold_expired)
++    self.assertEqual([], _wire(spike) + _wire(after), "no 0x38D frame may go out after the disengage")
++    # (2) THE DOCUMENTED RESIDUAL: the SAME one-frame spike with the driver's foot ON the gas pedal. That is a
++    # physically-pressed driver pedal (> 4 % of travel, and openpilot's own command cannot make it true - see
++    # _hold_nag_driven_away's docstring), so it is a driver who is in the car and driving: the latch clears on that
++    # frame. This is deliberate: the alternative is the roll-away above, which is worse. Pinned so nobody "fixes" one
++    # half of this trade without seeing the other.
++    spike_gas = _hold(b, 1, start=f, v=12.0, standstill=False, gas=True, engaged=False, long_active=False)
++    f += 1
++    self.assertEqual(NONE, spike_gas[0][2],
++                     "a glitch WITH the gas pedal held clears it - accepted: that is a driver on the pedal, and the "
++                     "roll-away hazard is the worse one")
++
++  def test_l5_a_BACKWARD_roll_reads_like_a_forward_one_and_stays_latched_without_gas(self):
++    """CD6: wheel speeds carry NO DIRECTION, so a car rolling BACKWARD reports the same positive vEgo as one rolling
++    forward. That is why a speed-only clear could not tell "the driver pulled away" from "the car is rolling away" in
++    either direction. Both signs, no pedal: latched. (The law does not take abs() - it does not need to: without a
++    driver on the gas, no sign of vEgo clears the latch.)
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertEqual(EXPIRED, hold[-1][2])
++    f = 12600
++    fwd = _hold(b, 60, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    rev_pos = _hold(b, 60, start=f, v=3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    rev_neg = _hold(b, 60, start=f, v=-3.01, standstill=False, gas=False, engaged=False, long_active=False)
++    f += 60
++    for label, leg in (("forward 3.01", fwd), ("backward as the bus reports it (+3.01)", rev_pos),
++                       ("backward as a signed reader reports it (-3.01)", rev_neg)):
++      self.assertEqual(60, len(leg), f"{label}: activity")
++      self.assertEqual({EXPIRED}, {n for _fr, _s, n in leg}, f"{label} with no pedal must NOT clear the latch")
++    self.assertTrue(b._hold_expired)
++
++  def test_l6_the_clear_fails_CLOSED_on_an_unreadable_gas_pedal(self):
++    """CD6: the gas pedal is now a TERM OF THE CLEAR, so an unreadable one must never count as pressed - exactly the
++    same rule the vEgo term already had. A missing attribute, None or a non-bool-ish object all fail closed.
++    """
++    b = self._brake()
++    hold = _hold(b, 12600)
++    self.assertEqual(EXPIRED, hold[-1][2])
++    # 3.01 m/s, no gasPressed attribute at all
++    missing = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, standstill=False, brakePressed=False,
++                                                 gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(EXPIRED, b._hold_nag_step(missing, 12700, 30), "a MISSING gasPressed must NOT clear the latch")
++    # 3.01 m/s, gasPressed explicitly None (a partially-filled sample, e.g. an old CarState double)
++    none_gas = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, gasPressed=None, standstill=False, brakePressed=False,
++                                                   gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(EXPIRED, b._hold_nag_step(none_gas, 12702, 30), "a None gasPressed must NOT clear the latch")
++    self.assertTrue(b._hold_expired, "fail closed: the latch must survive both unreadable pedals")
++    # the CONTROL: the same frame with a real True does clear, so the two legs above fail by VALUE, not by a harness
++    # that never reached the clear
++    ok = SimpleNamespace(out=SimpleNamespace(vEgo=3.01, gasPressed=True, standstill=False, brakePressed=False,
++                                             gearShifter=structs.CarState.GearShifter.drive))
++    self.assertEqual(NONE, b._hold_nag_step(ok, 12704, 30), "control: gas + 3.01 m/s must clear it")
++
++  def test_m_the_latch_lands_on_the_6000th_armed_frame_under_deployed(self):
++    """Off-by-one under the deployed config: 5999 armed sent frames in, the disengage arrives at FINAL; at 6000 it
++    arrives at EXPIRED."""
++    for n, want in ((5999, FINAL), (6000, EXPIRED)):
++      sha, sent, armed, nag = _disengage_stream(n_armed=n, cp_sp=_cp_sp_deployed(), check=_assert_deployed)
++      self.assertEqual(n, armed, "activity: the stream must reach the boundary")
++      self.assertGreater(sent, n)
++      self.assertEqual(want, max(nag), f"the state at armed sent frame {n}")

@@ -62,6 +62,33 @@ class CarParamsSP:
   pcmCruiseSpeed: bool = auto_field()
   intelligentCruiseButtonManagementAvailable: bool = auto_field()
   enableGasInterceptor: bool = auto_field()
+  fca11Brake: bool = auto_field()  # fork: production FCA11 longitudinal braking (HyundaiFca11Brake, default OFF)
+  # 0041: OPT-IN affine command law (HyundaiFca11AffineGain, default OFF). When ON the car layer inverts the fitted
+  # affine plant (extra = BITE + K*cmd_g, K~9.9 BITE~0.40) instead of the through-origin 0.67 gain, and the
+  # release-band floor drops from 8 to 4 LSB. OFF = byte-identical to 0040. Read once in Fca11LongBrake.__init__.
+  fca11AffineGain: bool = auto_field()
+  # 0045: SHADOW mode (HyundaiFca11Shadow, default OFF). Written ONLY by setup_interfaces; when set the wire stays OLD-LAW
+  # (the deployed law: fca11Brake as today, fca11AffineGain forced False) and V3 is computed + logged alongside, NEVER
+  # sent. Coupled with custom.capnp CarParamsSP.fca11Shadow @8.
+  fca11Shadow: bool = auto_field()
+  # 18x: DYNAMIC-RELEASE build (HyundaiFca11DynamicBrakes, default OFF). Written ONLY by setup_interfaces from that param;
+  # read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = gentle 1 LSB
+  # onset, a decrease limit, a soft release ramp and the k="b" level trace, all on the FEEL path only. OFF = the deployed
+  # law plus the three unconditional 18x rules, byte-for-byte. Coupled with custom.capnp CarParamsSP.fca11DynamicBrakes @10.
+  fca11DynamicBrakes: bool = auto_field()
+  # 17c delivery: OPT-IN measured-inverse pedal law for negative asks + a one-sided filter on the pedal-path ask
+  # (param HyundaiPedalDeliveryLaw, default OFF). Written ONLY by setup_interfaces from that param; when unset the
+  # pedal law is byte-for-byte the deployed linear one (gas_interceptor.get_pedal_command is still what runs).
+  pedalDeliveryLaw: bool = auto_field()
+  # 0042-Z: RISE-ONLY ask lag (param HyundaiGasRiseLag, default OFF). Written ONLY by setup_interfaces from that param;
+  # when unset no frame of the pedal path changes (the deployed tree skips the branch). Coupled with custom.capnp @12.
+  gasRiseLag: bool = auto_field()
+  # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default "0").
+  # Bitfield: 1 = a fault observed within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch,
+  # 2 = latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES consecutive fault frames; 0 = the deployed rule (any frame
+  # latches, fail-closed). Written ONLY by setup_interfaces; read once by the car layer and mirrored into the panda's
+  # safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES. Coupled with custom.capnp CarParamsSP @13.
+  fca11PedalGuard: int = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 
@@ -144,6 +171,13 @@ class CarControlSP:
   leadOne: 'LeadData' = field(default_factory=lambda: LeadData())
   leadTwo: 'LeadData' = field(default_factory=lambda: LeadData())
   intelligentCruiseButtonManagement: 'IntelligentCruiseButtonManagement' = field(default_factory=lambda: IntelligentCruiseButtonManagement())
+  # fork (adurham): raw LongitudinalPersonality (0 = aggressive, 1 = standard, 2 = relaxed) so the Hyundai pedal law can
+  # scale its ceilings/gains by the driver's feel dial. Defaults to STANDARD so no-arg construction is never aggressive.
+  personality: int = field(default=1)
+  # fork (adurham): raw CLU13 drive mode mirrored from CarStateSP.driveMode (1 normal / 2 eco / 3 sport / 6 N-custom /
+  # 7 N; 0 = unknown). The Hyundai pedal DELIVERY law is only valid in the mode it was measured in (NORMAL): the pedal
+  # map, and so the delivered decel for a given lift, changes with the mode. Defaults to 0 = unknown = deployed law.
+  driveMode: int = field(default=0)
 
   @auto_dataclass
   class Param:
@@ -166,3 +200,66 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  # fork (adurham): raw CLU13 CF_Clu_DriveMode (44|4) — the current drive mode (1 normal / 2 eco /
+  # 3 sport / 6 N-custom / 7 N), debounced one frame. 0 = not decoded / unknown. See drive_mode.py.
+  driveMode: int = auto_field()
+  # 0030 (D1-b): FCA11-long braking is unavailable for the REST of this ignition — the panda's fail-closed
+  # hyundai_fca11_long_cut (pedal fault; the camera hand-back is instead the self-releasing cam_brake) is set and
+  # only hyundai_init can clear it. It can be latched by a SINGLE pedal SCE frame at the instant the Hyundai safety
+  # is applied: on route 1a0 (2026-11-09) the first 0x701 frame after the mode switch was a STATE=3 (SCE) frame at
+  # 7.191973 s, inside hyundai_init's own interval (7.173, 7.192], so the cut was set 14 ms before this mirror and
+  # held for the rest of the drive (187/187 actuating frames refused at 666.33-670.07 s; FCA11 braking off 20.7 min).
+  # The superproject raises a persistent driver alert from this when CP_SP.fca11Brake is on (the feature otherwise
+  # fails silently while openpilot keeps planning stops it cannot execute). Coupled with custom.capnp CarStateSP.
+  fca11Unavailable: bool = auto_field()
+  # 0044: WHY it is unavailable, so a qlog alone answers it: bitfield 1 = pedal-fault latch (_pedal_cut),
+  # 2 = echo-confirmed refusal wall (_refused_cut), 3 = both; 0 = not unavailable. Written at the SAME site as
+  # fca11Unavailable (fca11_long.update). Observability ONLY — it gates no send and changes no byte on the wire.
+  # Coupled with custom.capnp CarStateSP.fca11CutSource (@22).
+  fca11CutSource: int = auto_field()
+  # 0053: TRANSIENT - the stock camera is BRAKING (braking-class FCA11 frame within the last ~1.5 s of camera frames):
+  # openpilot braking is paused and resumes on its own when the camera stops. Coupled with custom.capnp CarStateSP.
+  fca11CameraBraking: bool = auto_field()
+  # 0053: the panda refused passive FCA11 frames while the car layer believed the camera was not braking (a Python <->
+  # panda disagreement). Coupled with custom.capnp CarStateSP.
+  fca11Divergence: bool = auto_field()
+  # 0040: the three owner-approved FCA11 braking alerts. Set by GasInterceptorCarController.create_gas_command (the
+  # same 1-frame pattern as fca11_unavailable) and read by the superproject (car_specific.py -> events.py). Coupled
+  # with custom.capnp CarStateSP.
+  #   superviseStop: steady YELLOW, braking below FCA11_SUPERVISE_KPH ("supervise stop").
+  #   stopComplete:  steady YELLOW at/near a full stop while still holding ("stop complete - hold brake pedal").
+  #   brakeNow:      persistent RED on ESC non-response or hold-lost; clears ONLY on driver brake ("BRAKE NOW").
+  superviseStop: bool = auto_field()
+  stopComplete: bool = auto_field()
+  brakeNow: bool = auto_field()
+  # 0043-CD: the standstill hold countdown, 0 none / 1 soft (>= 3000 sent frames = 60 s) / 2 loud (4500 = 90 s) /
+  # 3 final (5500 = 110 s) / 4 EXPIRED (6000 = 120 s, a STICKY latch that survives the counter reset and clears only on
+  # the driver's brake press; it is what makes the superproject disengage and release the brakes). Written by the
+  # controller from Fca11LongBrake.hold_nag (a pure observer of the SENT level - the wire is untouched) and read by
+  # car_specific.py -> events.py. Coupled with custom.capnp CarStateSP.holdNag (@21).
+  holdNag: int = auto_field()
+  # 17c FEEDBACK: transient driver-mark confirmation, 0 = none / 1 = "marked GOOD" / 2 = "marked BAD". Armed for 2 s by
+  # Fca11LongBrake.on_driver_mark (the single write path of the k="m" record), carried by the controller's 1-frame
+  # pattern through CarState, and raised as a 2 s alert by car_specific.py -> events.py. Coupled with custom.capnp
+  # CarStateSP.driverMark (@20).
+  driverMark: int = auto_field()
+  # 0047: CLU13 CF_Clu_FuelLevel - fuel-tank level in percent (KDMLink-validated 16-bit sender
+  # decode; see sunnypilot/car/hyundai/fuel_level.py); 0.0 = not decoded / no valid frame yet.
+  # Coupled with custom.capnp CarStateSP.
+  fuelLevel: float = auto_field()
+  # 0048: KDMLink-derived telemetry (messages folded into the DBC by patch 0046). Every value is the
+  # last one seen off the C-CAN parser; the parser holds it across gaps. 0.0 = not decoded / no frame
+  # yet unless stated. Coupled with custom.capnp CarStateSP.
+  intakeTemp: float = auto_field()      # EMS_453 D2 (degC, x0.75 - 48); ~ambient + 10 when driving
+  lateralAccel: float = auto_field()    # ESP_49D (g, 16-bit centered); 0.0 is a real value (straight)
+  longAccel: float = auto_field()       # ESP_49D (g, 12-bit; the Elantra N new-gateway layout)
+  batteryVoltage: float = auto_field()  # BATT_568 D3 (V, x0.1; the newer gateway)
+  # N_MODE_4A0: the N-Custom settings block. Per-setting: 0/1/2 = the normal|sport|sport+ style steps,
+  # 3 = unset/default. All zero while the car is in NORMAL drive mode; live in SPORT / N (routes).
+  nModeEngine: int = auto_field()       # 0 Normal / 1 Sport / 2 Sport+
+  nModeSuspension: int = auto_field()   # 0 Comfort / 1 Normal / 2 Sport
+  nModeEsc: int = auto_field()          # 0 On / 1 Sport / 2 Off
+  nModeExhaust: int = auto_field()      # 0 Quiet / 1 Normal / 2 Sport+
+  nModeRevMatch: int = auto_field()     # 0 off / 1 on
+  nModeELSD: int = auto_field()         # 0 Normal / 1 Sport / 2 Sport+
+  nModeSteering: int = auto_field()     # 0 Comfort / 1 Normal / 2 Sport

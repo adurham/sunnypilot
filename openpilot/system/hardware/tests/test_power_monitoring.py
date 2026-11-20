@@ -229,3 +229,42 @@ class TestPowerMonitoring(OpenpilotTestCase):
     result = pm.max_time_offroad_exceeded(offroad_time_s)
 
     assert result == expected_result
+
+  # Test the shutdown boundaries against the raised offroad budget (#39 30 -> 55 Wh):
+  # the reset floor and the ceiling clamp follow the constant, depleting the budget to
+  # <= 0 still triggers, the low-voltage cutoff is untouched, and MaxTimeOffroad is
+  # unchanged.
+  def test_raised_budget_shutdown_boundaries(self, mocker):
+    POWER_DRAW = 0 # To stop shutting down for other reasons
+    pm_patch(mocker, "HARDWARE.get_current_power_draw", POWER_DRAW)
+
+    # Reset-if-low floor is CAR_BATTERY_CAPACITY_uWh / 10 with the new value (5.5e6 uWh)
+    pm = PowerMonitoring()
+    assert pm.get_car_battery_capacity() == int(CAR_BATTERY_CAPACITY_uWh / 10)
+    assert pm.get_car_battery_capacity() == 5.5e6
+
+    # The ceiling clamp still caps to the (now larger) constant
+    pm.car_battery_capacity_uWh = CAR_BATTERY_CAPACITY_uWh * 2
+    pm.calculate(GOOD_VOLTAGE, False)
+    assert pm.get_car_battery_capacity() == int(CAR_BATTERY_CAPACITY_uWh)
+
+    ignition = False
+    start_time = ssb
+    set_mock_time(start_time + DELAY_SHUTDOWN_TIME_S + 1)
+
+    # A healthy (raised) budget on its own does not shut down
+    pm.car_battery_capacity_uWh = CAR_BATTERY_CAPACITY_uWh
+    pm.car_voltage_mV = GOOD_VOLTAGE
+    assert not pm.should_shutdown(ignition, True, start_time, True)
+
+    # Depleting the raised budget to <= 0 still triggers the budget shutdown
+    pm.car_battery_capacity_uWh = 0
+    assert pm.should_shutdown(ignition, True, start_time, True)
+
+    # The low-voltage cutoff is untouched by the budget raise
+    pm.car_battery_capacity_uWh = CAR_BATTERY_CAPACITY_uWh
+    pm.car_voltage_mV = VOLTAGE_BELOW_PAUSE_CHARGING
+    assert pm.should_shutdown(ignition, True, start_time, True)
+
+    # MaxTimeOffroad / the fallback window are unchanged (still 30 h)
+    assert MAX_TIME_OFFROAD_S == 30 * 3600

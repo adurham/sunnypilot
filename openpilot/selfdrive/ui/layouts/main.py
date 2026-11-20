@@ -14,6 +14,9 @@ from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
 if gui_app.sunnypilot_ui():
   from openpilot.selfdrive.ui.sunnypilot.layouts.settings.settings import SettingsLayoutSP as SettingsLayout
   from openpilot.selfdrive.ui.sunnypilot.layouts.home import HomeLayoutSP as HomeLayout
+  # fork: big-UI (tici/tizi) twin of the mici 0033 swap -- the on-road view that draws the FCA11-cal
+  # driver-consent prompt. Same precedent as the two swaps above; upstream AugmentedRoadView is untouched.
+  from openpilot.selfdrive.ui.sunnypilot.onroad.cal_consent_road_view import AugmentedRoadViewCal as AugmentedRoadView
 
 
 class MainState(IntEnum):

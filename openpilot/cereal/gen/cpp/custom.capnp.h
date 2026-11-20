@@ -178,6 +178,16 @@ enum class LongitudinalPlanSource_ad47440556d96ec4: uint16_t {
 };
 CAPNP_DECLARE_ENUM(LongitudinalPlanSource, ad47440556d96ec4);
 CAPNP_DECLARE_SCHEMA(a567bce822ae28fe);
+CAPNP_DECLARE_SCHEMA(cb52698964ff4306);
+CAPNP_DECLARE_SCHEMA(994b7a960da75da3);
+enum class Candidate_994b7a960da75da3: uint16_t {
+  CRUISE,
+  LEAD0,
+  LEAD1,
+  LEAD2,
+  E2E,
+};
+CAPNP_DECLARE_ENUM(Candidate, 994b7a960da75da3);
 CAPNP_DECLARE_SCHEMA(c5a54619396de4c7);
 CAPNP_DECLARE_SCHEMA(da96579883444c35);
 CAPNP_DECLARE_SCHEMA(f6e831752fcdf793);
@@ -209,6 +219,22 @@ enum class EventName_b8007ed8a646b5e6: uint16_t {
   E2E_CHIME,
   LANE_CHANGE_ROAD_EDGE,
   BIG_MODEL_READY,
+  PEDAL_FACTORY_CRUISE_LOCKOUT,
+  PEDAL_BELOW_ENGAGE_SPEED,
+  FCA11_BRAKE_LOW_SPEED_D_E_P_R_E_C_A_T_E_D,
+  DRIVE_MODE_PERSONALITY_LOCKOUT,
+  FCA11_UNAVAILABLE,
+  FCA11_SUPERVISE_STOP,
+  FCA11_STOP_COMPLETE,
+  FCA11_BRAKE_NOW,
+  FCA11_CAMERA_BRAKING,
+  FCA11_DIVERGENCE,
+  DRIVER_MARK_GOOD,
+  DRIVER_MARK_BAD,
+  FCA11_HOLD_NAG_SOFT,
+  FCA11_HOLD_NAG_LOUD,
+  FCA11_HOLD_EXPIRED,
+  FCA11_HOLD_NAG_FINAL,
 };
 CAPNP_DECLARE_ENUM(EventName, b8007ed8a646b5e6);
 CAPNP_DECLARE_SCHEMA(80ae746ee2596b11);
@@ -241,6 +267,14 @@ CAPNP_DECLARE_SCHEMA(d8f4f047edce3c71);
 CAPNP_DECLARE_SCHEMA(9e62278160b7df26);
 CAPNP_DECLARE_SCHEMA(b86e6369214c01c8);
 CAPNP_DECLARE_SCHEMA(f416ec09499d9d19);
+CAPNP_DECLARE_SCHEMA(bdd296f3895125d8);
+enum class RoadType_bdd296f3895125d8: uint16_t {
+  UNKNOWN,
+  INTERSTATE,
+  HIGHWAY,
+  URBAN,
+};
+CAPNP_DECLARE_ENUM(RoadType, bdd296f3895125d8);
 CAPNP_DECLARE_SCHEMA(a1680744031fdb2d);
 CAPNP_DECLARE_SCHEMA(b73df234a23b0cc2);
 enum class TurnDirection_b73df234a23b0cc2: uint16_t {
@@ -478,10 +512,11 @@ struct LongitudinalPlanSP {
   typedef ::capnp::schemas::LongitudinalPlanSource_ad47440556d96ec4 LongitudinalPlanSource;
 
   struct E2eAlerts;
+  struct NoClose;
   struct Deprecated;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(f35cc4560bbf6ec2, 2, 5)
+    CAPNP_DECLARE_STRUCT_HEADER(f35cc4560bbf6ec2, 2, 6)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -622,6 +657,23 @@ struct LongitudinalPlanSP::E2eAlerts {
   };
 };
 
+struct LongitudinalPlanSP::NoClose {
+  NoClose() = delete;
+
+  class Reader;
+  class Builder;
+  class Pipeline;
+  typedef ::capnp::schemas::Candidate_994b7a960da75da3 Candidate;
+
+
+  struct _capnpPrivate {
+    CAPNP_DECLARE_STRUCT_HEADER(cb52698964ff4306, 6, 0)
+    #if !CAPNP_LITE
+    static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
+    #endif  // !CAPNP_LITE
+  };
+};
+
 struct LongitudinalPlanSP::Deprecated {
   Deprecated() = delete;
 
@@ -630,7 +682,7 @@ struct LongitudinalPlanSP::Deprecated {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(c5a54619396de4c7, 2, 5)
+    CAPNP_DECLARE_STRUCT_HEADER(c5a54619396de4c7, 2, 6)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -679,7 +731,7 @@ struct CarParamsSP {
   struct NeuralNetworkLateralControl;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(80ae746ee2596b11, 1, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(80ae746ee2596b11, 2, 1)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -728,7 +780,7 @@ struct CarControlSP {
 
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(a5cd762cd951a455, 0, 5)
+    CAPNP_DECLARE_STRUCT_HEADER(a5cd762cd951a455, 1, 5)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -823,7 +875,7 @@ struct CarStateSP {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(b86e6369214c01c8, 1, 0)
+    CAPNP_DECLARE_STRUCT_HEADER(b86e6369214c01c8, 5, 0)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -836,6 +888,8 @@ struct LiveMapDataSP {
   class Reader;
   class Builder;
   class Pipeline;
+  typedef ::capnp::schemas::RoadType_bdd296f3895125d8 RoadType;
+
 
   struct _capnpPrivate {
     CAPNP_DECLARE_STRUCT_HEADER(f416ec09499d9d19, 2, 1)
@@ -2331,6 +2385,9 @@ public:
   inline bool hasE2eAlerts() const;
   inline  ::cereal::LongitudinalPlanSP::E2eAlerts::Reader getE2eAlerts() const;
 
+  inline bool hasNoClose() const;
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Reader getNoClose() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -2399,6 +2456,13 @@ public:
   inline void adoptE2eAlerts(::capnp::Orphan< ::cereal::LongitudinalPlanSP::E2eAlerts>&& value);
   inline ::capnp::Orphan< ::cereal::LongitudinalPlanSP::E2eAlerts> disownE2eAlerts();
 
+  inline bool hasNoClose();
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Builder getNoClose();
+  inline void setNoClose( ::cereal::LongitudinalPlanSP::NoClose::Reader value);
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Builder initNoClose();
+  inline void adoptNoClose(::capnp::Orphan< ::cereal::LongitudinalPlanSP::NoClose>&& value);
+  inline ::capnp::Orphan< ::cereal::LongitudinalPlanSP::NoClose> disownNoClose();
+
 private:
   ::capnp::_::StructBuilder _builder;
   template <typename, ::capnp::Kind>
@@ -2421,6 +2485,7 @@ public:
   inline  ::cereal::LongitudinalPlanSP::SmartCruiseControl::Pipeline getSmartCruiseControl();
   inline  ::cereal::LongitudinalPlanSP::SpeedLimit::Pipeline getSpeedLimit();
   inline  ::cereal::LongitudinalPlanSP::E2eAlerts::Pipeline getE2eAlerts();
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Pipeline getNoClose();
 private:
   ::capnp::AnyPointer::Pipeline _typeless;
   friend class ::capnp::PipelineHook;
@@ -3196,6 +3261,192 @@ private:
 };
 #endif  // !CAPNP_LITE
 
+class LongitudinalPlanSP::NoClose::Reader {
+public:
+  typedef NoClose Reads;
+
+  Reader() = default;
+  inline explicit Reader(::capnp::_::StructReader base): _reader(base) {}
+
+  inline ::capnp::MessageSize totalSize() const {
+    return _reader.totalSize().asPublic();
+  }
+
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const {
+    return ::capnp::_::structString(_reader, *_capnpPrivate::brand());
+  }
+#endif  // !CAPNP_LITE
+
+  inline bool getEnabled() const;
+
+  inline bool getLeadPresent() const;
+
+  inline bool getLeadUsable() const;
+
+  inline bool getTracked() const;
+
+  inline bool getApplies() const;
+
+  inline float getPreCapAccel() const;
+
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Candidate getPreCapSource() const;
+
+  inline float getPostCapAccel() const;
+
+  inline float getFactor() const;
+
+  inline float getRawFactor() const;
+
+  inline  ::uint8_t getDwellFrames() const;
+
+  inline float getClosingSpeed() const;
+
+  inline float getFilteredClosing() const;
+
+  inline float getRawMeanClosing() const;
+
+  inline float getVRelBias() const;
+
+  inline bool getFilterValid() const;
+
+  inline bool getFilterCoasting() const;
+
+  inline  ::uint8_t getFilterRejects() const;
+
+  inline bool getGateReject() const;
+
+  inline bool getReinit() const;
+
+  inline bool getE2eGate() const;
+
+  inline float getE2eGated() const;
+
+  inline float getE2eFinal() const;
+
+private:
+  ::capnp::_::StructReader _reader;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::List;
+  friend class ::capnp::MessageBuilder;
+  friend class ::capnp::Orphanage;
+};
+
+class LongitudinalPlanSP::NoClose::Builder {
+public:
+  typedef NoClose Builds;
+
+  Builder() = delete;  // Deleted to discourage incorrect usage.
+                       // You can explicitly initialize to nullptr instead.
+  inline Builder(decltype(nullptr)) {}
+  inline explicit Builder(::capnp::_::StructBuilder base): _builder(base) {}
+  inline operator Reader() const { return Reader(_builder.asReader()); }
+  inline Reader asReader() const { return *this; }
+
+  inline ::capnp::MessageSize totalSize() const { return asReader().totalSize(); }
+#if !CAPNP_LITE
+  inline ::kj::StringTree toString() const { return asReader().toString(); }
+#endif  // !CAPNP_LITE
+
+  inline bool getEnabled();
+  inline void setEnabled(bool value);
+
+  inline bool getLeadPresent();
+  inline void setLeadPresent(bool value);
+
+  inline bool getLeadUsable();
+  inline void setLeadUsable(bool value);
+
+  inline bool getTracked();
+  inline void setTracked(bool value);
+
+  inline bool getApplies();
+  inline void setApplies(bool value);
+
+  inline float getPreCapAccel();
+  inline void setPreCapAccel(float value);
+
+  inline  ::cereal::LongitudinalPlanSP::NoClose::Candidate getPreCapSource();
+  inline void setPreCapSource( ::cereal::LongitudinalPlanSP::NoClose::Candidate value);
+
+  inline float getPostCapAccel();
+  inline void setPostCapAccel(float value);
+
+  inline float getFactor();
+  inline void setFactor(float value);
+
+  inline float getRawFactor();
+  inline void setRawFactor(float value);
+
+  inline  ::uint8_t getDwellFrames();
+  inline void setDwellFrames( ::uint8_t value);
+
+  inline float getClosingSpeed();
+  inline void setClosingSpeed(float value);
+
+  inline float getFilteredClosing();
+  inline void setFilteredClosing(float value);
+
+  inline float getRawMeanClosing();
+  inline void setRawMeanClosing(float value);
+
+  inline float getVRelBias();
+  inline void setVRelBias(float value);
+
+  inline bool getFilterValid();
+  inline void setFilterValid(bool value);
+
+  inline bool getFilterCoasting();
+  inline void setFilterCoasting(bool value);
+
+  inline  ::uint8_t getFilterRejects();
+  inline void setFilterRejects( ::uint8_t value);
+
+  inline bool getGateReject();
+  inline void setGateReject(bool value);
+
+  inline bool getReinit();
+  inline void setReinit(bool value);
+
+  inline bool getE2eGate();
+  inline void setE2eGate(bool value);
+
+  inline float getE2eGated();
+  inline void setE2eGated(float value);
+
+  inline float getE2eFinal();
+  inline void setE2eFinal(float value);
+
+private:
+  ::capnp::_::StructBuilder _builder;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+  friend class ::capnp::Orphanage;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::_::PointerHelpers;
+};
+
+#if !CAPNP_LITE
+class LongitudinalPlanSP::NoClose::Pipeline {
+public:
+  typedef NoClose Pipelines;
+
+  inline Pipeline(decltype(nullptr)): _typeless(nullptr) {}
+  inline explicit Pipeline(::capnp::AnyPointer::Pipeline&& typeless)
+      : _typeless(kj::mv(typeless)) {}
+
+private:
+  ::capnp::AnyPointer::Pipeline _typeless;
+  friend class ::capnp::PipelineHook;
+  template <typename, ::capnp::Kind>
+  friend struct ::capnp::ToDynamic_;
+};
+#endif  // !CAPNP_LITE
+
 class LongitudinalPlanSP::Deprecated::Reader {
 public:
   typedef Deprecated Reads;
@@ -3515,6 +3766,22 @@ public:
 
   inline bool getEnableGasInterceptor() const;
 
+  inline bool getFca11Brake() const;
+
+  inline bool getFca11AffineGain() const;
+
+  inline bool getFca11Shadow() const;
+
+  inline bool getPedalDeliveryLaw() const;
+
+  inline bool getFca11DynamicBrakes() const;
+
+  inline bool getFca11StopHoldClutch() const;
+
+  inline bool getGasRiseLag() const;
+
+  inline  ::uint8_t getFca11PedalGuard() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -3564,6 +3831,30 @@ public:
 
   inline bool getEnableGasInterceptor();
   inline void setEnableGasInterceptor(bool value);
+
+  inline bool getFca11Brake();
+  inline void setFca11Brake(bool value);
+
+  inline bool getFca11AffineGain();
+  inline void setFca11AffineGain(bool value);
+
+  inline bool getFca11Shadow();
+  inline void setFca11Shadow(bool value);
+
+  inline bool getPedalDeliveryLaw();
+  inline void setPedalDeliveryLaw(bool value);
+
+  inline bool getFca11DynamicBrakes();
+  inline void setFca11DynamicBrakes(bool value);
+
+  inline bool getFca11StopHoldClutch();
+  inline void setFca11StopHoldClutch(bool value);
+
+  inline bool getGasRiseLag();
+  inline void setGasRiseLag(bool value);
+
+  inline  ::uint8_t getFca11PedalGuard();
+  inline void setFca11PedalGuard( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -3802,6 +4093,10 @@ public:
   inline bool hasIntelligentCruiseButtonManagement() const;
   inline  ::cereal::IntelligentCruiseButtonManagement::Reader getIntelligentCruiseButtonManagement() const;
 
+  inline  ::uint8_t getPersonality() const;
+
+  inline  ::uint8_t getDriveMode() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -3864,6 +4159,12 @@ public:
   inline  ::cereal::IntelligentCruiseButtonManagement::Builder initIntelligentCruiseButtonManagement();
   inline void adoptIntelligentCruiseButtonManagement(::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement>&& value);
   inline ::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement> disownIntelligentCruiseButtonManagement();
+
+  inline  ::uint8_t getPersonality();
+  inline void setPersonality( ::uint8_t value);
+
+  inline  ::uint8_t getDriveMode();
+  inline void setDriveMode( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -4487,6 +4788,50 @@ public:
 
   inline float getSpeedLimit() const;
 
+  inline  ::uint8_t getDriveMode() const;
+
+  inline bool getFca11Unavailable() const;
+
+  inline bool getSuperviseStop() const;
+
+  inline bool getStopComplete() const;
+
+  inline bool getBrakeNow() const;
+
+  inline float getFuelLevel() const;
+
+  inline float getIntakeTemp() const;
+
+  inline float getLateralAccel() const;
+
+  inline float getLongAccel() const;
+
+  inline float getBatteryVoltage() const;
+
+  inline  ::uint8_t getNModeEngine() const;
+
+  inline  ::uint8_t getNModeSuspension() const;
+
+  inline  ::uint8_t getNModeEsc() const;
+
+  inline  ::uint8_t getNModeExhaust() const;
+
+  inline  ::uint8_t getNModeRevMatch() const;
+
+  inline  ::uint8_t getNModeELSD() const;
+
+  inline  ::uint8_t getNModeSteering() const;
+
+  inline bool getFca11CameraBraking() const;
+
+  inline bool getFca11Divergence() const;
+
+  inline  ::uint8_t getDriverMark() const;
+
+  inline  ::uint8_t getHoldNag() const;
+
+  inline  ::uint8_t getFca11CutSource() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4517,6 +4862,72 @@ public:
 
   inline float getSpeedLimit();
   inline void setSpeedLimit(float value);
+
+  inline  ::uint8_t getDriveMode();
+  inline void setDriveMode( ::uint8_t value);
+
+  inline bool getFca11Unavailable();
+  inline void setFca11Unavailable(bool value);
+
+  inline bool getSuperviseStop();
+  inline void setSuperviseStop(bool value);
+
+  inline bool getStopComplete();
+  inline void setStopComplete(bool value);
+
+  inline bool getBrakeNow();
+  inline void setBrakeNow(bool value);
+
+  inline float getFuelLevel();
+  inline void setFuelLevel(float value);
+
+  inline float getIntakeTemp();
+  inline void setIntakeTemp(float value);
+
+  inline float getLateralAccel();
+  inline void setLateralAccel(float value);
+
+  inline float getLongAccel();
+  inline void setLongAccel(float value);
+
+  inline float getBatteryVoltage();
+  inline void setBatteryVoltage(float value);
+
+  inline  ::uint8_t getNModeEngine();
+  inline void setNModeEngine( ::uint8_t value);
+
+  inline  ::uint8_t getNModeSuspension();
+  inline void setNModeSuspension( ::uint8_t value);
+
+  inline  ::uint8_t getNModeEsc();
+  inline void setNModeEsc( ::uint8_t value);
+
+  inline  ::uint8_t getNModeExhaust();
+  inline void setNModeExhaust( ::uint8_t value);
+
+  inline  ::uint8_t getNModeRevMatch();
+  inline void setNModeRevMatch( ::uint8_t value);
+
+  inline  ::uint8_t getNModeELSD();
+  inline void setNModeELSD( ::uint8_t value);
+
+  inline  ::uint8_t getNModeSteering();
+  inline void setNModeSteering( ::uint8_t value);
+
+  inline bool getFca11CameraBraking();
+  inline void setFca11CameraBraking(bool value);
+
+  inline bool getFca11Divergence();
+  inline void setFca11Divergence(bool value);
+
+  inline  ::uint8_t getDriverMark();
+  inline void setDriverMark( ::uint8_t value);
+
+  inline  ::uint8_t getHoldNag();
+  inline void setHoldNag( ::uint8_t value);
+
+  inline  ::uint8_t getFca11CutSource();
+  inline void setFca11CutSource( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -4574,6 +4985,8 @@ public:
   inline bool hasRoadName() const;
   inline  ::capnp::Text::Reader getRoadName() const;
 
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -4623,6 +5036,9 @@ public:
   inline  ::capnp::Text::Builder initRoadName(unsigned int size);
   inline void adoptRoadName(::capnp::Orphan< ::capnp::Text>&& value);
   inline ::capnp::Orphan< ::capnp::Text> disownRoadName();
+
+  inline  ::cereal::LiveMapDataSP::RoadType getRoadType();
+  inline void setRoadType( ::cereal::LiveMapDataSP::RoadType value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -7045,6 +7461,45 @@ inline ::capnp::Orphan< ::cereal::LongitudinalPlanSP::E2eAlerts> LongitudinalPla
       ::capnp::bounded<4>() * ::capnp::POINTERS));
 }
 
+inline bool LongitudinalPlanSP::Reader::hasNoClose() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline bool LongitudinalPlanSP::Builder::hasNoClose() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline  ::cereal::LongitudinalPlanSP::NoClose::Reader LongitudinalPlanSP::Reader::getNoClose() const {
+  return ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::get(_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline  ::cereal::LongitudinalPlanSP::NoClose::Builder LongitudinalPlanSP::Builder::getNoClose() {
+  return ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::get(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+#if !CAPNP_LITE
+inline  ::cereal::LongitudinalPlanSP::NoClose::Pipeline LongitudinalPlanSP::Pipeline::getNoClose() {
+  return  ::cereal::LongitudinalPlanSP::NoClose::Pipeline(_typeless.getPointerField(5));
+}
+#endif  // !CAPNP_LITE
+inline void LongitudinalPlanSP::Builder::setNoClose( ::cereal::LongitudinalPlanSP::NoClose::Reader value) {
+  ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::set(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), value);
+}
+inline  ::cereal::LongitudinalPlanSP::NoClose::Builder LongitudinalPlanSP::Builder::initNoClose() {
+  return ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::init(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline void LongitudinalPlanSP::Builder::adoptNoClose(
+    ::capnp::Orphan< ::cereal::LongitudinalPlanSP::NoClose>&& value) {
+  ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::adopt(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::cereal::LongitudinalPlanSP::NoClose> LongitudinalPlanSP::Builder::disownNoClose() {
+  return ::capnp::_::PointerHelpers< ::cereal::LongitudinalPlanSP::NoClose>::disown(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+
 inline  ::cereal::LongitudinalPlanSP::DynamicExperimentalControlDEPRECATED::DynamicExperimentalControlState LongitudinalPlanSP::DynamicExperimentalControlDEPRECATED::Reader::getState() const {
   return _reader.getDataField< ::cereal::LongitudinalPlanSP::DynamicExperimentalControlDEPRECATED::DynamicExperimentalControlState>(
       ::capnp::bounded<0>() * ::capnp::ELEMENTS);
@@ -7635,6 +8090,328 @@ inline void LongitudinalPlanSP::E2eAlerts::Builder::setLeadDepartAlert(bool valu
       ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool LongitudinalPlanSP::NoClose::Reader::getEnabled() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getEnabled() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setEnabled(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getLeadPresent() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getLeadPresent() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setLeadPresent(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getLeadUsable() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getLeadUsable() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setLeadUsable(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getTracked() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getTracked() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setTracked(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getApplies() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getApplies() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setApplies(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getPreCapAccel() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getPreCapAccel() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setPreCapAccel(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::cereal::LongitudinalPlanSP::NoClose::Candidate LongitudinalPlanSP::NoClose::Reader::getPreCapSource() const {
+  return _reader.getDataField< ::cereal::LongitudinalPlanSP::NoClose::Candidate>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::cereal::LongitudinalPlanSP::NoClose::Candidate LongitudinalPlanSP::NoClose::Builder::getPreCapSource() {
+  return _builder.getDataField< ::cereal::LongitudinalPlanSP::NoClose::Candidate>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setPreCapSource( ::cereal::LongitudinalPlanSP::NoClose::Candidate value) {
+  _builder.setDataField< ::cereal::LongitudinalPlanSP::NoClose::Candidate>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getPostCapAccel() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getPostCapAccel() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setPostCapAccel(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getFactor() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, 1065353216u);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getFactor() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, 1065353216u);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setFactor(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value, 1065353216u);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getRawFactor() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, 1065353216u);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getRawFactor() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, 1065353216u);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setRawFactor(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value, 1065353216u);
+}
+
+inline  ::uint8_t LongitudinalPlanSP::NoClose::Reader::getDwellFrames() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t LongitudinalPlanSP::NoClose::Builder::getDwellFrames() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setDwellFrames( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getClosingSpeed() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getClosingSpeed() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setClosingSpeed(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getFilteredClosing() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getFilteredClosing() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setFilteredClosing(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getRawMeanClosing() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getRawMeanClosing() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setRawMeanClosing(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getVRelBias() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getVRelBias() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setVRelBias(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getFilterValid() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getFilterValid() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setFilterValid(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getFilterCoasting() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getFilterCoasting() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setFilterCoasting(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t LongitudinalPlanSP::NoClose::Reader::getFilterRejects() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<36>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t LongitudinalPlanSP::NoClose::Builder::getFilterRejects() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<36>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setFilterRejects( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<36>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getGateReject() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getGateReject() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setGateReject(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getReinit() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<296>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getReinit() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<296>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setReinit(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<296>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Reader::getE2eGate() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<297>() * ::capnp::ELEMENTS);
+}
+
+inline bool LongitudinalPlanSP::NoClose::Builder::getE2eGate() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<297>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setE2eGate(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<297>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getE2eGated() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<10>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getE2eGated() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<10>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setE2eGated(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<10>() * ::capnp::ELEMENTS, value);
+}
+
+inline float LongitudinalPlanSP::NoClose::Reader::getE2eFinal() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<11>() * ::capnp::ELEMENTS);
+}
+
+inline float LongitudinalPlanSP::NoClose::Builder::getE2eFinal() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<11>() * ::capnp::ELEMENTS);
+}
+inline void LongitudinalPlanSP::NoClose::Builder::setE2eFinal(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<11>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool LongitudinalPlanSP::Deprecated::Reader::hasDec() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -7971,6 +8748,118 @@ inline void CarParamsSP::Builder::setEnableGasInterceptor(bool value) {
       ::capnp::bounded<50>() * ::capnp::ELEMENTS, value);
 }
 
+inline bool CarParamsSP::Reader::getFca11Brake() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11Brake() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11Brake(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<51>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11AffineGain() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11AffineGain() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11AffineGain(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<52>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11Shadow() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<53>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11Shadow() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<53>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11Shadow(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<53>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getPedalDeliveryLaw() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<54>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getPedalDeliveryLaw() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<54>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setPedalDeliveryLaw(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<54>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11DynamicBrakes() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<55>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11DynamicBrakes() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<55>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11DynamicBrakes(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<55>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11StopHoldClutch() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<56>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11StopHoldClutch() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<56>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11StopHoldClutch(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<56>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getGasRiseLag() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<57>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getGasRiseLag() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<57>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setGasRiseLag(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<57>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarParamsSP::Reader::getFca11PedalGuard() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarParamsSP::Builder::getFca11PedalGuard() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11PedalGuard( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<8>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool CarParamsSP::NeuralNetworkLateralControl::Reader::hasModel() const {
   return !_reader.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS).isNull();
@@ -8280,6 +9169,34 @@ inline void CarControlSP::Builder::adoptIntelligentCruiseButtonManagement(
 inline ::capnp::Orphan< ::cereal::IntelligentCruiseButtonManagement> CarControlSP::Builder::disownIntelligentCruiseButtonManagement() {
   return ::capnp::_::PointerHelpers< ::cereal::IntelligentCruiseButtonManagement>::disown(_builder.getPointerField(
       ::capnp::bounded<4>() * ::capnp::POINTERS));
+}
+
+inline  ::uint8_t CarControlSP::Reader::getPersonality() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarControlSP::Builder::getPersonality() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS);
+}
+inline void CarControlSP::Builder::setPersonality( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarControlSP::Reader::getDriveMode() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarControlSP::Builder::getDriveMode() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void CarControlSP::Builder::setDriveMode( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
 }
 
 inline bool CarControlSP::Param::Reader::hasKey() const {
@@ -9008,6 +9925,314 @@ inline void CarStateSP::Builder::setSpeedLimit(float value) {
       ::capnp::bounded<0>() * ::capnp::ELEMENTS, value);
 }
 
+inline  ::uint8_t CarStateSP::Reader::getDriveMode() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getDriveMode() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setDriveMode( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getFca11Unavailable() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getFca11Unavailable() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFca11Unavailable(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<40>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getSuperviseStop() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getSuperviseStop() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setSuperviseStop(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<41>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getStopComplete() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getStopComplete() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setStopComplete(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<42>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getBrakeNow() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getBrakeNow() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setBrakeNow(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<43>() * ::capnp::ELEMENTS, value);
+}
+
+inline float CarStateSP::Reader::getFuelLevel() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+
+inline float CarStateSP::Builder::getFuelLevel() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFuelLevel(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<2>() * ::capnp::ELEMENTS, value);
+}
+
+inline float CarStateSP::Reader::getIntakeTemp() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+
+inline float CarStateSP::Builder::getIntakeTemp() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setIntakeTemp(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<3>() * ::capnp::ELEMENTS, value);
+}
+
+inline float CarStateSP::Reader::getLateralAccel() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+
+inline float CarStateSP::Builder::getLateralAccel() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setLateralAccel(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<4>() * ::capnp::ELEMENTS, value);
+}
+
+inline float CarStateSP::Reader::getLongAccel() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+
+inline float CarStateSP::Builder::getLongAccel() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setLongAccel(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<5>() * ::capnp::ELEMENTS, value);
+}
+
+inline float CarStateSP::Reader::getBatteryVoltage() const {
+  return _reader.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline float CarStateSP::Builder::getBatteryVoltage() {
+  return _builder.getDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setBatteryVoltage(float value) {
+  _builder.setDataField<float>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeEngine() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeEngine() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeEngine( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<6>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeSuspension() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeSuspension() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeSuspension( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<7>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeEsc() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<28>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeEsc() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<28>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeEsc( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<28>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeExhaust() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<29>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeExhaust() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<29>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeExhaust( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<29>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeRevMatch() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<30>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeRevMatch() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<30>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeRevMatch( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<30>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeELSD() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<31>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeELSD() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<31>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeELSD( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<31>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getNModeSteering() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<32>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getNModeSteering() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<32>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setNModeSteering( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<32>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getFca11CameraBraking() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<44>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getFca11CameraBraking() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<44>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFca11CameraBraking(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<44>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarStateSP::Reader::getFca11Divergence() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<45>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarStateSP::Builder::getFca11Divergence() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<45>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFca11Divergence(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<45>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getDriverMark() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<33>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getDriverMark() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<33>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setDriverMark( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<33>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getHoldNag() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<34>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getHoldNag() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<34>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setHoldNag( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<34>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarStateSP::Reader::getFca11CutSource() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<35>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarStateSP::Builder::getFca11CutSource() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<35>() * ::capnp::ELEMENTS);
+}
+inline void CarStateSP::Builder::setFca11CutSource( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<35>() * ::capnp::ELEMENTS, value);
+}
+
 inline bool LiveMapDataSP::Reader::getSpeedLimitValid() const {
   return _reader.getDataField<bool>(
       ::capnp::bounded<0>() * ::capnp::ELEMENTS);
@@ -9110,6 +10335,20 @@ inline void LiveMapDataSP::Builder::adoptRoadName(
 inline ::capnp::Orphan< ::capnp::Text> LiveMapDataSP::Builder::disownRoadName() {
   return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Reader::getRoadType() const {
+  return _reader.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+
+inline  ::cereal::LiveMapDataSP::RoadType LiveMapDataSP::Builder::getRoadType() {
+  return _builder.getDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS);
+}
+inline void LiveMapDataSP::Builder::setRoadType( ::cereal::LiveMapDataSP::RoadType value) {
+  _builder.setDataField< ::cereal::LiveMapDataSP::RoadType>(
+      ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
 }
 
 inline  ::cereal::ModelDataV2SP::TurnDirection ModelDataV2SP::Reader::getLaneTurnDirection() const {

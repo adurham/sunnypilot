@@ -8,8 +8,11 @@ from typing import Any
 
 from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.fork.cruise_prefs import remove_unless_preserved
+from openpilot.sunnypilot.fork.hyundai_settings import (LEGACY_BRAKE_KEY, LEGACY_PEDAL_KEY, LEGACY_SHAPING_KEY,
+                                                       car_layer_overrides, migrate_hyundai_settings, resolve_state)
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -80,10 +83,12 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     params.remove("IntelligentCruiseButtonManagement")
 
   if not CP.openpilotLongitudinalControl and CP_SP.pcmCruiseSpeed:
+    # fork #30: these are the owner's stored cruise preferences. Keep them when longitudinal is
+    # only transiently unavailable (pedal interceptor disarmed for an ignition); the consumers
+    # are already gated on longitudinal being active, so nothing reads them while unavailable.
     cloudlog.warning("openpilot Longitudinal Control and ICBM not available, cleaning up params")
-    params.remove("CustomAccIncrementsEnabled")
-    params.remove("SmartCruiseControlVision")
-    params.remove("SmartCruiseControlMap")
+    for key in ("CustomAccIncrementsEnabled", "SmartCruiseControlVision", "SmartCruiseControlMap"):
+      remove_unless_preserved(params, key)
 
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
@@ -103,6 +108,12 @@ def setup_interfaces(CI: CarInterfaceBase, params: Params | None = None) -> None
 
 
 def initialize_params(params) -> list[dict[str, Any]]:
+  # fork (0046): one-time migration of the legacy pair / misnamed shaping key into the new keys.
+  # It writes only when the new key is absent; a fresh device (neither legacy key present) keeps the
+  # defaults.  Failure is never fatal: the resolver below falls back to the legacy values either way.
+  migrate_hyundai_settings(params)
+  hyundai = car_layer_overrides(resolve_state(params))
+
   keys: list = []
 
   # hyundai
@@ -129,4 +140,66 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "ToyotaTSS2Smooth",
   ])
 
-  return [{k: params.get(k, return_default=True)} for k in keys]
+  params_list = [{k: params.get(k, return_default=True)} for k in keys]
+
+  # fork (0046): the pedal master is owned by HyundaiLongitudinalMode (Stock / Comma pedal /
+  # Pedal + FCA11).  initialize_params() is still the ONLY feed into opendbc setup_interfaces, so
+  # the resolved boolean is handed over under the legacy key name the car layer reads.  The resolver
+  # is defensive: a stale libparams (new key unknown) derives the same value from the legacy pair.
+  params_list.append({"HyundaiGasInterceptor": hyundai[LEGACY_PEDAL_KEY]})
+
+  # fork: optional pedal CAN ID dialect override (auto/standard/remapped). Same stale-libparams hazard; missing -> "auto"
+  # (opendbc treats an absent key as auto, i.e. whichever pedal dialect the fingerprint saw, standard preferred).
+  try:
+    params_list.append({"HyundaiGasInterceptorIDSet": params.get("HyundaiGasInterceptorIDSet", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasInterceptorIDSet param unknown to libparams (not rebuilt?); using auto pedal ID detection")
+
+  # fork (0046): FCA11 braking is mode 2 (Pedal + FCA11) of HyundaiLongitudinalMode.  Same single
+  # feed, same defensive resolver: the car layer receives the legacy key name it already reads.
+  params_list.append({"HyundaiFca11Brake": hyundai[LEGACY_BRAKE_KEY]})
+
+  # fork (0044/0046): FCA11 brake-SHAPING law.  The user-facing key is now HyundaiFca11Shaping; the
+  # historical HyundaiFca11AffineGain is the fallback until the one-time shim writes the new key.
+  # The car layer still receives the value under the old name because its dataclass field and capnp
+  # ordinal @7 are a wire contract.  Same defensive resolver as the sibling keys: a missing value is
+  # OFF, never a raise.  Takes effect at the next ignition.
+  params_list.append({"HyundaiFca11AffineGain": hyundai[LEGACY_SHAPING_KEY]})
+
+  # fork (0045): FCA11 SHADOW mode. Same stale-libparams guard: a missing key leaves Shadow off. When ON, opendbc
+  # setup_interfaces keeps the wire OLD-LAW (HyundaiFca11Brake as today, shaping forced off) and the FCA11 module computes +
+  # logs V3 alongside (never sent). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiFca11Shadow": params.get("HyundaiFca11Shadow", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11Shadow param unknown to libparams (not rebuilt?); FCA11 shadow mode stays disabled")
+
+  # fork (18x): dynamic-release build of the FCA11 law. Same stale-libparams guard: a missing key leaves the build OFF
+  # (the deployed law + the three unconditional 18x rules). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiFca11DynamicBrakes": params.get("HyundaiFca11DynamicBrakes", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11DynamicBrakes param unknown to libparams (not rebuilt?); the dynamic release stays OFF")
+
+  # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0" = the deployed
+  # fail-closed rule). Same stale-libparams guard as the siblings: a missing/junk value leaves the guard OFF, i.e. the
+  # deployed behaviour, never raises. It only ever WEAKENS a fail-closed latch for a bounded window / frame count, so it
+  # must stay 0 until the owner signs off; opendbc mirrors the value into the panda's safetyParam bits 4096/8192.
+  try:
+    params_list.append({"HyundaiFca11PedalGuard": params.get("HyundaiFca11PedalGuard", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11PedalGuard param unknown to libparams (not rebuilt?); the pedal-fault guard stays OFF (deployed rule)")
+  # fork (17c delivery): measured-inverse pedal law for negative asks + a pedal-path ask filter. Same stale-libparams
+  # guard: a missing key leaves the law OFF (the deployed linear law). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiPedalDeliveryLaw": params.get("HyundaiPedalDeliveryLaw", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiPedalDeliveryLaw param unknown to libparams (not rebuilt?); the deployed pedal law stays active")
+  # fork (0042 rise-lag): rise-only first-order lag on the accel ask. Same stale-libparams guard: a missing key leaves
+  # the lag OFF (the deployed pedal path). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiGasRiseLag": params.get("HyundaiGasRiseLag", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiGasRiseLag param unknown to libparams (not rebuilt?); the ask lag stays OFF")
+
+  return params_list
