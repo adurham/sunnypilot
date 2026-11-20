@@ -17,7 +17,7 @@ diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypi
 index 1fb2e2e..21a4e1c 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-@@ -148,6 +148,35 @@ HOLD_SPEED_OFFSET_HIGHWAY_V = [0.34, 0.43, 0.49, 0.56]                 # m/s^2 e
+@@ -148,6 +148,38 @@ HOLD_SPEED_OFFSET_HIGHWAY_V = [0.34, 0.43, 0.49, 0.56]                 # m/s^2 e
  HOLD_CMD_BP = [0., 5., 10., 15., 20., 25., 30., 35.]                  # vEgo, m/s
  HOLD_CMD_V = [0., 0.08, 0.085, 0.095, *[PEDAL_SCALE_HIGHWAY * o for o in HOLD_SPEED_OFFSET_HIGHWAY_V]]  # pedal fraction
  
@@ -42,9 +42,12 @@ index 1fb2e2e..21a4e1c 100644
 +# measured and deployed curves meet within 0.01.
 +# THE FITTED TABLE replaces the hold at every breakpoint up to 18 m/s and MEETS the deployed value at 20 m/s, so the
 +# highway law (20 m/s and up: 0.1224 / 0.1548 / 0.1764 / 0.2016) is BIT-IDENTICAL with the param on or off - cruise
-+# hold and highway following are untouched by construction. The 18-20 segment is the blend into that frozen point (at
-+# 19 m/s it sits on the measured 20-22 crossing, 0.100). 0 m/s stays exactly 0: this car has gas-only authority, so
-+# any pedal at a standstill is uncommanded motion.
++# hold and highway following are untouched by construction. DISCLOSED KINK at 18-20 m/s: the fitted value climbs from
++# 0.081 @18 m/s to the deployed 0.1224 @20, so at 19 m/s it reads 0.102 - the measured 20-22 crossing (0.100), NOT the
++# measured 18-20 point (0.081): a slope about 2x the measured one over that 2 m/s leg, chosen so the table meets the
++# frozen highway value at 20. It is the one place the fit is worse than the measurement (up to ~0.02 pedal = ~0.05
++# m/s^2 of extra hold at 19 m/s - the direction of the deployed defect, small, and inside the 18-20 blend).
++# 0 m/s stays exactly 0: this car has gas-only authority, so any pedal at a standstill is uncommanded motion.
 +# NOT addressed (reported, not fixed): the residual +0.06 m/s^2 at 20-22 m/s, which lives inside the frozen highway leg.
 +HOLD_FIT_BP = [0., 2., 3., 4., 5., 6., 8., 10., 12., 14., 16., 18., 20., 25., 30., 35.]   # vEgo, m/s
 +HOLD_FIT_V = [0., 0.014, 0.044, 0.049, 0.057, 0.060, 0.060, 0.063, 0.066, 0.069, 0.070, 0.081,

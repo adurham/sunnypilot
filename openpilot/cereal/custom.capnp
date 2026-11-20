@@ -441,7 +441,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
   gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
   fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192
-  pedalHoldFit @14 :Bool;  # fork (0049): the pedal law's MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF); identical to the deployed hold at 0 m/s and at 20 m/s and up; mirrors opendbc CarParamsSP
+  pedalHoldFit @14 :Bool;  # fork (0047): the pedal law's MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF); identical to the deployed hold at 0 m/s and at 20 m/s and up; mirrors opendbc CarParamsSP
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 

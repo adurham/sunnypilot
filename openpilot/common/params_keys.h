@@ -302,7 +302,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // law would put it. Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
     // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal path, byte for byte.
     {"HyundaiGasRiseLag", {PERSISTENT | BACKUP, BOOL, "0"}},
-    // fork (0049 hold-fit): the pedal law's HOLD feedforward (the pedal fraction it commands at accel = 0, the "pedal
+    // fork (0047 hold-fit): the pedal law's HOLD feedforward (the pedal fraction it commands at accel = 0, the "pedal
     // that holds speed on flat ground") re-measured from the car's own logs. The deployed 5-15 m/s leg came from a
     // driver steady-pedal fit that over-reads, so at ask 0 the car ACCELERATED +0.12..+0.29 m/s^2 instead of holding
     // (peak at 4-7 m/s; the 2026-11-19 59:37-59:40 creep behind the RV), and 12-20 m/s was ~25 % high. ON uses the
