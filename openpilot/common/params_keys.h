@@ -302,6 +302,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // law would put it. Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
     // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal path, byte for byte.
     {"HyundaiGasRiseLag", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0049 hold-fit): the pedal law's HOLD feedforward (the pedal fraction it commands at accel = 0, the "pedal
+    // that holds speed on flat ground") re-measured from the car's own logs. The deployed 5-15 m/s leg came from a
+    // driver steady-pedal fit that over-reads, so at ask 0 the car ACCELERATED +0.12..+0.29 m/s^2 instead of holding
+    // (peak at 4-7 m/s; the 2026-11-19 59:37-59:40 creep behind the RV), and 12-20 m/s was ~25 % high. ON uses the
+    // measured table (identical to the deployed one at 0 m/s and at 20 m/s and up, so cruise hold and the highway law
+    // are untouched). Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
+    // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal law, byte for byte.
+    {"HyundaiPedalHoldFit", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
     // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may
