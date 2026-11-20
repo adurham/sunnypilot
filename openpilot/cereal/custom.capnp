@@ -323,6 +323,8 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   # Semantics are the deployed cap's own: `closingSpeed = max(filteredClosing, rawMeanClosing)`; `factor` is the min of
   # `rawFactor` over the last RELEASE_DWELL_S (so a tighten is immediate and a release needs the dwell); `tracked` is
   # "a lead is present or the filter is coasting a dropout"; `applies` is the cap's own gate for touching the ask.
+  # `factor`/`rawFactor` DEFAULT TO 1: a message written before these fields existed (or a frame where the cap is not
+  # running) therefore reads as "no cap", never as "fully capped" -- a reader must still gate on `enabled`/`applies`.
   struct NoClose {
     # which candidate won the min() over (MPC, cruise, e2e); mirrors log.LongitudinalPlan.LongitudinalPlanSource
     enum Candidate { cruise @0; lead0 @1; lead1 @2; lead2 @3; e2e @4; }
@@ -337,8 +339,8 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     preCapSource @6 :Candidate;  # the candidate that set preCapAccel
     postCapAccel @7 :Float32;    # preCapAccel after the cap (== preCapAccel when no cap / a non-positive ask)
 
-    factor @8 :Float32;          # dwelled cap factor actually applied, in [0, 1] (1 = no cap)
-    rawFactor @9 :Float32;       # this frame's un-dwelled factor (before the min-window)
+    factor @8 :Float32 = 1;      # dwelled cap factor actually applied, in [0, 1] (1 = no cap)
+    rawFactor @9 :Float32 = 1;   # this frame's un-dwelled factor (before the min-window)
     dwellFrames @10 :UInt8;      # frames of the release-dwell window currently occupied (0 = window flushed)
 
     closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing)

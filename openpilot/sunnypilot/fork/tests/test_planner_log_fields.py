@@ -90,6 +90,15 @@ class TestSchemaAppendOnly(OpenpilotTestCase):
     self.assertEqual(parse(m_sp.group(1)), [(n, int(o)) for o, n in
                                             [(0, 'cruise'), (1, 'lead0'), (2, 'lead1'), (3, 'lead2'), (4, 'e2e')]])
 
+  def test_the_defaults_read_as_no_cap_on_a_message_that_never_set_them(self):
+    """A message written before the fields existed (or any message that leaves them alone) must read factor/rawFactor = 1
+    -- "no cap" -- and not 0, which would read as "fully capped" to a review of an old log."""
+    nc = messaging.new_message('longitudinalPlanSP').longitudinalPlanSP.noClose
+    self.assertEqual(nc.factor, 1.0)
+    self.assertEqual(nc.rawFactor, 1.0)
+    self.assertFalse(nc.enabled)
+    self.assertFalse(nc.applies)
+
   def test_the_log_message_round_trips_every_field(self):
     msg = messaging.new_message('longitudinalPlanSP')
     nc = msg.longitudinalPlanSP.noClose
