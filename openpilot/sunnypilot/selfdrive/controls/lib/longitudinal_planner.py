@@ -142,4 +142,11 @@ class LongitudinalPlannerSP:
     e2eAlerts.greenLightAlert = self.e2e_alerts_helper.green_light_alert
     e2eAlerts.leadDepartAlert = self.e2e_alerts_helper.lead_depart_alert
 
+    # fork (2026-11-19): log-only fields appended by the planner subclass (LongitudinalPlanner -> `noClose`). A no-op
+    # in this base class, so a planner that does not override it publishes exactly the message it published before.
+    self.publish_fork_plan_log(longitudinalPlanSP)
+
     pm.send('longitudinalPlanSP', plan_sp_send)
+
+  def publish_fork_plan_log(self, plan_sp) -> None:
+    """fork hook: log-only planner telemetry, filled by LongitudinalPlanner. Nothing here is read by control code."""

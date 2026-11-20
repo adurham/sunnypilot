@@ -83,6 +83,15 @@ class LeadClosingFilter:
     self.rejects = 0
     self.missed = 0
     self.closing = 0.
+    # LOG-ONLY track-hygiene flags (2026-11-19), published on longitudinalPlanSP.noClose. Nothing reads them: they are
+    # written after the decision they describe and cleared per frame, so no branch can depend on them.
+    self.gate_reject = False   # this frame's dRel failed the innovation gate
+    self.reinit = False        # the track re-initialised this frame (REINIT_FRAMES consecutive rejections)
+
+  @property
+  def bias(self) -> float:
+    """LOG-ONLY: the vRel bias state (m/s) of the 3-state filter (state x = [gap, gap rate, vRel bias])."""
+    return float(self.x[2]) if self.valid else 0.
 
   def _init(self, d: float, v: float) -> None:
     self.x = np.array([d, v, 0.])
@@ -101,6 +110,8 @@ class LeadClosingFilter:
     self.P = self._F @ self.P @ self._F.T + self._Q
 
   def update(self, lead_present: bool, d_rel: float | None, v_rel: float | None) -> float:
+    self.gate_reject = False  # log-only: per-frame flags, cleared every frame
+    self.reinit = False
     d_ok = d_rel is not None and math.isfinite(d_rel) and d_rel >= 0.
     v_ok = v_rel is not None and math.isfinite(v_rel)
     if not (lead_present and d_ok):
@@ -125,8 +136,10 @@ class LeadClosingFilter:
     innov = d - self.x[0]
     if abs(innov) > max(GATE_SIGMA * math.sqrt(S), GATE_MIN_M):
       self.rejects += 1
+      self.gate_reject = True  # log-only
       if self.rejects >= REINIT_FRAMES:
         self._init(d, v)
+        self.reinit = True  # log-only: REINIT_FRAMES consistent rejections = this is a new lead
         self.closing = float(-self.x[1])
         return self.closing
       v_ok = False  # a rejected frame's vRel belongs to the same (other) object: do not fuse it either

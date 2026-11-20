@@ -138,6 +138,16 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.no_close = NoCloseCap()
     # fork (lane C, route 194 #8): a held standstill releases only on a sustained go (fork/standstill_launch.py)
     self.standstill_launch = StandstillLaunchDebounce()
+    # fork (2026-11-19): LOG-ONLY planner telemetry, published on longitudinalPlanSP.noClose (custom.capnp) every frame.
+    # Written in update() and read only by publish_fork_plan_log(); no control path reads them, so they cannot change
+    # the ask. The offline reviews had to rebuild these from longitudinalPlan.speeds/accels + modelV2.
+    self._log_pre_cap = 0.          # min(MPC, cruise, e2e) before the cap
+    self._log_pre_cap_src = 0       # log.LongitudinalPlan.LongitudinalPlanSource of the winner
+    self._log_post_cap = 0.         # the ask after the cap
+    self._log_e2e_gated = 0.        # e2e after the far-lead gate + turn limit
+    self._log_e2e_final = 0.        # e2e after AccelBoost + stop commitment = the e2e candidate
+    self._log_e2e_gate = False      # the gate's state this frame
+    self._log_lead_present = False  # radarState.leadOne.present
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -290,6 +300,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                model_plans_stop(sm['modelV2'].velocity.x),
                                                t_follow if t_follow is not None else
                                                get_T_FOLLOW(sm['selfdriveState'].personality))
+    self._log_e2e_gate = bool(self.e2e_gate)  # fork (2026-11-19): log-only
     # G4: the e2e candidate owns the launch and was never turn-limited (get_cruise_accel's
     # limit_accel_in_turns only clips the cruise candidate). Limit its positive accel to the
     # leftover longitudinal budget of the same a_total_max(v) ellipse, floored at 0.3 m/s^2 so a
@@ -297,6 +308,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # MPC/lead candidate's braking is untouched.
     output_a_target_e2e = min(output_a_target_e2e,
                               max(turn_accel_limit(v_ego, steer_angle_without_offset, self.CP), 0.3))
+    self._log_e2e_gated = float(output_a_target_e2e)  # fork (2026-11-19): log-only, after gate + turn limit
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     self.a_cruise = get_cruise_accel(v_cruise, v_ego, self.a_cruise, self.dt)
@@ -310,17 +322,22 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                   sm['radarState'].leadOne.present or sm['radarState'].leadTwo.present,
                                                   sm['modelV2'].position.x, sm['modelV2'].velocity.x,
                                                   sm['modelV2'].position.t)
+    self._log_e2e_final = float(output_a_target_e2e)  # fork (2026-11-19): log-only, the e2e candidate in the min()
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop),
                   (output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e)]
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
+    self._log_pre_cap = float(output_a_target)        # fork (2026-11-19): log-only, pre-cap candidate
+    self._log_pre_cap_src = int(self.mpc.source)      # fork (2026-11-19): log-only, which candidate won
     # fork: last-stage cap - no positive ask while the gap to the lead is not growing (fork/no_close.py). After the min()
     # so no candidate can raise it back; dRel/vRel feed its closing-speed filter (fork/lead_closing.py).
     _lead = sm['radarState'].leadOne
     output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead),
                                            float(_lead.dRel), float(_lead.vRel))
+    self._log_lead_present = bool(_lead.present)      # fork (2026-11-19): log-only
+    self._log_post_cap = float(output_a_target)       # fork (2026-11-19): log-only, after the cap
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     # fork (lane C): a model shouldStop flicker must not release a held standstill (route 194 #8). Hold-only: never adds a
     # go, never raises the ask; a moving car and a reset planner pass through unchanged.
@@ -356,3 +373,39 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     pm.send('longitudinalPlan', plan_send)
 
     self.publish_longitudinal_plan_sp(sm, pm)
+
+  def publish_fork_plan_log(self, plan_sp) -> None:
+    """fork (2026-11-19): LOG-ONLY planner telemetry on longitudinalPlanSP.noClose (custom.capnp). Pure writes from
+    values the planner already computed this frame; nothing here feeds back into the ask. Ordered so an offline
+    reviewer reads the chain the cap actually applied: preCapAccel (min of MPC/cruise/e2e) -> factor -> postCapAccel."""
+    try:
+      nc = plan_sp.noClose
+    except Exception:
+      # a cereal build that predates the appended field must never take the plan publish (and with it longitudinal
+      # control) down with it: the fields are diagnostics, so a missing schema means "publish the plan unchanged".
+      return
+    cap = self.no_close
+    lead_filter = cap.lead_filter
+    nc.enabled = bool(cap.enabled)
+    nc.leadPresent = bool(self._log_lead_present)
+    nc.leadUsable = bool(cap.lead_usable)
+    nc.tracked = bool(cap.tracked)
+    nc.applies = bool(cap.applies)
+    nc.preCapAccel = float(self._log_pre_cap)
+    nc.preCapSource = int(self._log_pre_cap_src)
+    nc.postCapAccel = float(self._log_post_cap)
+    nc.factor = float(cap.factor)
+    nc.rawFactor = float(cap.raw_factor)
+    nc.dwellFrames = int(cap.dwell_frames)
+    nc.closingSpeed = float(cap.closing_speed)
+    nc.filteredClosing = float(cap.filtered_closing)
+    nc.rawMeanClosing = float(cap.raw_mean)
+    nc.vRelBias = float(lead_filter.bias)
+    nc.filterValid = bool(lead_filter.valid)
+    nc.filterCoasting = bool(lead_filter.coasting)
+    nc.filterRejects = int(lead_filter.rejects)
+    nc.gateReject = bool(lead_filter.gate_reject)
+    nc.reinit = bool(lead_filter.reinit)
+    nc.e2eGate = bool(self._log_e2e_gate)
+    nc.e2eGated = float(self._log_e2e_gated)
+    nc.e2eFinal = float(self._log_e2e_final)
