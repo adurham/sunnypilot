@@ -6,8 +6,9 @@ from opendbc.car.structs import car
 from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.hardware import PC, COMMA_HARDWARE
-from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
+from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess, RestartingPythonProcess
 from openpilot.common.hardware.hw import Paths
+from openpilot.sunnypilot import jetlink_adapter
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
 
@@ -204,6 +205,10 @@ procs += [
   PythonProcess("models_manager", "openpilot.sunnypilot.models.manager", only_offroad),
   NativeProcess("modeld_tinygrad", "openpilot/sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
   PythonProcess("modeld_warmup", "openpilot.sunnypilot.modeld_v2.warmup", only_offroad),
+
+  # Jetlink gadget owner (default off: should_run is False unless the JetlinkLink param is set). Runs onroad too: it
+  # holds the USB gadget open for as long as the link is on, so a drive never sees the unplug at an ignition edge.
+  RestartingPythonProcess(jetlink_adapter.OWNER, jetlink_adapter.__name__, jetlink_adapter.should_run),
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),

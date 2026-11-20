@@ -52,6 +52,7 @@ from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
 from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
+from openpilot.sunnypilot import jetlink_adapter
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.modeld_v2.helpers import load_model
@@ -104,7 +105,8 @@ def _offload_chestnut_present() -> bool:
   """OFFLOAD §4f: never probe USB/chestnut on the Mac path. OFFLOAD unset => upstream's detection, verbatim."""
   if os.environ.get('OFFLOAD') == '1':
     return os.environ.get('OFFLOAD_CHESTNUT') == '1'
-  return _find_driving_pkl(get_active_bundle(chestnut=True)) is not None and (chestnut_present() or cable_connected())
+  # a Jetson or an iPhone on the USB-C port looks like a chestnut to cable_connected(): the cable counts only while Jetlink is off
+  return _find_driving_pkl(get_active_bundle(chestnut=True)) is not None and (chestnut_present() or jetlink_adapter.chestnut_cable(cable_connected()))
 
 
 def _load_offload_car_params():
@@ -366,6 +368,7 @@ def main(demo=False):
   setproctitle(PROCESS_NAME)
 
   CHESTNUT = _offload_chestnut_present()
+  jetlink_adapter.prepare(CHESTNUT)  # before going realtime: the GPU thread it starts would inherit SCHED_FIFO 54 on core 7
   if CHESTNUT:
     from tinygrad.runtime.ops_amd import AMDDevice
     AMDDevice.wait_timeout_ms = 3000
@@ -429,6 +432,8 @@ def main(demo=False):
   small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
   if model is None:
     model = small_model
+  # the joining Jetlink model drives as small_model until the big model is ready (default off: returns model unchanged)
+  model = jetlink_adapter.attach(model, small_model, vipc_client_main.width, vipc_client_main.height)
   params.put_bool("ChestnutLoading", False)
   assert model is not None
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
@@ -557,6 +562,8 @@ def main(demo=False):
     run_count = run_count + 1
 
     frame_drop_ratio = frames_dropped / (1 + frames_dropped)
+    # Jetlink's joining model reads the drop ratio to hand a lagging big model back
+    model.frame_drop_ratio = frame_drop_ratio
 
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
@@ -595,6 +602,8 @@ def main(demo=False):
       model_output = None
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
+    if jetlink_adapter.handed_over(model):  # a swap or a hand-back stalls a frame or two: restart the filter's warmup
+      run_count = 0
 
     if model_output is not None:
       modelv2_send = messaging.new_message('modelV2')
