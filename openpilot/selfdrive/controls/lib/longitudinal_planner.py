@@ -20,6 +20,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
 from openpilot.sunnypilot.fork.no_close import NoCloseCap
+from openpilot.sunnypilot.fork.min_gap_floor import MinGapFloor
 from openpilot.sunnypilot.fork.standstill_launch import StandstillLaunchDebounce
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -136,6 +137,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork: never accelerate toward a lead (fork/no_close.py, param NoCloseOnLead). Owner 2026-11-01: the car must
     # not speed up to reach the follow gap on a car it can already see.
     self.no_close = NoCloseCap()
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). Keys on the
+    # GAP alone, so a vision lead-speed failure cannot disarm it.
+    self.min_gap_floor = MinGapFloor()
     # fork (lane C, route 194 #8): a held standstill releases only on a sustained go (fork/standstill_launch.py)
     self.standstill_launch = StandstillLaunchDebounce()
     # fork (2026-11-19): LOG-ONLY planner telemetry, published on longitudinalPlanSP.noClose (custom.capnp) every frame.
@@ -336,6 +340,17 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     _lead = sm['radarState'].leadOne
     output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead),
                                            float(_lead.dRel), float(_lead.vRel))
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). The last
+    # resort for when every lead-SPEED rule is blinded (2026-11-19: vision read a trailer as pulling away while the gap
+    # shrank): keys on the 0.5 s median GAP alone, and only ever deepens the ask. It also owns the post-release hold
+    # (zero throttle, no brake) so a release can never hand the pedal back at a short gap.
+    output_a_target = self.min_gap_floor.update(output_a_target, v_ego, not reset_state,
+                                                sm['carState'].gasPressed, bool(_lead.present),
+                                                float(_lead.dRel),
+                                                # modelProb is a LeadData field in cereal, NOT a radarState one: v1's
+                                                # wiring read radarState.modelProb and would have raised on the car.
+                                                float(getattr(_lead, 'modelProb', 1.0)),
+                                                bool(sm['carState'].standstill))
     self._log_lead_present = bool(_lead.present)      # fork (2026-11-19): log-only
     self._log_post_cap = float(output_a_target)       # fork (2026-11-19): log-only, after the cap
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
