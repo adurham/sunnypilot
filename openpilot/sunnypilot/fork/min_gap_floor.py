@@ -35,7 +35,9 @@ Fail-safe (each one is a unit test)
   doubts. (``leadOne`` has no prob field of its own; ``modelProb`` is the leadsV3 probability radard used for it.)
 - driver gas: OFF (the driver is asking for torque; a brake floor must not fight it).
 - launch / standstill: OFF below V_MIN = 1.5 m/s on entry and released below V_RELEASE = 1.0 m/s, and ``active`` false
-  whenever the planner resets (long inactive / override). A launch from rest therefore never sees it.
+  whenever the planner resets (long inactive / override). Because the median buffer is deliberately pre-warmed while the
+  car sits still, standing still also starts a LAUNCH_GRACE_S = 2 s clock during which the floor may not ARM - without it
+  a launch from an ordinary short queue stop (2.4-3.0 m) would brake a legitimate pull-away the instant v passed 1.5 m/s.
 - above V_MAX = 10 m/s: OFF. Highway gaps are a different question (a -1.0 brake at 70 mph is not this rule's business).
 
 Anti-chatter
@@ -62,6 +64,7 @@ K_EXIT = 0.8       # s: exit gap = max(D_EXIT, K_EXIT * v_ego)  -> 0.8 s headway
 A_FLOOR = -1.0     # m/s^2: the ask the floor imposes; below every FCA11 onset threshold, so it always brakes
 N_MED = 10         # samples of the 0.5 s median at 20 Hz
 MIN_SAMPLES = 5    # a lead must supply at least 0.25 s of its own samples before the floor may ADD a brake
+LAUNCH_GRACE_S = 2.0  # s after leaving a standstill during which the floor may not arm (see the launch fence below)
 V_RELEASE = 1.0    # m/s: release below this even while the gap is short (never brake a car to a standstill)
 MIN_LEAD_PROB = 0.5  # leadOne.prob below this = the model does not trust the track -> do nothing
 
@@ -91,6 +94,7 @@ class MinGapFloor:
     self.enabled = False
     self.on = False           # the floor is active on this frame (diagnostics / tests)
     self.gap_med = float("nan")  # the median gap the decision used on the last frame
+    self.launch_hold = 0.0    # s of post-standstill grace remaining before the floor may arm
     n = max(1, int(round(N_MED)))
     self._buf: deque[float] = deque(maxlen=n)
     self._read_param()
@@ -124,6 +128,15 @@ class MinGapFloor:
       self._read_param()
     self._frame += 1
 
+    # LAUNCH FENCE. The median buffer is deliberately pre-warmed while the car sits at a standstill, so without this a
+    # launch from an ordinary short queue stop (2.4-3.0 m behind the lead) would arm the floor the instant v passes
+    # 1.5 m/s and brake a legitimate pull-away. Standing still (re)starts a LAUNCH_GRACE_S clock; the floor may not ARM
+    # until it has run out. It never extends or releases an already-active floor.
+    if standstill:
+      self.launch_hold = LAUNCH_GRACE_S
+    elif self.launch_hold > 0.0:
+      self.launch_hold = max(0.0, self.launch_hold - self.dt)
+
     if lead_present and d_rel is not None and bool(np.isfinite(d_rel)) and float(lead_prob) >= MIN_LEAD_PROB:
       usable = True
       self._buf.append(float(d_rel))
@@ -143,5 +156,7 @@ class MinGapFloor:
     else:
       # MIN_SAMPLES: a lead that has just appeared / re-appeared must produce 0.25 s of its own samples first, so one
       # noisy first frame can never add a brake. An already-active floor is exempt (it only ever releases on the gap).
-      self.on = (len(self._buf) >= MIN_SAMPLES) and (v > V_MIN) and (v <= V_MAX) and d < enter_gap(v)
+      # launch_hold: never arm during the post-standstill grace window.
+      self.on = ((len(self._buf) >= MIN_SAMPLES) and (self.launch_hold <= 0.0)
+                 and (v > V_MIN) and (v <= V_MAX) and d < enter_gap(v))
     return floor_ask(accel, self.on)

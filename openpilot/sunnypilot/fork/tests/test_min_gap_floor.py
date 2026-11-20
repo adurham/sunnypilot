@@ -127,6 +127,20 @@ class TestArmingEnvelope(OpenpilotTestCase):
       f = make()
       self.assertEqual(feed(f, 40, 1.0, v), 0.0, msg=f"v={v}")
 
+  def test_a_launch_from_a_short_queue_gap_is_not_braked(self):
+    """The review's catch: the median buffer is pre-warmed during a standstill, so a normal pull-away from a 2.5 m queue
+    stop would arm the floor as soon as v passed 1.5 m/s. Standing still must start the 2 s launch grace."""
+    f = make()
+    self.assertEqual(feed(f, 20, 2.5, 0.0, standstill=True), 0.0)   # 1 s held at a normal queue gap
+    self.assertAlmostEqual(f.launch_hold, mg.LAUNCH_GRACE_S)
+    out = 0.0
+    for i in range(39):                                            # the 2 s grace: 39 frames of a pull-away, v 0.15 -> 3.0 m/s
+      v = min(3.0, 0.075 * (i + 1) * 2)
+      out = f.update(0.0, v, True, False, True, 2.5, 1.0, False)
+      self.assertEqual(out, 0.0, msg=f"frame {i} v={v:.2f}")
+    # grace spent and the gap still short (a lead that is NOT pulling away): now it arms
+    self.assertEqual(f.update(0.0, 3.0, True, False, True, 2.5, 1.0, False), -1.0)
+
   def test_no_entry_above_v_max(self):
     f = make()
     self.assertEqual(feed(f, 40, 1.0, mg.V_MAX + 0.5), 0.0)
