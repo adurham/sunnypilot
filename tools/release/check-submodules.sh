@@ -16,7 +16,8 @@ while read -r hash submodule ref; do
 
   hash=$(echo "$hash" | sed 's/^[+-]//')
 
-  if [ "$submodule" = "tinygrad_repo" ]; then
+  # tinygrad's pin is not on its master; jetlink is a fork whose default branch is `main`, not `master`
+  if [ "$submodule" = "tinygrad_repo" ] || [ "$submodule" = "jetlink_repo" ]; then
     echo "Skipping $submodule"
     continue
   fi
