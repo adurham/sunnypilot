@@ -4,11 +4,14 @@ Fork: low-speed minimum-gap brake floor (adurham/sunnypilot). Inert unless the `
 Why this exists
 ---------------
 Route 000001ac, 2026-11-19, I-80/94 stop-and-go at 12-14 mph, night, a flat-rear white RV trailer directly ahead.
-From 59:37 to 59:45.7 the car crept from ~7.5 m to 1.4-2.7 m behind that trailer (THW 0.3-0.5 s) while the published ask
-sat at exactly 0.00 and the car accelerated 4.08 -> 6.21 m/s; the driver braked and disengaged. Vision read the trailer as
-pulling away (vRel +13.7/+15.0 m/s spikes while the gap shrank), so the MPC and the e2e candidates both stayed positive,
-``NoCloseOnLead`` released twice, and nothing ever asked for a brake. The gap itself was never wrong - the 0.5 s median
-dRel tracked the trailer at 1.4-2.7 m.
+From 59:37 to 59:45.7 the car crept from ~7.5 m to 1.4-2.7 m (raw dRel) behind that trailer (THW 0.3-0.6 s) while it
+accelerated 4.08 -> 6.21 m/s; the driver braked and disengaged. The published ask was exactly 0.00 while the speed rose
+4.08 -> 5.11 m/s (59:37.0-59:40.0), -0.16..+0.1 at 5.2-5.3 m/s, and +0.06..+0.39 while it rose 5.47 -> 6.14 m/s
+(59:43.7-59:45.5, ``NoCloseOnLead`` released a second time) - F-SIM-CREEP-2026-11-19. Vision read the trailer as pulling
+away (vRel +13.7/+15.0 m/s spikes while the gap shrank), so the MPC and the e2e candidates both stayed positive and
+nothing ever asked for a brake: the lowest ask after 59:35 was -0.16, which on the car's continuous brake law (no -0.5
+onset) is about its coast point - no friction brake. The raw range was noisy (4.6 -> 8.9 -> 3.1 m inside 0.3 s); the
+0.5 s median dRel tracked the trailer (minimum 1.6 m).
 
 That is the hole this fills: every existing rule keys on the lead's SPEED (vRel / closing / vLead), and every one of them
 is blind when the speed is wrong. The gap is the robust signal at these ranges, so the last resort keys on the gap alone.
@@ -69,7 +72,9 @@ so a phantom that blinks out for a second cannot buy a fresh 5 s; it is forgotte
 gap recovers, the car stops, the driver disengages) or after BUDGET_FORGET_S with the floor off. When it runs out the floor
 steps into HOLD for at most CAP_HOLD_MAX_S and then OFF, and LATCHES (``cap_latched``): no re-arm until the gap has been seen
 above the recovery band for RECOVER_DWELL_S, the car stops, the driver disengages, or no usable lead has been seen for
-LATCH_FORGET_ABSENT_S. A lead dropout never clears the latch.
+LATCH_FORGET_ABSENT_S. A lead dropout never clears the latch, and neither does a driver override (a gas press): the
+budget, the latch and the flicker history survive it (see "Driver override vs a real disengage"). A real disengage
+followed by a re-engagement starts a new approach with a fresh budget.
 
 Staleness (review item 4)
 -------------------------
@@ -79,9 +84,35 @@ so a frozen message cannot keep padding the median with the same range.
 
 Re-arm, cooldown and the flicker bound (review item 7)
 -------------------------------------------------------
-A re-arm after a release (or after a driver gas override) needs REARM_COOLDOWN_S. A dropout EXPIRY is a fail-safe stop,
-not a release, so its re-arm is not cooldown-gated (5 s of blindness next to a close lead is worse) - but once
+A re-arm after a release (or after a driver override, see below) needs REARM_COOLDOWN_S. A dropout EXPIRY is a fail-safe
+stop, not a release, so its re-arm is not cooldown-gated (5 s of blindness next to a close lead is worse) - but once
 FLICKER_REARMS such re-arms have happened inside FLICKER_WINDOW_S, the next expiry starts the cooldown too.
+
+Driver override vs a real disengage (2026-11-20 Opus review, finding 1)
+------------------------------------------------------------------------
+On this car a driver gas press does NOT reach the planner as ``gasPressed`` with the planner still active: it raises
+``gasPressedOverride`` (ET.OVERRIDE_LONGITUDINAL, the only such event), so ``CC.longActive`` goes false,
+``longControlState`` goes off and the planner resets (``active`` False) - usually on the FIRST gas frame (133 of 171
+engaged presses in the 390-segment corpus), sometimes one frame BEFORE ``gasPressed`` is seen, sometimes with no gas frame
+sampled at all, and on the release the planner can stay reset for 0-2 frames after the gas is gone. v2.1 as first
+committed tested ``not active`` before ``gas`` and treated every reset as the end of the approach, so a gas press wiped
+the brake budget and the duration-cap latch and almost never started the cooldown (after a capped phantom a 6 s press
+bought a fresh 5 s of -1.0, and the floor could brake again on the first frame after the driver lifted off).
+
+So the floor tells the two apart by the ENGAGEMENT (``selfdriveState.enabled``, read inside the contained hook), never by
+which of the two signals arrives first:
+  * not engaged                         -> a REAL DISENGAGE: the approach is over (everything may reset).
+  * engaged and (gas or planner reset)   -> a DRIVER OVERRIDE (once the planner has been in control since the engagement):
+                                           the brake is dropped on that frame and the ask passed through; the brake
+                                           budget, the duration-cap latch (set now if the budget is already spent) and
+                                           the flicker history are KEPT; the cooldown is held full on EVERY override
+                                           frame, so it runs REARM_COOLDOWN_S from the release whatever the floor's state
+                                           was; the budget-forget clock restarts after the override.
+  * engaged, planner reset, no gas, and the planner not yet in control since the engagement -> engagement start-up:
+                                           the floor stays OFF (nothing to keep; no cooldown), as before.
+The latch can still be forgotten during an override by the unchanged lead rule (LATCH_FORGET_ABSENT_S with no usable lead:
+the phantom is gone), never by the press itself. An override shorter than one planner frame that the planner never
+samples is invisible here; the car layer still drops the brake because ``longActive`` is false.
 
 Containment (review items 2/3; the v1 bug)
 ------------------------------------------
@@ -245,7 +276,8 @@ class MinGapFloor:
 
   Diagnostics (read by tests / the shadow replay, never by the planner): ``state``, ``gap_med`` (the median the decision
   used), ``launch_hold`` / ``rearm_t`` (clocks, s remaining), ``brake_t`` (s of brake in this approach), ``hold_t``,
-  ``cap_latched``, ``dependency`` (why the floor may or may not arm), ``enabled``, ``faulted`` (the drive-long latch).
+  ``cap_latched``, ``dependency`` (why the floor may or may not arm), ``enabled``, ``faulted`` (the drive-long latch),
+  ``override`` (this frame was read as a driver override: engaged, and gas or a planner reset).
   """
 
   def __init__(self, params=None, dt: float = DT_MDL, cp_sp=None, car_layer="auto", cp_sp_parser=None):
@@ -279,6 +311,8 @@ class MinGapFloor:
     self.off_t = 0.0              # s continuously OFF (forgets the brake budget)
     self.absent_t = 0.0           # s with no usable lead (forgets a cap latch)
     self.cap_latched = False
+    self.override = False         # diagnostics: this frame was a driver override (engaged, gas or planner reset)
+    self._live = False            # the planner has been in control since the engagement (tells an override from start-up)
     self._bridge_from = OFF
     self._last_radar_t = None
     self._last_expiry_t = None
@@ -339,6 +373,8 @@ class MinGapFloor:
   def _set_enabled(self, enabled: bool, dep: str) -> None:
     if self.enabled and not enabled:
       self._full_reset(clear_buffer=True)   # a later re-enable starts cold, never from a stale BRAKE
+      self._live = False                    # (together with the full reset: _live False always means no approach memory)
+      self.override = False
     self.enabled = bool(enabled)
     self.dependency = dep
     if dep != self._dep_logged:
@@ -400,11 +436,12 @@ class MinGapFloor:
       lead_prob = float(lead.modelProb)     # a LeadData field: read directly; a missing field raises (fail closed)
       gas = bool(car_state.gasPressed)
       standstill = bool(car_state.standstill)
+      engaged = bool(sm['selfdriveState'].enabled)   # tells a driver OVERRIDE (still engaged) from a real disengage
       radar_t = int(sm.logMonoTime['radarState']) * 1e-9
       now_t = int(sm.logMonoTime['modelV2']) * 1e-9
       radar_md_t = int(radar.mdMonoTime) * 1e-9
       return self._rule(float(accel), float(v_ego), bool(active), gas, present, d_rel, lead_prob, standstill,
-                        radar_t, radar_md_t, now_t)
+                        radar_t, radar_md_t, now_t, engaged)
     except Exception:
       try:
         self._fault()
@@ -416,17 +453,22 @@ class MinGapFloor:
   # -- the rule ------------------------------------------------------------------------------------------------------
   def update(self, accel: float, v_ego: float, active: bool, gas_pressed: bool = False, lead_present: bool = False,
              d_rel: float | None = None, lead_prob: float = float("nan"), standstill: bool = False,
-             radar_t: float | None = None, radar_md_t: float | None = None, now_t: float | None = None) -> float:
+             radar_t: float | None = None, radar_md_t: float | None = None, now_t: float | None = None,
+             engaged: bool = True) -> float:
     """The rule with explicit inputs (tests / offline replay). ``lead_prob`` defaults to UNTRUSTED. ``radar_t`` /
     ``now_t`` (s) are the radarState and planner-frame times; ``None`` (a caller without message timing) counts every call
-    as a new sample and never stale - the planner hook always passes the real times."""
+    as a new sample and never stale - the planner hook always passes the real times. ``engaged`` is
+    ``selfdriveState.enabled`` (the hook reads it): True + (gas or ``active`` False) is a driver OVERRIDE, False a real
+    disengage. Its default (True) is the conservative one for a caller without engagement data: it can only keep the
+    approach memory and add cooldown, never clear them."""
     self._poll()
     if not self.enabled:
       return float(accel)
     return self._rule(float(accel), float(v_ego), bool(active), bool(gas_pressed), bool(lead_present), d_rel,
-                      lead_prob, bool(standstill), radar_t, radar_md_t, now_t)
+                      lead_prob, bool(standstill), radar_t, radar_md_t, now_t, bool(engaged))
 
-  def _rule(self, accel, v, active, gas_pressed, lead_present, d_rel, lead_prob, standstill, radar_t, radar_md_t, now_t):
+  def _rule(self, accel, v, active, gas_pressed, lead_present, d_rel, lead_prob, standstill, radar_t, radar_md_t, now_t,
+            engaged=True):
     dt = self.dt
     self.t += dt
 
@@ -458,16 +500,26 @@ class MinGapFloor:
     if self.cap_latched and self.absent_t >= LATCH_FORGET_ABSENT_S - 1e-9:
       self._end_approach()                     # no usable lead for a while: whatever produced the phantom is gone
 
-    # hard fail-safes: the planner / the driver own the frame
-    if not active:
+    # hard fail-safes: the planner / the driver own the frame. Told apart by the ENGAGEMENT, never by which of gas /
+    # planner reset arrives first (on this car a gas press usually reaches the planner as a reset; see the module notes).
+    if not engaged:
+      # a REAL DISENGAGE: the approach is over
+      self.override = False
+      self._live = False
       self._full_reset(clear_buffer=not usable)
       return float(accel)
-    if gas_pressed:
-      if self.state != OFF:
-        self.rearm_t = max(self.rearm_t, REARM_COOLDOWN_S)   # a driver override is a release
+    if gas_pressed or not active:
+      if gas_pressed or self._live:
+        # a DRIVER OVERRIDE: gas, the planner reset it causes (before, with or after the gas frames), the release lag
+        self._override(usable)
+        return float(accel)
+      # engaged, but the planner has not been in control since the engagement (start-up frames): stay OFF, keep nothing
+      # new (there is no approach memory to keep - _live is False only after a real disengage or a disable reset it)
+      self.override = False
       self._to_off(clear_buffer=not usable)
-      self._tick_off()
       return float(accel)
+    self.override = False
+    self._live = True
 
     if not usable:
       # LEAD DROPOUT / UNTRUSTED / STALE. Drop the brake at once, but keep the buffer and hold the pedal at zero for up
@@ -574,6 +626,20 @@ class MinGapFloor:
     self.state = BRAKE
     self.exit_t = self.recover_t = 0.0
     self.off_t = 0.0
+
+  def _override(self, usable: bool) -> None:
+    """A driver override (engaged; gas, or the planner reset a gas press causes). The brake is dropped on this frame (the
+    caller passes the ask through) and the approach memory is KEPT: the brake budget, the duration-cap latch and the
+    flicker history. A budget already spent is latched here exactly as the cap would latch it, so an override at that
+    frame cannot turn the latch into a 10 s forget. The cooldown is held full on every override frame (it runs
+    REARM_COOLDOWN_S from the release), and the budget-forget and latch-recovery clocks restart after the override."""
+    self.override = True
+    if self.brake_t >= BRAKE_MAX_S - 1e-9:
+      self.cap_latched = True
+    self._to_off(clear_buffer=not usable)
+    self.rearm_t = max(self.rearm_t, REARM_COOLDOWN_S)
+    self.off_t = 0.0
+    self.latch_recover_t = 0.0
 
   def _enter_hold(self) -> None:
     self.state = HOLD

@@ -16,8 +16,13 @@ Where each requirement is pinned:
   review item 6  what the hold ask does at the car layer         TestHoldOnTheCarsOwnLaw
   review item 7  flicker bound                                  TestFlicker
   review item 8  gas / disengage drop BRAKE within one frame    TestOffAndFailsafe, TestContainmentOnRealMessages
+  Opus review finding 1  a gas press arrives as a planner RESET  TestOverrideVsDisengage, TestRealPlanner
+                 (override vs disengage; real signal orders from route 000001ac and the 390-segment corpus)
 The real-message replay of the REAL planner over rlogs (red on v1 @ 1604d4a250, green here) is the sim harness
 ~/comma-sim/wsSTOP/drive-2026-11-19/sim/mingap/v2fix/scripts/replay_real.py; TestRealPlanner is its in-tree miniature.
+Note: TestOffAndFailsafe.test_driver_gas_drops_an_active_brake_in_one_frame_and_starts_the_cooldown feeds gas with the
+planner still ACTIVE on the first press frame - an order this car produces in only ~22 % of engaged presses; the orders
+it does produce are in TestOverrideVsDisengage.
 """
 import os
 
@@ -806,7 +811,7 @@ class LogSM(dict):
     self.logMonoTime = {}
 
 
-def real_sm(t, d=2.0, prob=1.0, present=True, gas=False, stand=False, v=5.0, radar_t=None):
+def real_sm(t, d=2.0, prob=1.0, present=True, gas=False, stand=False, v=5.0, radar_t=None, enabled=True):
   rs = messaging.new_message('radarState')
   rs.logMonoTime = int(round((radar_t if radar_t is not None else t - DT) * 1e9))
   rs.radarState.mdMonoTime = rs.logMonoTime
@@ -815,8 +820,12 @@ def real_sm(t, d=2.0, prob=1.0, present=True, gas=False, stand=False, v=5.0, rad
   rs.radarState.leadOne.modelProb = prob
   cs = messaging.new_message('carState')
   cs.carState.vEgo, cs.carState.gasPressed, cs.carState.standstill = v, gas, stand
-  sm = LogSM(radarState=rs.radarState.as_reader(), carState=cs.carState.as_reader())
-  sm.logMonoTime = {'radarState': rs.logMonoTime, 'modelV2': int(round(t * 1e9)), 'carState': int(round(t * 1e9))}
+  ss = messaging.new_message('selfdriveState')
+  ss.selfdriveState.enabled = enabled
+  sm = LogSM(radarState=rs.radarState.as_reader(), carState=cs.carState.as_reader(),
+             selfdriveState=ss.selfdriveState.as_reader())
+  sm.logMonoTime = {'radarState': rs.logMonoTime, 'modelV2': int(round(t * 1e9)), 'carState': int(round(t * 1e9)),
+                    'selfdriveState': int(round(t * 1e9))}
   return sm
 
 
@@ -912,6 +921,195 @@ class TestContainmentOnRealMessages(OpenpilotTestCase):
     self.assertNotIn(mg.A_FLOOR, outs[STALE_FRAMES + 1:])
 
 
+# --- REAL driver gas presses, one code per planner frame exactly as plannerd's SubMaster saw them (gasPressed from carState,
+# planner reset = controlsState.longControlState == off, engaged = selfdriveState.enabled; scan: wsSTOP/drive-2026-11-19/
+# sim/mingap/fix2/scripts/press_catalog.py). Codes:  '.' engaged, planner active, no gas   'g' engaged, planner ACTIVE, gas
+#   'G' engaged, planner RESET, gas   'r' engaged, planner RESET, no gas   'D' NOT engaged (a real disengage)
+REAL_PRESS_RESET_FIRST = 'G' * 44 + 'r'     # 000001ac--0fd72a8378--65 @3919.76: reset on the 1st gas frame, 1-frame lag
+REAL_PRESS_ACTIVE_FIRST = 'g' + 'G' * 8 + 'r'  # 000001ac--0fd72a8378--36 @2214.75: planner still active on frame 1, lag 1
+REAL_RESET_BEFORE_GAS = 'r' + 'G' * 95      # 000001ac--0fd72a8378--65 @3924.46: the reset arrives a frame BEFORE the gas
+REAL_ISOLATED_RESET = 'r'                    # 000001ac--0fd72a8378--67 @4078.96: a reset with no gas frame sampled at all
+REAL_LONG_PRESS = 'G' * 118 + 'r'            # 000001ac--0fd72a8378--100 @6012.97: a 5.9 s press, 1-frame lag
+REAL_LAG_2 = 'G' * 18 + 'rr'                 # 00000199--a5acf5c6e9--1 @91.21: a two-frame release lag
+_SIG = {'.': (False, True, True), 'g': (True, True, True), 'G': (True, False, True), 'r': (False, False, True),
+        'D': (False, False, False)}          # code -> (gasPressed, planner active = not reset_state, selfdriveState.enabled)
+COOLDOWN_FRAMES = int(round(mg.REARM_COOLDOWN_S / DT))
+
+
+class HookCtx:
+  """Drives the REAL hook ``apply()`` with REAL capnp readers, one planner frame per code: ``active`` is what the planner
+  passes (``not reset_state``); gasPressed and selfdriveState.enabled are in the messages. Fresh radarState every frame."""
+
+  def __init__(self, f, t0=200.0):
+    self.f, self.t = f, t0
+
+  def run(self, codes, d=2.0, v=5.0, ask=0.0, present=True):
+    outs = []
+    for code in codes:
+      gas, active, enabled = _SIG[code]
+      self.t += DT
+      outs.append(self.f.apply(real_sm(self.t, d=d, present=present, gas=gas, v=v, enabled=enabled), ask, v, active))
+    return outs
+
+
+class TestOverrideVsDisengage(OpenpilotTestCase):
+  """Opus review finding 1: on this car a driver gas press reaches the floor as a PLANNER RESET (gasPressedOverride ->
+  longActive False -> longControlState off), usually on the first gas frame, sometimes a frame before the gas, and the
+  release can lag 1-2 frames. v2.1 read every reset as the end of the approach: no cooldown, budget and cap latch wiped.
+  Every test here feeds a REAL signal order through the real hook; the ones marked RED-v2.1 fail on ac1e439c03."""
+
+  def _armed(self, d=2.0, v=5.0):
+    f = make()
+    c = HookCtx(f)
+    self.assertEqual(c.run('.' * 30, d=d, v=v)[-1], mg.A_FLOOR)
+    return f, c
+
+  def test_every_real_order_drops_the_brake_on_its_first_frame_and_the_cooldown_runs_from_the_release(self):
+    """RED-v2.1: re-braked on the first frame after the release (reset-first / reset-before-gas / isolated reset / lag 2)
+    or 4.55 s after it (active-first: its cooldown started at the press, not at the release)."""
+    for seq in (REAL_PRESS_RESET_FIRST, REAL_PRESS_ACTIVE_FIRST, REAL_RESET_BEFORE_GAS, REAL_ISOLATED_RESET, REAL_LAG_2,
+                REAL_LONG_PRESS):
+      with self.subTest(seq=f"{seq[:3]}..{len(seq)}"):
+        f, c = self._armed()
+        press = c.run(seq, d=2.0, ask=0.6)                    # the lead stays 2 m away the whole time
+        self.assertTrue(all(o == 0.6 for o in press))         # the driver's ask from the FIRST press frame, never -1.0
+        self.assertEqual(f.state, mg.OFF)
+        after = c.run('.' * (COOLDOWN_FRAMES + 40), d=2.0, ask=0.1)
+        self.assertIn(mg.A_FLOOR, after)                      # the floor still works afterwards (budget left) ...
+        first = after.index(mg.A_FLOOR)
+        self.assertGreaterEqual(first, COOLDOWN_FRAMES - 1)   # ... but not within 5 s of the last override frame
+        self.assertLessEqual(first, COOLDOWN_FRAMES + 1)
+
+  def test_a_6_s_press_after_a_capped_phantom_keeps_the_cap_latch(self):
+    """RED-v2.1: the press cleared the latch and the budget; on release the floor braked a fresh 5 s at -1.0."""
+    f = make()
+    c = HookCtx(f)
+    outs = c.run('.' * int(round(12.0 / DT)), d=2.5, v=9.0)    # a constant 2.5 m phantom at 9 m/s on a clear road
+    self.assertEqual(sum(o == mg.A_FLOOR for o in outs), int(round(mg.BRAKE_MAX_S / DT)))
+    self.assertTrue(f.cap_latched)
+    self.assertEqual(f.state, mg.OFF)
+    press = c.run(REAL_LONG_PRESS, d=2.5, v=9.0, ask=0.6)      # the driver presses the gas for 5.9 s; the phantom stays
+    self.assertTrue(all(o == 0.6 for o in press))
+    self.assertTrue(f.cap_latched)
+    self.assertAlmostEqual(f.brake_t, mg.BRAKE_MAX_S)
+    after = c.run('.' * int(round(30.0 / DT)), d=2.5, v=9.0, ask=0.1)
+    self.assertTrue(all(o == 0.1 for o in after))              # still latched 30 s later: not one brake frame
+    self.assertTrue(f.cap_latched)
+
+  def test_a_press_during_the_cap_hold_keeps_the_latch(self):
+    """RED-v2.1: as above, with the press inside the 5 s zero-pedal hold that follows the cap."""
+    f = make()
+    c = HookCtx(f)
+    c.run('.' * int(round(7.0 / DT)), d=2.5, v=9.0)
+    self.assertEqual(f.state, mg.HOLD)
+    self.assertTrue(f.cap_latched)
+    self.assertTrue(all(o == 0.6 for o in c.run(REAL_PRESS_RESET_FIRST, d=2.5, v=9.0, ask=0.6)))
+    self.assertTrue(f.cap_latched)
+    self.assertNotIn(mg.A_FLOOR, c.run('.' * int(round(30.0 / DT)), d=2.5, v=9.0, ask=0.1))
+
+  def test_an_override_on_the_frame_the_budget_runs_out_still_latches(self):
+    """RED-v2.1. The cap latches on the BRAKE frame after the budget is spent; an override landing exactly there must latch
+    too (otherwise the 10 s budget-forget would hand a persisting phantom a fresh 5 s)."""
+    f = make()
+    c = HookCtx(f)
+    outs = []
+    while sum(o == mg.A_FLOOR for o in outs) < int(round(mg.BRAKE_MAX_S / DT)):
+      outs += c.run('.', d=2.5, v=9.0)
+    self.assertEqual(f.state, mg.BRAKE)
+    self.assertFalse(f.cap_latched)
+    c.run(REAL_PRESS_RESET_FIRST, d=2.5, v=9.0, ask=0.6)
+    self.assertTrue(f.cap_latched)
+    self.assertNotIn(mg.A_FLOOR, c.run('.' * int(round(30.0 / DT)), d=2.5, v=9.0, ask=0.1))
+
+  def test_a_press_during_the_hold_runs_the_cooldown_from_the_release(self):
+    """RED-v2.1: the hold's own cooldown (started at the release into HOLD) ran out during the press, so the floor braked
+    on the first frame after it."""
+    f, c = self._armed()
+    c.run('.' * 25, d=5.6)                                     # the gap opens past the exit band for 1 s: release, HOLD
+    self.assertEqual(f.state, mg.HOLD)
+    c.run('.' * 60, d=2.0)                                     # 3 s of HOLD while the gap closes again
+    self.assertEqual(f.state, mg.HOLD)
+    self.assertTrue(all(o == 0.6 for o in c.run(REAL_PRESS_RESET_FIRST, d=2.0, ask=0.6)))
+    after = c.run('.' * (COOLDOWN_FRAMES + 40), d=2.0, ask=0.1)
+    self.assertGreaterEqual(after.index(mg.A_FLOOR), COOLDOWN_FRAMES - 1)
+
+  def test_a_press_during_the_bridge_keeps_the_brake_budget(self):
+    """RED-v2.1 (a fresh 5 s after the press). One approach gets ONE 5 s budget, a gas press in the middle included."""
+    f = make()
+    c = HookCtx(f)
+    braked = sum(o == mg.A_FLOOR for o in c.run('.' * 64, d=2.0))          # ~3 s of brake
+    c.run('.' * 6, d=2.0, present=False)                                   # the lead drops out: BRIDGE
+    self.assertEqual(f.state, mg.BRIDGE)
+    budget = f.brake_t
+    self.assertTrue(all(o == 0.6 for o in c.run(REAL_PRESS_ACTIVE_FIRST, d=2.0, ask=0.6)))
+    self.assertAlmostEqual(f.brake_t, budget)
+    braked += sum(o == mg.A_FLOOR for o in c.run('.' * int(round(20.0 / DT)), d=2.0, ask=0.1))
+    self.assertEqual(braked, int(round(mg.BRAKE_MAX_S / DT)))
+    self.assertTrue(f.cap_latched)
+
+  def test_gas_never_brakes_while_pressed(self):
+    f, c = self._armed()
+    for seq in (REAL_LONG_PRESS, 'g' * 40, 'G' * 40):
+      self.assertTrue(all(o == 0.7 for o in c.run(seq, d=1.5, ask=0.7)))
+
+  def test_a_real_disengage_ends_the_approach(self):
+    """A real disengage may reset everything: after re-engaging, a new approach has a fresh budget (green on v2.1 too)."""
+    f = make()
+    c = HookCtx(f)
+    c.run('.' * int(round(12.0 / DT)), d=2.5, v=9.0)
+    self.assertTrue(f.cap_latched)
+    self.assertTrue(all(o == 0.3 for o in c.run('D' * 20, d=2.5, v=9.0, ask=0.3)))
+    self.assertFalse(f.cap_latched)
+    self.assertEqual(f.brake_t, 0.0)
+    again = c.run('.' * int(round(20.0 / DT)), d=2.5, v=9.0)    # re-engaged (any cooldown left from the cap hold runs out)
+    self.assertEqual(sum(o == mg.A_FLOOR for o in again), int(round(mg.BRAKE_MAX_S / DT)))   # a fresh, full budget
+
+  def test_a_disengage_during_a_press_ends_the_approach(self):
+    """Real corpus order (00000196--9f739d721d--2 @148.96: G r G86 then disengaged): the disengage wins."""
+    f = make()
+    c = HookCtx(f)
+    c.run('.' * int(round(12.0 / DT)), d=2.5, v=9.0)
+    self.assertTrue(f.cap_latched)
+    c.run('G' + 'r' + 'G' * 86 + 'D' * 84, d=2.5, v=9.0, ask=0.3)
+    self.assertFalse(f.cap_latched)
+    self.assertEqual(f.brake_t, 0.0)
+
+  def test_engagement_start_up_frames_are_not_an_override(self):
+    """Engaged with the planner not yet in control (2 such single frames in the 390-segment corpus): no cooldown, as
+    before - the floor may arm as soon as the planner is in control (green on v2.1 too)."""
+    f = make()
+    c = HookCtx(f)
+    c.run('D' * 20, d=2.0)
+    c.run('rr', d=2.0)
+    self.assertEqual(f.rearm_t, 0.0)
+    self.assertEqual(c.run('.' * 10, d=2.0)[-1], mg.A_FLOOR)
+
+  def test_override_diagnostic_and_the_update_api(self):
+    """``override`` marks the frames read as a driver override; update(engaged=...) gives the same answers as the hook."""
+    f, c = self._armed()
+    c.run('G')
+    self.assertTrue(f.override)
+    c.run('.')
+    self.assertFalse(f.override)
+    g = make()
+    for _ in range(30):
+      g.update(0.0, 5.0, True, False, True, 2.0, 1.0, False)
+    self.assertEqual(g.state, mg.BRAKE)
+    self.assertEqual(g.update(0.6, 5.0, False, True, True, 2.0, 1.0, False, engaged=True), 0.6)
+    self.assertTrue(g.override)
+    self.assertGreater(g.rearm_t, mg.REARM_COOLDOWN_S - DT)
+    self.assertEqual(g.update(0.6, 5.0, False, False, True, 2.0, 1.0, False, engaged=False), 0.6)
+    self.assertFalse(g.override)
+
+  def test_a_missing_self_drive_state_fails_closed(self):
+    """The new read is inside the contained hook: no selfdriveState -> the floor latches off, the ask passes."""
+    f = make()
+    sm = real_sm(30.0)
+    del sm['selfdriveState']
+    self.assertEqual(f.apply(sm, 0.25, 5.0, True), 0.25)
+    self.assertTrue(f.faulted)
+
+
 class TestRealPlanner(OpenpilotTestCase):
   """The REAL LongitudinalPlanner on real capnp messages, floor OFF and ON (the in-tree miniature of the rlog replay)."""
 
@@ -945,6 +1143,42 @@ class TestRealPlanner(OpenpilotTestCase):
     self.assertLessEqual(min(on), mg.A_FLOOR + 1e-9)            # the floor's brake reaches the published ask
     first = st_on.index(mg.BRAKE)
     self.assertEqual(on[:first], off[:first])                    # identical until the floor acts
+
+  def test_a_gas_press_that_arrives_as_a_planner_reset_through_the_real_planner(self):
+    """RED-v2.1. The real planner computes ``reset_state`` from controlsState.longControlState itself; feed the real order
+    of REAL_PRESS_RESET_FIRST (gas + longControlState off, then one frame of longControlState off without gas) while the
+    floor brakes, the lead staying close. The published ask must leave -1.0 on the first press frame and must not return
+    to -1.0 within 5 s of the release."""
+    from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+    from openpilot.sunnypilot.fork.tests.test_lead_closing import make_planner, planner_sm
+    p = make_planner(v0=5.0)
+    p.min_gap_floor = mg.MinGapFloor(params=FakeParams(enabled=True), dt=DT, cp_sp=capnp_cp_sp())
+    codes = '.' * 40 + REAL_PRESS_RESET_FIRST + '.' * (COOLDOWN_FRAMES + 30)
+    outs, states, t = [], [], 0.0
+    for code in codes:
+      gas, active, enabled = _SIG[code]
+      t += DT
+      msgs = planner_sm(5.0, 0.3, 2.0, +3.0, v_cruise_kph=40.)    # a 2 m gap that vision says is pulling away
+      msgs['carState'].gasPressed = gas
+      msgs['controlsState'].longControlState = LongCtrlState.pid if active else LongCtrlState.off
+      msgs['selfdriveState'].enabled = enabled
+      sm = LogSM(**msgs)
+      sm.logMonoTime = {k: int(round(t * 1e9)) for k in msgs}
+      sm.logMonoTime['radarState'] = int(round((t - DT) * 1e9))
+      msgs['radarState'].mdMonoTime = sm.logMonoTime['radarState']
+      p.update(sm)
+      outs.append(float(p.output_a_target))
+      states.append(p.min_gap_floor.state)
+    self.assertFalse(p.min_gap_floor.faulted)
+    i0 = 40
+    i1 = i0 + len(REAL_PRESS_RESET_FIRST)
+    self.assertEqual(states[i0 - 1], mg.BRAKE)
+    self.assertLessEqual(outs[i0 - 1], mg.A_FLOOR + 1e-9)
+    self.assertTrue(all(o > mg.A_FLOOR + 1e-6 for o in outs[i0:i1]))       # dropped on the first press frame
+    after = states[i1:]
+    first = after.index(mg.BRAKE)
+    self.assertGreaterEqual(first, COOLDOWN_FRAMES - 1)                   # not within 5 s of the release
+    self.assertTrue(all(o > mg.A_FLOOR + 1e-6 for o in outs[i1:i1 + first]))
 
   def test_real_lead_data_has_model_prob_and_radar_state_does_not(self):
     """The schema fact v1 got wrong, asserted on the real cereal."""
