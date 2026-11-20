@@ -34,6 +34,13 @@ class VisualsLayout(Widget):
            "blind spot as long as your car has BSM supported."),
         None,
       ),
+      "ConfidenceMeter": (
+        lambda: tr("Show Driving Confidence Dot"),
+        tr("Display the model's driving confidence as a small dot on the right edge of the driving " +
+           "screen, the same indicator the comma 4 shows. The dot sits high when the model is " +
+           "confident and low when it expects you to take over. It does not affect driving."),
+        None,
+      ),
       "TorqueBar": (
         lambda: tr("Steering Arc"),
         tr("Display steering arc on the driving screen when lateral control is enabled."),

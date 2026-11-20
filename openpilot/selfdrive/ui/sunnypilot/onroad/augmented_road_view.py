@@ -5,9 +5,12 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 import pyray as rl
+from openpilot.cereal import log
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.ui_state import UIStatus, ui_state
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.selfdrive.ui.sunnypilot.onroad.confidence_meter import ConfidenceMeter
+from openpilot.selfdrive.ui.sunnypilot.onroad.hold_timer import HoldTimerOverlay
 
 BORDER_COLORS_SP = {
   UIStatus.LAT_ONLY: rl.Color(0x00, 0xC8, 0xC8, 0xFF),  # Cyan for lateral-only state
@@ -19,6 +22,10 @@ class AugmentedRoadViewSP:
   def __init__(self):
     self._fade_texture = gui_app.texture("icons_mici/onroad/onroad_fade.png")
     self._fade_alpha_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
+    # comma 3X additions: the confidence dot (the mici confidence ball) and the
+    # standstill hold timer that has to stay visible while an alert is up.
+    self._confidence_meter = ConfidenceMeter()
+    self._hold_timer = HoldTimerOverlay()
 
   def update_fade_out_bottom_overlay(self, _content_rect):
     # Fade out bottom of overlays for looks (only when engaged)
@@ -29,3 +36,29 @@ class AugmentedRoadViewSP:
                           rl.Rectangle(0, 0, self._fade_texture.width, self._fade_texture.height),
                           _content_rect, rl.Vector2(0, 0), 0.0,
                           rl.Color(255, 255, 255, int(255 * fade_alpha)))
+
+  def render_top_overlays(self, content_rect: rl.Rectangle) -> None:
+    """Draw the 3X additions that must sit ON TOP of the alert layer.
+
+    Called by AugmentedRoadView._render at the end of its overlay stack (after the
+    HUD, the alert renderer and the driver-state renderer), so neither element can
+    be covered by an alert box or a full-screen banner.
+
+    * The confidence dot (the comma 4's confidence ball) on the right edge - off
+      while a FULL alert is up: an urgent takeover screen is not the place for it,
+      and mici's own full alert covers the ball the same way.
+    * The standstill hold timer as a small pill, ONLY while an alert is up.  With
+      no alert the existing "STOPPED" circle already shows it, so this never
+      duplicates the timer.
+    """
+    if not ui_state.started:
+      return
+
+    alert_size = ui_state.sm['selfdriveState'].alertSize
+    if ui_state.confidence_meter and alert_size != log.SelfdriveState.AlertSize.full:
+      self._confidence_meter.update()
+      self._confidence_meter.render(content_rect)
+
+    if (ui_state.standstill_timer and alert_size != log.SelfdriveState.AlertSize.none
+            and ui_state.sm['carState'].standstill):
+      self._hold_timer.render(content_rect, self._hud_renderer.standstill_elapsed_time)
