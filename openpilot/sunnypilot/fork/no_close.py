@@ -112,6 +112,15 @@ class NoCloseCap:
     self.factor = 1.         # dwelled cap factor applied on the last frame (1 = no cap)
     self.closing = False     # factor < 1, i.e. some cap is in effect
     self.closing_speed = 0.  # m/s, the closing estimate used on the last frame
+    # LOG-ONLY telemetry (2026-11-19): the same quantities the cap acts on, recorded for the rlog. Published on
+    # longitudinalPlanSP.noClose (custom.capnp). Nothing below READS them, so they cannot change the ask.
+    self.raw_factor = 1.       # this frame's un-dwelled factor, before the min-window
+    self.raw_mean = 0.         # the 1 s raw (vEgo - vLead) envelope mean, 0 when it was not the source
+    self.filtered_closing = 0.  # the closing filter's gap rate for this frame
+    self.dwell_frames = 0      # release-dwell window occupancy in frames (0 = flushed)
+    self.tracked = False       # a lead is present, or the filter is coasting a dropout
+    self.lead_usable = False   # this frame's vLead is usable
+    self.applies = False       # the cap's own gate: tracked and (usable or coasting)
     self.lead_filter = LeadClosingFilter(dt)
     self._window: deque[float] = deque(maxlen=max(1, int(round(RELEASE_DWELL_S / dt))))
     self._raw: deque[float] = deque(maxlen=max(1, int(round(RAW_MEAN_S / dt))))
@@ -135,6 +144,13 @@ class NoCloseCap:
     self.factor = 1.
     self.closing = False
     self.closing_speed = 0.
+    self.raw_factor = 1.
+    self.raw_mean = 0.
+    self.filtered_closing = 0.
+    self.dwell_frames = 0
+    self.tracked = False
+    self.lead_usable = False
+    self.applies = False
 
   def update(self, accel: float, v_ego: float, lead_present: bool, v_lead: float | None,
              d_rel: float | None = None, v_rel: float | None = None) -> float:
@@ -154,11 +170,20 @@ class NoCloseCap:
       elif not self.lead_filter.valid:
         self._raw.clear()
     tracked = lead_present or (filtered and self.lead_filter.coasting)
+    self.lead_usable = bool(usable)   # log-only
+    self.tracked = bool(tracked)      # log-only
 
     if not self.enabled or not tracked:
       self._reset()
+      # the reset above clears the telemetry too; the frame's own inputs are still worth recording
+      self.lead_usable = bool(usable)
+      self.tracked = bool(tracked)
       return accel
 
+    self.filtered_closing = float(self.lead_filter.closing)  # log-only: the filter ran above this line
+    # log-only: the 1 s raw envelope's OWN value, logged whether or not it is the source -- `closingSpeed` is what the cap
+    # actually USED, this is the other candidate source, so a review can see which one drove the factor.
+    self.raw_mean = float(sum(self._raw) / len(self._raw)) if self._raw else 0.
     if filtered and self.lead_filter.valid:
       raw_mean = sum(self._raw) / len(self._raw) if self._raw else self.lead_filter.closing
       self.closing_speed = max(self.lead_filter.closing, raw_mean)
@@ -171,8 +196,12 @@ class NoCloseCap:
       # bad frame cannot release a cap the dwell is holding.
       raw = 1.
     self._window.append(raw)
+    self.raw_factor = float(raw)          # log-only
+    self.dwell_frames = len(self._window)  # log-only
     self.factor = min(self._window)  # this frame is in the window: tighten is immediate; a rise needs the dwell
     self.closing = self.factor < 1.
-    if accel <= 0. or not (usable or (filtered and self.lead_filter.coasting)):
+    applies = bool(usable or (filtered and self.lead_filter.coasting))
+    self.applies = applies  # log-only
+    if accel <= 0. or not applies:
       return accel  # brake/coast bit-for-bit; an unusable lead-speed frame is inert for that frame (as before)
     return accel * self.factor

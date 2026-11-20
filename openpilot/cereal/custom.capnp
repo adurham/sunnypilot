@@ -206,6 +206,12 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   aTarget @5 :Float32;
   events @6 :List(OnroadEventSP.Event);
   e2eAlerts @7 :E2eAlerts;
+  # fork (2026-11-19): LOG-ONLY planner fields. Everything the offline reviews had to REBUILD from the plan
+  # (longitudinalPlan.speeds/accels) and modelV2: the pre-cap candidate that lost/won the min(), the NoCloseCap factor
+  # with its release-dwell state, the closing-speed estimate the cap used (3-state Kalman filter + 1 s raw-mean
+  # envelope) with the filter's track-hygiene flags, and the e2e candidate's stages. APPENDED at ordinal 8: no existing
+  # field is renamed, reordered or renumbered. Nothing here is read by control code.
+  noClose @8 :NoClose;
 
   deprecated :group {
     dec @0 :DynamicExperimentalControlDEPRECATED;
@@ -311,6 +317,43 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   struct E2eAlerts {
     greenLightAlert @0 :Bool;
     leadDepartAlert @1 :Bool;
+  }
+
+  # fork (2026-11-19): per-frame NoCloseOnLead (fork/no_close.py + fork/lead_closing.py) telemetry, 20 Hz, rlog + qlog.
+  # Semantics are the deployed cap's own: `closingSpeed = max(filteredClosing, rawMeanClosing)`; `factor` is the min of
+  # `rawFactor` over the last RELEASE_DWELL_S (so a tighten is immediate and a release needs the dwell); `tracked` is
+  # "a lead is present or the filter is coasting a dropout"; `applies` is the cap's own gate for touching the ask.
+  struct NoClose {
+    # which candidate won the min() over (MPC, cruise, e2e); mirrors log.LongitudinalPlan.LongitudinalPlanSource
+    enum Candidate { cruise @0; lead0 @1; lead1 @2; lead2 @3; e2e @4; }
+
+    enabled @0 :Bool;            # NoCloseOnLead param as read this frame
+    leadPresent @1 :Bool;        # radarState.leadOne.present
+    leadUsable @2 :Bool;         # the frame's vLead is finite and >= MIN_LEAD_SPEED_VALID
+    tracked @3 :Bool;            # leadPresent or the closing filter is coasting a <= 0.5 s dropout
+    applies @4 :Bool;            # tracked AND (leadUsable or coasting): the cap may touch the ask
+
+    preCapAccel @5 :Float32;     # min(MPC, cruise, e2e) BEFORE the cap -- the ask the cap scales
+    preCapSource @6 :Candidate;  # the candidate that set preCapAccel
+    postCapAccel @7 :Float32;    # preCapAccel after the cap (== preCapAccel when no cap / a non-positive ask)
+
+    factor @8 :Float32;          # dwelled cap factor actually applied, in [0, 1] (1 = no cap)
+    rawFactor @9 :Float32;       # this frame's un-dwelled factor (before the min-window)
+    dwellFrames @10 :UInt8;      # frames of the release-dwell window currently occupied (0 = window flushed)
+
+    closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing)
+    filteredClosing @12 :Float32;  # m/s, the 3-state Kalman filter's gap rate (> 0 = the gap is shrinking)
+    rawMeanClosing @13 :Float32;   # m/s, mean of (vEgo - vLead) over the last RAW_MEAN_S (~1 s) envelope
+    vRelBias @14 :Float32;       # m/s, the filter's vRel bias state (vision vRel is biased for seconds at a time)
+    filterValid @15 :Bool;       # the filter has a live track
+    filterCoasting @16 :Bool;    # bridging a short lead dropout (<= HOLD_FRAMES)
+    filterRejects @17 :UInt8;    # consecutive innovation-gate rejections (0..REINIT_FRAMES)
+    gateReject @18 :Bool;        # this frame's dRel was rejected by the innovation gate
+    reinit @19 :Bool;            # the track re-initialised this frame (REINIT_FRAMES rejections = a new lead)
+
+    e2eGate @20 :Bool;           # far-lead e2e gate state this frame
+    e2eGated @21 :Float32;       # e2e candidate after gate + turn limit (m/s^2)
+    e2eFinal @22 :Float32;       # e2e candidate after AccelBoost + stop commitment -- what entered the min()
   }
 }
 
