@@ -345,6 +345,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
     {"MinGapBrakeFloor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/min_gap_floor.py (low-speed minimum-gap brake floor, default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"ConfidenceMeter", {PERSISTENT | BACKUP, BOOL, "1"}},  // 3X: the comma 4 confidence ball on the wide onroad screen
 
     // sunnypilot model params
     {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},

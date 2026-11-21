@@ -53,6 +53,10 @@ FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonal
                      "MinGapBrakeFloor",     # 2026-11-19: low-speed minimum-gap brake floor (fork/min_gap_floor.py) - a whole
                                              #          key outside every prefix; a stale libparams_c.so must fail this guard
                      "AdaptiveFollowDistance",  # same class of miss (a fork key outside every Hyundai* prefix), covered now
+                     "ConfidenceMeter",      # 3X confidence dot (2026-11-20): a whole key outside every prefix. The UI
+                                             #          builds Settings > Display at startup and reads it there, so a
+                                             #          stale libparams_c.so raises UnknownKeyName and the UI cannot start;
+                                             #          naming it puts it under the compiled-libparams guard
                      "HyundaiPedalDeliveryLaw",  # 17c delivery: inside Hyundai*, but named so a prefix edit cannot drop it
                      "HyundaiGasRiseLag",  # 0042-Z rise-lag: named for the same reason (a fork key that must stay registered)
                      "HyundaiPedalHoldFit")  # 0047 hold-fit: same reason (inside the pedal family, but named so a prefix edit cannot drop it)
