@@ -18,6 +18,8 @@ Where each requirement is pinned:
   review item 8  gas / disengage drop BRAKE within one frame    TestOffAndFailsafe, TestContainmentOnRealMessages
   Opus review finding 1  a gas press arrives as a planner RESET  TestOverrideVsDisengage, TestRealPlanner
                  (override vs disengage; real signal orders from route 000001ac and the 390-segment corpus)
+  Opus re-check, open items (2026-11-21)  the post-cap coast is   TestCoastBoundInWallTime, TestEnableMidDrive
+                 bounded in WALL time; the launch grace after a mid-drive enable (real dropout train, real crawl launch)
 The real-message replay of the REAL planner over rlogs (red on v1 @ 1604d4a250, green here) is the sim harness
 ~/comma-sim/wsSTOP/drive-2026-11-19/sim/mingap/v2fix/scripts/replay_real.py; TestRealPlanner is its in-tree miniature.
 Note: TestOffAndFailsafe.test_driver_gas_drops_an_active_brake_in_one_frame_and_starts_the_cooldown feeds gas with the
@@ -1185,6 +1187,131 @@ class TestRealPlanner(OpenpilotTestCase):
     self.assertIn('modelProb', log.RadarState.LeadData.schema.fieldnames)
     self.assertNotIn('modelProb', log.RadarState.schema.fieldnames)
     self.assertIn('mdMonoTime', log.RadarState.schema.fieldnames)
+
+
+# --- 2026-11-21 follow-up (the Opus re-check's open items): the coast after the duration cap is bounded in WALL time, and
+# the launch grace holds after a mid-drive enable. Every test from here to TestWiring is RED on 66ac205755, GREEN here.
+# A REAL close-lead dropout train as the floor saw it, one code per planner frame ('u' usable, 'x' not: absent, untrusted
+# or stale): 000001b0--0bfbcacdc4--52 @3155.19, a 1-frame and a 9-frame dropout 0.6 s apart (the longest close-lead train
+# in that drive and route 000001ac; sim/mingap/coast-bound/scripts/scan_flicker.py).
+REAL_DROPOUT_TRAIN = 'x' + 'u' * 11 + 'x' * 9 + 'uu'
+# A REAL launch from a crawl, vEgo per planner frame: 000001ac--0fd72a8378--5, its last frame under 1 m/s (@334.48) is index
+# 15 here (driven by hand there; replayed engaged behind a 2.5 m lead; sim/mingap/coast-bound/scripts/scan_launch.py).
+REAL_CRAWL_LAUNCH_V = [0.405, 0.45, 0.493, 0.538, 0.575, 0.61, 0.641, 0.676, 0.708, 0.745, 0.781, 0.821, 0.857, 0.898, 0.945,
+                       0.996, 1.057, 1.13, 1.206, 1.288, 1.366, 1.472, 1.514, 1.584, 1.649, 1.718, 1.794, 1.875, 1.951,
+                       2.026, 2.098, 2.166, 2.225, 2.282, 2.336, 2.388, 2.472, 2.482, 2.527, 2.57, 2.614, 2.649, 2.678,
+                       2.697, 2.708, 2.713, 2.712, 2.709, 2.706, 2.701, 2.698, 2.693, 2.688, 2.68, 2.678, 2.675, 2.671,
+                       2.667, 2.665, 2.661, 2.659, 2.652, 2.65, 2.647, 2.645, 2.642, 2.64, 2.632, 2.626, 2.619, 2.615,
+                       2.615, 2.615, 2.613, 2.607, 2.596, 2.585, 2.582, 2.581, 2.58]
+REAL_CRAWL_LAST_SLOW = 15
+BUDGET_FRAMES = int(round(mg.BRAKE_MAX_S / DT))
+CAP_COAST_FRAMES = int(round(mg.CAP_HOLD_MAX_S / DT))
+GRACE_FRAMES = int(round(mg.LAUNCH_GRACE_S / DT))
+POLL_FRAMES = int(round(mg.POLL_S / DT))
+
+
+def run_lead(c, pattern, d=2.5, v=9.0, ask=0.0):
+  """The REAL hook, one planner frame per code: 'u' a usable lead at d, 'x' the lead gone (radarState present False)."""
+  outs = []
+  for ch in pattern:
+    outs += c.run('.', d=d, v=v, ask=ask, present=(ch == 'u'))
+  return outs
+
+
+class TestCoastBoundInWallTime(OpenpilotTestCase):
+  """After the 5 s brake cap the zero-pedal coast lasts CAP_HOLD_MAX_S of WALL time from the cap (a lead-dropout BRIDGE
+  frame counts like a HOLD frame), then the ask passes through and the latch holds. RED on 66ac205755: only HOLD frames
+  counted, so every dropout stretched the coast (19 frames out / 1 in: towards ~100 s), and a dropout on the very frame
+  the budget ran out skipped the cap - an UNLATCHED hold with no time bound and, once its bridge expired, a second 5 s
+  brake 10 s later on the same phantom."""
+
+  def _coast(self, outs, v=9.0):
+    """The frames whose ask the floor replaced by the coast ask (HOLD and BRIDGE publish the same zero-pedal ask)."""
+    return [i for i, o in enumerate(outs) if o == HOLD(v)]
+
+  def _assert_one_capped_approach(self, f, outs, ask=0.0):
+    coast = self._coast(outs)
+    last_brake = len(outs) - 1 - outs[::-1].index(mg.A_FLOOR)
+    self.assertEqual(sum(o == mg.A_FLOOR for o in outs), BUDGET_FRAMES)  # ONE 5 s brake for the whole approach
+    self.assertEqual(coast[0], last_brake + 1)                          # the coast starts on the frame after it ...
+    self.assertEqual(len(coast), CAP_COAST_FRAMES)                      # ... lasts 5.0 s ...
+    self.assertEqual(coast[-1] - coast[0] + 1, CAP_COAST_FRAMES)        # ... of WALL time (one contiguous stretch)
+    self.assertTrue(all(o == ask for o in outs[coast[-1] + 1:]))        # then the ask passes through, untouched
+    self.assertTrue(f.cap_latched)                                      # and the latch holds while the phantom stays
+
+  def test_a_real_dropout_train_cannot_stretch_the_capped_coast(self):
+    f = make()
+    c = HookCtx(f)
+    outs = c.run('.' * 130, d=2.5, v=9.0)                  # a constant 2.5 m phantom at 9 m/s: 5 s brake, cap, coast
+    self.assertTrue(f.cap_latched)
+    self.assertEqual(f.state, mg.HOLD)
+    outs += run_lead(c, REAL_DROPOUT_TRAIN)                 # the real dropouts, 1.3 s into the coast
+    outs += c.run('.' * int(round(30.0 / DT)), d=2.5, v=9.0)
+    self._assert_one_capped_approach(f, outs)               # 66ac205755: 110 coast frames (5.5 s)
+
+  def test_a_19_out_1_in_flicker_cannot_stretch_it_towards_100_s(self):
+    f = make()
+    c = HookCtx(f)
+    outs = c.run('.' * 110, d=2.5, v=9.0)
+    outs += run_lead(c, ('x' * 19 + 'u') * int(round(120.0 / DT / 20)))   # each dropout just inside the 1 s bridge
+    self._assert_one_capped_approach(f, outs)               # 66ac205755: ~95 s of coast
+
+  def test_a_dropout_on_the_frame_the_budget_runs_out_is_the_cap(self):
+    f = make()
+    c = HookCtx(f)
+    outs = c.run('.' * 104, d=2.5, v=9.0)                  # arms on frame 4, brakes frames 4..103: the budget is spent
+    self.assertEqual(sum(o == mg.A_FLOOR for o in outs), BUDGET_FRAMES)
+    self.assertEqual(f.state, mg.BRAKE)
+    outs += run_lead(c, REAL_DROPOUT_TRAIN[0])              # the lead is gone on exactly the frame the cap is due
+    self.assertTrue(f.cap_latched)                          # that IS the cap (66ac205755: unlatched, no time bound)
+    outs += c.run('.' * int(round(60.0 / DT)), d=2.5, v=9.0)   # the phantom then stays for a minute
+    self._assert_one_capped_approach(f, outs)
+
+  def test_a_long_dropout_on_that_frame_cannot_buy_a_second_5_s_brake(self):
+    f = make()
+    c = HookCtx(f)
+    outs = c.run('.' * 104, d=2.5, v=9.0)
+    outs += c.run('.' * 25, d=2.5, v=9.0, present=False)   # gone 1.25 s from that frame: the bridge expires -> OFF
+    outs += c.run('.' * int(round(40.0 / DT)), d=2.5, v=9.0)   # back for 40 s (66ac205755: a fresh 5 s after 10 s OFF)
+    self.assertEqual(sum(o == mg.A_FLOOR for o in outs), BUDGET_FRAMES)
+    self.assertTrue(f.cap_latched)
+    self.assertLessEqual(len(self._coast(outs)), CAP_COAST_FRAMES)
+
+
+class TestEnableMidDrive(OpenpilotTestCase):
+  """RED on 66ac205755 (the re-check fuzz's only two hits): the rule's clocks do not run while the floor is off, so the 2 s
+  launch grace never saw a crawl that happened then; read ON by the 1 Hz poll just after the crawl, the floor armed
+  0.45 s after the car crossed 1 m/s. A mid-drive enable now assumes the car was crawling up to the last frame the floor
+  did not see: no arm within LAUNCH_GRACE_S of it."""
+
+  def _replay(self, p, speeds, flip_at, flip, d=2.5):
+    f = make(params=p)
+    outs, t = [], 300.0
+    for i, v in enumerate(speeds):
+      if i == flip_at:
+        flip()                    # switched on mid-drive; the hook only reads it at its next 1 Hz poll
+      t += DT
+      outs.append(f.apply(real_sm(t, d=d, v=v), 0.0, v, True))
+    return f, outs
+
+  def test_switched_on_during_a_real_crawl_the_launch_grace_still_holds(self):
+    cases = (('the param', FakeParams(enabled=False), lambda p: setattr(p, 'enabled', True)),
+             ('the car layer law', FakeParams(enabled=True, cp_sp_raw=capnp_cp_sp_bytes(dynamic=False)),
+              lambda p: setattr(p, 'cp_sp_raw', capnp_cp_sp_bytes())))
+    for name, p, on in cases:
+      with self.subTest(enable=name):
+        f, outs = self._replay(p, REAL_CRAWL_LAUNCH_V, REAL_CRAWL_LAST_SLOW - 5, flip=lambda p=p, on=on: on(p))
+        self.assertTrue(f.enabled)
+        first = outs.index(mg.A_FLOOR)                     # it does arm once the grace is over (the lead stays 2.5 m)
+        self.assertGreaterEqual(first - REAL_CRAWL_LAST_SLOW, GRACE_FRAMES)   # 66ac205755: 9 frames after the crawl
+        self.assertGreaterEqual(first - (POLL_FRAMES - 1), GRACE_FRAMES)      # 2 s after the last frame it did not see
+
+  def test_switched_on_at_cruise_the_first_arm_waits_the_grace_too(self):
+    """Conservative by design: the floor cannot know what happened while it was off, so ANY mid-drive enable starts the
+    grace - here a steady 8 m/s behind a 3 m lead: the first brake 2 s after the enable, not 0.25 s (66ac205755)."""
+    p = FakeParams(enabled=False)
+    f, outs = self._replay(p, [8.0] * 120, 1, d=3.0, flip=lambda: setattr(p, 'enabled', True))
+    self.assertGreaterEqual(outs.index(mg.A_FLOOR) - (POLL_FRAMES - 1), GRACE_FRAMES)
 
 
 class TestWiring(OpenpilotTestCase):

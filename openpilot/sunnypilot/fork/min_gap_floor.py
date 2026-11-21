@@ -32,7 +32,7 @@ candidate and no later stage can raise it back). It only ever DEEPENS an ask (``
                    or BRAKE_MAX_S of brake in this approach (the DURATION CAP: latches, see below)
     HOLD           out = min(accel, hold_ask(v))                  # zero pedal, NO friction brake (see "the hold")
     HOLD -> OFF    d >= max(D_RECOVER, K_RECOVER*v) CONTINUOUSLY for RECOVER_DWELL_S, or v < V_STANDSTILL,
-                   or (after a duration cap only) CAP_HOLD_MAX_S of hold
+                   or (after a duration cap only) CAP_HOLD_MAX_S of WALL time from the cap, BRIDGE frames included
     BRAKE/HOLD -> BRIDGE   the lead goes absent, untrusted or STALE: brake dropped, pedal held at zero, median kept, for at
                    most LEAD_BRIDGE_S; a lead back inside it resumes BRAKE (only if the bridge came from BRAKE)
     BRIDGE -> OFF  the dropout outlasts the bridge (buffer cleared): a fail-safe stop
@@ -71,11 +71,14 @@ A persistently short dRel (a phantom) would otherwise hold -1.0 from 10 m/s down
 of BRAKE_MAX_S per approach (the two real brakes were 2.55 s and 3.75 s). The budget is CUMULATIVE across lead dropouts,
 so a phantom that blinks out for a second cannot buy a fresh 5 s; it is forgotten only when the approach really ends (the
 gap recovers, the car stops, the driver disengages) or after BUDGET_FORGET_S with the floor off. When it runs out the floor
-steps into HOLD for at most CAP_HOLD_MAX_S of HOLD frames (lead-dropout BRIDGE frames in between, also zero pedal, are
-not counted, so a flickering lead can stretch the coast in wall time) and then OFF, and LATCHES (``cap_latched``): no
+steps into HOLD for at most CAP_HOLD_MAX_S of WALL time from the cap and then OFF, and LATCHES (``cap_latched``): no
 re-arm until the gap has been seen above the recovery band for RECOVER_DWELL_S, the car stops, the driver disengages, or
-no usable lead has been seen for
-LATCH_FORGET_ABSENT_S. A lead dropout never clears the latch, and neither does a driver override (a gas press): the
+no usable lead has been seen for LATCH_FORGET_ABSENT_S. Wall time means every planner frame after the cap counts, a
+lead-dropout BRIDGE frame (also zero pedal) exactly like a HOLD frame, so a flickering lead cannot stretch the coast
+(2026-11-21: before, only HOLD frames counted - 19 dropout frames per hold frame could stretch it towards ~100 s - and a
+dropout on the very frame the budget ran out skipped the cap altogether, leaving an UNLATCHED hold with no time bound;
+that dropout is now the cap itself, and its coast counts from that frame).
+A lead dropout never clears the latch, and neither does a driver override (a gas press): the
 budget, the latch and the flicker history survive it (see "Driver override vs a real disengage"). A real disengage
 followed by a re-engagement starts a new approach with a fresh budget.
 
@@ -168,11 +171,11 @@ MIN_SAMPLES = 5       # a lead must supply at least 0.25 s of its own samples be
 EXIT_DWELL_S = 1.0    # s the MEDIAN must stay above the exit band before a brake releases
 RECOVER_DWELL_S = 1.0  # s the MEDIAN must stay above the recovery band before the hold ends (or a cap latch clears)
 LEAD_BRIDGE_S = 1.0   # s a dropout may last with the pedal held at zero and the buffer kept
-LAUNCH_GRACE_S = 2.0  # s after v drops under 1 m/s during which the floor may not arm
+LAUNCH_GRACE_S = 2.0  # s after v drops under 1 m/s (or after the floor is switched on mid-drive) it may not arm
 REARM_COOLDOWN_S = 5.0  # s after a release / a driver override before the floor may arm again
 MIN_LEAD_PROB = 0.5   # modelProb below this (or NaN) = untrusted -> no brake (bridge instead). Vacuous for vision leads.
 BRAKE_MAX_S = 5.0     # s of BRAKE per approach, cumulative across dropouts (review item 4)
-CAP_HOLD_MAX_S = 5.0  # s the zero-pedal hold may last after a duration cap before the floor lets go (latched)
+CAP_HOLD_MAX_S = 5.0  # s (wall time) the zero-pedal hold may last after a duration cap before the floor lets go (latched)
 BUDGET_FORGET_S = 10.0  # s of floor-OFF after which an approach's brake budget is forgotten
 LATCH_FORGET_ABSENT_S = 5.0  # s with no usable lead after which a duration-cap latch is forgotten
 STALE_RADAR_S = 0.25  # s: a radarState older than this at the planner frame is a lost lead (review item 4)
@@ -278,7 +281,8 @@ class MinGapFloor:
   """Owned by LongitudinalPlanner. ``apply`` is the contained planner hook; ``update`` is the rule with explicit inputs.
 
   Diagnostics (read by tests / the shadow replay, never by the planner): ``state``, ``gap_med`` (the median the decision
-  used), ``launch_hold`` / ``rearm_t`` (clocks, s remaining), ``brake_t`` (s of brake in this approach), ``hold_t``,
+  used), ``launch_hold`` / ``rearm_t`` (clocks, s remaining), ``brake_t`` (s of brake in this approach), ``hold_t`` (s of
+  hold; after a duration cap the wall time of the capped coast, BRIDGE frames included),
   ``cap_latched``, ``dependency`` (why the floor may or may not arm), ``enabled``, ``faulted`` (the drive-long latch),
   ``override`` (this frame was read as a driver override: engaged, and gas or a planner reset).
   """
@@ -378,6 +382,11 @@ class MinGapFloor:
       self._full_reset(clear_buffer=True)   # a later re-enable starts cold, never from a stale BRAKE
       self._live = False                    # (together with the full reset: _live False always means no approach memory)
       self.override = False
+    elif enabled and not self.enabled and self._frame > 0:
+      # switched ON mid-drive (the param, or the car layer's law): the rule's clocks did not run while it was off, so it
+      # cannot know whether the car has just pulled away from a crawl -> the launch grace starts now (conservative).
+      # Not at construction / the planner's first frame: there is no drive history yet, the first slow frame starts it.
+      self.launch_hold = LAUNCH_GRACE_S
     self.enabled = bool(enabled)
     self.dependency = dep
     if dep != self._dep_logged:
@@ -476,7 +485,8 @@ class MinGapFloor:
     self.t += dt
 
     # clocks. The launch grace (re)starts whenever the car is under 1 m/s, not only at a true standstill, so a crawl at
-    # 0.5-0.9 m/s that never stops still gets the grace when it launches. It never releases an active floor.
+    # 0.5-0.9 m/s that never stops still gets the grace when it launches (and when the floor is switched on mid-drive,
+    # see _set_enabled: these clocks do not run while it is off). It never releases an active floor.
     if standstill or v < V_RELEASE:
       self.launch_hold = LAUNCH_GRACE_S
     elif self.launch_hold > 0.0:
@@ -528,11 +538,21 @@ class MinGapFloor:
       # LEAD DROPOUT / UNTRUSTED / STALE. Drop the brake at once, but keep the buffer and hold the pedal at zero for up
       # to LEAD_BRIDGE_S so a momentary loss does not hand the pedal back at a 2 m gap. From OFF: nothing to protect.
       if self.state in (BRAKE, HOLD, BRIDGE) and len(self._buf):
+        cap_frame = self.state == BRAKE and self.brake_t >= BRAKE_MAX_S - 1e-9
+        if cap_frame:
+          self._cap()                          # the budget ran out on the frame the lead went: that IS the duration cap
         if self.state != BRIDGE:
           self._bridge_from = self.state
           self.bridge_t = 0.0
         self.state = BRIDGE
         self.bridge_t += dt
+        if self.cap_latched and not cap_frame:
+          # the coast after a duration cap runs in WALL time: a dropout frame counts exactly like a hold frame
+          self.hold_t += dt
+          if self.hold_t >= CAP_HOLD_MAX_S - 1e-9:
+            self._end_cap_hold(clear_buffer=True)
+            self._tick_off()
+            return float(accel)
         if self.bridge_t >= LEAD_BRIDGE_S - 1e-9:
           self._expire()
           return float(accel)
@@ -563,11 +583,7 @@ class MinGapFloor:
 
     if self.state == BRAKE:
       if self.brake_t >= BRAKE_MAX_S - 1e-9:
-        # THE DURATION CAP: a sustained false brake must not run the car down from 10 m/s. Zero-pedal hold (no brake)
-        # for at most CAP_HOLD_MAX_S, then OFF; latched until the gap is seen to recover.
-        self._enter_hold()
-        self.cap_latched = True
-        self.latch_recover_t = 0.0
+        self._cap()                          # THE DURATION CAP (see _cap)
       elif v > V_MAX or v <= V_RELEASE:
         self._enter_hold()                   # leaving the band never frees the ask, and starts the cooldown
       elif d >= exit_gap(v):
@@ -588,8 +604,7 @@ class MinGapFloor:
       else:
         self.recover_t = 0.0
       if self.state == HOLD and self.cap_latched and self.hold_t >= CAP_HOLD_MAX_S - 1e-9:
-        self._to_off()                       # the capped approach is handed back; the latch stays
-        self.rearm_t = max(self.rearm_t, REARM_COOLDOWN_S)
+        self._end_cap_hold()
       if self.state == HOLD and self._may_arm(v, d):
         self._enter_brake()                  # the gap collapsed again after the cooldown: a second genuine approach
 
@@ -648,6 +663,20 @@ class MinGapFloor:
     self.state = HOLD
     self.rearm_t = max(self.rearm_t, REARM_COOLDOWN_S)
     self.exit_t, self.recover_t, self.hold_t = 0.0, 0.0, 0.0
+
+  def _cap(self) -> None:
+    """THE DURATION CAP: this approach's brake budget is spent (a sustained false brake must not run the car down from
+    10 m/s). Zero-pedal hold, no brake, for at most CAP_HOLD_MAX_S of WALL time from this frame (every planner frame
+    counts, HOLD and lead-dropout BRIDGE alike), then OFF; latched until the gap is seen to recover. Reached from BRAKE
+    on the first frame after the budget ran out, or from the BRIDGE that frame starts when the lead goes on it."""
+    self._enter_hold()
+    self.cap_latched = True
+    self.latch_recover_t = 0.0
+
+  def _end_cap_hold(self, clear_buffer: bool = False) -> None:
+    """The capped approach is handed back after CAP_HOLD_MAX_S: OFF, the latch stays, the cooldown restarts."""
+    self._to_off(clear_buffer)
+    self.rearm_t = max(self.rearm_t, REARM_COOLDOWN_S)
 
   def _expire(self) -> None:
     """A dropout outlasted the bridge: a fail-safe stop (OFF, buffer cleared). Not cooldown-gated - unless the lead has
