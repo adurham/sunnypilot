@@ -212,6 +212,17 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
   # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
   if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
     CP_SP.pedalDeliveryLaw = True
+  # 0047 HOLD FIT (HyundaiPedalHoldFit, PERSISTENT BOOL, default "0" = OFF): the pedal law's hold feedforward
+  # (hold_cmd(v), the "pedal fraction that holds speed on flat ground") re-measured from the car's own logs. The
+  # deployed 5-15 m/s leg came from a driver STEADY-PEDAL fit that over-reads, so at ask 0 the car accelerated
+  # +0.12..+0.29 m/s^2 instead of holding (peak at 4-7 m/s; the 2026-11-19 59:37-59:40 creep behind the RV), and the
+  # 12-20 m/s leg was ~25 % high. ON uses the measured HOLD_FIT_* table, which is identical to the deployed one at
+  # 0 m/s and at 20 m/s and up, so the highway law and cruise hold are untouched by construction. Same truthy parser
+  # and same "missing key on a stale libparams -> OFF" rule as the sibling Hyundai keys; it rides the pedal feature
+  # (this function only runs with the pedal armed). Read at CarParams build time => a toggle takes effect at the NEXT
+  # ignition. OFF = the deployed law, byte for byte.
+  if _param_truthy(params_dict.get("HyundaiPedalHoldFit")):
+    CP_SP.pedalHoldFit = True
   # 0042-Z RISE-LAG (HyundaiGasRiseLag, PERSISTENT BOOL, default "0" = OFF): a first-order lag on the accel ask applied
   # to RISES ONLY, ahead of the pedal law (gas_interceptor.filter_gas_rise). Lane Y measured the small NORMAL-mode gas
   # moves as real 1.3-2 s planner requests, not pedal artefacts, so the ask is the only lever; the lag slows a rise
@@ -222,6 +233,15 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
   # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
   if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
     CP_SP.gasRiseLag = True
+  # 0056 STANDSTILL CLAMP (HyundaiFca11StandstillClamp, PERSISTENT BOOL, default "0" = OFF): at a stop, raise the
+  # continuous law's standstill hold to its 30-step level at the panda's +4 per sent frame (7 -> 30 in ~0.12 s instead of
+  # ~0.7 s). Written HERE because the car layer only READS getattr(CP_SP, "fca11StandstillClamp", False) - without this
+  # writer the key would be a no-op (the 0043/0044 unreachable-key class). Same truthy parser and the same dependency as
+  # the sibling FCA11 keys: it shapes FCA11 braking, so it is inert without HyundaiFca11Brake, and in Shadow (whose wire is
+  # the OLD-LAW). The car layer additionally requires the continuous law (AffineGain + DynamicBrakes) - on any other law it
+  # is inert. Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
+  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StandstillClamp")) and not shadow:
+    CP_SP.fca11StandstillClamp = True
 
 
 def _param_truthy(raw) -> bool:

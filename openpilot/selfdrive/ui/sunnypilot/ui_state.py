@@ -50,6 +50,7 @@ class UIStateSP:
     self.active_runner_tinygrad: bool = False
     self.blindspot: bool = False
     self.chevron_metrics = None
+    self.confidence_meter: bool = True
     self.custom_interactive_timeout: int = 0
     self.developer_ui = None
     self.hide_v_ego_ui: bool = False
@@ -174,6 +175,8 @@ class UIStateSP:
     self.chestnut_compiled = self.chestnut_compiled or self.model_runner_tinygrad
     self.blindspot = self.params.get_bool("BlindSpot")
     self.chevron_metrics = self.params.get("ChevronInfo")
+    # 3X: the comma 4 confidence ball ported to the wide screen (default ON).
+    self.confidence_meter = self.params.get_bool("ConfidenceMeter")
     self.custom_interactive_timeout = self.params.get("InteractivityTimeout", return_default=True)
     self.developer_ui = self.params.get("DevUIInfo")
     self.hide_v_ego_ui = self.params.get_bool("HideVEgoUI")

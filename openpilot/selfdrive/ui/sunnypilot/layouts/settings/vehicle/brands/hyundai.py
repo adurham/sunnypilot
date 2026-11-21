@@ -76,6 +76,12 @@ class HyundaiSettings(BrandSettings):
                                                callback=self._on_shaping_changed)
     self.fca11_dynamic_release_toggle = toggle_item_sp(tr("Smooth Brake Release"), self._dynamic_desc,
                                                        param="HyundaiFca11DynamicBrakes", callback=self._on_toggle_changed)
+    # Test setting (off by default): the stopped-car hold is applied in about a tenth of a second instead of about
+    # seven tenths. Needs both smooth switches above (it lives in the law they select).
+    self._clamp_desc = tr("Test setting, off by default: when the car comes to a stop, applies the full stopped-car hold "
+                          "at once instead of over about 0.7 seconds. Needs both switches above.")
+    self.fca11_standstill_clamp_toggle = toggle_item_sp(tr("Firm Hold At Stops"), self._clamp_desc,
+                                                        param="HyundaiFca11StandstillClamp", callback=self._on_toggle_changed)
 
     # ---- Pedal --------------------------------------------------------------------------------
     self.pedal_header = _section(tr("Pedal"))
@@ -98,7 +104,7 @@ class HyundaiSettings(BrandSettings):
     self.items = [
       self.longitudinal_header, self.mode_item, self.drive_mode_personality_toggle, self.longitudinal_tuning_item,
       self.follow_header, self.elastic_follow_toggle, self.no_close_toggle, self.stop_approach_toggle,
-      self.fca11_header, self.fca11_shaping_toggle, self.fca11_dynamic_release_toggle,
+      self.fca11_header, self.fca11_shaping_toggle, self.fca11_dynamic_release_toggle, self.fca11_standstill_clamp_toggle,
       self.pedal_header, self.pedal_delivery_toggle, self.gas_rise_lag_toggle,
     ]
 
@@ -191,7 +197,8 @@ class HyundaiSettings(BrandSettings):
     self.fca11_header.set_visible(True)
     fca11_hint = "" if brake else tr("Needs Pedal + FCA11. ") + "<br><br>"
     for item, desc in ((self.fca11_shaping_toggle, self._shaping_desc),
-                       (self.fca11_dynamic_release_toggle, self._dynamic_desc)):
+                       (self.fca11_dynamic_release_toggle, self._dynamic_desc),
+                       (self.fca11_standstill_clamp_toggle, self._clamp_desc)):
       item.action_item.set_enabled(path_toggle_state(brake, offroad).enabled)
       item.set_description(fca11_hint + self._offroad_hint(desc, offroad))
       item.show_description(True)
