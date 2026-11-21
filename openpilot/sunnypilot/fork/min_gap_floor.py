@@ -4,14 +4,15 @@ Fork: low-speed minimum-gap brake floor (adurham/sunnypilot). Inert unless the `
 Why this exists
 ---------------
 Route 000001ac, 2026-11-19, I-80/94 stop-and-go at 12-14 mph, night, a flat-rear white RV trailer directly ahead.
-From 59:37 to 59:45.7 the car crept from ~7.5 m to 1.4-2.7 m (raw dRel) behind that trailer (THW 0.3-0.6 s) while it
-accelerated 4.08 -> 6.21 m/s; the driver braked and disengaged. The published ask was exactly 0.00 while the speed rose
-4.08 -> 5.11 m/s (59:37.0-59:40.0), -0.16..+0.1 at 5.2-5.3 m/s, and +0.06..+0.39 while it rose 5.47 -> 6.14 m/s
+From 59:37 to 59:45.7 the car crept from ~4.6 m to 1.4-2.7 m (raw dRel) behind that trailer (THW 0.3-0.6 s) while it
+accelerated 4.08 -> 6.21 m/s; the driver braked and disengaged. The published ask was 0.00 while the speed rose
+4.08 -> 5.11 m/s (59:37.0-59:40.0; exactly 0.00 on 56 of 60 frames, the rest +0.01..+0.10), -0.16..-0.02 at
+5.2-5.3 m/s (59:40.3-59:42.8), 0.00 again at 59:42.8-59:43.6, and +0.06..+0.39 while it rose 5.47 -> 6.14 m/s
 (59:43.7-59:45.5, ``NoCloseOnLead`` released a second time) - F-SIM-CREEP-2026-11-19. Vision read the trailer as pulling
 away (vRel +13.7/+15.0 m/s spikes while the gap shrank), so the MPC and the e2e candidates both stayed positive and
-nothing ever asked for a brake: the lowest ask after 59:35 was -0.16, which on the car's continuous brake law (no -0.5
-onset) is about its coast point - no friction brake. The raw range was noisy (4.6 -> 8.9 -> 3.1 m inside 0.3 s); the
-0.5 s median dRel tracked the trailer (minimum 1.6 m).
+nothing ever asked for a brake: from 59:35.7 the lowest ask was -0.165, which on the car's continuous brake law (no -0.5
+onset) is about its coast point - no friction brake. The raw range was noisy (4.6 -> 8.9 m within 0.16 s at 59:35.2,
+back to 3.4 m by 59:35.9); the 0.5 s median dRel tracked the trailer (minimum 1.69 m).
 
 That is the hole this fills: every existing rule keys on the lead's SPEED (vRel / closing / vLead), and every one of them
 is blind when the speed is wrong. The gap is the robust signal at these ranges, so the last resort keys on the gap alone.
@@ -70,8 +71,10 @@ A persistently short dRel (a phantom) would otherwise hold -1.0 from 10 m/s down
 of BRAKE_MAX_S per approach (the two real brakes were 2.55 s and 3.75 s). The budget is CUMULATIVE across lead dropouts,
 so a phantom that blinks out for a second cannot buy a fresh 5 s; it is forgotten only when the approach really ends (the
 gap recovers, the car stops, the driver disengages) or after BUDGET_FORGET_S with the floor off. When it runs out the floor
-steps into HOLD for at most CAP_HOLD_MAX_S and then OFF, and LATCHES (``cap_latched``): no re-arm until the gap has been seen
-above the recovery band for RECOVER_DWELL_S, the car stops, the driver disengages, or no usable lead has been seen for
+steps into HOLD for at most CAP_HOLD_MAX_S of HOLD frames (lead-dropout BRIDGE frames in between, also zero pedal, are
+not counted, so a flickering lead can stretch the coast in wall time) and then OFF, and LATCHES (``cap_latched``): no
+re-arm until the gap has been seen above the recovery band for RECOVER_DWELL_S, the car stops, the driver disengages, or
+no usable lead has been seen for
 LATCH_FORGET_ABSENT_S. A lead dropout never clears the latch, and neither does a driver override (a gas press): the
 budget, the latch and the flicker history survive it (see "Driver override vs a real disengage"). A real disengage
 followed by a re-engagement starts a new approach with a fresh budget.
