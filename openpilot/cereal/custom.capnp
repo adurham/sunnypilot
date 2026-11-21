@@ -441,6 +441,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
   gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
   fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192
+  fca11StandstillClamp @14 :Bool;  # fork (0056, TEST SETTING): FCA11 standstill clamp - the stopped hold reaches its 30 steps at the panda's +4 per sent frame (param HyundaiFca11StandstillClamp, default OFF); mirrors opendbc CarParamsSP. Also the A/B arm marker in every rlog
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 

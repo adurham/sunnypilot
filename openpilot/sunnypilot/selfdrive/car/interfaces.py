@@ -189,6 +189,13 @@ def initialize_params(params) -> list[dict[str, Any]]:
     params_list.append({"HyundaiFca11PedalGuard": params.get("HyundaiFca11PedalGuard", return_default=True)})
   except UnknownKeyName:
     cloudlog.warning("HyundaiFca11PedalGuard param unknown to libparams (not rebuilt?); the pedal-fault guard stays OFF (deployed rule)")
+  # fork (0056, TEST SETTING): the FCA11 standstill clamp. Same stale-libparams guard as the siblings: a missing key leaves
+  # the clamp OFF (today's law). opendbc setup_interfaces writes CP_SP.fca11StandstillClamp only with HyundaiFca11Brake
+  # ON and Shadow OFF; the car layer additionally requires the continuous law. Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiFca11StandstillClamp": params.get("HyundaiFca11StandstillClamp", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiFca11StandstillClamp param unknown to libparams (not rebuilt?); the standstill clamp stays OFF")
   # fork (17c delivery): measured-inverse pedal law for negative asks + a pedal-path ask filter. Same stale-libparams
   # guard: a missing key leaves the law OFF (the deployed linear law). Takes effect at the next ignition.
   try:
