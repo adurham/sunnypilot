@@ -208,5 +208,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
     params_list.append({"HyundaiGasRiseLag": params.get("HyundaiGasRiseLag", return_default=True)})
   except UnknownKeyName:
     cloudlog.warning("HyundaiGasRiseLag param unknown to libparams (not rebuilt?); the ask lag stays OFF")
+  # fork (0047 hold-fit): the pedal law's hold feedforward re-measured from the car's logs. Same stale-libparams guard:
+  # a missing key leaves the fitted table OFF (the deployed hold, byte for byte). Takes effect at the next ignition.
+  try:
+    params_list.append({"HyundaiPedalHoldFit": params.get("HyundaiPedalHoldFit", return_default=True)})
+  except UnknownKeyName:
+    cloudlog.warning("HyundaiPedalHoldFit param unknown to libparams (not rebuilt?); the deployed hold table stays active")
 
   return params_list
