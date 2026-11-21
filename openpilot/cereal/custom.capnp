@@ -337,15 +337,22 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
 
     preCapAccel @5 :Float32;     # min(MPC, cruise, e2e) BEFORE the cap -- the ask the cap scales
     preCapSource @6 :Candidate;  # the candidate that set preCapAccel
-    postCapAccel @7 :Float32;    # preCapAccel after the cap (== preCapAccel when no cap / a non-positive ask)
+    postCapAccel @7 :Float32;    # the NoClose cap's OUTPUT: preCapAccel after the cap (== preCapAccel when no cap / a
+                                 # non-positive ask). NOT the published request: it is taken BEFORE every stage that runs
+                                 # after the cap -- any optional later stage, the standstill-launch hold, the
+                                 # ACCEL_MIN/MAX clip -- so on a frame where one of them changes the ask it differs from
+                                 # the same frame's longitudinalPlan.aTarget, which is the final ask.
 
     factor @8 :Float32 = 1;      # dwelled cap factor actually applied, in [0, 1] (1 = no cap)
     rawFactor @9 :Float32 = 1;   # this frame's un-dwelled factor (before the min-window)
     dwellFrames @10 :UInt8;      # frames of the release-dwell window currently occupied (0 = window flushed)
 
-    closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing)
-    filteredClosing @12 :Float32;  # m/s, the 3-state Kalman filter's gap rate (> 0 = the gap is shrinking)
-    rawMeanClosing @13 :Float32;   # m/s, mean of (vEgo - vLead) over the last RAW_MEAN_S (~1 s) envelope
+    closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing); 0 while the cap
+                                 # is OFF or no lead is tracked (the three closing fields are reset, not the filter's state)
+    filteredClosing @12 :Float32;  # m/s, the 3-state Kalman filter's gap rate (> 0 = the gap is shrinking); 0 while the
+                                   # cap is OFF or no lead is tracked, even though the filter itself keeps running
+    rawMeanClosing @13 :Float32;   # m/s, mean of (vEgo - vLead) over the last RAW_MEAN_S (~1 s), logged whether or not it
+                                   # fed closingSpeed; 0 while the cap is OFF or no lead is tracked, or the envelope is empty
     vRelBias @14 :Float32;       # m/s, the filter's vRel bias state (vision vRel is biased for seconds at a time)
     filterValid @15 :Bool;       # the filter has a live track
     filterCoasting @16 :Bool;    # bridging a short lead dropout (<= HOLD_FRAMES)
