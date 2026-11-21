@@ -9,22 +9,35 @@ The standstill hold timer, drawn ALONGSIDE the alert on the comma 3X (tici).
 Why this exists.  The standstill timer (Settings > Display > "Enable Standstill
 Timer") is drawn by CircularAlertsRenderer as the big "STOPPED 1:30" circle on the
 right of the 3X screen.  That whole layer is suppressed whenever ANY selfdrive
-alert is up (`_allow_e2e_alerts` requires `selfdriveState.alertSize == none`), and
-the fork's own hold-countdown alerts start at exactly 1:00 ("Stopped - press the
-brake", 0043-CD).  So from 1:00 to 2:00 - the only part of the hold where the
-timer matters, because the brakes are released at 2:00 - the message takes the
-timer's place and the driver cannot see how long is left.
+alert is up (`_allow_e2e_alerts` requires `selfdriveState.alertSize == none`).
+During an openpilot (FCA11) hold an alert is up from the dead stop to the end:
+the small "stop complete - hold brake pedal" (fca11StopComplete) from +0.06 s,
+then the 0043 countdown ("Stopped - press the brake" at 1:00, "Press the brake
+now" at 1:30, the full-screen "Brakes release in 10 seconds" at 1:50, "BRAKES
+RELEASED" at 2:00).  Measured on the owner's 2026-11-19/20 drives: an alert on
+screen for the whole of every engaged hold (no alert-free stretch over 1.0 s), so
+the circle was never visible while openpilot held the car - only on stops the
+driver held himself.  (Review correction, 2026-11-20: the first write-up said the
+circle vanished only from 1:00.)
 
-This renderer puts the same clock in its own small pill in the TOP-RIGHT corner,
-drawn AFTER the alert renderer (see AugmentedRoadViewSP.render_top_overlays), so
-it survives even the full-screen "Brakes release in 10 seconds" / "BRAKES
-RELEASED" banners.  The top-right corner is the one region no 3X alert or HUD
-element occupies (alert text starts 200 px down; the MAX box and speed are
-top-left / top-centre).
+This renderer puts the same clock in its own small pill in the TOP-RIGHT corner
+whenever an alert is up, drawn AFTER the alert renderer (see
+AugmentedRoadViewSP.render_top_overlays), so it shows for the whole hold and
+survives even the full-screen banners.  The top-right corner is the one region no
+3X alert or HUD element occupies (alert text starts 200 px down; the MAX box and
+speed are top-left / top-centre; the developer UI's right column starts 260 px
+down).
 
-Display only: it reads the clock CircularAlertsRenderer already keeps (the same
-wall-clock seconds the circle shows) and never touches the countdown itself, the
-brake law, alert text, priorities or timing.
+Display only: it reads the clock CircularAlertsRenderer already keeps and never
+touches the countdown itself, the brake law, alert text, priorities or timing.
+That clock adds 1/target_fps per rendered onroad frame (a frame count, not a
+wall clock); on the owner's holds the UI rendered without gaps (longest 125 ms)
+and the clock read 59.95-60.25 s when the controller's own sent-frame countdown
+reached its 60 s tier, i.e. it tracks the release to within a fraction of a
+second.  It stands still while the onroad view is not rendered (e.g. settings
+open), and it is the time since carState.standstill, not the controller's
+counter - so on a stop openpilot is not holding it can pass 2:00 with nothing
+released.
 """
 import pyray as rl
 

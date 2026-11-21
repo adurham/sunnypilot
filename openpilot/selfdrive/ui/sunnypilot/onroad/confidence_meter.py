@@ -11,8 +11,9 @@ The mici UI draws a single dot on the right edge of its side panel
 (no confidence) to the top (full confidence), and its colour follows the driving
 state and the model's own disengage predictions.  The 3X screen has no side panel,
 so the same dot is drawn as a thin vertical track on the right edge of the road
-view - the one strip of the 3X screen nothing else uses (the circular alerts end
-~110 px short of the edge, and the alert band never reaches it).
+view (the circular alerts end ~110 px short of the edge, and the alert band never
+reaches it). When the developer UI's right column is on, that column owns the
+edge, so the track moves to the column's left (dot_center_inset).
 
 Meaning, unchanged from mici:
   * full engagement: confidence = (1 - max(brakeDisengageProbs)) *
@@ -27,6 +28,7 @@ import math
 import pyray as rl
 
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.selfdrive.ui.sunnypilot.onroad.developer_ui import DeveloperUiState
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app
 
@@ -46,6 +48,20 @@ DOT_RADIUS = 30
 EDGE_INSET = 40          # dot centre from the right content edge
 TRACK_TOP_FRAC = 0.28    # track top / bottom as a fraction of the content height
 TRACK_BOTTOM_FRAC = 0.72
+
+# Review fix (2026-11-20): the developer UI's RIGHT column (Settings > Display > Developer UI = Right or Both;
+# developer_ui/__init__.py _draw_right_dev_ui: container_width 184, its own UI_BORDER_SIZE 20, x = right - 184 - 2*20)
+# covers right-224 .. right-12 over the whole height of this track, so a dot at right-40 sat on its labels, values and
+# units. With that column on, the track moves to the column's left, like CircularAlertsRenderer moves left for it.
+DEV_UI_RIGHT_COLUMN_WIDTH = 184 + 2 * 20   # right-edge strip the column owns (pinned to developer_ui by a test)
+DEV_UI_CLEARANCE = 60                      # dot centre to the column's left edge: the 44 px masking ring + 16 px gap
+
+
+def dot_center_inset(developer_ui) -> float:
+  """Distance from the content rect's right edge to the dot's centre, for the developer-UI mode in use."""
+  if developer_ui in (DeveloperUiState.RIGHT, DeveloperUiState.BOTH):
+    return DEV_UI_RIGHT_COLUMN_WIDTH + DEV_UI_CLEARANCE
+  return EDGE_INSET
 
 
 def disengage_confidence(brake_probs, steer_probs) -> float:
@@ -146,7 +162,7 @@ class ConfidenceMeter:
     bottom = rect.y + rect.height * TRACK_BOTTOM_FRAC
 
     # A faint track so the dot's position reads as a scale, not a stray blob.
-    x = rect.x + rect.width - EDGE_INSET
+    x = rect.x + rect.width - dot_center_inset(ui_state.developer_ui)
     rl.draw_rectangle_rounded(rl.Rectangle(x - 3, top, 6, bottom - top), 0.5, 8,
                               rl.Color(255, 255, 255, 38))
 
