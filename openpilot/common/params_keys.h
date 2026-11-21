@@ -335,6 +335,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AdaptiveFollowDistance", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/adaptive_follow.py
     {"NoCloseOnLead", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/no_close.py (never accelerate toward a lead)
     {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
+    {"MinGapBrakeFloor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/min_gap_floor.py (low-speed minimum-gap brake floor, default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnypilot model params

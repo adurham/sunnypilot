@@ -22,6 +22,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
 from openpilot.sunnypilot.fork.no_close import NoCloseCap
+from openpilot.sunnypilot.fork.min_gap_floor import MinGapFloor
 from openpilot.sunnypilot.fork.standstill_launch import StandstillLaunchDebounce
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -148,6 +149,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork: never accelerate toward a lead (fork/no_close.py, param NoCloseOnLead). Owner 2026-11-01: the car must
     # not speed up to reach the follow gap on a car it can already see.
     self.no_close = NoCloseCap()
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). Keys on the
+    # GAP alone, so a vision lead-speed failure cannot disarm it. CP_SP goes in for its dependency gate: the floor arms
+    # only while the car layer runs the continuous FCA11 law its zero-pedal / zero-brake hold is defined on. The
+    # constructor never raises.
+    self.min_gap_floor = MinGapFloor(cp_sp=CP_SP)
     # fork (lane C, route 194 #8): a held standstill releases only on a sustained go (fork/standstill_launch.py)
     self.standstill_launch = StandstillLaunchDebounce()
     # fork (2026-11-19): LOG-ONLY planner telemetry, published on longitudinalPlanSP.noClose (custom.capnp) every frame.
@@ -354,6 +360,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # (any optional post-cap stage, the standstill-launch hold, the ACCEL_MIN/MAX clip), so it is NOT
     # longitudinalPlan.aTarget on a frame where one of those changes the ask
     self._log_post_cap = float(output_a_target)
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). The last
+    # resort for when every lead-SPEED rule is blinded (2026-11-19: vision read a trailer as pulling away while the gap
+    # shrank): keys on the 0.5 s median GAP alone and only ever deepens the ask. CONTAINED: with the param OFF it reads
+    # no message field and returns the ask object itself; with it ON any exception passes the ask through unmodified and
+    # latches the floor off for the drive. (v1 evaluated sm['radarState'].modelProb - not a RadarState field - here on
+    # EVERY frame, param OFF included, which raises AttributeError on the first planner frame.)
+    output_a_target = self.min_gap_floor.apply(sm, output_a_target, v_ego, not reset_state)
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     # fork (lane C): a model shouldStop flicker must not release a held standstill (route 194 #8). Hold-only: never adds a
     # go, never raises the ask; a moving car and a reset planner pass through unchanged.

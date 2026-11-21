@@ -50,6 +50,8 @@ FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonal
                      "HyundaiFca11Shadow",   # 0045: named explicitly (also covered by HyundaiFca11) so a prefix edit can't drop it
                      "StopApproachCommit",   # 17c lane C: a whole key, not a prefix; without this the compiled-libparams guard
                                              #          never checks it and a stale libparams_c.so would silently disable the feature
+                     "MinGapBrakeFloor",     # 2026-11-19: low-speed minimum-gap brake floor (fork/min_gap_floor.py) - a whole
+                                             #          key outside every prefix; a stale libparams_c.so must fail this guard
                      "AdaptiveFollowDistance",  # same class of miss (a fork key outside every Hyundai* prefix), covered now
                      "HyundaiPedalDeliveryLaw",  # 17c delivery: inside Hyundai*, but named so a prefix edit cannot drop it
                      "HyundaiGasRiseLag")  # 0042-Z rise-lag: named for the same reason (a fork key that must stay registered)
