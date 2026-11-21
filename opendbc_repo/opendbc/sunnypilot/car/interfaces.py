@@ -222,6 +222,15 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
   # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
   if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
     CP_SP.gasRiseLag = True
+  # 0056 STANDSTILL CLAMP (HyundaiFca11StandstillClamp, PERSISTENT BOOL, default "0" = OFF): at a stop, raise the
+  # continuous law's standstill hold to its 30-step level at the panda's +4 per sent frame (7 -> 30 in ~0.12 s instead of
+  # ~0.7 s). Written HERE because the car layer only READS getattr(CP_SP, "fca11StandstillClamp", False) - without this
+  # writer the key would be a no-op (the 0043/0044 unreachable-key class). Same truthy parser and the same dependency as
+  # the sibling FCA11 keys: it shapes FCA11 braking, so it is inert without HyundaiFca11Brake, and in Shadow (whose wire is
+  # the OLD-LAW). The car layer additionally requires the continuous law (AffineGain + DynamicBrakes) - on any other law it
+  # is inert. Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
+  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StandstillClamp")) and not shadow:
+    CP_SP.fca11StandstillClamp = True
 
 
 def _param_truthy(raw) -> bool:

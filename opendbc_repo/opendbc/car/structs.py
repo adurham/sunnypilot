@@ -89,6 +89,12 @@ class CarParamsSP:
   # latches, fail-closed). Written ONLY by setup_interfaces; read once by the car layer and mirrored into the panda's
   # safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES. Coupled with custom.capnp CarParamsSP @13.
   fca11PedalGuard: int = auto_field()
+  # 0056: STANDSTILL CLAMP (param HyundaiFca11StandstillClamp, default OFF). Written ONLY by setup_interfaces from that
+  # param; read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = at a
+  # stop the continuous law's standstill hold reaches its 30-step level at the panda's +4 per sent frame instead of the
+  # 2 m/s^3 slew; it only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
+  # CarParamsSP.fca11StandstillClamp @14.
+  fca11StandstillClamp: bool = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 

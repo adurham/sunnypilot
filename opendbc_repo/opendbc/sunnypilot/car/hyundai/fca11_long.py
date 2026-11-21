@@ -1239,6 +1239,41 @@ FCA11_CONT_TRIM_ENABLED = True
 # command noise below 0.5 LSB produces no level change at all. 0.0 = plain rounding (the pre-0040 behaviour).
 FCA11_CONT_QHYST_LSB = 1.0
 
+# *** 0056: THE STANDSTILL CLAMP (param HyundaiFca11StandstillClamp -> CP_SP.fca11StandstillClamp, DEFAULT OFF) ***
+# THE PROBLEM (wsSTOP/drive-2026-11-19 F-OPUS-REVIEW-stop-creep §4): every held stop arrives on the 7-step creep floor
+# and the standstill hold then slews to its 30 steps at the 2 m/s^3 jerk limit - 7 -> 30 in ~0.69 s. 26 of the logged
+# stopped-hold slips (10-29 cm of roll, then a 2.6-4.5 m/s^3 grab) all came within ~11 s of the stop, and 22 of the 28
+# gentle clutch-open arrivals slipped. The working hypothesis is that the ESC sets its standstill grip around the moment of
+# stopping, so the hold must be in place AT the stop, not 0.7 s later. The car's own "Creep Off" only works under the
+# driver's own brake pedal (owner, tested), and the gearbox releases its ~26 Nm of creep only for driver pedal pressure,
+# which our ESC braking never produces - so the remaining lever is the speed of the hold itself.
+# THE CHANGE: at the stop (CarState.standstill - the hold detection the law already uses for its 30-step target - AND
+# vEgo <= FCA11_SS_CLAMP_V_MPS) the law's wire level is raised toward that same hold at up to the PANDA's own onset step,
+# +4 per sent frame (7 -> 30 in ~0.12 s). It is a FLOOR inside _cont_level, max(law, floor), and the law's own state
+# (_shape_acc, the trim, the quantiser and down-step references) is NEVER written by it, so:
+#   * it never commands less than today's law, never more than the 30-step hold (the law ceiling), never more than the
+#     panda's +4 over the last sent frame;
+#   * it retires the moment the law's own slew reaches it (no step - the two are equal), so there is no hand-back and
+#     nothing to re-seed (contrast the cal tool, whose _shape_reset() hand-back releases 30 -> 0 for ~0.4 s);
+#   * it never acts before the stop (vEgo <= 0.08 implies the first vEgo < 0.10 frame has already passed), never while the
+#     driver presses gas or brake, never out of D, never on a vetoed frame (`ok`), never when the planner asks to move:
+#     the first frame without a stop demand (bn <= 0) hands the wire back to the law's own level on that SAME frame, so
+#     the launch/release path is byte-identical to today's from that frame on, and the clamp stays disarmed until the
+#     car has moved at >= FCA11_SS_CLAMP_REARM_V_MPS again (once per stop);
+#   * a standstill flag that drops while it is engaged (a slip) does NOT end it - the floor keeps its level (it stops
+#     rising) while the planner still asks to stop, because weakening the hold during a roll is the one thing it must not
+#     do; FCA11_SS_CLAMP_MAX_S bounds that, after which the floor decays at the law's own down-slew toward the law;
+#   * any exception latches it off for the ignition (today's law); a non-finite speed retires it for the frame.
+# Pedal: the gas side reads gas_hold (the wire window armed by every sent frame >= 4 LSB - armed on exactly the same
+# frames with and without the clamp), so the pedal command is identical, i.e. exactly 0 while held.
+# Known, intended side effect: the 2:00 hold countdown counts sent frames at >= 20 steps, which the clamp reaches
+# ~0.15 s earlier, so the countdown runs that much ahead (the hold at >= 20 steps still lasts the same 120 s).
+FCA11_SS_CLAMP_V_MPS = 0.08            # m/s: vEgo at/below this (and CarState.standstill) = the stop; 0.08 < the 0.10 stop edge
+FCA11_SS_CLAMP_REARM_V_MPS = 0.5       # m/s: the clamp re-arms only once the car moves again (slips peak 0.12-0.30 m/s)
+FCA11_SS_CLAMP_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP   # +4 per SENT frame: the panda's own onset gate, never more
+FCA11_SS_CLAMP_MAX_S = 3.0             # s: an engaged floor the law has not reached by then decays at the law's down-slew
+FCA11_SS_CLAMP_MAX_FRAMES = int(round(FCA11_SS_CLAMP_MAX_S * 100))   # controller frames at 100 Hz
+
 
 def fca11_cont_coast(v_ego_mps: float) -> float:
   """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
@@ -1979,6 +2014,22 @@ class Fca11LongBrake:
     self.cont_law = bool(FCA11_CONT_ENABLED) and self.shape_track
     if self.cont_law:
       self._shape_acc = 0.0   # 0037: the level starts at TRUE zero (there is no 4 LSB floor to sit on)
+    # 0056: the STANDSTILL CLAMP (FCA11_SS_CLAMP_* block). Read ONCE, from CP_SP only, DEFAULT OFF, and only ever on the
+    # continuous-law instance (never the feel/old law, never the Shadow V3 core: _shadow_core_params() has no such field).
+    # `getattr` with False is the fail-CLOSED direction here: a CP_SP without the field is today's law.
+    self.ss_clamp = bool(self.cont_law) and bool(getattr(CP_SP, "fca11StandstillClamp", False))
+    self._ss_armed = False             # a stop may clamp (set once the car has moved >= FCA11_SS_CLAMP_REARM_V_MPS)
+    self._ss_engaged = False           # the floor is above the law's own level on the wire right now
+    self._ss_lvl = 0.0                 # the floor's (fractional) level, only meaningful while engaged
+    self._ss_wire = 0                  # the integer level the floor put on the wire last sent frame (while engaged)
+    self._ss_since = 0                 # controller frame the floor engaged on (the FCA11_SS_CLAMP_MAX_S clock)
+    self._ss_frame: int | None = None  # last SENT frame the clamp step ran on (a gap retires the floor)
+    self._ss_off_sent = 0              # the level the LAW ITSELF put on the wire last sent frame (its panda-gate reference)
+    self._ss_fault = False             # an exception latched the clamp off for this ignition
+    self._ss_handback = False          # _ss_watch saw a move ask / pedal at the stop: retire on the next sent frame
+    self.ss_clamp_engagements = 0      # diagnostics only: floors engaged / sent frames raised / exceptions
+    self.ss_clamp_frames = 0
+    self.ss_clamp_faults = 0
     self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
     self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
     self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
@@ -2764,6 +2815,13 @@ class Fca11LongBrake:
     self._shape_in_hold_band = False
     self._shape_band_clear()
     self._track_reset()
+    if getattr(self, "ss_clamp", False):
+      # 0056: longActive off / disable / a cal edge end the clamp AND disarm it (the next stop it may serve is one the
+      # car drives into under openpilot again). Floor state only - nothing the law reads.
+      self._ss_engaged = False
+      self._ss_handback = False
+      self._ss_armed = False
+      self._ss_frame = None
 
   def _track_reset(self) -> None:
     """0035: a fresh tracking episode - no trim, no need history, no latched ceiling.
@@ -2869,6 +2927,11 @@ class Fca11LongBrake:
       # accumulator. Re-quantising here returned a level the wire does not carry (the onset clamp and the down-step
       # clamp both hold the wire away from `_shape_acc`), and `cont_dec` feeds `want_brake = cont_dec > 0` on EVERY
       # frame - so a stale recomputation could open or hold an episode on a frame that sends nothing.
+      if self.ss_clamp and self._ss_engaged and int(self._dec_last_sent) == int(self._ss_wire):
+        # 0056: re-offer the level last SENT, which is the clamp's while it is engaged AND still on the wire (a veto or
+        # a passive close since then rewrote `_dec_last_sent`, and the law's own answer is then the only one). The floor
+        # only exists while the law's own level is >= 4, so `want_brake` is decided exactly as without it.
+        return max(int(self._cont_q_last), int(self._ss_wire))
       return int(self._cont_q_last)
     v = max(0.0, float(v_kph) / 3.6)
     standstill = bool(getattr(CS.out, "standstill", False))
@@ -2964,7 +3027,12 @@ class Fca11LongBrake:
     prev_wire = int(self._cont_q_last)
     dec = fca11_cont_qhyst(new_acc, self._cont_q_bus)
     dec = max(dec, prev_wire - int(FCA11_CONT_DOWN_STEP_LSB))
-    dec = min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+    # 0056: while the standstill clamp is engaged the wire carries the clamp's level, so the law's own panda-gate
+    # reference is the level the LAW put on the wire last sent frame (`_ss_off_sent`) - exactly the `_dec_last_sent` it
+    # would have had without the clamp. OFF (and whenever the floor is not engaged): `_dec_last_sent`, byte for byte.
+    ref_sent = self._ss_off_sent if (self.ss_clamp and self._ss_engaged and
+                                     int(self._dec_last_sent) == int(self._ss_wire)) else self._dec_last_sent
+    dec = min(dec, ref_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
     dec = max(0, int(dec))
     self._cont_q_last = dec
     self._cont_q_bus = dec     # sub_bite_gate zeroes this on a frame it withholds (the wire then carries 0)
@@ -2977,7 +3045,132 @@ class Fca11LongBrake:
     # 0038-excl: `cont_low_lsb_frames` (a SENT frame at 1-3 LSB) is counted at the SEND SITE below, not here - a
     # sub-bite level withheld from the wire (throttle held) is not a sent 1-3 LSB frame and must not inflate the
     # first-drive harvest of what 1-3 LSB actually delivers.
+    if self.ss_clamp:
+      # 0056: the standstill clamp - a floor on the WIRE level only; everything above (the law's state) is already final.
+      return self._ss_clamp_step(dec, bn, bw, standstill, CS, frame)
     return dec
+
+  def _ss_retire(self) -> None:
+    """0056: end an engaged floor; the wire is the law's own level from this frame on (nothing of the law is touched)."""
+    self._ss_engaged = False
+    self._ss_handback = False
+    self._ss_lvl = 0.0
+    self._ss_wire = 0
+
+  def _ss_watch(self, CS, accel: float) -> None:
+    """0056: run on EVERY longActive controller frame, before any veto or send-slot gate, so no frame of a launch request
+    or a driver input can be missed by the clamp (the law itself only advances on the 50 Hz send slot):
+      * moving (no standstill flag, vEgo >= FCA11_SS_CLAMP_REARM_V_MPS): an engaged floor is handed back to the law on
+        the next sent frame (it never brakes a car that is really moving), and the next stop may clamp once;
+      * at a standstill, the planner asking to move (the law's own `bn <= 0`) or the driver's gas / brake: disarm for
+        the rest of this stop and hand an engaged floor back to the law on the next sent frame (whose law level is
+        computed exactly as without the clamp), so the launch is byte-identical to today's from there on."""
+    if self._ss_fault:
+      return
+    try:
+      v = float(CS.out.vEgo)
+      if not math.isfinite(v):
+        self._ss_armed = False
+        self._ss_handback = True
+        return
+      standstill = bool(getattr(CS.out, "standstill", False))
+      if (not standstill) and v >= FCA11_SS_CLAMP_REARM_V_MPS:
+        # really moving (well above the 0.12-0.30 m/s of a slip): not a stop any more - hand an engaged floor back to
+        # the law, and let the next stop clamp once
+        self._ss_armed = True
+        if self._ss_engaged:
+          self._ss_handback = True
+      move_ask = fca11_cont_brake_need(max(0.0, -float(accel)), max(0.0, v)) <= 0.0
+      if standstill and (move_ask or bool(CS.out.gasPressed) or bool(CS.out.brakePressed)):
+        self._ss_armed = False
+        if self._ss_engaged:
+          self._ss_handback = True
+    except Exception:  # noqa: BLE001 - the clamp may only ever fall back to today's law
+      self._ss_fault = True
+      self.ss_clamp_faults += 1
+      self._ss_armed = False
+      self._ss_handback = True
+
+  def _ss_clamp_step(self, dec_off: int, bn: float, bw: float, standstill: bool, CS, frame: int) -> int:
+    """0056: the wire level for one SENT frame of the continuous law with the standstill clamp ON (see FCA11_SS_CLAMP_*).
+
+    ``dec_off`` is the law's own level for this frame, computed exactly as without the clamp. Returns ``dec_off`` or a
+    floor above it. FAIL-SAFE: any exception latches the clamp off for the ignition and returns ``dec_off``.
+    """
+    if self._ss_fault:
+      self._ss_retire()
+      return int(dec_off)
+    try:
+      return self._ss_clamp_step_checked(int(dec_off), float(bn), float(bw), bool(standstill), CS, int(frame))
+    except Exception:  # noqa: BLE001 - the clamp may only ever fall back to today's law
+      self._ss_fault = True
+      self.ss_clamp_faults += 1
+      self._ss_retire()
+      self._ss_armed = False
+      return int(dec_off)
+
+  def _ss_clamp_step_checked(self, dec_off: int, bn: float, bw: float, standstill: bool, CS, frame: int) -> int:
+    contiguous = self._ss_frame is not None and (frame - self._ss_frame) == FCA11_SEND_EVERY
+    self._ss_frame = frame
+    if self._ss_engaged and int(self._dec_last_sent) != int(self._ss_wire):
+      # something other than the clamp rewrote the wire reference since the last sent frame (a passive close, a refused
+      # echo's re-ramp, a longActive drop): today's law owns the wire - `_cont_level` already used `_dec_last_sent`
+      # for this frame's gate (see ref_sent there), exactly as without the clamp
+      self._ss_retire()
+      contiguous = False
+    v = float(CS.out.vEgo)
+    if not math.isfinite(v):
+      # a speed we cannot read is not a stop: today's law, and no clamp until the car has moved again
+      self._ss_retire()
+      self._ss_armed = False
+      return dec_off
+    if (not standstill) and v >= FCA11_SS_CLAMP_REARM_V_MPS:
+      self._ss_armed = True            # the car is really moving: the next stop may clamp once
+    if standstill and bn <= 0.0:
+      self._ss_armed = False           # the planner asked to move at this stop: hands off until the car has moved again
+    hold = float(min(int(FCA11_CONT_CEIL_LSB), int(fca11_standstill_hold_lsb())))
+    # the stop demand the law's own hold blend serves (bn > 0, stop band), a level the ESC actually bites on (>= 4 LSB:
+    # never the sub-bite range the throttle gate owns), no driver input, gear D. `ok` (every veto) already holds - this
+    # function only runs inside _cont_level, which update() calls only when it does.
+    clean = bool(bn > 0.0 and bw > 0.0 and dec_off >= FCA11_FEEL_FIRST_LSB and
+                 not bool(CS.out.gasPressed) and not bool(CS.out.brakePressed) and
+                 CS.out.gearShifter == structs.CarState.GearShifter.drive)
+    trigger = bool(standstill and v <= FCA11_SS_CLAMP_V_MPS)
+    if not self._ss_engaged:
+      if not (self._ss_armed and clean and trigger and contiguous and dec_off < hold) or self._ss_handback:
+        self._ss_handback = False
+        return dec_off
+      self._ss_armed = False           # once per stop
+      self._ss_engaged = True
+      self._ss_since = frame
+      self._ss_lvl = float(dec_off)
+      self.ss_clamp_engagements += 1
+    elif not (clean and contiguous) or self._ss_handback:
+      # no stop demand any more (the planner asks to move), driver input, gear, a sub-bite law level, a gap in the
+      # sent frames, or _ss_watch saw a move ask / a pedal at this stop on any frame since the last sent one: today's
+      # law owns this frame - the SAME frame, so a launch is byte-identical from here on
+      self._ss_retire()
+      return dec_off
+    lvl = float(self._ss_lvl)
+    if (frame - self._ss_since) < FCA11_SS_CLAMP_MAX_FRAMES:
+      if trigger:
+        lvl = min(hold, float(self._dec_last_sent) + float(FCA11_SS_CLAMP_STEP_LSB))   # up at the panda's +4, to the hold
+    else:
+      # bounded: a floor the law has not reached in FCA11_SS_CLAMP_MAX_S (the car kept rolling under a stop demand)
+      # decays at the law's own down-slew toward the law instead of being held indefinitely
+      lvl -= min(float(HYUNDAI_FCA11_LONG_RATE_STEP), FCA11_CONT_JERK_DOWN_MULT * FCA11_CONT_JERK * FCA11_SHAPE_SENT_DT /
+                 fca11_cont_slope(lvl), float(FCA11_CONT_DOWN_STEP_LSB))
+    # the panda's onset gate on the REAL wire (the last level actually sent), the 30-step hold, and never below the law
+    lvl = min(lvl, float(self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), hold)
+    out = int(math.floor(lvl + 0.5))
+    if out <= dec_off:
+      self._ss_retire()                # the law has reached the floor: the two are equal, so there is no step
+      return dec_off
+    self._ss_lvl = lvl
+    self._ss_wire = out
+    self._ss_off_sent = dec_off        # what the law itself would have put on the wire (its gate reference next frame)
+    self.ss_clamp_frames += 1
+    return out
 
   def _shape_band_clear(self) -> None:
     """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
@@ -3955,6 +4148,8 @@ class Fca11LongBrake:
 
     self._planner_ask = float(CC.actuators.accel)   # the raw planner ask: the ONLY thing that may open the 46 LSB gate
     accel = self._closing_demand(CS, self._planner_ask)
+    if self.ss_clamp:
+      self._ss_watch(CS, accel)   # 0056: EVERY longActive frame (any send slot, any veto): arming + the hand-back rules
     ok, _why = self.fca11_ok(CS, frame)
     self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
 
