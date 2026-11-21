@@ -1,5 +1,5 @@
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index d5bec36..2bcd93d 100644
+index d5bec360..2bcd93d9 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
 @@ -83,6 +83,10 @@ class CarParamsSP:
@@ -14,7 +14,7 @@ index d5bec36..2bcd93d 100644
    # Bitfield: 1 = a fault observed within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch,
    # 2 = latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES consecutive fault frames; 0 = the deployed rule (any frame
 diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
-index 1fb2e2e..c701fe4 100644
+index 1fb2e2e8..c701fe41 100644
 --- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
 @@ -148,6 +148,74 @@ HOLD_SPEED_OFFSET_HIGHWAY_V = [0.34, 0.43, 0.49, 0.56]                 # m/s^2 e
@@ -455,7 +455,7 @@ index 1fb2e2e..c701fe4 100644
      # 185 HAND-OVER: remember whether this frame was active, so the NEXT frame can tell an engagement's first frame.
      # Set on every call (including the inactive frames that reset the episode), after all command paths above.
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
-index b20f225..89f770a 100644
+index b20f225b..89f770af 100644
 --- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
 @@ -2876,3 +2876,625 @@ class TestGasRiseLag42:
@@ -1085,13 +1085,13 @@ index b20f225..89f770a 100644
 +    assert checked == 300 and total > 20000, (checked, total)
 +    assert clears > 100, clears        # not vacuous: the fault-clear schedule really fired on both modes' runs
 diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
-index d35896d..7c6ebac 100644
+index d35896de..e745a692 100644
 --- a/opendbc/sunnypilot/car/interfaces.py
 +++ b/opendbc/sunnypilot/car/interfaces.py
-@@ -222,6 +222,17 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
-   # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
-   if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
-     CP_SP.gasRiseLag = True
+@@ -212,6 +212,17 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
+   if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
+     CP_SP.pedalDeliveryLaw = True
 +  # 0047 HOLD FIT (HyundaiPedalHoldFit, PERSISTENT BOOL, default "0" = OFF): the pedal law's hold feedforward
 +  # (hold_cmd(v), the "pedal fraction that holds speed on flat ground") re-measured from the car's own logs. The
 +  # deployed 5-15 m/s leg came from a driver STEADY-PEDAL fit that over-reads, so at ask 0 the car accelerated
@@ -1103,6 +1103,6 @@ index d35896d..7c6ebac 100644
 +  # ignition. OFF = the deployed law, byte for byte.
 +  if _param_truthy(params_dict.get("HyundaiPedalHoldFit")):
 +    CP_SP.pedalHoldFit = True
- 
- 
- def _param_truthy(raw) -> bool:
+   # 0042-Z RISE-LAG (HyundaiGasRiseLag, PERSISTENT BOOL, default "0" = OFF): a first-order lag on the accel ask applied
+   # to RISES ONLY, ahead of the pedal law (gas_interceptor.filter_gas_rise). Lane Y measured the small NORMAL-mode gas
+   # moves as real 1.3-2 s planner requests, not pedal artefacts, so the ask is the only lever; the lag slows a rise
