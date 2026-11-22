@@ -557,10 +557,10 @@ index 6d041c2a..6cc9c0fa 100644
  
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
 new file mode 100644
-index 00000000..e7d34788
+index 00000000..a0a49f3f
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,745 @@
 +"""0057: the STRONG STANDSTILL HOLD (param HyundaiFca11StrongHold -> CP_SP.fca11StrongHold, INT, DEFAULT 0 = OFF).
 +
 +Once the continuous law holds its own 30-step standstill level at a REAL standstill, the wire may rise above it to 40
@@ -662,8 +662,8 @@ index 00000000..e7d34788
 +    return [lv for f, lv in self.wire if since <= f < until]
 +
 +
-+def _pair(script, sh_on=1, clamp=None):
-+  off, on = _Drive(sh=0, clamp=clamp), _Drive(sh=sh_on, clamp=clamp)
++def _pair(script, sh_on=1, clamp=None, cls=fl.Fca11LongBrake):
++  off, on = _Drive(sh=0, clamp=clamp), _Drive(sh=sh_on, clamp=clamp, cls=cls)
 +  for d in (off, on):
 +    script(d)
 +  return off, on
@@ -761,14 +761,18 @@ index 00000000..e7d34788
 +class TestMode1(unittest.TestCase):
 +  """(c) mode 1: identical until the law holds its 30 at a real standstill, then 34 38 40."""
 +
-+  def _check(self, clamp):
-+    off, on = _pair(_stop_hold_launch, clamp=clamp)
++  def _check(self, clamp, cls=fl.Fca11LongBrake):
++    off, on = _pair(_stop_hold_launch, clamp=clamp, cls=cls)
 +    o = dict(off.wire)
 +    first_diff = next(f for f, lv in on.wire if lv != o[f])
 +    # the first raised frame is the one on which the LAW ITSELF (not the clamp floor) first sends its 30, at a real
 +    # standstill; from there the wire climbs at the panda's +4 per sent frame to 40 (three sent frames, ~60 ms)
 +    self.assertGreaterEqual(first_diff, T_STOP)
 +    self.assertEqual(o[first_diff], 30, (first_diff, off.levels(since=T_STOP, until=first_diff + 2)))
++    if not clamp:
++      # law alone: the sent frame before the first raise is still the law's own climb (29), i.e. the raise starts ON the
++      # first frame the law commands its 30 - the wire goes 29 -> 33, never 29 -> 30 -> 34
++      self.assertLess(o[first_diff - 2], 30, (first_diff, off.levels(since=T_STOP, until=first_diff + 2)))
 +    prev_wire = dict(on.wire)[first_diff - 2]
 +    seq = on.levels(since=first_diff, until=first_diff + 10)
 +    want = []
