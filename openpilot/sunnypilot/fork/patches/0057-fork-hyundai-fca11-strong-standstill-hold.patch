@@ -1,15 +1,16 @@
 diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
-index 221ca174..eba0a3ba 100644
+index 221ca174..faf13d1a 100644
 --- a/opendbc/car/structs.py
 +++ b/opendbc/car/structs.py
-@@ -99,6 +99,13 @@ class CarParamsSP:
+@@ -99,6 +99,14 @@ class CarParamsSP:
    # 2 m/s^3 slew; it only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
    # CarParamsSP.fca11StandstillClamp @14.
    fca11StandstillClamp: bool = auto_field()
 +  # 0057: STRONG STANDSTILL HOLD (param HyundaiFca11StrongHold, INT, default 0 = OFF; 1 = On, 2 = the parked staircase
 +  # test). Written ONLY by setup_interfaces from that param; read ONCE by the car layer (getattr + fca11_strong_hold_mode,
 +  # so every un-wired CP_SP - old builds, test doubles - is OFF). ON = at a REAL standstill, once the continuous law holds
-+  # its own 30 steps, the wire may rise above it (to 40; the parked test steps 32-46) at the panda's +4 per sent frame; it
++  # its own 30 steps, the wire may rise above it (to 40; the parked test steps 32-46) at +2 per sent frame (half the
++  # panda's +4 gate, so one lost frame cannot make the next one a refused +8); it
 +  # only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
 +  # CarParamsSP.fca11StrongHold @16 (UInt8).
 +  fca11StrongHold: int = auto_field()
@@ -17,10 +18,10 @@ index 221ca174..eba0a3ba 100644
    neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
  
 diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-index 6d041c2a..6cc9c0fa 100644
+index 6d041c2a..b4512360 100644
 --- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
 +++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
-@@ -1274,6 +1274,80 @@ FCA11_SS_CLAMP_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP   # +4 per SENT frame: th
+@@ -1274,6 +1274,90 @@ FCA11_SS_CLAMP_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP   # +4 per SENT frame: th
  FCA11_SS_CLAMP_MAX_S = 3.0             # s: an engaged floor the law has not reached by then decays at the law's down-slew
  FCA11_SS_CLAMP_MAX_FRAMES = int(round(FCA11_SS_CLAMP_MAX_S * 100))   # controller frames at 100 Hz
  
@@ -36,11 +37,14 @@ index 6d041c2a..6cc9c0fa 100644
 +# at a REAL standstill (CarState.standstill AND vEgo <= FCA11_SH_V_MPS), with the planner still asking to stay stopped
 +# (the law's own stop demand bn > 0 AND the raw planner ask <= FCA11_SH_HOLD_ASK_MPS2), gear D, no pedal, and the ESC
 +# acknowledging our request (TCS13 FCA_ACK, CS.fca11_esc_ack), the WIRE level is raised above the law to
-+# FCA11_SH_CEIL_LSB (40) at the panda's own +4 per sent frame (30 -> 34 -> 38 -> 40, three sent frames, ~60 ms). Like
++# FCA11_SH_CEIL_LSB (40) at +2 per sent frame, half the panda's own +4 gate (30 -> 32 -> 34 -> 36 -> 38 -> 40, five
++# sent frames, ~0.1 s; with the law alone 29 -> 31 -> ... -> 39 -> 40), so a single lost host frame anywhere in the climb
++# still leaves the next frame inside the panda's gate (FCA11_SH_STEP_LSB). Like
 +# 0056 it is a FLOOR on the wire only, max(law + clamp, floor), and it never writes the law's or the clamp's state (both
 +# keep seeing the wire they would have sent - `_base_last_sent()`), so:
 +#   * it never commands less than today's law + clamp, never more than its target (40 in mode 1, the probe step in mode
-+#     2), never more than HYUNDAI_FCA11_LONG_MAX_DEC (asserted below), never more than +4 over the last sent frame;
++#     2), never more than HYUNDAI_FCA11_LONG_MAX_DEC (asserted below), never more than +2 over the last sent frame
++#     (FCA11_SH_STEP_LSB; the panda's own +4 is the outer bound, also applied);
 +#   * it only ever RAISES at a real standstill. A slip that drops the standstill flag while it is engaged stops the rise
 +#     and KEEPS the level while the planner still asks to stop (the 0056 rule: weakening the hold during a roll is the
 +#     one thing it must not do); the car really moving (>= FCA11_SH_REARM_V_MPS, 0.5 m/s, above every logged slip) hands
@@ -56,13 +60,15 @@ index 6d041c2a..6cc9c0fa 100644
 +#     FCA11_SH_MAX_S (= the 2:00 hold countdown, after which the hold is handed back anyway);
 +#   * any exception latches it off for the ignition (today's law); a non-finite speed retires it.
 +# MODE 2 ("Parked test"): the same floor and every mode-1 gate, with a SCHEDULE instead of the 40 target: ONE staircase
-+# per ignition, FCA11_SH_PROBE_STEPS (32 36 40 44 46) for FCA11_SH_PROBE_DWELL_S each, started once the law has held its
-+# 30 at a real standstill for FCA11_SH_PROBE_SETTLE_S (no prior motion needed: it is run parked, engaged behind a
-+# stationary object). It ABORTS - back to the law's own 30-step hold on the same frame, never to brake-off, never re-run
-+# this ignition - on any motion (vEgo > FCA11_SH_PROBE_ABORT_V_MPS or the standstill flag dropping), the ESC's FCA_ACK
-+# or StandStill bit dropping, any FCA11 alert state (BRAKE NOW, unavailable, camera braking, divergence, hold nag), and
-+# every mode-1 step-aside rule. It can never start once the car has been driven above FCA11_SH_PROBE_MAX_V_SEEN_MPS this
-+# ignition, so a mode 2 left on by mistake cannot run the staircase at a red light; after it ends the setting is inert.
++# per ignition, FCA11_SH_PROBE_STEPS (32 36 40 44 46) for FCA11_SH_PROBE_DWELL_S each (the dwell counts from the step's
++# first sent frame, so a 4-step rise spends 1 of its 400 sent frames, 20 ms, on the +2 level between), started once the
++# law has held its 30 at a real standstill for FCA11_SH_PROBE_SETTLE_S (no prior motion needed: it is run parked,
++# engaged behind a stationary object). It ABORTS - back to the law's own 30-step hold on the same frame, never to
++# brake-off, never re-run this ignition - on any motion (vEgo > FCA11_SH_PROBE_ABORT_V_MPS or the standstill flag
++# dropping), the ESC's FCA_ACK or StandStill bit dropping, any FCA11 alert state (BRAKE NOW, unavailable, camera
++# braking, divergence, hold nag), and every mode-1 step-aside rule. It can never start once the car has been driven
++# above FCA11_SH_PROBE_MAX_V_SEEN_MPS this ignition, so a mode 2 left on by mistake cannot run the staircase at a red
++# light; after it ends the setting is inert.
 +# Pedal: the gas side reads gas_hold (armed by every sent frame >= 4 LSB - the same frames with and without this), so the
 +# pedal command is identical: exactly 0 while held. The hold countdown counts sent frames >= 20 steps, which the law was
 +# already sending, so it runs exactly as today. Every sent frame above the law is written to the k="sh" log channel
@@ -74,7 +80,10 @@ index 6d041c2a..6cc9c0fa 100644
 +FCA11_SH_V_MPS = FCA11_SS_CLAMP_V_MPS      # 0.08 m/s: it only ever RAISES at/below this AND with CarState.standstill
 +FCA11_SH_REARM_V_MPS = FCA11_SS_CLAMP_REARM_V_MPS   # 0.5 m/s: really moving -> hand back; the next stop may engage once
 +FCA11_SH_HOLD_ASK_MPS2 = -1.0              # the RAW planner ask must stay at/below this (a held stop asks -2.0 m/s^2)
-+FCA11_SH_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP   # +4 per SENT frame: the panda's own onset gate, never more
++FCA11_SH_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP // 2   # +2 per SENT frame: HALF the panda's +4 gate, so ONE lost
++# host frame in the climb leaves the next frame at exactly +4 over the panda's last ACCEPTED level (accepted), not +8
++# (refused -> the law re-ramps from 4). 30 -> 40 in five sent frames (~0.1 s) instead of three (~0.06 s). Rev 2 of 0057
++# (F-OPUS-REVIEW-strong-hold-2026-11-22 §2). +3 would NOT do: a lost 33 makes the next 36 +6 over the panda's 30.
 +FCA11_SH_MAX_S = 120.0                     # s: = the 2:00 hold countdown (FCA11_HOLD_NAG_EXPIRE_FRAMES)
 +FCA11_SH_MAX_FRAMES = int(round(FCA11_SH_MAX_S * 100))   # controller frames at 100 Hz
 +FCA11_SH_PROBE_STEPS = (32, 36, 40, 44, 46)  # mode 2: the parked staircase, climbed from the law's own 30-step hold
@@ -86,6 +95,8 @@ index 6d041c2a..6cc9c0fa 100644
 +FCA11_SH_PROBE_MAX_V_SEEN_MPS = 2.0        # m/s: driven faster than this this ignition -> the staircase never starts
 +assert FCA11_SH_CEIL_LSB <= HYUNDAI_FCA11_LONG_MAX_DEC and max(FCA11_SH_PROBE_STEPS) <= HYUNDAI_FCA11_LONG_MAX_DEC
 +assert FCA11_SH_CEIL_LSB > FCA11_CONT_CEIL_LSB and min(FCA11_SH_PROBE_STEPS) > FCA11_CONT_CEIL_LSB
++# rev 2: two climb steps fit inside ONE panda gate, so a single lost frame never makes the next one a refused +8
++assert 0 < FCA11_SH_STEP_LSB and 2 * FCA11_SH_STEP_LSB <= HYUNDAI_FCA11_LONG_RATE_STEP
 +# the whole staircase (settle + 5 dwells = 42 s) ends before the hold countdown's first banner (60 s)
 +assert FCA11_SH_PROBE_SETTLE_SENT + len(FCA11_SH_PROBE_STEPS) * FCA11_SH_PROBE_DWELL_SENT < FCA11_HOLD_NAG_SOFT_FRAMES
 +
@@ -101,7 +112,7 @@ index 6d041c2a..6cc9c0fa 100644
  
  def fca11_cont_coast(v_ego_mps: float) -> float:
    """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
-@@ -2030,6 +2104,31 @@ class Fca11LongBrake:
+@@ -2030,6 +2114,31 @@ class Fca11LongBrake:
      self.ss_clamp_engagements = 0      # diagnostics only: floors engaged / sent frames raised / exceptions
      self.ss_clamp_frames = 0
      self.ss_clamp_faults = 0
@@ -133,7 +144,7 @@ index 6d041c2a..6cc9c0fa 100644
      self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
      self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
      self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
-@@ -2822,6 +2921,16 @@ class Fca11LongBrake:
+@@ -2822,6 +2931,16 @@ class Fca11LongBrake:
        self._ss_handback = False
        self._ss_armed = False
        self._ss_frame = None
@@ -150,7 +161,7 @@ index 6d041c2a..6cc9c0fa 100644
  
    def _track_reset(self) -> None:
      """0035: a fresh tracking episode - no trim, no need history, no latched ceiling.
-@@ -2927,12 +3036,17 @@ class Fca11LongBrake:
+@@ -2927,12 +3046,17 @@ class Fca11LongBrake:
        # accumulator. Re-quantising here returned a level the wire does not carry (the onset clamp and the down-step
        # clamp both hold the wire away from `_shape_acc`), and `cont_dec` feeds `want_brake = cont_dec > 0` on EVERY
        # frame - so a stale recomputation could open or hold an episode on a frame that sends nothing.
@@ -171,7 +182,7 @@ index 6d041c2a..6cc9c0fa 100644
      v = max(0.0, float(v_kph) / 3.6)
      standstill = bool(getattr(CS.out, "standstill", False))
      need = max(0.0, -float(accel_ask))
-@@ -3030,8 +3144,10 @@ class Fca11LongBrake:
+@@ -3030,8 +3154,10 @@ class Fca11LongBrake:
      # 0056: while the standstill clamp is engaged the wire carries the clamp's level, so the law's own panda-gate
      # reference is the level the LAW put on the wire last sent frame (`_ss_off_sent`) - exactly the `_dec_last_sent` it
      # would have had without the clamp. OFF (and whenever the floor is not engaged): `_dec_last_sent`, byte for byte.
@@ -183,7 +194,7 @@ index 6d041c2a..6cc9c0fa 100644
      dec = min(dec, ref_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
      dec = max(0, int(dec))
      self._cont_q_last = dec
-@@ -3047,9 +3163,20 @@ class Fca11LongBrake:
+@@ -3047,9 +3173,20 @@ class Fca11LongBrake:
      # first-drive harvest of what 1-3 LSB actually delivers.
      if self.ss_clamp:
        # 0056: the standstill clamp - a floor on the WIRE level only; everything above (the law's state) is already final.
@@ -205,7 +216,7 @@ index 6d041c2a..6cc9c0fa 100644
    def _ss_retire(self) -> None:
      """0056: end an engaged floor; the wire is the law's own level from this frame on (nothing of the law is touched)."""
      self._ss_engaged = False
-@@ -3112,7 +3239,7 @@ class Fca11LongBrake:
+@@ -3112,7 +3249,7 @@ class Fca11LongBrake:
    def _ss_clamp_step_checked(self, dec_off: int, bn: float, bw: float, standstill: bool, CS, frame: int) -> int:
      contiguous = self._ss_frame is not None and (frame - self._ss_frame) == FCA11_SEND_EVERY
      self._ss_frame = frame
@@ -214,7 +225,7 @@ index 6d041c2a..6cc9c0fa 100644
        # something other than the clamp rewrote the wire reference since the last sent frame (a passive close, a refused
        # echo's re-ramp, a longActive drop): today's law owns the wire - `_cont_level` already used `_dec_last_sent`
        # for this frame's gate (see ref_sent there), exactly as without the clamp
-@@ -3154,14 +3281,14 @@ class Fca11LongBrake:
+@@ -3154,14 +3291,14 @@ class Fca11LongBrake:
      lvl = float(self._ss_lvl)
      if (frame - self._ss_since) < FCA11_SS_CLAMP_MAX_FRAMES:
        if trigger:
@@ -231,7 +242,7 @@ index 6d041c2a..6cc9c0fa 100644
      out = int(math.floor(lvl + 0.5))
      if out <= dec_off:
        self._ss_retire()                # the law has reached the floor: the two are equal, so there is no step
-@@ -3172,6 +3299,290 @@ class Fca11LongBrake:
+@@ -3172,6 +3309,290 @@ class Fca11LongBrake:
      self.ss_clamp_frames += 1
      return out
  
@@ -480,7 +491,7 @@ index 6d041c2a..6cc9c0fa 100644
 +      self.sh_engagements += 1
 +    lvl = float(self._sh_lvl)
 +    if trigger:
-+      lvl = min(float(target), float(self._dec_last_sent) + float(FCA11_SH_STEP_LSB))   # up at the panda's +4
++      lvl = min(float(target), float(self._dec_last_sent) + float(FCA11_SH_STEP_LSB))   # up at +2 (half the panda's +4)
 +    # a slip (no trigger) keeps the level: never rises while moving, never weakens the hold during a roll. The panda's
 +    # onset gate on the REAL wire, the target, the panda cap - and never below the law + clamp.
 +    lvl = min(lvl, float(self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), float(target),
@@ -522,7 +533,7 @@ index 6d041c2a..6cc9c0fa 100644
    def _shape_band_clear(self) -> None:
      """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
      self._shape_band_entry_lsb: int | None = None   # the level held at band entry (None = not in the band yet)
-@@ -3501,6 +3912,8 @@ class Fca11LongBrake:
+@@ -3501,6 +3922,8 @@ class Fca11LongBrake:
      if self._mark_log is None:
        from opendbc.sunnypilot.car.hyundai import fca11_shadow_log
        self._mark_log = self.shadow_log if self.shadow_log is not None else self._dyn_log
@@ -531,7 +542,7 @@ index 6d041c2a..6cc9c0fa 100644
        if self._mark_log is None:
          self._mark_log = fca11_shadow_log.ShadowLogger(header=dict(
            note=("FCA11 DRIVER-MARK trace (k=m): one record per driver verdict, by SOURCE. GOOD = the bookmark swipe "
-@@ -3949,6 +4362,14 @@ class Fca11LongBrake:
+@@ -3949,6 +4372,14 @@ class Fca11LongBrake:
    def _update_law(self, CC: structs.CarControl, CS, frame: int, personality=PERSONALITY_STANDARD) -> list[CanData]:
      """The FCA11 law path (OLD-LAW, or V3 when affine_gain - never in Shadow). Unchanged by 0045 except its name."""
      sends: list[CanData] = []
@@ -546,7 +557,7 @@ index 6d041c2a..6cc9c0fa 100644
      # 18x: the gas window ages out one controller frame per frame, on EVERY frame (including a disabled one and one with
      # longActive off): it is a fact about the panda's BRAKE_THROTTLE_EXCL_US, not about our episode.
      if self._gas_guard_left > 0:
-@@ -4150,6 +4571,8 @@ class Fca11LongBrake:
+@@ -4150,6 +4581,8 @@ class Fca11LongBrake:
      accel = self._closing_demand(CS, self._planner_ask)
      if self.ss_clamp:
        self._ss_watch(CS, accel)   # 0056: EVERY longActive frame (any send slot, any veto): arming + the hand-back rules
@@ -557,21 +568,23 @@ index 6d041c2a..6cc9c0fa 100644
  
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
 new file mode 100644
-index 00000000..a0a49f3f
+index 00000000..cb6bec3e
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
-@@ -0,0 +1,745 @@
+@@ -0,0 +1,794 @@
 +"""0057: the STRONG STANDSTILL HOLD (param HyundaiFca11StrongHold -> CP_SP.fca11StrongHold, INT, DEFAULT 0 = OFF).
 +
 +Once the continuous law holds its own 30-step standstill level at a REAL standstill, the wire may rise above it to 40
-+(mode 1) or through the parked staircase 32/36/40/44/46 (mode 2), at the panda's +4 per sent frame. Every assertion is
++(mode 1) or through the parked staircase 32/36/40/44/46 (mode 2), at +2 per sent frame (rev 2: half the panda's +4
++gate, so one lost frame in the climb can never make the next one a refused +8). Every assertion is
 +stated in INPUT terms (what the car and the planner did), and the property test is run against deliberately broken
 +variants that must FAIL it (positive controls).
 +
 +  (a) wiring: the INT parse, the setup_interfaces writer (FCA11 on, Shadow off), the continuous law only, absent = OFF
 +  (b) OFF (field absent / 0 / junk) is byte-identical, and no strong-hold state moves
-+  (c) mode 1: identical until the law itself holds 30 at a real standstill, then 34 38 40 - never above 40, never above
-+      the last sent + 4, never below the law, and the 0056 clamp below it runs untouched
++  (c) mode 1: identical until the law itself holds 30 at a real standstill, then 32 34 36 38 40 - never above 40, never
++      above the last sent + 2, never below the law, and the 0056 clamp below it runs untouched; one lost frame anywhere
++      in the climb leaves the next frame inside the panda's +4 gate (and a +3 or +4 climb would not)
 +  (d) the "never" table: gas, brake, gear, the planner asking to move or easing its ask, not armed (no prior motion),
 +      the standstill flag without the speed, the speed without the flag, a non-finite speed, no FCA_ACK
 +  (e) a launch request hands the wire back on the SAME frame: the launch is byte-identical from there on
@@ -704,7 +717,11 @@ index 00000000..a0a49f3f
 +    self.assertEqual(MAX_DEC, 46)
 +    self.assertEqual(fl.FCA11_SH_CEIL_LSB, 40)
 +    self.assertLessEqual(max(fl.FCA11_SH_PROBE_STEPS), MAX_DEC)
-+    self.assertEqual(fl.FCA11_SH_STEP_LSB, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
++    # rev 2: +2 per sent frame = HALF the panda's +4 gate, so one lost climb frame leaves the next at exactly +4 over the
++    # panda's last accepted level (accepted) instead of +8 (refused)
++    self.assertEqual(fl.FCA11_SH_STEP_LSB, 2)
++    self.assertEqual(fl.FCA11_SH_STEP_LSB, fl.HYUNDAI_FCA11_LONG_RATE_STEP // 2)
++    self.assertLessEqual(2 * fl.FCA11_SH_STEP_LSB, fl.HYUNDAI_FCA11_LONG_RATE_STEP)
 +    self.assertEqual(fl.FCA11_SH_V_MPS, fl.FCA11_SS_CLAMP_V_MPS)
 +    self.assertEqual(fl.FCA11_SH_REARM_V_MPS, fl.FCA11_SS_CLAMP_REARM_V_MPS)
 +    steps = (fl.FCA11_CONT_CEIL_LSB,) + tuple(fl.FCA11_SH_PROBE_STEPS)
@@ -759,14 +776,15 @@ index 00000000..a0a49f3f
 +
 +# ---------------------------------------------------------------------------------------------------------------------
 +class TestMode1(unittest.TestCase):
-+  """(c) mode 1: identical until the law holds its 30 at a real standstill, then 34 38 40."""
++  """(c) mode 1: identical until the law holds its 30 at a real standstill, then 32 34 36 38 40 (rev 2: +2 per frame)."""
 +
 +  def _check(self, clamp, cls=fl.Fca11LongBrake):
 +    off, on = _pair(_stop_hold_launch, clamp=clamp, cls=cls)
 +    o = dict(off.wire)
 +    first_diff = next(f for f, lv in on.wire if lv != o[f])
 +    # the first raised frame is the one on which the LAW ITSELF (not the clamp floor) first sends its 30, at a real
-+    # standstill; from there the wire climbs at the panda's +4 per sent frame to 40 (three sent frames, ~60 ms)
++    # standstill; from there the wire climbs at +2 per sent frame to 40 (five sent frames, ~0.1 s, with the clamp:
++    # 30 -> 32 34 36 38 40; with the law alone, which arrives from 29: 31 33 35 37 39 40)
 +    self.assertGreaterEqual(first_diff, T_STOP)
 +    self.assertEqual(o[first_diff], 30, (first_diff, off.levels(since=T_STOP, until=first_diff + 2)))
 +    if not clamp:
@@ -774,13 +792,15 @@ index 00000000..a0a49f3f
 +      # first frame the law commands its 30 - the wire goes 29 -> 33, never 29 -> 30 -> 34
 +      self.assertLess(o[first_diff - 2], 30, (first_diff, off.levels(since=T_STOP, until=first_diff + 2)))
 +    prev_wire = dict(on.wire)[first_diff - 2]
-+    seq = on.levels(since=first_diff, until=first_diff + 10)
++    seq = on.levels(since=first_diff, until=first_diff + 20)
 +    want = []
 +    for _ in seq:
-+      prev_wire = min(fl.FCA11_SH_CEIL_LSB, prev_wire + 4)
++      prev_wire = min(fl.FCA11_SH_CEIL_LSB, prev_wire + fl.FCA11_SH_STEP_LSB)
 +      want.append(prev_wire)
 +    self.assertEqual(seq, want, seq)
-+    self.assertEqual(seq[2:], [40] * (len(seq) - 2), seq)
++    climb = [32, 34, 36, 38] if clamp else [31, 33, 35, 37, 39]     # the literal rev-2 staircase, pinned
++    self.assertEqual(seq[:len(climb)], climb, seq)
++    self.assertEqual(seq[len(climb):], [40] * (len(seq) - len(climb)), seq)
 +    self.assertEqual(on.b.sh_engagements, 1)
 +    prev = 0
 +    for f, lv in on.wire:
@@ -790,6 +810,7 @@ index 00000000..a0a49f3f
 +      if lv > o[f]:
 +        inp = on.inputs[f]
 +        self.assertTrue(inp["standstill"] and inp["v"] <= fl.FCA11_SH_V_MPS and inp["accel"] <= -1.0, (f, inp))
++        self.assertLessEqual(lv, prev + fl.FCA11_SH_STEP_LSB, f)   # a raised frame is never more than +2 over the last
 +      prev = lv
 +    return off, on
 +
@@ -801,6 +822,39 @@ index 00000000..a0a49f3f
 +    # the clamp below it ran exactly as without the strong hold (same engagements, same fast climb to 30)
 +    self.assertEqual(off.b.ss_clamp_engagements, on.b.ss_clamp_engagements)
 +    self.assertEqual(off.levels(until=T_STOP + 30), on.levels(until=T_STOP + 30))
++
++  def test_one_lost_climb_frame_stays_inside_the_panda_gate(self):
++    # rev 2 (F-OPUS-REVIEW-strong-hold-2026-11-22 §2): ONE host frame lost anywhere in the climb must not make the panda
++    # refuse the next one. A lost frame never reaches the panda (no echo), so the car layer sends on unchanged and the
++    # panda judges the next frame against the frame BEFORE the lost one. Two lost in a row are NOT covered (+6).
++    for clamp in (True, False):
++      off, on = _pair(_stop_hold_launch, clamp=clamp)
++      self.assertGreater(on.b.sh_frames, 0)
++      self.assertEqual(_single_loss_refusals(off, on), [], clamp)
++    # positive controls: the rev-1 +4 climb (a lost 34 -> the next 38 is +8 over the panda's 30) and a +3 climb (a lost
++    # 33 -> the next 36 is +6) are both caught by the same check
++    from unittest import mock
++    for step in (3, 4):
++      with mock.patch.object(fl, "FCA11_SH_STEP_LSB", step):
++        off, on = _pair(_stop_hold_launch, clamp=True)
++      self.assertTrue(_single_loss_refusals(off, on), step)
++
++
++def _single_loss_refusals(off, on):
++  """The panda's onset gate (hyundai.h: accept an actuating level only if <= HYUNDAI_FCA11_LONG_MAX_DEC and <= its last
++  ACCEPTED level + HYUNDAI_FCA11_LONG_RATE_STEP) applied to the ON wire with ONE sent frame k dropped, for every k from
++  the frame before the strong hold's first raise through the frame after its last. Returns (frame, ref, lost, next) for
++  every k whose loss would get the NEXT frame refused."""
++  o = dict(off.wire)
++  frames = [f for f, _ in on.wire]
++  lv = [x for _, x in on.wire]
++  raised = [i for i, f in enumerate(frames) if lv[i] > o[f]]
++  bad = []
++  for k in range(max(1, raised[0] - 1), min(len(lv) - 1, raised[-1] + 2)):
++    ref, nxt = lv[k - 1], lv[k + 1]
++    if nxt > min(MAX_DEC, ref + fl.HYUNDAI_FCA11_LONG_RATE_STEP):
++      bad.append((frames[k], ref, lv[k], nxt))
++  return bad
 +
 +
 +class TestNever(unittest.TestCase):
@@ -964,8 +1018,12 @@ index 00000000..a0a49f3f
 +      else:
 +        runs.append([lv, 1])
 +    above = [(lv, n) for lv, n in runs if lv > 30]
-+    self.assertEqual([lv for lv, _ in above], list(fl.FCA11_SH_PROBE_STEPS), runs)
-+    self.assertTrue(all(n == fl.FCA11_SH_PROBE_DWELL_SENT for _, n in above), above)
++    # rev 2: each step's dwell counts from its first sent frame, and a 4-step rise climbs at +2, so it spends ONE of its
++    # FCA11_SH_PROBE_DWELL_SENT frames (20 ms) on the level between: 32 | 34 36 | 38 40 | 42 44 | 46
++    dw = fl.FCA11_SH_PROBE_DWELL_SENT
++    self.assertEqual([lv for lv, _ in above], [32, 34, 36, 38, 40, 42, 44, 46], runs)
++    self.assertEqual(above, [(32, dw), (34, 1), (36, dw - 1), (38, 1), (40, dw - 1), (42, 1), (44, dw - 1), (46, dw)])
++    self.assertEqual([lv for lv, n in above if n > 1], list(fl.FCA11_SH_PROBE_STEPS))
 +    self.assertEqual(on.levels()[-1], 30)                     # back to the law's own hold
 +    self.assertEqual(on.b._sh_probe_state, "done")
 +    self.assertEqual(on.b.sh_probe_end_reason, "complete")
@@ -974,6 +1032,8 @@ index 00000000..a0a49f3f
 +    for f, lv in on.wire:
 +      self.assertLessEqual(lv, prev + 4, f)
 +      self.assertGreaterEqual(lv, o[f], f)
++      if lv > o[f]:
++        self.assertLessEqual(lv, prev + fl.FCA11_SH_STEP_LSB, f)
 +      prev = lv
 +
 +  def _aborted(self, v=0.0, standstill=True, resend=True, **kw):
@@ -1133,7 +1193,7 @@ index 00000000..a0a49f3f
 +        self.assertIn(key, r)
 +      self.assertGreater(r["lvl"], r["law"])
 +      self.assertEqual(len(r["whl"]), 4)
-+    self.assertEqual({r["lvl"] for r in sh} - {34, 38, 40}, set())
++    self.assertEqual({r["lvl"] for r in sh}, {32, 34, 36, 38, 40})   # rev 2: the +2 climb, then 40
 +    ends = [r for r in recs if r.get("k") == "sh_end"]
 +    self.assertEqual([r["reason"] for r in ends], ["handback"])
 +
@@ -1307,20 +1367,21 @@ index 00000000..a0a49f3f
 +if __name__ == "__main__":
 +  unittest.main()
 diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
-index f790678f..b640fef9 100644
+index f790678f..bdd2b708 100644
 --- a/opendbc/sunnypilot/car/interfaces.py
 +++ b/opendbc/sunnypilot/car/interfaces.py
-@@ -242,6 +242,16 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+@@ -242,6 +242,17 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
    # is inert. Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
    if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StandstillClamp")) and not shadow:
      CP_SP.fca11StandstillClamp = True
 +  # 0057 STRONG STANDSTILL HOLD (HyundaiFca11StrongHold, PERSISTENT INT, default "0" = OFF; 1 = On, 2 = Parked test): at
 +  # a real standstill, once the continuous law holds its own 30-step level, let the wire rise above it (to 40; the
-+  # parked test steps 32/36/40/44/46) at the panda's +4 per sent frame. Written HERE because the car layer only READS
-+  # CP_SP.fca11StrongHold - without this writer the key would be a no-op (the 0043/0044 unreachable-key class). Same INT
-+  # parser and the same dependency as the sibling FCA11 keys: inert without HyundaiFca11Brake and in Shadow. Any value
-+  # but 1 or 2 (junk, a missing key on a stale libparams) is 0. The car layer additionally requires the continuous law.
-+  # Read at CarParams build time => a change takes effect at the NEXT ignition. OFF = byte for byte deployed.
++  # parked test steps 32/36/40/44/46) at +2 per sent frame (half the panda's +4 gate). Written HERE because the car
++  # layer only READS CP_SP.fca11StrongHold - without this writer the key would be a no-op (the 0043/0044 unreachable-key
++  # class). Same INT parser and the same dependency as the sibling FCA11 keys: inert without HyundaiFca11Brake and in
++  # Shadow. Any value but 1 or 2 (junk, a missing key on a stale libparams) is 0. The car layer additionally requires
++  # the continuous law. Read at CarParams build time => a change takes effect at the NEXT ignition. OFF = byte for byte
++  # deployed.
 +  if CP_SP.fca11Brake and not shadow:
 +    sh_mode = _param_int(params_dict.get("HyundaiFca11StrongHold"))
 +    CP_SP.fca11StrongHold = sh_mode if sh_mode in (1, 2) else 0
