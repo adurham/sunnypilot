@@ -568,10 +568,10 @@ index 6d041c2a..b4512360 100644
  
 diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
 new file mode 100644
-index 00000000..cb6bec3e
+index 00000000..b4dd445c
 --- /dev/null
 +++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_strong_hold.py
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,808 @@
 +"""0057: the STRONG STANDSTILL HOLD (param HyundaiFca11StrongHold -> CP_SP.fca11StrongHold, INT, DEFAULT 0 = OFF).
 +
 +Once the continuous law holds its own 30-step standstill level at a REAL standstill, the wire may rise above it to 40
@@ -611,6 +611,9 @@ index 00000000..cb6bec3e
 +D = structs.CarState.GearShifter.drive
 +P = structs.CarState.GearShifter.park
 +MAX_DEC = fl.HYUNDAI_FCA11_LONG_MAX_DEC
++# rev 2: the climb rule as a LITERAL (half the panda's +4), so a positive control that patches the module constant back
++# to +4 is still judged against +2
++SH_STEP = 2
 +
 +
 +def _cp_sp(sh=None, clamp=None, aff=True, dyn=True, brake=True):
@@ -1267,6 +1270,10 @@ index 00000000..cb6bec3e
 +      bad.append((f, "over_ceiling"))
 +    if lv > prev + fl.HYUNDAI_FCA11_LONG_RATE_STEP:
 +      bad.append((f, "over_rate"))
++    if lv > o[f] and lv > prev + SH_STEP:
++      # rev 2: a frame the strong hold raised is never more than +2 over the last sent frame - also through slips,
++      # eased asks, ack drops and vetoes mid-climb (a lost frame then still leaves the next one inside the panda gate)
++      bad.append((f, "over_sh_step"))
 +    if lv > max(prev, o[f]) and not (inp["standstill"] and inp["v"] <= fl.FCA11_SH_V_MPS):
 +      bad.append((f, "rise_while_moving"))
 +    if lv > o[f]:
@@ -1319,6 +1326,13 @@ index 00000000..cb6bec3e
 +    bad, eng = _property()
 +    self.assertEqual(bad, [], bad[:20])
 +    self.assertGreater(eng, 40)                               # it really engaged
++
++  def test_control_climbs_at_the_panda_rate(self):
++    # rev 2 positive control: the rev-1 +4 climb fails the +2 rule (the rest of the rules still hold for it)
++    from unittest import mock
++    with mock.patch.object(fl, "FCA11_SH_STEP_LSB", fl.HYUNDAI_FCA11_LONG_RATE_STEP):
++      bad, _ = _property(seeds=range(5))
++    self.assertTrue(bad and all(v[2] == "over_sh_step" for v in bad), bad[:5])
 +
 +  def test_control_rises_while_moving(self):
 +    bad, _ = _property(_broken(("    if trigger:\n      lvl = min(", "    if True:\n      lvl = min(")), seeds=range(30))
