@@ -292,6 +292,24 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // time => takes effect at the NEXT ignition; it changes a FAIL-CLOSED path, so it must stay 0 until the owner
     // signs off on a first-drive test.
     {"HyundaiFca11PedalGuard", {PERSISTENT | BACKUP, INT, "0"}},
+    // fork (0056, TEST SETTING, default OFF): the standstill clamp. At a stop the continuous FCA11 law's standstill hold
+    // reaches its 30-step level at the panda's +4 per sent frame (~0.12 s) instead of the 2 m/s^3 slew (~0.7 s); it only
+    // ever ADDS braking once the car is stopped (vEgo <= 0.08 m/s and CarState.standstill), never while the driver presses
+    // gas or brake, never when the planner asks to move. Inert unless HyundaiFca11Brake is ON and the continuous law runs
+    // (HyundaiFca11Shaping + HyundaiFca11DynamicBrakes). Read at CarParams build time => takes effect at the NEXT
+    // ignition. OFF (the default) = today's law, byte for byte.
+    {"HyundaiFca11StandstillClamp", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0057, TEST SETTING, default 0 = OFF): "Stronger Hold At Stops". 0 Off / 1 On / 2 Parked test. At a REAL
+    // standstill (CarState.standstill AND vEgo <= 0.08 m/s), once the continuous FCA11 law already holds its own 30-step
+    // level, with the planner still asking to stay stopped, no pedal, gear D and the ESC acknowledging (FCA_ACK), the
+    // brake request may rise above 30: to 40 (On), or through one parked staircase 32/36/40/44/46 per ignition (Parked
+    // test; never after the car has been driven above 2 m/s that ignition), at +2 per sent frame (half the panda's +4
+    // gate, so one lost frame cannot get the next one refused). The panda's own cap (46) and rate gate are unchanged. It
+    // only ever ADDS braking at a standstill; once raised it steps aside on any launch request, eased ask, pedal, veto,
+    // motion >= 0.5 m/s or FCA_ACK drop. Inert unless HyundaiFca11Brake is ON and the continuous
+    // law runs (HyundaiFca11Shaping + HyundaiFca11DynamicBrakes). Read at CarParams build time => takes effect at the
+    // NEXT ignition. 0 (the default) = today's law, byte for byte.
+    {"HyundaiFca11StrongHold", {PERSISTENT | BACKUP, INT, "0"}},
     // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
     // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
     // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
@@ -311,6 +329,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // law would put it. Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
     // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal path, byte for byte.
     {"HyundaiGasRiseLag", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0047 hold-fit): the pedal law's HOLD feedforward (the pedal fraction it commands at accel = 0, the "pedal
+    // that holds speed on flat ground") re-measured from the car's own logs. The deployed 5-15 m/s leg came from a
+    // driver steady-pedal fit that over-reads, so at ask 0 the car ACCELERATED +0.12..+0.29 m/s^2 instead of holding
+    // (peak at 4-7 m/s; the 2026-11-19 59:37-59:40 creep behind the RV), and 12-20 m/s was ~25 % high. ON uses the
+    // measured table (identical to the deployed one at 0 m/s and at 20 m/s and up, so cruise hold and the highway law
+    // are untouched). Inert unless HyundaiGasInterceptor is armed (opendbc setup_interfaces). Read at CarParams build
+    // time => a toggle takes effect at the NEXT ignition. OFF (the default) = the deployed pedal law, byte for byte.
+    {"HyundaiPedalHoldFit", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveModePersonality", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: drive mode -> personality + N lockout (default OFF)
     // fork: offload mode gate (Mac model offload). Absent/empty => every offload path stays inert.
     // Values: "shadow" (frame+model on Mac, return path in shadow names) or "drive" (arbiter may
@@ -328,7 +354,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AdaptiveFollowDistance", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/adaptive_follow.py
     {"NoCloseOnLead", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/no_close.py (never accelerate toward a lead)
     {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
+    {"MinGapBrakeFloor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/min_gap_floor.py (low-speed minimum-gap brake floor, default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"ConfidenceMeter", {PERSISTENT | BACKUP, BOOL, "1"}},  // 3X: the comma 4 confidence ball on the wide onroad screen
 
     // sunnypilot model params
     {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},

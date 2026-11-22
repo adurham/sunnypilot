@@ -115,7 +115,9 @@ class NoCloseCap:
     # LOG-ONLY telemetry (2026-11-19): the same quantities the cap acts on, recorded for the rlog. Published on
     # longitudinalPlanSP.noClose (custom.capnp). Nothing below READS them, so they cannot change the ask.
     self.raw_factor = 1.       # this frame's un-dwelled factor, before the min-window
-    self.raw_mean = 0.         # the 1 s raw (vEgo - vLead) envelope mean, 0 when it was not the source
+    self.raw_mean = 0.         # the 1 s raw (vEgo - vLead) envelope's OWN mean, logged whether or not it fed the
+                               # closing estimate; 0 while the cap is off or no lead is tracked (reset) or the envelope
+                               # is empty (no usable lead speed since it was last cleared)
     self.filtered_closing = 0.  # the closing filter's gap rate for this frame
     self.dwell_frames = 0      # release-dwell window occupancy in frames (0 = flushed)
     self.tracked = False       # a lead is present, or the filter is coasting a dropout

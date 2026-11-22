@@ -1,0 +1,862 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index d5bec360..9d799a18 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -89,6 +89,12 @@ class CarParamsSP:
+   # latches, fail-closed). Written ONLY by setup_interfaces; read once by the car layer and mirrored into the panda's
+   # safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES. Coupled with custom.capnp CarParamsSP @13.
+   fca11PedalGuard: int = auto_field()
++  # 0056: STANDSTILL CLAMP (param HyundaiFca11StandstillClamp, default OFF). Written ONLY by setup_interfaces from that
++  # param; read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = at a
++  # stop the continuous law's standstill hold reaches its 30-step level at the panda's +4 per sent frame instead of the
++  # 2 m/s^3 slew; it only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
++  # CarParamsSP.fca11StandstillClamp @14.
++  fca11StandstillClamp: bool = auto_field()
+ 
+   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/fca11_long.py b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+index 9fef2b9b..6d041c2a 100644
+--- a/opendbc/sunnypilot/car/hyundai/fca11_long.py
++++ b/opendbc/sunnypilot/car/hyundai/fca11_long.py
+@@ -1239,6 +1239,41 @@ FCA11_CONT_TRIM_ENABLED = True
+ # command noise below 0.5 LSB produces no level change at all. 0.0 = plain rounding (the pre-0040 behaviour).
+ FCA11_CONT_QHYST_LSB = 1.0
+ 
++# *** 0056: THE STANDSTILL CLAMP (param HyundaiFca11StandstillClamp -> CP_SP.fca11StandstillClamp, DEFAULT OFF) ***
++# THE PROBLEM (wsSTOP/drive-2026-11-19 F-OPUS-REVIEW-stop-creep §4): every held stop arrives on the 7-step creep floor
++# and the standstill hold then slews to its 30 steps at the 2 m/s^3 jerk limit - 7 -> 30 in ~0.69 s. 26 of the logged
++# stopped-hold slips (10-29 cm of roll, then a 2.6-4.5 m/s^3 grab) all came within ~11 s of the stop, and 22 of the 28
++# gentle clutch-open arrivals slipped. The working hypothesis is that the ESC sets its standstill grip around the moment of
++# stopping, so the hold must be in place AT the stop, not 0.7 s later. The car's own "Creep Off" only works under the
++# driver's own brake pedal (owner, tested), and the gearbox releases its ~26 Nm of creep only for driver pedal pressure,
++# which our ESC braking never produces - so the remaining lever is the speed of the hold itself.
++# THE CHANGE: at the stop (CarState.standstill - the hold detection the law already uses for its 30-step target - AND
++# vEgo <= FCA11_SS_CLAMP_V_MPS) the law's wire level is raised toward that same hold at up to the PANDA's own onset step,
++# +4 per sent frame (7 -> 30 in ~0.12 s). It is a FLOOR inside _cont_level, max(law, floor), and the law's own state
++# (_shape_acc, the trim, the quantiser and down-step references) is NEVER written by it, so:
++#   * it never commands less than today's law, never more than the 30-step hold (the law ceiling), never more than the
++#     panda's +4 over the last sent frame;
++#   * it retires the moment the law's own slew reaches it (no step - the two are equal), so there is no hand-back and
++#     nothing to re-seed (contrast the cal tool, whose _shape_reset() hand-back releases 30 -> 0 for ~0.4 s);
++#   * it never acts before the stop (vEgo <= 0.08 implies the first vEgo < 0.10 frame has already passed), never while the
++#     driver presses gas or brake, never out of D, never on a vetoed frame (`ok`), never when the planner asks to move:
++#     the first frame without a stop demand (bn <= 0) hands the wire back to the law's own level on that SAME frame, so
++#     the launch/release path is byte-identical to today's from that frame on, and the clamp stays disarmed until the
++#     car has moved at >= FCA11_SS_CLAMP_REARM_V_MPS again (once per stop);
++#   * a standstill flag that drops while it is engaged (a slip) does NOT end it - the floor keeps its level (it stops
++#     rising) while the planner still asks to stop, because weakening the hold during a roll is the one thing it must not
++#     do; FCA11_SS_CLAMP_MAX_S bounds that, after which the floor decays at the law's own down-slew toward the law;
++#   * any exception latches it off for the ignition (today's law); a non-finite speed retires it for the frame.
++# Pedal: the gas side reads gas_hold (the wire window armed by every sent frame >= 4 LSB - armed on exactly the same
++# frames with and without the clamp), so the pedal command is identical, i.e. exactly 0 while held.
++# Known, intended side effect: the 2:00 hold countdown counts sent frames at >= 20 steps, which the clamp reaches
++# ~0.15 s earlier, so the countdown runs that much ahead (the hold at >= 20 steps still lasts the same 120 s).
++FCA11_SS_CLAMP_V_MPS = 0.08            # m/s: vEgo at/below this (and CarState.standstill) = the stop; 0.08 < the 0.10 stop edge
++FCA11_SS_CLAMP_REARM_V_MPS = 0.5       # m/s: the clamp re-arms only once the car moves again (slips peak 0.12-0.30 m/s)
++FCA11_SS_CLAMP_STEP_LSB = HYUNDAI_FCA11_LONG_RATE_STEP   # +4 per SENT frame: the panda's own onset gate, never more
++FCA11_SS_CLAMP_MAX_S = 3.0             # s: an engaged floor the law has not reached by then decays at the law's down-slew
++FCA11_SS_CLAMP_MAX_FRAMES = int(round(FCA11_SS_CLAMP_MAX_S * 100))   # controller frames at 100 Hz
++
+ 
+ def fca11_cont_coast(v_ego_mps: float) -> float:
+   """Engine-braking decel (m/s^2, >= 0) at ``v`` - the smooth monotone fit of the measured foot-off 0x700 ENABLE=0 bins."""
+@@ -1979,6 +2014,22 @@ class Fca11LongBrake:
+     self.cont_law = bool(FCA11_CONT_ENABLED) and self.shape_track
+     if self.cont_law:
+       self._shape_acc = 0.0   # 0037: the level starts at TRUE zero (there is no 4 LSB floor to sit on)
++    # 0056: the STANDSTILL CLAMP (FCA11_SS_CLAMP_* block). Read ONCE, from CP_SP only, DEFAULT OFF, and only ever on the
++    # continuous-law instance (never the feel/old law, never the Shadow V3 core: _shadow_core_params() has no such field).
++    # `getattr` with False is the fail-CLOSED direction here: a CP_SP without the field is today's law.
++    self.ss_clamp = bool(self.cont_law) and bool(getattr(CP_SP, "fca11StandstillClamp", False))
++    self._ss_armed = False             # a stop may clamp (set once the car has moved >= FCA11_SS_CLAMP_REARM_V_MPS)
++    self._ss_engaged = False           # the floor is above the law's own level on the wire right now
++    self._ss_lvl = 0.0                 # the floor's (fractional) level, only meaningful while engaged
++    self._ss_wire = 0                  # the integer level the floor put on the wire last sent frame (while engaged)
++    self._ss_since = 0                 # controller frame the floor engaged on (the FCA11_SS_CLAMP_MAX_S clock)
++    self._ss_frame: int | None = None  # last SENT frame the clamp step ran on (a gap retires the floor)
++    self._ss_off_sent = 0              # the level the LAW ITSELF put on the wire last sent frame (its panda-gate reference)
++    self._ss_fault = False             # an exception latched the clamp off for this ignition
++    self._ss_handback = False          # _ss_watch saw a move ask / pedal at the stop: retire on the next sent frame
++    self.ss_clamp_engagements = 0      # diagnostics only: floors engaged / sent frames raised / exceptions
++    self.ss_clamp_frames = 0
++    self.ss_clamp_faults = 0
+     self._track_trim = 0.0               # 0035: integral trim (LSB), episode-local
+     self._track_hist = deque(maxlen=FCA11_TRACK_LAG_SENT + 1)   # 0035: need per sent frame (the 0.3 s lag line)
+     self._track_ceil_hi = False          # 0035 F2: latched raised (30 LSB) ceiling - hysteresis, never re-cut per frame
+@@ -2764,6 +2815,13 @@ class Fca11LongBrake:
+     self._shape_in_hold_band = False
+     self._shape_band_clear()
+     self._track_reset()
++    if getattr(self, "ss_clamp", False):
++      # 0056: longActive off / disable / a cal edge end the clamp AND disarm it (the next stop it may serve is one the
++      # car drives into under openpilot again). Floor state only - nothing the law reads.
++      self._ss_engaged = False
++      self._ss_handback = False
++      self._ss_armed = False
++      self._ss_frame = None
+ 
+   def _track_reset(self) -> None:
+     """0035: a fresh tracking episode - no trim, no need history, no latched ceiling.
+@@ -2869,6 +2927,11 @@ class Fca11LongBrake:
+       # accumulator. Re-quantising here returned a level the wire does not carry (the onset clamp and the down-step
+       # clamp both hold the wire away from `_shape_acc`), and `cont_dec` feeds `want_brake = cont_dec > 0` on EVERY
+       # frame - so a stale recomputation could open or hold an episode on a frame that sends nothing.
++      if self.ss_clamp and self._ss_engaged and int(self._dec_last_sent) == int(self._ss_wire):
++        # 0056: re-offer the level last SENT, which is the clamp's while it is engaged AND still on the wire (a veto or
++        # a passive close since then rewrote `_dec_last_sent`, and the law's own answer is then the only one). The floor
++        # only exists while the law's own level is >= 4, so `want_brake` is decided exactly as without it.
++        return max(int(self._cont_q_last), int(self._ss_wire))
+       return int(self._cont_q_last)
+     v = max(0.0, float(v_kph) / 3.6)
+     standstill = bool(getattr(CS.out, "standstill", False))
+@@ -2964,7 +3027,12 @@ class Fca11LongBrake:
+     prev_wire = int(self._cont_q_last)
+     dec = fca11_cont_qhyst(new_acc, self._cont_q_bus)
+     dec = max(dec, prev_wire - int(FCA11_CONT_DOWN_STEP_LSB))
+-    dec = min(dec, self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
++    # 0056: while the standstill clamp is engaged the wire carries the clamp's level, so the law's own panda-gate
++    # reference is the level the LAW put on the wire last sent frame (`_ss_off_sent`) - exactly the `_dec_last_sent` it
++    # would have had without the clamp. OFF (and whenever the floor is not engaged): `_dec_last_sent`, byte for byte.
++    ref_sent = self._ss_off_sent if (self.ss_clamp and self._ss_engaged and
++                                     int(self._dec_last_sent) == int(self._ss_wire)) else self._dec_last_sent
++    dec = min(dec, ref_sent + HYUNDAI_FCA11_LONG_RATE_STEP)
+     dec = max(0, int(dec))
+     self._cont_q_last = dec
+     self._cont_q_bus = dec     # sub_bite_gate zeroes this on a frame it withholds (the wire then carries 0)
+@@ -2977,8 +3045,133 @@ class Fca11LongBrake:
+     # 0038-excl: `cont_low_lsb_frames` (a SENT frame at 1-3 LSB) is counted at the SEND SITE below, not here - a
+     # sub-bite level withheld from the wire (throttle held) is not a sent 1-3 LSB frame and must not inflate the
+     # first-drive harvest of what 1-3 LSB actually delivers.
++    if self.ss_clamp:
++      # 0056: the standstill clamp - a floor on the WIRE level only; everything above (the law's state) is already final.
++      return self._ss_clamp_step(dec, bn, bw, standstill, CS, frame)
+     return dec
+ 
++  def _ss_retire(self) -> None:
++    """0056: end an engaged floor; the wire is the law's own level from this frame on (nothing of the law is touched)."""
++    self._ss_engaged = False
++    self._ss_handback = False
++    self._ss_lvl = 0.0
++    self._ss_wire = 0
++
++  def _ss_watch(self, CS, accel: float) -> None:
++    """0056: run on EVERY longActive controller frame, before any veto or send-slot gate, so no frame of a launch request
++    or a driver input can be missed by the clamp (the law itself only advances on the 50 Hz send slot):
++      * moving (no standstill flag, vEgo >= FCA11_SS_CLAMP_REARM_V_MPS): an engaged floor is handed back to the law on
++        the next sent frame (it never brakes a car that is really moving), and the next stop may clamp once;
++      * at a standstill, the planner asking to move (the law's own `bn <= 0`) or the driver's gas / brake: disarm for
++        the rest of this stop and hand an engaged floor back to the law on the next sent frame (whose law level is
++        computed exactly as without the clamp), so the launch is byte-identical to today's from there on."""
++    if self._ss_fault:
++      return
++    try:
++      v = float(CS.out.vEgo)
++      if not math.isfinite(v):
++        self._ss_armed = False
++        self._ss_handback = True
++        return
++      standstill = bool(getattr(CS.out, "standstill", False))
++      if (not standstill) and v >= FCA11_SS_CLAMP_REARM_V_MPS:
++        # really moving (well above the 0.12-0.30 m/s of a slip): not a stop any more - hand an engaged floor back to
++        # the law, and let the next stop clamp once
++        self._ss_armed = True
++        if self._ss_engaged:
++          self._ss_handback = True
++      move_ask = fca11_cont_brake_need(max(0.0, -float(accel)), max(0.0, v)) <= 0.0
++      if standstill and (move_ask or bool(CS.out.gasPressed) or bool(CS.out.brakePressed)):
++        self._ss_armed = False
++        if self._ss_engaged:
++          self._ss_handback = True
++    except Exception:  # noqa: BLE001 - the clamp may only ever fall back to today's law
++      self._ss_fault = True
++      self.ss_clamp_faults += 1
++      self._ss_armed = False
++      self._ss_handback = True
++
++  def _ss_clamp_step(self, dec_off: int, bn: float, bw: float, standstill: bool, CS, frame: int) -> int:
++    """0056: the wire level for one SENT frame of the continuous law with the standstill clamp ON (see FCA11_SS_CLAMP_*).
++
++    ``dec_off`` is the law's own level for this frame, computed exactly as without the clamp. Returns ``dec_off`` or a
++    floor above it. FAIL-SAFE: any exception latches the clamp off for the ignition and returns ``dec_off``.
++    """
++    if self._ss_fault:
++      self._ss_retire()
++      return int(dec_off)
++    try:
++      return self._ss_clamp_step_checked(int(dec_off), float(bn), float(bw), bool(standstill), CS, int(frame))
++    except Exception:  # noqa: BLE001 - the clamp may only ever fall back to today's law
++      self._ss_fault = True
++      self.ss_clamp_faults += 1
++      self._ss_retire()
++      self._ss_armed = False
++      return int(dec_off)
++
++  def _ss_clamp_step_checked(self, dec_off: int, bn: float, bw: float, standstill: bool, CS, frame: int) -> int:
++    contiguous = self._ss_frame is not None and (frame - self._ss_frame) == FCA11_SEND_EVERY
++    self._ss_frame = frame
++    if self._ss_engaged and int(self._dec_last_sent) != int(self._ss_wire):
++      # something other than the clamp rewrote the wire reference since the last sent frame (a passive close, a refused
++      # echo's re-ramp, a longActive drop): today's law owns the wire - `_cont_level` already used `_dec_last_sent`
++      # for this frame's gate (see ref_sent there), exactly as without the clamp
++      self._ss_retire()
++      contiguous = False
++    v = float(CS.out.vEgo)
++    if not math.isfinite(v):
++      # a speed we cannot read is not a stop: today's law, and no clamp until the car has moved again
++      self._ss_retire()
++      self._ss_armed = False
++      return dec_off
++    if (not standstill) and v >= FCA11_SS_CLAMP_REARM_V_MPS:
++      self._ss_armed = True            # the car is really moving: the next stop may clamp once
++    if standstill and bn <= 0.0:
++      self._ss_armed = False           # the planner asked to move at this stop: hands off until the car has moved again
++    hold = float(min(int(FCA11_CONT_CEIL_LSB), int(fca11_standstill_hold_lsb())))
++    # the stop demand the law's own hold blend serves (bn > 0, stop band), a level the ESC actually bites on (>= 4 LSB:
++    # never the sub-bite range the throttle gate owns), no driver input, gear D. `ok` (every veto) already holds - this
++    # function only runs inside _cont_level, which update() calls only when it does.
++    clean = bool(bn > 0.0 and bw > 0.0 and dec_off >= FCA11_FEEL_FIRST_LSB and
++                 not bool(CS.out.gasPressed) and not bool(CS.out.brakePressed) and
++                 CS.out.gearShifter == structs.CarState.GearShifter.drive)
++    trigger = bool(standstill and v <= FCA11_SS_CLAMP_V_MPS)
++    if not self._ss_engaged:
++      if not (self._ss_armed and clean and trigger and contiguous and dec_off < hold) or self._ss_handback:
++        self._ss_handback = False
++        return dec_off
++      self._ss_armed = False           # once per stop
++      self._ss_engaged = True
++      self._ss_since = frame
++      self._ss_lvl = float(dec_off)
++      self.ss_clamp_engagements += 1
++    elif not (clean and contiguous) or self._ss_handback:
++      # no stop demand any more (the planner asks to move), driver input, gear, a sub-bite law level, a gap in the
++      # sent frames, or _ss_watch saw a move ask / a pedal at this stop on any frame since the last sent one: today's
++      # law owns this frame - the SAME frame, so a launch is byte-identical from here on
++      self._ss_retire()
++      return dec_off
++    lvl = float(self._ss_lvl)
++    if (frame - self._ss_since) < FCA11_SS_CLAMP_MAX_FRAMES:
++      if trigger:
++        lvl = min(hold, float(self._dec_last_sent) + float(FCA11_SS_CLAMP_STEP_LSB))   # up at the panda's +4, to the hold
++    else:
++      # bounded: a floor the law has not reached in FCA11_SS_CLAMP_MAX_S (the car kept rolling under a stop demand)
++      # decays at the law's own down-slew toward the law instead of being held indefinitely
++      lvl -= min(float(HYUNDAI_FCA11_LONG_RATE_STEP), FCA11_CONT_JERK_DOWN_MULT * FCA11_CONT_JERK * FCA11_SHAPE_SENT_DT /
++                 fca11_cont_slope(lvl), float(FCA11_CONT_DOWN_STEP_LSB))
++    # the panda's onset gate on the REAL wire (the last level actually sent), the 30-step hold, and never below the law
++    lvl = min(lvl, float(self._dec_last_sent + HYUNDAI_FCA11_LONG_RATE_STEP), hold)
++    out = int(math.floor(lvl + 0.5))
++    if out <= dec_off:
++      self._ss_retire()                # the law has reached the floor: the two are equal, so there is no step
++      return dec_off
++    self._ss_lvl = lvl
++    self._ss_wire = out
++    self._ss_off_sent = dec_off        # what the law itself would have put on the wire (its gate reference next frame)
++    self.ss_clamp_frames += 1
++    return out
++
+   def _shape_band_clear(self) -> None:
+     """WI3: forget the hold band's standstill-gate state (band exit, episode (re)open, disable, cal edge)."""
+     self._shape_band_entry_lsb: int | None = None   # the level held at band entry (None = not in the band yet)
+@@ -3955,6 +4148,8 @@ class Fca11LongBrake:
+ 
+     self._planner_ask = float(CC.actuators.accel)   # the raw planner ask: the ONLY thing that may open the 46 LSB gate
+     accel = self._closing_demand(CS, self._planner_ask)
++    if self.ss_clamp:
++      self._ss_watch(CS, accel)   # 0056: EVERY longActive frame (any send slot, any veto): arming + the hand-back rules
+     ok, _why = self.fca11_ok(CS, frame)
+     self._last_why = _why  # 0040: this frame's gate reason -> the episode's end_reason if !ok
+ 
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_fca11_standstill_clamp.py b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_standstill_clamp.py
+new file mode 100644
+index 00000000..9f35bc7e
+--- /dev/null
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_fca11_standstill_clamp.py
+@@ -0,0 +1,567 @@
++"""0056: the FCA11 STANDSTILL CLAMP (param HyundaiFca11StandstillClamp -> CP_SP.fca11StandstillClamp, DEFAULT OFF).
++
++At a stop the continuous law's standstill hold reaches its 30 steps at the panda's +4 per sent frame instead of the
++2 m/s^3 slew. Every assertion below is stated in INPUT terms (what the car and the planner did), not in the clamp's own
++state, and the property test is run against two deliberately broken variants that must FAIL it (positive controls).
++
++  (a) wiring: setup_interfaces writes the field only with FCA11 braking on and Shadow off; the car layer reads it only on
++      the continuous-law instance; a CP_SP without the field is OFF
++  (b) OFF (field absent / False) is byte-identical to the law without the clamp code path
++  (c) ON: identical before the stop, +4 per sent frame to 30 after it, never above 30, never above the last sent + 4
++  (d) the "never" table: gas, brake, gear, planner asking to move, not armed, standstill flag without the speed, the
++      speed without the standstill flag, a non-finite speed
++  (e) the planner asking to move hands the wire back on the SAME frame: the launch is byte-identical from there on
++  (f) a slip (standstill flag dropping) while engaged does not lower the floor; the law catching up retires it without
++      a step; the clamp is once per stop and re-arms only after the car has moved
++  (g) fail-safe: an exception inside the clamp latches it off and returns the law's own level
++  (h) through the REAL gas path: the pedal frames are identical ON vs OFF (exactly 0 while held)
++  (i) randomised two-mode lockstep property test + two broken variants that must fail it
++
++Run from the opendbc root:  PYTHONPATH=. python -m pytest -q opendbc/sunnypilot/car/hyundai/tests/test_fca11_standstill_clamp.py
++"""
++import inspect
++import math
++import random
++import unittest
++
++from opendbc.car import structs
++import opendbc.sunnypilot.car.hyundai.fca11_long as fl
++from opendbc.sunnypilot.car.hyundai.tests.test_fca11_long import _CS, _cam
++
++STD = fl.PERSONALITY_STANDARD
++D = structs.CarState.GearShifter.drive
++P = structs.CarState.GearShifter.park
++
++
++def _cp_sp(clamp=None, aff=True, dyn=True):
++  kw = dict(fca11Brake=True, enableGasInterceptor=True, fca11AffineGain=aff, fca11DynamicBrakes=dyn)
++  if clamp is not None:
++    kw["fca11StandstillClamp"] = clamp
++  return structs.CarParamsSP(**kw)
++
++
++def _brake(clamp=None, aff=True, dyn=True, cls=fl.Fca11LongBrake):
++  return cls(structs.CarParams(), _cp_sp(clamp, aff, dyn))
++
++
++def _cc(accel, long_active=True):
++  cc = structs.CarControl()
++  cc.enabled = cc.latActive = True
++  cc.longActive = long_active
++  cc.actuators.accel = accel
++  return cc
++
++
++class _Drive:
++  """Feeds one input frame at a time; records the SENT 0x38D level per controller frame (None on a non-send frame)."""
++
++  def __init__(self, clamp=None, cls=fl.Fca11LongBrake):
++    self.b = _brake(clamp, cls=cls)
++    self.f = 0
++    self.wire = []          # (frame, level) for every SENT 0x38D
++
++  def step(self, accel, v, a_ego=0.0, standstill=False, gas=False, brake=False, gear=D, long_active=True,
++           cam_ok=True):
++    cs = _CS(v_ego=v, cam=_cam() if cam_ok else None, a_ego=a_ego, gear=gear, brake=brake, gas=gas)
++    cs.out.standstill = standstill
++    cs.fca11_lead_drel_m = cs.fca11_lead_vrel_mps = cs.fca11_lead_one = None
++    out = None
++    for s in self.b.update(_cc(accel, long_active), cs, self.f, STD):
++      out = fl._get_bits(s.dat, 8, 8)
++      self.wire.append((self.f, out))
++    self.f += 1
++    return out
++
++  def run(self, n, accel, v, **kw):
++    for _ in range(n):
++      self.step(accel, v, **kw)
++    return self
++
++  def approach(self):
++    """2 s braking at 3 m/s (arms the clamp), then down the creep floor to v = 0.09 m/s (flag still False)."""
++    self.run(100, -1.0, 3.0, a_ego=-0.9)
++    for v in (2.0, 1.5, 1.0, 0.6, 0.3, 0.15, 0.09):
++      self.run(10, -0.6, v, a_ego=-0.8)
++    return self
++
++  def levels(self, since=0, until=10 ** 9):
++    return [lv for f, lv in self.wire if since <= f < until]
++
++
++def _pair(script):
++  """Run the same input script through an OFF and an ON instance; return both drives."""
++  off, on = _Drive(clamp=False), _Drive(clamp=True)
++  for d in (off, on):
++    script(d)
++  return off, on
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class TestWiring(unittest.TestCase):
++  """(a) who may switch it on."""
++
++  def test_default_is_off_and_needs_the_continuous_law(self):
++    self.assertFalse(_brake().ss_clamp)                       # field absent -> OFF
++    self.assertFalse(_brake(clamp=False).ss_clamp)
++    self.assertTrue(_brake(clamp=True).ss_clamp)
++    self.assertFalse(_brake(clamp=True, aff=False).ss_clamp)  # no shaping -> feel/old law -> inert
++    self.assertFalse(_brake(clamp=True, dyn=False).ss_clamp)  # no DynamicBrakes -> no continuous law -> inert
++    cp = structs.CarParamsSP(fca11Brake=False, enableGasInterceptor=True, fca11AffineGain=True, fca11DynamicBrakes=True,
++                             fca11StandstillClamp=True)
++    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), cp).ss_clamp)   # FCA11 braking off -> inert
++
++  def test_the_shadow_core_never_carries_it(self):
++    self.assertFalse(fl.Fca11LongBrake(structs.CarParams(), fl._shadow_core_params(), core=True).ss_clamp)
++
++  def test_setup_interfaces_writer(self):
++    from opendbc.car.car_helpers import interfaces
++    from opendbc.car.hyundai.values import CAR
++    from opendbc.sunnypilot.car.interfaces import setup_interfaces
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import BASE_FINGERPRINT, STD as PEDAL
++    car = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++    fp = {i: {} for i in range(8)}
++    fp[0] = {**BASE_FINGERPRINT, **PEDAL}
++    CarInterface = interfaces[car]
++
++    def written(extra):
++      CP = CarInterface.get_params(car, fp, [], alpha_long=False, is_release=False, docs=False)
++      CP_SP = CarInterface.get_params_sp(CP, car, fp, [], alpha_long=False, is_release_sp=False, docs=False)
++      setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}, {"HyundaiFca11AffineGain": True},
++                                                 {"HyundaiFca11DynamicBrakes": True}] + extra)
++      return CP_SP.fca11StandstillClamp
++
++    self.assertFalse(written([{"HyundaiFca11Brake": True}]))                                         # key absent
++    self.assertTrue(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11StandstillClamp": True}]))
++    self.assertTrue(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11StandstillClamp": "1"}]))
++    self.assertFalse(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11StandstillClamp": False}]))
++    self.assertFalse(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11StandstillClamp": None}]))   # stale libparams
++    self.assertFalse(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11StandstillClamp": "junk"}]))
++    self.assertFalse(written([{"HyundaiFca11Brake": False}, {"HyundaiFca11StandstillClamp": True}]))
++    self.assertFalse(written([{"HyundaiFca11Brake": True}, {"HyundaiFca11Shadow": True},
++                              {"HyundaiFca11StandstillClamp": True}]))
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++def _stop_hold_launch(d):
++  d.approach()
++  d.run(300, -2.0, 0.0, standstill=True)                  # 3 s held
++  d.run(150, 0.4, 0.0, standstill=True)                   # the planner asks to move
++  d.run(100, 0.6, 1.0, a_ego=0.8)                         # moving off
++
++
++class TestOffIdentity(unittest.TestCase):
++  """(b) the OFF instance (field absent) and an explicit False are the same law, frame for frame."""
++
++  def test_absent_and_false_are_identical(self):
++    a, b = _Drive(clamp=None), _Drive(clamp=False)
++    for d in (a, b):
++      _stop_hold_launch(d)
++    self.assertEqual(a.wire, b.wire)
++    self.assertEqual(b.b.ss_clamp_engagements, 0)
++
++
++class TestOnArrival(unittest.TestCase):
++  """(c) identical before the stop, then +4 per sent frame to 30."""
++
++  def test_identical_before_the_stop_and_fast_after_it(self):
++    off, on = _pair(_stop_hold_launch)
++    t_stop = 100 + 70                                     # first frame with v <= 0.08 and the standstill flag
++    self.assertEqual(off.levels(until=t_stop), on.levels(until=t_stop))
++    seq_on = on.levels(since=t_stop, until=t_stop + 40)
++    seq_off = off.levels(since=t_stop, until=t_stop + 80)
++    self.assertEqual(seq_on[:7], [11, 15, 19, 23, 27, 30, 30], seq_on)     # 7 -> 30 in 6 sent frames (0.12 s)
++    self.assertGreater(seq_off.index(30), 30, seq_off)                     # today's law: ~0.7 s (> 30 sent frames)
++    self.assertEqual(on.b.ss_clamp_engagements, 1)
++
++  def test_bounds_on_every_sent_frame(self):
++    off, on = _pair(_stop_hold_launch)
++    o = dict(off.wire)
++    prev = 0
++    for f, lv in on.wire:
++      self.assertLessEqual(lv, 30)
++      self.assertGreaterEqual(lv, o[f], f)                 # never below today's law
++      self.assertLessEqual(lv, prev + 4, f)                # never faster than the panda's onset step
++      prev = lv
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class TestNever(unittest.TestCase):
++  """(d) the clamp must not act in any of these; each case is the whole stop, frame for frame, against OFF."""
++
++  def _case(self, **hold_kw):
++    def script(d):
++      d.approach()
++      d.run(150, hold_kw.get("accel", -2.0),
++            hold_kw.get("v", 0.0), standstill=hold_kw.get("standstill", True), gas=hold_kw.get("gas", False),
++            brake=hold_kw.get("brake", False), gear=hold_kw.get("gear", D))
++    off, on = _pair(script)
++    self.assertEqual(off.wire, on.wire)
++    self.assertEqual(on.b.ss_clamp_engagements, 0)
++
++  def test_gas(self):
++    self._case(gas=True)
++
++  def test_brake(self):
++    self._case(brake=True)
++
++  def test_gear(self):
++    self._case(gear=P)
++
++  def test_planner_asking_to_move(self):
++    self._case(accel=0.3)
++
++  def test_standstill_flag_but_still_rolling_at_0p09(self):
++    self._case(v=0.09)
++
++  def test_slow_but_no_standstill_flag(self):
++    self._case(v=0.05, standstill=False)
++
++  def test_not_armed_without_movement(self):
++    # engaged at a standstill from the start: the car never moved under openpilot, so there is no stop to serve
++    off, on = _pair(lambda d: d.run(300, -2.0, 0.0, standstill=True))
++    self.assertEqual(off.wire, on.wire)
++
++  def test_non_finite_speed(self):
++    def script(d):
++      d.approach()
++      d.run(100, -2.0, float("nan"), standstill=True)
++    off, on = _pair(script)
++    self.assertEqual(off.wire, on.wire)
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class TestHandBack(unittest.TestCase):
++  """(e) + (f)"""
++
++  def test_planner_go_inside_the_floor_is_byte_identical_from_that_frame(self):
++    def script(d):
++      d.approach()
++      d.run(12, -2.0, 0.0, standstill=True)               # floor engaged and at 30, the law still ~12
++      d.run(150, 0.4, 0.0, standstill=True)                # launch request
++      d.run(100, -2.0, 0.0, standstill=True)               # and a re-stop request while still stopped
++    off, on = _pair(script)
++    t_go = 170 + 12
++    on_l, off_l = on.levels(until=t_go), off.levels(until=t_go)
++    self.assertGreater(max(a - b for a, b in zip(on_l, off_l)), 10)        # the floor was well above the law
++    self.assertEqual(on.levels(since=t_go), off.levels(since=t_go))        # identical from the go frame on
++
++  def test_a_slip_does_not_lower_the_floor_and_catch_up_has_no_step(self):
++    def script(d):
++      d.approach()
++      d.run(14, -0.85, 0.0, standstill=True)               # 7 sent frames: the floor reaches 30 (the law ~10)
++      d.run(40, -0.85, 0.15, a_ego=0.3, standstill=False)  # 0.4 s slip: the flag drops
++      d.run(200, -0.85, 0.0, standstill=True)
++    off, on = _pair(script)
++    t_slip = 170 + 14
++    slip_on = on.levels(since=t_slip, until=t_slip + 40)
++    self.assertEqual(min(slip_on), 30, slip_on)            # held through the roll
++    self.assertLess(min(off.levels(since=t_slip, until=t_slip + 40)), 20)  # today's law sits on the demand
++    seq = on.levels(since=170)
++    for a, b in zip(seq, seq[1:]):
++      self.assertGreaterEqual(b, a - 3, seq)               # no step down anywhere, incl. the catch-up retirement
++    self.assertEqual(on.levels()[-50:], off.levels()[-50:])
++
++  def test_once_per_stop_and_rearm_after_moving(self):
++    def script(d):
++      d.approach()
++      d.run(150, -2.0, 0.0, standstill=True)
++      d.run(30, -0.6, 0.12, standstill=False)              # a slip after catch-up: no second clamp
++      d.run(100, -2.0, 0.0, standstill=True)
++      d.approach()                                         # drove off and stopped again
++      d.run(100, -2.0, 0.0, standstill=True)
++    _off, on = _pair(script)
++    self.assertEqual(on.b.ss_clamp_engagements, 2)
++
++
++class TestFailSafe(unittest.TestCase):
++  """(g)"""
++
++  @staticmethod
++  def _faulty(after_engaged_sends):
++    class Faulty(fl.Fca11LongBrake):
++      n_eng = 0
++
++      def _ss_clamp_step_checked(self, *a, **k):
++        if self._ss_engaged:
++          Faulty.n_eng += 1
++          if Faulty.n_eng > after_engaged_sends:
++            raise RuntimeError("injected")
++        return super()._ss_clamp_step_checked(*a, **k)
++    return Faulty
++
++  def test_exception_while_engaged_returns_the_law_on_that_frame_and_latches(self):
++    Faulty = self._faulty(2)
++    off, on = _Drive(clamp=False), _Drive(clamp=True, cls=Faulty)
++    for d in (off, on):
++      _stop_hold_launch(d)
++    self.assertEqual(on.b.ss_clamp_faults, 1)
++    self.assertTrue(on.b._ss_fault)
++    self.assertEqual(on.b.ss_clamp_engagements, 1)
++    o = dict(off.wire)
++    diff = [f for f, lv in on.wire if lv != o[f]]
++    self.assertEqual(len(diff), 3, diff)                   # engage frame + 2 sends, then the fault: the law's level
++    t_fault = diff[-1] + 2
++    self.assertEqual([lv for f, lv in on.wire if f >= t_fault], [lv for f, lv in off.wire if f >= t_fault])
++
++  def test_exception_in_the_watch_latches_off(self):
++    class FaultyWatch(fl.Fca11LongBrake):
++      def _ss_watch(self, CS, accel):
++        if self._ss_engaged:
++          CS = None                                        # any attribute access now raises inside the guarded body
++        return super()._ss_watch(CS, accel)
++    off, on = _Drive(clamp=False), _Drive(clamp=True, cls=FaultyWatch)
++    for d in (off, on):
++      _stop_hold_launch(d)
++    self.assertTrue(on.b._ss_fault)
++    o = dict(off.wire)
++    diff = [f for f, lv in on.wire if lv != o[f]]
++    self.assertEqual(len(diff), 1, diff)                   # only the engagement frame differs, then today's law
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++class TestRealGasPath(unittest.TestCase):
++  """(h) the pedal: through GasInterceptorCarController.create_gas_command on the car's own CarInterface."""
++
++  def _ci(self, clamp):
++    from opendbc.car.car_helpers import interfaces
++    from opendbc.car.hyundai.values import CAR
++    from opendbc.sunnypilot.car.interfaces import setup_interfaces
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import BASE_FINGERPRINT, STD as PEDAL
++    car = CAR.HYUNDAI_ELANTRA_2022_NON_SCC
++    fp = {i: {} for i in range(8)}
++    fp[0] = {**BASE_FINGERPRINT, **PEDAL}
++    CarInterface = interfaces[car]
++    CP = CarInterface.get_params(car, fp, [], alpha_long=False, is_release=False, docs=False)
++    CP_SP = CarInterface.get_params_sp(CP, car, fp, [], alpha_long=False, is_release_sp=False, docs=False)
++    setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}, {"HyundaiFca11Brake": True},
++                                               {"HyundaiFca11AffineGain": True}, {"HyundaiFca11DynamicBrakes": True},
++                                               {"HyundaiFca11StandstillClamp": clamp}])
++    return CarInterface(CP, CP_SP)
++
++  def test_pedal_frames_identical_and_zero_while_held(self):
++    from opendbc.sunnypilot.car.hyundai.tests.test_gas_interceptor import _Fca11CS, _fca11_cam_frame
++    script = [(150, 0.3, 4.0, False), (100, -1.0, 3.0, False)]
++    script += [(10, -0.6, v, False) for v in (2.0, 1.5, 1.0, 0.6, 0.3, 0.15, 0.09)]
++    script += [(300, -2.0, 0.0, True), (200, 0.5, 0.0, True), (100, 0.6, 1.0, False)]
++    out = {}
++    for clamp in (False, True):
++      CI = self._ci(clamp)
++      self.assertEqual(CI.CC.fca11_brake.ss_clamp, clamp)
++      pedal, lv, f = [], [], 0
++      for n, accel, v, ss in script:
++        for _ in range(n):
++          cs = _Fca11CS(v_ego=v, cam=(0, _fca11_cam_frame(alive=f % 16)))
++          cs.out.standstill = ss
++          cs.out.aEgo = 0.0
++          sends = CI.CC.create_gas_command(_cc(accel), cs, f, STD)
++          pedal += [(f, bytes(d)) for a, d, _s in sends if a in (0x200, 0x700)]
++          lv += [(f, d[1]) for a, d, _s in sends if a == 0x38D]
++          f += 1
++      out[clamp] = (pedal, lv)
++    self.assertEqual(out[False][0], out[True][0])         # every pedal frame byte-identical
++    self.assertNotEqual(out[False][1], out[True][1])      # while the brake stream did change (the clamp ran)
++    held = [d for f, d in out[True][0] if 500 <= f < 800]
++    self.assertTrue(held)
++    from opendbc.sunnypilot.car.hyundai.tests.test_fca11_continuous import _gas_word
++    self.assertEqual({_gas_word(d) for d in held}, {0})
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# (i) randomised two-mode lockstep property test, stated in INPUT terms, with positive controls
++def _gen_inputs(rng, n=4000):
++  """A random but car-shaped drive: approaches, stops of random length, slips (flag drops at low speed), planner
++  launch / dither / mild asks, rolling at any speed. Each episode is CLEAN (no driver input) or NOISY (per-frame driver
++  gas/brake taps, gear changes, camera dropouts, longActive drops), so the clamp is both exercised and interrupted."""
++  seq = []
++  v = rng.uniform(0.0, 6.0)
++  while len(seq) < n:
++    ep = []
++    kind = rng.random()
++    if kind < 0.45:                                       # approach to a stop, then a hold
++      v = rng.uniform(1.0, 6.0)
++      while v > 0.0:
++        v = max(0.0, v - rng.uniform(0.005, 0.03))
++        ep.append(dict(accel=rng.uniform(-1.5, -0.3), v=v, ss=v < 0.104 and rng.random() < 0.9))
++      for _ in range(rng.randint(20, 400)):
++        slip = rng.random() < 0.02
++        vv = rng.uniform(0.09, 0.3) if slip else rng.choice((0.0, 0.0, 0.0, rng.uniform(0.0, 0.09)))
++        ep.append(dict(accel=rng.choice((-2.0, -2.0, -2.0, -0.85, rng.uniform(-2.0, 0.2))), v=vv,
++                       ss=(not slip) and vv < 0.104 and rng.random() < 0.97))
++      v = 0.0
++    elif kind < 0.6:                                      # a hold without an approach (mild asks, dither, slips)
++      for _ in range(rng.randint(20, 300)):
++        slip = rng.random() < 0.05
++        vv = rng.uniform(0.09, 0.3) if slip else rng.uniform(0.0, 0.09)
++        ep.append(dict(accel=rng.uniform(-2.0, 0.3), v=vv, ss=(not slip) and rng.random() < 0.95))
++    elif kind < 0.8:                                      # launch
++      for _ in range(rng.randint(5, 150)):
++        v = min(8.0, v + rng.uniform(0.0, 0.05))
++        ep.append(dict(accel=rng.uniform(0.0, 1.0), v=v, ss=v < 0.104))
++    else:                                                 # rolling at any speed with any ask
++      for _ in range(rng.randint(5, 100)):
++        v = rng.uniform(0.0, 3.0)
++        ep.append(dict(accel=rng.uniform(-2.0, 1.0), v=v, ss=v < 0.104 and rng.random() < 0.8))
++    noisy = rng.random() < 0.4
++    for s in ep:
++      s["gas"] = noisy and rng.random() < 0.01
++      s["brake"] = noisy and rng.random() < 0.005
++      s["gear"] = P if (noisy and rng.random() < 0.003) else D
++      s["la"] = not (noisy and rng.random() < 0.003)
++      s["cam"] = not (noisy and rng.random() < 0.005)
++    seq += ep
++  return seq[:n]
++
++
++def _check(seq, cls=fl.Fca11LongBrake):
++  """Run seq through OFF and ON (cls) in lockstep; return (violations, engagements). Invariants in INPUT terms:
++    I1 ON >= OFF   I2 ON <= 30   I3 ON <= previous ON + 4 (the panda's onset step)
++    I4 ON == OFF before the first frame with the standstill flag AND v <= 0.08 since the car last moved >= 0.5 m/s
++    I5 ON == OFF after any standstill frame whose ask asks to move (or any driver pedal at a standstill), until the car
++       has moved >= 0.5 m/s again
++    I6 ON == OFF on any frame with driver gas/brake, gear != D or a move ask
++    I7 a drop of > 3 steps between two sent ON frames only if OFF dropped > 3 too, or a move ask / driver pedal / gear /
++       longActive drop / camera dropout / moving >= 0.5 m/s happened since the previous sent frame
++    I8 ON only rises above OFF's own rise on a frame with the standstill flag and v <= 0.08 (the trigger)
++    I9 a run of sent frames with ON != OFF lasts at most FCA11_SS_CLAMP_MAX_S + 1 s, and there is at most one such run
++       between two moving (>= 0.5 m/s) frames
++    I10 the pedal side (braking, gas_hold) is identical"""
++  off, on = _Drive(clamp=False), _Drive(clamp=True, cls=cls)
++  bad = []
++  prev_on = prev_off = 0
++  seen_stop = False
++  go_lock = False
++  event = False            # an I7 excuse since the previous sent frame
++  run_len = 0
++  runs_since_move = 0
++  limit = int((fl.FCA11_SS_CLAMP_MAX_S + 1.0) * 100) // fl.FCA11_SEND_EVERY
++  for i, s in enumerate(seq):
++    kw = dict(standstill=s["ss"], gas=s["gas"], brake=s["brake"], gear=s["gear"], long_active=s["la"], cam_ok=s["cam"])
++    a = off.step(s["accel"], s["v"], **kw)
++    b = on.step(s["accel"], s["v"], **kw)
++    move_ask = s["accel"] > -fl.fca11_cont_coast(max(0.0, s["v"]))
++    moving = s["v"] >= 0.5 and not s["ss"]
++    if moving:
++      seen_stop = False
++      go_lock = False
++      runs_since_move = 0
++    if s["ss"] and s["v"] <= 0.08:
++      seen_stop = True
++    if s["ss"] and (move_ask or s["gas"] or s["brake"]):
++      go_lock = True
++    if move_ask or s["gas"] or s["brake"] or s["gear"] != D or not s["la"] or not s["cam"] or moving:
++      event = True
++    if off.b.braking != on.b.braking or off.b.gas_hold != on.b.gas_hold:
++      bad.append((i, "I10 pedal-side flags differ", off.b.gas_hold, on.b.gas_hold))
++    if (a is None) != (b is None):
++      bad.append((i, "send slot differs", a, b)); continue
++    if a is None:
++      continue
++    if b > 30:
++      bad.append((i, "I2 above 30", a, b))
++    if b < a:
++      bad.append((i, "I1 ON below OFF", a, b))
++    if b > prev_on + 4:
++      bad.append((i, "I3 faster than +4", prev_on, b))
++    if b < prev_on - 3 and not (a < prev_off - 3 or event):
++      bad.append((i, "I7 unexcused drop", prev_on, b))
++    trig = s["ss"] and s["v"] <= 0.08
++    if (not trig) and b > prev_on and b != a and (b - prev_on) > (a - prev_off):
++      bad.append((i, "I8 rose without the trigger", prev_on, b))
++    if b != a:
++      if not seen_stop:
++        bad.append((i, "I4 differs before the stop", a, b))
++      if go_lock:
++        bad.append((i, "I5 differs after a move ask / pedal at the stop", a, b))
++      if s["gas"] or s["brake"] or s["gear"] != D or move_ask:
++        bad.append((i, "I6 differs under driver input / gear / a move ask", a, b))
++      if run_len == 0:
++        runs_since_move += 1
++        if runs_since_move > 1:
++          bad.append((i, "I9 second clamp run without moving", a, b))
++      run_len += 1
++      if run_len > limit:
++        bad.append((i, "I9 clamp run too long", run_len, limit))
++    else:
++      run_len = 0
++    prev_on, prev_off = b, a
++    event = False
++  return bad, on.b.ss_clamp_engagements
++
++
++def _long_creep(d):
++  """Deterministic: a stop that engages the clamp, then 6 s of creeping with the flag down under a stop ask."""
++  d.approach()
++  d.run(8, -0.5, 0.0, standstill=True)
++  d.run(600, -0.5, 0.2, a_ego=0.0, standstill=False)
++  d.run(100, -0.5, 0.0, standstill=True)
++
++
++class _Recorder:
++  """Records the inputs a _Drive script would feed, as a _check() sequence."""
++  def __init__(self):
++    self.seq = []
++
++  def step(self, accel, v, a_ego=0.0, standstill=False, gas=False, brake=False, gear=D, long_active=True, cam_ok=True):
++    self.seq.append(dict(accel=accel, v=v, ss=standstill, gas=gas, brake=brake, gear=gear, la=long_active, cam=cam_ok))
++
++  run = _Drive.run
++  approach = _Drive.approach
++
++
++def _seq_of(script):
++  r = _Recorder()
++  script(r)
++  return r.seq
++
++
++def _broken(old, new):
++  """A copy of the clamp step with one line changed (the positive controls)."""
++  src = inspect.getsource(fl.Fca11LongBrake._ss_clamp_step_checked)
++  assert src.count(old) == 1, old
++  src = "\n".join(line[2:] if line.startswith("  ") else line for line in src.replace(old, new).splitlines())
++  ns = dict(fl.__dict__)
++  exec(compile(src, "<broken>", "exec"), ns)
++
++  class Broken(fl.Fca11LongBrake):
++    pass
++  Broken._ss_clamp_step_checked = ns["_ss_clamp_step_checked"]
++  return Broken
++
++
++class TestPropertyTwoMode(unittest.TestCase):
++
++  def test_random_drives(self):
++    total = 0
++    for seed in range(40):
++      bad, n = _check(_gen_inputs(random.Random(seed), n=6000))
++      self.assertEqual(bad[:5], [], seed)
++      total += n
++    self.assertGreater(total, 30, "the generator must actually exercise the clamp")
++
++  def test_positive_control_planner_go_ignored(self):
++    Broken = _broken("    elif not (clean and contiguous) or self._ss_handback:", "    elif not contiguous:")
++    hits = sum(len(_check(_gen_inputs(random.Random(s)), cls=Broken)[0]) for s in range(12))
++    self.assertGreater(hits, 0, "the property test must catch a clamp that holds through a launch request")
++
++  def test_the_long_creep_terminates(self):
++    bad, n = _check(_seq_of(_long_creep))
++    self.assertEqual((bad[:5], n), ([], 1))
++
++  def test_positive_control_never_decays(self):
++    Broken = _broken("    if (frame - self._ss_since) < FCA11_SS_CLAMP_MAX_FRAMES:", "    if True:")
++    bad, _n = _check(_seq_of(_long_creep), cls=Broken)
++    self.assertTrue(any("I9" in b[1] for b in bad), bad[:5])
++
++  def test_positive_control_raises_without_the_trigger(self):
++    Broken = _broken("      if trigger:\n        lvl = min(hold,", "      if True:\n        lvl = min(hold,")
++    hits = [b for s_ in range(40) for b in _check(_gen_inputs(random.Random(s_), n=6000), cls=Broken)[0]]
++    self.assertTrue(any("I8" in b[1] for b in hits), hits[:5])
++
++  def test_positive_control_acts_before_the_stop(self):
++    Broken = _broken("    trigger = bool(standstill and v <= FCA11_SS_CLAMP_V_MPS)", "    trigger = bool(v <= 0.3)")
++    hits = sum(len(_check(_gen_inputs(random.Random(s)), cls=Broken)[0]) for s in range(12))
++    self.assertGreater(hits, 0, "the property test must catch a clamp that acts while the car still rolls")
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index d35896de..2b407f9c 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -222,6 +222,15 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # armed). Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
+   if _param_truthy(params_dict.get("HyundaiGasRiseLag")):
+     CP_SP.gasRiseLag = True
++  # 0056 STANDSTILL CLAMP (HyundaiFca11StandstillClamp, PERSISTENT BOOL, default "0" = OFF): at a stop, raise the
++  # continuous law's standstill hold to its 30-step level at the panda's +4 per sent frame (7 -> 30 in ~0.12 s instead of
++  # ~0.7 s). Written HERE because the car layer only READS getattr(CP_SP, "fca11StandstillClamp", False) - without this
++  # writer the key would be a no-op (the 0043/0044 unreachable-key class). Same truthy parser and the same dependency as
++  # the sibling FCA11 keys: it shapes FCA11 braking, so it is inert without HyundaiFca11Brake, and in Shadow (whose wire is
++  # the OLD-LAW). The car layer additionally requires the continuous law (AffineGain + DynamicBrakes) - on any other law it
++  # is inert. Read at CarParams build time => a toggle takes effect at the NEXT ignition. OFF = byte for byte deployed.
++  if CP_SP.fca11Brake and _param_truthy(params_dict.get("HyundaiFca11StandstillClamp")) and not shadow:
++    CP_SP.fca11StandstillClamp = True
+ 
+ 
+ def _param_truthy(raw) -> bool:
