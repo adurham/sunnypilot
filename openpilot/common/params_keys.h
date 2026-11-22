@@ -303,9 +303,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // standstill (CarState.standstill AND vEgo <= 0.08 m/s), once the continuous FCA11 law already holds its own 30-step
     // level, with the planner still asking to stay stopped, no pedal, gear D and the ESC acknowledging (FCA_ACK), the
     // brake request may rise above 30: to 40 (On), or through one parked staircase 32/36/40/44/46 per ignition (Parked
-    // test; never after the car has been driven above 2 m/s that ignition), at the panda's +4 per sent frame. The panda's
-    // own cap (46) and rate gate are unchanged. It only ever ADDS braking at a standstill and steps aside on any launch
-    // request, pedal, veto, motion >= 0.5 m/s or FCA_ACK drop. Inert unless HyundaiFca11Brake is ON and the continuous
+    // test; never after the car has been driven above 2 m/s that ignition), at +2 per sent frame (half the panda's +4
+    // gate, so one lost frame cannot get the next one refused). The panda's own cap (46) and rate gate are unchanged. It
+    // only ever ADDS braking at a standstill; once raised it steps aside on any launch request, eased ask, pedal, veto,
+    // motion >= 0.5 m/s or FCA_ACK drop. Inert unless HyundaiFca11Brake is ON and the continuous
     // law runs (HyundaiFca11Shaping + HyundaiFca11DynamicBrakes). Read at CarParams build time => takes effect at the
     // NEXT ignition. 0 (the default) = today's law, byte for byte.
     {"HyundaiFca11StrongHold", {PERSISTENT | BACKUP, INT, "0"}},
