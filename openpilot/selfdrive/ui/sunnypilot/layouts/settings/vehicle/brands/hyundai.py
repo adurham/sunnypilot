@@ -34,6 +34,31 @@ def _on(raw) -> bool:
   return bool(raw is True or str(raw if raw is not None else "0").strip() == "1")
 
 
+# 0057: "Stronger Hold At Stops" (HyundaiFca11StrongHold, INT 0 Off / 1 On / 2 Parked test). The button index IS the
+# stored value; anything unreadable shows as Off (the car layer reads anything but 1/2 as OFF too).
+STRONG_HOLD_KEY = "HyundaiFca11StrongHold"
+STRONG_HOLD_LABELS = ("Off", "On", "Parked test")
+
+
+def strong_hold_index(raw) -> int:
+  if isinstance(raw, bytes):
+    raw = raw.decode(errors="ignore")
+  if isinstance(raw, bool):
+    return 0
+  try:
+    v = int(str(raw).strip())
+  except (TypeError, ValueError):
+    return 0
+  return v if v in (0, 1, 2) else 0
+
+
+def _read_strong_hold():
+  try:
+    return ui_state.params.get(STRONG_HOLD_KEY, return_default=True)
+  except Exception:
+    return None
+
+
 class HyundaiSettings(BrandSettings):
   def __init__(self):
     super().__init__()
@@ -82,6 +107,16 @@ class HyundaiSettings(BrandSettings):
                           "at once instead of over about 0.7 seconds. Needs both switches above.")
     self.fca11_standstill_clamp_toggle = toggle_item_sp(tr("Firm Hold At Stops"), self._clamp_desc,
                                                         param="HyundaiFca11StandstillClamp", callback=self._on_toggle_changed)
+    # Test setting (off by default): once the car is stopped and the hold is at its usual 30 steps, ask the brakes for
+    # a little more. "Parked test" runs the one-time step test from the parked test sheet. No param= on the row: the
+    # write is guarded (like the mode selector) so a stale libparams without the key cannot take the page down.
+    self._strong_hold_desc = tr("Test setting, off by default. On: once the car is stopped and holding, asks the brakes "
+                                "for a little more (0.40 g instead of 0.30 g) so the car does not creep. Parked test: "
+                                "runs the step test from the test sheet once, only while parked, never after driving. "
+                                "Needs both smooth switches above.")
+    self.fca11_strong_hold_item = multiple_button_item_sp(
+      tr("Stronger Hold At Stops"), self._strong_hold_desc, [tr(label) for label in STRONG_HOLD_LABELS],
+      button_width=250, callback=self._on_strong_hold_selected, inline=False)
 
     # ---- Pedal --------------------------------------------------------------------------------
     self.pedal_header = _section(tr("Pedal"))
@@ -105,8 +140,18 @@ class HyundaiSettings(BrandSettings):
       self.longitudinal_header, self.mode_item, self.drive_mode_personality_toggle, self.longitudinal_tuning_item,
       self.follow_header, self.elastic_follow_toggle, self.no_close_toggle, self.stop_approach_toggle,
       self.fca11_header, self.fca11_shaping_toggle, self.fca11_dynamic_release_toggle, self.fca11_standstill_clamp_toggle,
+      self.fca11_strong_hold_item,
       self.pedal_header, self.pedal_delivery_toggle, self.gas_rise_lag_toggle,
     ]
+
+  @staticmethod
+  def _on_strong_hold_selected(index):
+    # Guarded like the mode selector: a stale libparams (key not registered) cannot take the settings page down. The
+    # row re-reads the stored value every frame, so a failed write simply shows the old value.
+    try:
+      ui_state.params.put(STRONG_HOLD_KEY, int(index))
+    except Exception:
+      pass
 
   @staticmethod
   def _on_tuning_selected(index):
@@ -204,6 +249,11 @@ class HyundaiSettings(BrandSettings):
       item.show_description(True)
       item.set_visible(True)
     self.fca11_shaping_toggle.action_item.set_state(state.shaping)
+    self.fca11_strong_hold_item.action_item.set_enabled(path_toggle_state(brake, offroad).enabled)
+    self.fca11_strong_hold_item.action_item.set_selected_button(strong_hold_index(_read_strong_hold()))
+    self.fca11_strong_hold_item.set_description(fca11_hint + self._offroad_hint(self._strong_hold_desc, offroad))
+    self.fca11_strong_hold_item.show_description(True)
+    self.fca11_strong_hold_item.set_visible(True)
 
     # ---- Pedal ------------------------------------------------------------------------------
     self.pedal_header.set_visible(True)

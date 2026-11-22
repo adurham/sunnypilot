@@ -450,6 +450,7 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192
   fca11StandstillClamp @14 :Bool;  # fork (0056, TEST SETTING): FCA11 standstill clamp - the stopped hold reaches its 30 steps at the panda's +4 per sent frame (param HyundaiFca11StandstillClamp, default OFF); mirrors opendbc CarParamsSP. Also the A/B arm marker in every rlog
   pedalHoldFit @15 :Bool;  # fork (0047): the pedal law's MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF); identical to the deployed hold at 0 m/s and at 20 m/s and up; mirrors opendbc CarParamsSP
+  fca11StrongHold @16 :UInt8;  # fork (0057, TEST SETTING): "Stronger Hold At Stops" - 0 off / 1 on (a held stop may rise from 30 to 40 steps at a real standstill) / 2 the parked staircase test 32-46 (param HyundaiFca11StrongHold, INT, default 0); mirrors opendbc CarParamsSP. Also the arm marker in every rlog
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 

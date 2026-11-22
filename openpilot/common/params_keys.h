@@ -299,6 +299,16 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // (HyundaiFca11Shaping + HyundaiFca11DynamicBrakes). Read at CarParams build time => takes effect at the NEXT
     // ignition. OFF (the default) = today's law, byte for byte.
     {"HyundaiFca11StandstillClamp", {PERSISTENT | BACKUP, BOOL, "0"}},
+    // fork (0057, TEST SETTING, default 0 = OFF): "Stronger Hold At Stops". 0 Off / 1 On / 2 Parked test. At a REAL
+    // standstill (CarState.standstill AND vEgo <= 0.08 m/s), once the continuous FCA11 law already holds its own 30-step
+    // level, with the planner still asking to stay stopped, no pedal, gear D and the ESC acknowledging (FCA_ACK), the
+    // brake request may rise above 30: to 40 (On), or through one parked staircase 32/36/40/44/46 per ignition (Parked
+    // test; never after the car has been driven above 2 m/s that ignition), at the panda's +4 per sent frame. The panda's
+    // own cap (46) and rate gate are unchanged. It only ever ADDS braking at a standstill and steps aside on any launch
+    // request, pedal, veto, motion >= 0.5 m/s or FCA_ACK drop. Inert unless HyundaiFca11Brake is ON and the continuous
+    // law runs (HyundaiFca11Shaping + HyundaiFca11DynamicBrakes). Read at CarParams build time => takes effect at the
+    // NEXT ignition. 0 (the default) = today's law, byte for byte.
+    {"HyundaiFca11StrongHold", {PERSISTENT | BACKUP, INT, "0"}},
     // fork (17c delivery, pedal lane): measured-inverse pedal law for NEGATIVE asks + a one-sided pedal-path ask filter.
     // The reader is MERGED in this tree: opendbc gas_interceptor.py applies get_delivery_pedal_command on the
     // negative-ask path and on the positive-ask else-branch under the 16-20 m/s cross-fade. (The earlier
