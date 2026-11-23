@@ -337,15 +337,22 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
 
     preCapAccel @5 :Float32;     # min(MPC, cruise, e2e) BEFORE the cap -- the ask the cap scales
     preCapSource @6 :Candidate;  # the candidate that set preCapAccel
-    postCapAccel @7 :Float32;    # preCapAccel after the cap (== preCapAccel when no cap / a non-positive ask)
+    postCapAccel @7 :Float32;    # the NoClose cap's OUTPUT: preCapAccel after the cap (== preCapAccel when no cap / a
+                                 # non-positive ask). NOT the published request: it is taken BEFORE every stage that runs
+                                 # after the cap -- any optional later stage, the standstill-launch hold, the
+                                 # ACCEL_MIN/MAX clip -- so on a frame where one of them changes the ask it differs from
+                                 # the same frame's longitudinalPlan.aTarget, which is the final ask.
 
     factor @8 :Float32 = 1;      # dwelled cap factor actually applied, in [0, 1] (1 = no cap)
     rawFactor @9 :Float32 = 1;   # this frame's un-dwelled factor (before the min-window)
     dwellFrames @10 :UInt8;      # frames of the release-dwell window currently occupied (0 = window flushed)
 
-    closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing)
-    filteredClosing @12 :Float32;  # m/s, the 3-state Kalman filter's gap rate (> 0 = the gap is shrinking)
-    rawMeanClosing @13 :Float32;   # m/s, mean of (vEgo - vLead) over the last RAW_MEAN_S (~1 s) envelope
+    closingSpeed @11 :Float32;   # m/s, the estimate the cap used: max(filteredClosing, rawMeanClosing); 0 while the cap
+                                 # is OFF or no lead is tracked (the three closing fields are reset, not the filter's state)
+    filteredClosing @12 :Float32;  # m/s, the 3-state Kalman filter's gap rate (> 0 = the gap is shrinking); 0 while the
+                                   # cap is OFF or no lead is tracked, even though the filter itself keeps running
+    rawMeanClosing @13 :Float32;   # m/s, mean of (vEgo - vLead) over the last RAW_MEAN_S (~1 s), logged whether or not it
+                                   # fed closingSpeed; 0 while the cap is OFF or no lead is tracked, or the envelope is empty
     vRelBias @14 :Float32;       # m/s, the filter's vRel bias state (vision vRel is biased for seconds at a time)
     filterValid @15 :Bool;       # the filter has a live track
     filterCoasting @16 :Bool;    # bridging a short lead dropout (<= HOLD_FRAMES)
@@ -441,6 +448,9 @@ struct CarParamsSP @0x80ae746ee2596b11 {
   pedalDeliveryLaw @9 :Bool;  # fork (17c): measured-inverse pedal law for negative asks + pedal-path ask filter (HyundaiPedalDeliveryLaw, default OFF); mirrors opendbc CarParamsSP
   gasRiseLag @12 :Bool;  # fork (0042-Z): rise-only first-order lag on the accel ask ahead of the pedal law (HyundaiGasRiseLag, default OFF); mirrors opendbc CarParamsSP
   fca11PedalGuard @13 :UInt8;  # PROPOSAL (0045): pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default 0 = deployed). Bitfield 1 = grace window after hyundai_init, 2 = N consecutive fault frames; mirrors opendbc CarParamsSP and the panda safetyParam bits 4096/8192
+  fca11StandstillClamp @14 :Bool;  # fork (0056, TEST SETTING): FCA11 standstill clamp - the stopped hold reaches its 30 steps at the panda's +4 per sent frame (param HyundaiFca11StandstillClamp, default OFF); mirrors opendbc CarParamsSP. Also the A/B arm marker in every rlog
+  pedalHoldFit @15 :Bool;  # fork (0047): the pedal law's MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF); identical to the deployed hold at 0 m/s and at 20 m/s and up; mirrors opendbc CarParamsSP
+  fca11StrongHold @16 :UInt8;  # fork (0057, TEST SETTING): "Stronger Hold At Stops" - 0 off / 1 on (a held stop may rise from 30 to 40 steps at a real standstill) / 2 the parked staircase test 32-46 (param HyundaiFca11StrongHold, INT, default 0); mirrors opendbc CarParamsSP. Also the arm marker in every rlog
 
   neuralNetworkLateralControl @2 :NeuralNetworkLateralControl;
 

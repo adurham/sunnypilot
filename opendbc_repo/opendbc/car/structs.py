@@ -83,12 +83,30 @@ class CarParamsSP:
   # 0042-Z: RISE-ONLY ask lag (param HyundaiGasRiseLag, default OFF). Written ONLY by setup_interfaces from that param;
   # when unset no frame of the pedal path changes (the deployed tree skips the branch). Coupled with custom.capnp @12.
   gasRiseLag: bool = auto_field()
+  # 0047: MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF). Written ONLY by setup_interfaces
+  # from that param; when unset the pedal law is byte-for-byte the deployed one (HOLD_CMD_*). Coupled with custom.capnp
+  # CarParamsSP.pedalHoldFit @14 and checked by check_capnp_parity.py.
+  pedalHoldFit: bool = auto_field()
   # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default "0").
   # Bitfield: 1 = a fault observed within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch,
   # 2 = latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES consecutive fault frames; 0 = the deployed rule (any frame
   # latches, fail-closed). Written ONLY by setup_interfaces; read once by the car layer and mirrored into the panda's
   # safetyParam bits PEDAL_FAULT_GRACE / PEDAL_FAULT_FRAMES. Coupled with custom.capnp CarParamsSP @13.
   fca11PedalGuard: int = auto_field()
+  # 0056: STANDSTILL CLAMP (param HyundaiFca11StandstillClamp, default OFF). Written ONLY by setup_interfaces from that
+  # param; read ONCE by the car layer (getattr, so every un-wired CP_SP - old builds, test doubles - is OFF). ON = at a
+  # stop the continuous law's standstill hold reaches its 30-step level at the panda's +4 per sent frame instead of the
+  # 2 m/s^3 slew; it only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
+  # CarParamsSP.fca11StandstillClamp @14.
+  fca11StandstillClamp: bool = auto_field()
+  # 0057: STRONG STANDSTILL HOLD (param HyundaiFca11StrongHold, INT, default 0 = OFF; 1 = On, 2 = the parked staircase
+  # test). Written ONLY by setup_interfaces from that param; read ONCE by the car layer (getattr + fca11_strong_hold_mode,
+  # so every un-wired CP_SP - old builds, test doubles - is OFF). ON = at a REAL standstill, once the continuous law holds
+  # its own 30 steps, the wire may rise above it (to 40; the parked test steps 32-46) at +2 per sent frame (half the
+  # panda's +4 gate, so one lost frame cannot make the next one a refused +8); it
+  # only ever ADDS braking at a standstill. OFF = byte-for-byte today's law. Coupled with custom.capnp
+  # CarParamsSP.fca11StrongHold @16 (UInt8).
+  fca11StrongHold: int = auto_field()
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 

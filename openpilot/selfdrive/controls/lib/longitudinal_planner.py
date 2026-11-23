@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import functools
 import math
 import numpy as np
 
+from openpilot.cereal import custom
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.constants import CV
@@ -20,6 +22,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
 from openpilot.sunnypilot.fork.no_close import NoCloseCap
+from openpilot.sunnypilot.fork.min_gap_floor import MinGapFloor
 from openpilot.sunnypilot.fork.standstill_launch import StandstillLaunchDebounce
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -124,6 +127,16 @@ def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt):
   return target_accel
 
 
+@functools.cache
+def _precap_source_values() -> frozenset[int]:
+  """fork (2026-11-20): the values the log field noClose.preCapSource can NAME -- the enumerants of the field's OWN enum
+  (custom.capnp NoClose.Candidate), not of the LongitudinalPlanSource it mirrors. pycapnp accepts any int in 0..65535
+  on an enum WRITE and only raises outside it, and a value that is not an enumerant then makes every reader's
+  str()/to_dict() raise, so the fill checks against this before it writes. Resolved on first use, inside the fill's
+  guard, so a cereal build without the appended struct cannot break this module's import."""
+  return frozenset(int(v) for v in custom.LongitudinalPlanSP.NoClose.Candidate.schema.enumerants.values())
+
+
 class LongitudinalPlanner(LongitudinalPlannerSP):
   def __init__(self, CP, CP_SP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
@@ -136,6 +149,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork: never accelerate toward a lead (fork/no_close.py, param NoCloseOnLead). Owner 2026-11-01: the car must
     # not speed up to reach the follow gap on a car it can already see.
     self.no_close = NoCloseCap()
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). Keys on the
+    # GAP alone, so a vision lead-speed failure cannot disarm it. CP_SP goes in for its dependency gate: the floor arms
+    # only while the car layer runs the continuous FCA11 law its zero-pedal / zero-brake hold is defined on. The
+    # constructor never raises.
+    self.min_gap_floor = MinGapFloor(cp_sp=CP_SP)
     # fork (lane C, route 194 #8): a held standstill releases only on a sustained go (fork/standstill_launch.py)
     self.standstill_launch = StandstillLaunchDebounce()
     # fork (2026-11-19): LOG-ONLY planner telemetry, published on longitudinalPlanSP.noClose (custom.capnp) every frame.
@@ -148,6 +166,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self._log_e2e_final = 0.        # e2e after AccelBoost + stop commitment = the e2e candidate
     self._log_e2e_gate = False      # the gate's state this frame
     self._log_lead_present = False  # radarState.leadOne.present
+    self._log_fill_failed = False   # the publish guard already logged its one error (see publish_fork_plan_log)
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -337,7 +356,17 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target = self.no_close.update(output_a_target, v_ego, bool(_lead.present), float(_lead.vLead),
                                            float(_lead.dRel), float(_lead.vRel))
     self._log_lead_present = bool(_lead.present)      # fork (2026-11-19): log-only
-    self._log_post_cap = float(output_a_target)       # fork (2026-11-19): log-only, after the cap
+    # fork (2026-11-19): log-only, the ask the cap returned (custom.capnp postCapAccel) -- taken BEFORE every later stage
+    # (any optional post-cap stage, the standstill-launch hold, the ACCEL_MIN/MAX clip), so it is NOT
+    # longitudinalPlan.aTarget on a frame where one of those changes the ask
+    self._log_post_cap = float(output_a_target)
+    # fork: low-speed minimum-gap brake floor (fork/min_gap_floor.py, param MinGapBrakeFloor, default OFF). The last
+    # resort for when every lead-SPEED rule is blinded (2026-11-19: vision read a trailer as pulling away while the gap
+    # shrank): keys on the 0.5 s median GAP alone and only ever deepens the ask. CONTAINED: with the param OFF it reads
+    # no message field and returns the ask object itself; with it ON any exception passes the ask through unmodified and
+    # latches the floor off for the drive. (v1 evaluated sm['radarState'].modelProb - not a RadarState field - here on
+    # EVERY frame, param OFF included, which raises AttributeError on the first planner frame.)
+    output_a_target = self.min_gap_floor.apply(sm, output_a_target, v_ego, not reset_state)
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     # fork (lane C): a model shouldStop flicker must not release a held standstill (route 194 #8). Hold-only: never adds a
     # go, never raises the ask; a moving car and a reset planner pass through unchanged.
@@ -377,35 +406,73 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
   def publish_fork_plan_log(self, plan_sp) -> None:
     """fork (2026-11-19): LOG-ONLY planner telemetry on longitudinalPlanSP.noClose (custom.capnp). Pure writes from
     values the planner already computed this frame; nothing here feeds back into the ask. Ordered so an offline
-    reviewer reads the chain the cap actually applied: preCapAccel (min of MPC/cruise/e2e) -> factor -> postCapAccel."""
+    reviewer reads the chain the cap actually applied: preCapAccel (min of MPC/cruise/e2e) -> factor -> postCapAccel.
+
+    No failure in here may ever take the plan publish (and with it longitudinal control) down, and the struct is either
+    FULLY filled or left at its schema defaults (factor/rawFactor = 1 = "no cap", the rest 0/False) -- never half-filled,
+    which would read as this frame's values next to defaults that look real. Three layers: (1) every value is coerced
+    and checked against its field's range (the two UInt8s) or enum (preCapSource) BEFORE the first write; (2) if a
+    write still fails part-way, the struct is re-initialised to its defaults before the error is handled (only a failure
+    of that reset itself -- a broken message builder -- could leave it partial, and that is still contained); (3) the
+    WHOLE body is guarded, including the error log itself. The caller then publishes the plan it already built. The
+    first failure is logged once per planner, with its traceback (20 Hz would flood the swaglog); a transient still
+    recovers on the next frame."""
     try:
+      cap = self.no_close
+      lead_filter = cap.lead_filter
+      # phase 1 - every conversion that can raise (float()/int() on a bad value, `bias`/`valid` are properties,
+      # pycapnp rejects a numpy scalar on a write) plus every range/enum check pycapnp would otherwise only hit on the
+      # WRITE, in phase 2, after some fields had been set. Nothing is written to the message yet.
+      values = {
+        'enabled': bool(cap.enabled),
+        'leadPresent': bool(self._log_lead_present),
+        'leadUsable': bool(cap.lead_usable),
+        'tracked': bool(cap.tracked),
+        'applies': bool(cap.applies),
+        'preCapAccel': float(self._log_pre_cap),
+        'preCapSource': int(self._log_pre_cap_src),
+        'postCapAccel': float(self._log_post_cap),
+        'factor': float(cap.factor),
+        'rawFactor': float(cap.raw_factor),
+        'dwellFrames': int(cap.dwell_frames),
+        'closingSpeed': float(cap.closing_speed),
+        'filteredClosing': float(cap.filtered_closing),
+        'rawMeanClosing': float(cap.raw_mean),
+        'vRelBias': float(lead_filter.bias),
+        'filterValid': bool(lead_filter.valid),
+        'filterCoasting': bool(lead_filter.coasting),
+        'filterRejects': int(lead_filter.rejects),
+        'gateReject': bool(lead_filter.gate_reject),
+        'reinit': bool(lead_filter.reinit),
+        'e2eGate': bool(self._log_e2e_gate),
+        'e2eGated': float(self._log_e2e_gated),
+        'e2eFinal': float(self._log_e2e_final),
+      }
+      for key in ('dwellFrames', 'filterRejects'):
+        if not 0 <= values[key] <= 255:
+          raise ValueError(f'{key} out of UInt8 range: {values[key]}')
+      # an enum field: pycapnp raises on a WRITE outside 0..65535, and inside it a value that is no enumerant writes
+      # fine but leaves a log no reader can decode (str()/to_dict() raise)
+      if values['preCapSource'] not in _precap_source_values():
+        raise ValueError(f"preCapSource is not a NoClose.Candidate enumerant: {values['preCapSource']}")
+      # phase 2 - only now touch the message. `noClose` itself is missing on a cereal build that predates the appended
+      # field; that raises here, still before a single field is written.
       nc = plan_sp.noClose
-    except Exception:
-      # a cereal build that predates the appended field must never take the plan publish (and with it longitudinal
-      # control) down with it: the fields are diagnostics, so a missing schema means "publish the plan unchanged".
-      return
-    cap = self.no_close
-    lead_filter = cap.lead_filter
-    nc.enabled = bool(cap.enabled)
-    nc.leadPresent = bool(self._log_lead_present)
-    nc.leadUsable = bool(cap.lead_usable)
-    nc.tracked = bool(cap.tracked)
-    nc.applies = bool(cap.applies)
-    nc.preCapAccel = float(self._log_pre_cap)
-    nc.preCapSource = int(self._log_pre_cap_src)
-    nc.postCapAccel = float(self._log_post_cap)
-    nc.factor = float(cap.factor)
-    nc.rawFactor = float(cap.raw_factor)
-    nc.dwellFrames = int(cap.dwell_frames)
-    nc.closingSpeed = float(cap.closing_speed)
-    nc.filteredClosing = float(cap.filtered_closing)
-    nc.rawMeanClosing = float(cap.raw_mean)
-    nc.vRelBias = float(lead_filter.bias)
-    nc.filterValid = bool(lead_filter.valid)
-    nc.filterCoasting = bool(lead_filter.coasting)
-    nc.filterRejects = int(lead_filter.rejects)
-    nc.gateReject = bool(lead_filter.gate_reject)
-    nc.reinit = bool(lead_filter.reinit)
-    nc.e2eGate = bool(self._log_e2e_gate)
-    nc.e2eGated = float(self._log_e2e_gated)
-    nc.e2eFinal = float(self._log_e2e_final)
+      try:
+        for key, value in values.items():
+          setattr(nc, key, value)
+      except Exception:
+        # a write failed part-way (a schema out of step with this file, a pycapnp error): back to the schema defaults,
+        # never a half-filled struct, then let the guard below handle the error
+        plan_sp.init('noClose')
+        raise
+    except Exception as e:
+      if not self._log_fill_failed:
+        self._log_fill_failed = True     # first, so a logger that itself fails is not retried every frame either
+        try:
+          # constant text, the type name and the traceback; no str(e) in this code -- it can raise too, outside any
+          # guard (logging's own traceback formatter survives a failing str())
+          cloudlog.error("fork: planner log fields not filled (%s); the plan publish is unaffected, further fill errors "
+                         "are not logged", type(e).__name__, exc_info=e)
+        except Exception:
+          pass   # the log line is best-effort: nothing in this function may raise

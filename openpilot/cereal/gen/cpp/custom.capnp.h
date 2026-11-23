@@ -3782,6 +3782,12 @@ public:
 
   inline  ::uint8_t getFca11PedalGuard() const;
 
+  inline bool getFca11StandstillClamp() const;
+
+  inline bool getPedalHoldFit() const;
+
+  inline  ::uint8_t getFca11StrongHold() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -3855,6 +3861,15 @@ public:
 
   inline  ::uint8_t getFca11PedalGuard();
   inline void setFca11PedalGuard( ::uint8_t value);
+
+  inline bool getFca11StandstillClamp();
+  inline void setFca11StandstillClamp(bool value);
+
+  inline bool getPedalHoldFit();
+  inline void setPedalHoldFit(bool value);
+
+  inline  ::uint8_t getFca11StrongHold();
+  inline void setFca11StrongHold( ::uint8_t value);
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -8858,6 +8873,48 @@ inline  ::uint8_t CarParamsSP::Builder::getFca11PedalGuard() {
 inline void CarParamsSP::Builder::setFca11PedalGuard( ::uint8_t value) {
   _builder.setDataField< ::uint8_t>(
       ::capnp::bounded<8>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getFca11StandstillClamp() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<58>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getFca11StandstillClamp() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<58>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11StandstillClamp(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<58>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool CarParamsSP::Reader::getPedalHoldFit() const {
+  return _reader.getDataField<bool>(
+      ::capnp::bounded<59>() * ::capnp::ELEMENTS);
+}
+
+inline bool CarParamsSP::Builder::getPedalHoldFit() {
+  return _builder.getDataField<bool>(
+      ::capnp::bounded<59>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setPedalHoldFit(bool value) {
+  _builder.setDataField<bool>(
+      ::capnp::bounded<59>() * ::capnp::ELEMENTS, value);
+}
+
+inline  ::uint8_t CarParamsSP::Reader::getFca11StrongHold() const {
+  return _reader.getDataField< ::uint8_t>(
+      ::capnp::bounded<9>() * ::capnp::ELEMENTS);
+}
+
+inline  ::uint8_t CarParamsSP::Builder::getFca11StrongHold() {
+  return _builder.getDataField< ::uint8_t>(
+      ::capnp::bounded<9>() * ::capnp::ELEMENTS);
+}
+inline void CarParamsSP::Builder::setFca11StrongHold( ::uint8_t value) {
+  _builder.setDataField< ::uint8_t>(
+      ::capnp::bounded<9>() * ::capnp::ELEMENTS, value);
 }
 
 inline bool CarParamsSP::NeuralNetworkLateralControl::Reader::hasModel() const {

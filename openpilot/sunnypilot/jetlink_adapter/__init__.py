@@ -169,6 +169,19 @@ def _adapter_class():
       # (a stop, a blinker, the brake): it steers again on its own
       return bool(sm['carControl'].enabled or sm['carControlSP'].mads.enabled)
 
+    def warm_handback(self) -> bool:
+      # jetlink.openpilot.interface.ModelSide.warm_handback (optional): keep the small model warm for a hand-back.
+      # From the frame after the large model's first held frame (its answer missed the 46 ms deadline, so the last
+      # one went out again), the small model is reset once and runs every frame unpublished in the large model's
+      # wait; when the large model hands back, the small model takes over warm instead of reset. Reset at the
+      # hand-back, its first 4 frames plan from an empty history: on the 2026-11-21 drive that put a 0.40 to
+      # 0.65 m/s^2 jump into the steering command, steering active (MADS too), at hand-backs from 7 to 18 m/s.
+      # jetlink caps it at 60 warm frames in any 10 s (joining.WARM_MAX, 30 % of the frames). Only the joining
+      # model asks, once, on modeld's main thread, and it exists only while JetlinkLink is on: with the link off
+      # (the default) nothing asks and nothing changes. jetlink takes a raise or any answer but True as off.
+      # Delete this method to go back to a cold hand-back
+      return True
+
   return Adapter
 
 

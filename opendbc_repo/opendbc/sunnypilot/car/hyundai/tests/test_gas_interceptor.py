@@ -2876,3 +2876,625 @@ class TestGasRiseLag42:
     CI_bypass = self._ci(True)
     CI_bypass.CC.gas_rise_lag = False
     assert self._wire(CI_bypass, [a for a, _ in series]) == off
+
+
+# ---- 0047: the MEASURED low/mid-speed hold table (HyundaiPedalHoldFit, default OFF) --------------------------------
+
+def _get_ci_hold(fit: bool, pedal=REM):
+  """CarInterface with the pedal armed and the 0047 hold-fit switch on/off."""
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = {**BASE_FINGERPRINT, **pedal}
+  CarInterface = interfaces[CAR_UNDER_TEST]
+  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
+  params_list: list = [{"HyundaiGasInterceptor": True}]
+  if fit:
+    params_list.append({"HyundaiPedalHoldFit": True})
+  setup_interfaces(CarInterface, CP, CP_SP, params_list)
+  assert CP_SP.enableGasInterceptor
+  return CarInterface, CP, CP_SP
+
+
+# the car's as-found pedal-path keys (BRIEF-fix-2026-11-19.md), the same list sim/hold-fix2/lawsim.py uses
+DEPLOYED_KEYS_47 = {"HyundaiGasInterceptor": True, "HyundaiPedalDeliveryLaw": True, "HyundaiGasRiseLag": True,
+                    "HyundaiFca11Brake": True, "HyundaiFca11AffineGain": True, "HyundaiFca11DynamicBrakes": True,
+                    "HyundaiFca11PedalGuard": 1}
+
+
+def _get_ci_hold47(fit: bool, overrides=None):
+  """CarInterface with the car's as-found pedal keys and the 0047 hold-fit switch on/off."""
+  fingerprint = {i: {} for i in range(8)}
+  fingerprint[0] = {**BASE_FINGERPRINT, **REM}
+  CarInterface = interfaces[CAR_UNDER_TEST]
+  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
+                                     docs=False)
+  keys = {**DEPLOYED_KEYS_47, **(overrides or {})}
+  setup_interfaces(CarInterface, CP, CP_SP, [{k: v} for k, v in keys.items()] + [{"HyundaiPedalHoldFit": bool(fit)}])
+  return CarInterface, CP, CP_SP
+
+
+def _wire_pedal(w):
+  """0x700/0x200 command bytes -> the commanded pedal fraction (the encoding replay_real/lawsim decode)."""
+  if w is None:
+    return np.nan
+  raw = (w[0] << 8) | w[1]
+  return (raw * 0.11855 - 55.126) / 255. if raw > 0 else 0.
+
+
+class _Hold47Arm:
+  """One controller of the 0047 two-mode comparison, stepped through the REAL create_gas_command with a fresh camera
+  frame, so the FCA11 brake law really brakes (the same _Fca11CS / _fca11_cam_frame doubles the integration tests use).
+
+  Per frame it records the published pedal `gas`, the DEPLOYED law's pedal `_gas_law` (None on a pre-0047 tree, so the
+  pins fail BY VALUE there instead of by AttributeError), the four latches, the 0x700/0x200 command bytes and the 0x38D
+  brake bytes.
+  """
+
+  def __init__(self, fit: bool, overrides=None):
+    CarInterface, CP, CP_SP = _get_ci_hold47(fit, overrides)
+    self.CI = CarInterface(CP, CP_SP)
+    assert self.CI.CC.hold_fit is bool(fit)
+    self.cs = _Fca11CS(v_ego=10., cam=(0, _fca11_cam_frame(alive=5)))
+    self.cs.fca11_lead_drel_m = None
+    self.cs.fca11_lead_vrel_mps = None
+    self.cs.fca11_lead_one = None
+    self.frame = 0
+
+  def step(self, ask, v, vc=255.0, lead=None, active=True, fault=0, gas_pressed=False, brake_pressed=False,
+           personality=1, drive_mode=1):
+    cs = self.cs
+    cs.out.vEgo = float(v)
+    cs.out.vCruise = float(vc)
+    cs.out.gasPressed = bool(gas_pressed)
+    cs.out.brakePressed = bool(brake_pressed)
+    cs.interceptor_state = int(fault)
+    if lead is None:
+      cs.fca11_lead_drel_m = cs.fca11_lead_vrel_mps = cs.fca11_lead_one = None
+      cs.fca11_lead_closing = False
+    else:
+      cs.fca11_lead_drel_m, cs.fca11_lead_vrel_mps = float(lead[0]), float(lead[1])
+      cs.fca11_lead_one = object()
+      cs.fca11_lead_closing = float(lead[1]) < -0.5
+    cc = structs.CarControl()
+    cc.enabled = cc.latActive = True
+    cc.longActive = bool(active)
+    cc.actuators.accel = float(ask)
+    sends = self.CI.CC.create_gas_command(cc.as_reader(), cs, self.frame, 0, int(personality), int(drive_mode))
+    self.frame += 1
+    C = self.CI.CC
+    has_law = hasattr(C, "_gas_law")
+    brk = [bytes(d) for a, d, _ in sends if a == 0x38D]
+    ped = [bytes(d) for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
+    return dict(gas=float(C.gas), law=(float(C._gas_law) if has_law else None),
+                wire=(ped[0] if ped else None), brake=(brk[0] if brk else None),
+                latches=(bool(C.overspeed_released), bool(C.coast_zero_latched), bool(C.gas_launching),
+                         bool(C.fca11_brake.gas_hold)))
+
+
+def _two_mode_scan(off, on, tol_lsb=0.5):
+  """Every frame: the deployed pedal inside the ON controller is OFF's pedal BITWISE, ON's published pedal is <= it,
+  the four latches are equal, the 0x38D frames are byte-identical and the pedal wire is never above OFF's. Returns the
+  numbers instead of asserting, so a RED run prints the defect's size."""
+  res = dict(frames=len(off), worst_lsb=-1e9, first_pos=None, n_pos=0, n_law=0, n_latch=0, n_brake=0, n_wire=0,
+             n_above_law=0, n_clear=0, worst_wire_lsb=-1e9)
+  for i, (a, b) in enumerate(zip(off, on)):
+    d = (b["gas"] - a["gas"]) * 255.
+    res["worst_lsb"] = max(res["worst_lsb"], d)
+    if d > tol_lsb:
+      res["n_pos"] += 1
+      if res["first_pos"] is None:
+        res["first_pos"] = i
+    if a["law"] is not None and b["law"] is not None:
+      if b["law"] != a["gas"]:          # bitwise: same code, same carried state
+        res["n_law"] += 1
+      if not b["gas"] <= b["law"]:
+        res["n_above_law"] += 1
+    if b["latches"] != a["latches"]:
+      res["n_latch"] += 1
+    if b["brake"] != a["brake"]:
+      res["n_brake"] += 1
+    wa, wb = _wire_pedal(a["wire"]), _wire_pedal(b["wire"])
+    if a["gas"] > 0. and a["wire"] is not None and wa == 0.:
+      res["n_clear"] += 1                     # a fault CLEAR frame: the slot carried zero while the pedal was live
+    if not (np.isnan(wa) and np.isnan(wb)):
+      dw = (wb - wa) * 255. if (np.isfinite(wa) and np.isfinite(wb)) else 0.
+      res["worst_wire_lsb"] = max(res["worst_wire_lsb"], dw)
+      if dw > tol_lsb:
+        res["n_wire"] += 1
+  return res
+
+
+class TestPedalHoldFit47:
+  """0047: the pedal law's hold feedforward (the pedal fraction it commands at accel = 0) re-measured from the car's logs.
+
+  The deployed table's 5-15 m/s leg came from a driver STEADY-PEDAL fit that over-reads (it pools accelerating
+  frames), so at ask 0 the car accelerated instead of holding: median +0.19 m/s^2 over 25 routes / 390 segments /
+  298,341 foot-off frames, peaking at +0.29 at 4-7 m/s, and +0.07..+0.10 at 12-20 m/s
+  (F-SIM-PEDAL-FF-2026-11-20.md). HOLD_FIT_* is the pedal that measured ZERO net accel in each band. It meets the
+  deployed table exactly at 0 m/s and at 20 m/s and up, so the highway law and cruise hold are untouched.
+  """
+
+  # The REAL 2026-11-19 route 000001ac window 59:36.5-59:40.6 (10 Hz, engaged): vEgo 3.85 -> 5.30 m/s at ask 0.00 with
+  # the pedal commanded 605-637 raw (0.071-0.080 pedal) - the creep behind the RV. ask is 0.00 for the whole window
+  # apart from two one-frame dithers (0.058, 0.012) and the closing -0.07/-0.17.
+  WIN_V = [3.852, 3.905, 3.981, 4.021, 4.067, 4.11, 4.157, 4.188, 4.238, 4.284, 4.324, 4.376, 4.4, 4.429,
+           4.466, 4.535, 4.593, 4.627, 4.656, 4.68, 4.731, 4.779, 4.817, 4.85, 4.888, 4.928, 4.969, 5.017,
+           5.077, 5.104, 5.145, 5.206, 5.26, 5.299]
+  WIN_ASK = [0.542, 0.538, 0.131, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.058, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, -0.073, -0.165]
+
+  def _ci(self, fit=True):
+    CarInterface, CP, CP_SP = _get_ci_hold(fit)
+    # getattr: on a pre-0047 tree the field does not exist at all and the pin must fail BY VALUE, not by AttributeError
+    assert getattr(CP_SP, "pedalHoldFit", fit) is fit
+    return CarInterface(CP, CP_SP)
+
+  @staticmethod
+  def _sp(mode=1):
+    sp = structs.CarControlSP()
+    sp.driveMode = int(mode)
+    return sp
+
+  def _gas(self, CI, series):
+    """[(accel, v_ego)] per 100 Hz frame -> the controller's pedal command (fraction) per frame."""
+    out = []
+    for i, (accel, v) in enumerate(series):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = CC.longActive = True
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = 255.
+      CI.CS.out.brakePressed = False
+      CI.CS.out.gasPressed = False
+      CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
+      out.append(float(CI.CC.gas))
+    return out
+
+  def _gas_active(self, CI, frames):
+    """[(accel, v_ego, long_active)] per 100 Hz frame -> the pedal command per frame; longActive varies, so an
+    inactive frame commands 0 and closes the episode exactly as a real disengage does."""
+    out = []
+    for i, (accel, v, active) in enumerate(frames):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = True
+      CC.longActive = bool(active)
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = 255.
+      CI.CS.out.brakePressed = False
+      CI.CS.out.gasPressed = False
+      CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
+      out.append(float(CI.CC.gas))
+    return out
+
+  def _wire(self, CI, series):
+    """The 0x700 command bytes per SEND SLOT (even frames) - what the pedal actually receives."""
+    out = []
+    for i, (accel, v) in enumerate(series):
+      CC = structs.CarControl()
+      CC.enabled = CC.latActive = CC.longActive = True
+      CC.actuators.accel = float(accel)
+      CI.update([])
+      CI.CS.out.vEgo = float(v)
+      CI.CS.out.vCruise = 255.
+      CI.CS.out.brakePressed = False
+      CI.CS.out.gasPressed = False
+      _, sends = CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
+      for a, d, _ in sends:
+        if a == gi.REMAPPED_IDS.command_addr:
+          out.append((i, bytes(d)))
+    return out
+
+  # ---- the switch ---------------------------------------------------------------------------------------------------
+  def test_param_defaults_off_and_reads_the_key(self):
+    _, _, off = _get_ci_hold(False)
+    assert getattr(off, "pedalHoldFit", None) is False
+    assert off.enableGasInterceptor is True
+    for val, want in ((True, True), ("1", True), (b"1", True), (False, False), ("0", False), ("true", False), (2, False)):
+      fingerprint = {i: {} for i in range(8)}
+      fingerprint[0] = {**BASE_FINGERPRINT, **REM}
+      CarInterface = interfaces[CAR_UNDER_TEST]
+      CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+      CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
+                                         docs=False)
+      setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}, {"HyundaiPedalHoldFit": val}])
+      assert CP_SP.pedalHoldFit is want, (val, CP_SP.pedalHoldFit)
+    # a stale libparams (key absent -> None) is OFF, never an exception
+    fingerprint = {i: {} for i in range(8)}
+    fingerprint[0] = {**BASE_FINGERPRINT, **REM}
+    CarInterface = interfaces[CAR_UNDER_TEST]
+    CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
+    CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
+                                       docs=False)
+    setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}])
+    assert CP_SP.pedalHoldFit is False
+
+  def test_table_shape_matches_the_measurement(self):
+    """The fitted table is the measured zero-net-accel pedal per band, meets the deployed one at 0 and >= 20 m/s,
+    and is strictly lower in between (that is the defect it corrects)."""
+    assert gi.HOLD_FIT_BP[0] == 0. and gi.HOLD_FIT_V[0] == 0.          # any pedal at a standstill is uncommanded motion
+    assert len(gi.HOLD_FIT_BP) == len(gi.HOLD_FIT_V)
+    assert gi.HOLD_FIT_BP == sorted(gi.HOLD_FIT_BP)
+    for v in (0., 20., 22., 25., 27., 30., 35., 40.):
+      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(gi.get_hold_command(v), abs=1e-12), v
+    for v in (2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18.):
+      h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
+      assert 0. < h_on < h_off, (v, h_on, h_off)
+    # monotone non-decreasing below the highway junction (a hold table that dips would command a lift while speeding up)
+    xs = [gi.get_hold_command(v, hold_fit=True) for v in (2., 4., 6., 8., 10., 12., 14., 16., 18., 20.)]
+    assert xs == sorted(xs), xs
+    # the measured zero-net-accel values at the breakpoints. UPDATED for 0047 REVISION 2 (F-HOLD-DERIVE-2026-11-20):
+    # the table is now the DERIVED value AT each node (3/4/5/6/8 m/s moved from 0.044/0.049/0.057/0.060/0.060), so the
+    # pins are the node values themselves rather than the first fit read at band midpoints.
+    for v, want in ((2., 0.014), (3., 0.032), (4., 0.038), (5., 0.044), (6., 0.050), (8., 0.052), (10., 0.063),
+                    (12., 0.066), (16., 0.070)):
+      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(want, abs=1e-9), v
+    # ... and each of the revised bands still lands on its DERIVED band hold within 0.005 pedal (the derivation's bins
+    # are 1 cm wide and its route-clustered CI90 is 0.006-0.016, so 0.005 is the tight end of what a node can be held to)
+    for v, want in ((3.5, 0.038), (4.5, 0.038), (5.5, 0.050), (7.5, 0.047), (9.0, 0.057)):
+      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(want, abs=0.005), v
+    # the DEPLOYED table is untouched by this patch (no global redefinition)
+    assert gi.HOLD_CMD_V == [pytest.approx(x) for x in (0., 0.08, 0.085, 0.095, 0.1224, 0.1548, 0.1764, 0.2016)]
+
+  # ---- OFF = the deployed law, byte for byte ------------------------------------------------------------------------
+  def test_off_path_is_the_deployed_table_and_bypass_reproduces_it(self):
+    series = ([(1.0, 2.0)] * 40 + [(0.0, 4.5)] * 60 + [(-0.2, 6.0)] * 40 + [(0.25, 8.0)] * 40 +
+              [(0.0, 15.0)] * 60 + [(-0.4, 22.0)] * 40 + [(0.0, 26.0)] * 60 + [(0.6, 30.0)] * 40)
+    off = self._wire(self._ci(False), series)
+    # the ON controller with the flag bypassed IS the OFF controller, byte for byte
+    ci_bypass = self._ci(True)
+    ci_bypass.CC.hold_fit = False
+    assert self._wire(ci_bypass, series) == off
+    # ... and the real switch DOES move the wire on that same series (the test is not vacuous)
+    assert self._wire(self._ci(True), series) != off
+    # OFF's pedal command is the deployed law's, evaluated directly
+    for accel, v in ((0.0, 4.5), (0.0, 10.0), (0.3, 6.0), (-0.15, 8.0)):
+      assert gi.get_pedal_command(accel, v, gi.PERSONALITY_STANDARD, False) == pytest.approx(
+        gi.get_pedal_command(accel, v), abs=1e-12)
+      assert gi.get_hold_command(v, hold_fit=False) == pytest.approx(float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V)))
+
+  def test_highway_is_bit_identical_20_ms_and_up(self):
+    """20 m/s and up is the frozen highway law: ON must be identical to OFF on EVERY send slot, not approximately."""
+    series = [(0.0, 20.0)] * 120 + [(0.4, 22.5)] * 80 + [(-0.3, 26.0)] * 80 + [(0.0, 30.0)] * 80 + [(0.8, 34.0)] * 80
+    assert self._wire(self._ci(True), series) == self._wire(self._ci(False), series)
+
+  @pytest.mark.parametrize("riselag", [True, False])
+  def test_highway_rise_from_a_steady_pedal_is_bit_identical(self, riselag):
+    """The highway law is identical DYNAMICALLY too, not only in the steady state the test above checks: from a steady
+    pedal at a constant 20-36 m/s, through mild rises (< 0.5 m/s^2, the soft re-entry band), a deliberate rise and a dip,
+    the switch-ON controller publishes OFF's pedal bit for bit and the same 0x700 bytes. RED on e04f25ed89, whose 20 m/s
+    node was the literal 0.1224, one float ulp below the deployed 0.36 * 0.34: at 20-25 m/s ON's steady pedal then sat
+    1 ulp under the deployed hold and only ON climbed on the soft re-entry cap (up to 1.49 LSB less for ~0.2 s)."""
+    ov = {} if riselag else {"HyundaiGasRiseLag": False}
+    for v in (20.0, 20.5, 21.0, 22.0, 22.5, 24.0, 25.0, 27.5, 30.0, 34.0, 36.0):
+      rows = ([dict(ask=0.0, v=v)] * 300 + [dict(ask=0.3, v=v)] * 60 + [dict(ask=0.0, v=v)] * 200 +
+              [dict(ask=0.45, v=v)] * 60 + [dict(ask=-0.2, v=v)] * 60 + [dict(ask=0.8, v=v)] * 60)
+      off, on = self._pair(rows, ov)
+      bad = [i for i, (a, b) in enumerate(zip(off, on)) if a["gas"] != b["gas"] or a["wire"] != b["wire"]]
+      worst = max((a["gas"] - b["gas"]) * 255. for a, b in zip(off, on))
+      assert not bad, (v, riselag, bad[0], len(bad), worst)
+    # the fitted 20-35 m/s nodes ARE the deployed nodes (not retyped literals)
+    assert list(gi.HOLD_FIT_BP[-4:]) == list(gi.HOLD_CMD_BP[-4:]) and list(gi.HOLD_FIT_V[-4:]) == list(gi.HOLD_CMD_V[-4:])
+
+  def test_standstill_commands_exactly_zero(self):
+    on = self._gas(self._ci(True), [(0.0, 0.0)] * 200 + [(-0.5, 0.0)] * 100)
+    assert max(on) == 0.
+
+  # ---- what it does to the incident window --------------------------------------------------------------------------
+  def test_incident_window_creep_is_removed(self):
+    """The 2026-11-19 59:37-59:40 fixture: the deployed law commands the hold that produced +0.23..+0.44 m/s^2; the
+    fitted one commands the pedal that measured ~0 net accel there (11-20 m/s^2 per unit pedal at 4-6 m/s)."""
+    rows = [(a, v) for a, v in zip(self.WIN_ASK, self.WIN_V) for _ in range(10)]   # 10 Hz fixture -> 100 Hz frames
+    on = self._gas(self._ci(True), rows)
+    off = self._gas(self._ci(False), rows)
+    k0 = 30                                                          # the window opens on the +0.54 closing ask
+    d = [o - n for o, n in zip(off[k0:], on[k0:])]
+    assert min(d) > 0., min(d)                                       # ON is strictly less pedal on every creep frame
+    assert 0.026 < float(np.median(d)) < 0.042, float(np.median(d))   # deployed 0.064-0.085 vs fitted 0.038-0.046 pedal
+    # the measured plant gain at 4-6 m/s is 11.5-20 m/s^2 per unit pedal, so this is 0.17-0.44 m/s^2 of thrust the
+    # deployed law was adding at ask 0 - the window measured +0.34 m/s^2 (aEgo) with a grade term of only +0.03
+    assert 11.5 * float(np.median(d)) > 0.15, 11.5 * float(np.median(d))
+    # ... and once the rate limiter has walked down, ON sits exactly on the fitted table (no artefact in the fixture)
+    checked = settle = 0
+    for i in range(50, len(rows) - 1):
+      if rows[i][0] != 0.:                                           # the two one-frame ask dithers reset the settle
+        settle = 0
+        continue
+      settle += 1
+      if settle < 8:                                                 # a fall of <= 8 LSB is walked down over ~6 frames
+        continue
+      assert on[i] == pytest.approx(float(np.interp(rows[i][1], gi.HOLD_FIT_BP, gi.HOLD_FIT_V)), abs=0.002), (i, on[i])
+      checked += 1
+    assert checked > 200                                             # not vacuous: most of the window is ask 0.00
+
+  # ---- the dip-then-rise direction invariant ------------------------------------------------------------------------
+  def test_rise_out_of_a_dip_never_commands_more_than_the_deployed_law(self):
+    """0047 FIX (dip-then-rise): ON must NEVER command more pedal than the deployed (OFF) law from the same state.
+
+    The one path that broke this was the 17c soft re-entry cap. It was proportional to each arm's OWN hold, and a rise
+    whose starting pedal sits BELOW both holds is the state where that is not monotone: the ON arm (lower hold) reaches
+    its own hold FIRST, switches to the full jerk rate while the OFF arm is still on its slower cap, and overtakes it.
+    Measured on the 0047 REVISION 1 code at 18 m/s, dip ask -0.02 for 10 frames, then ask +0.45: ON +12.137 LSB
+    (= 0.0476 pedal, ~+0.17 m/s^2 for 0.24 s) ABOVE the deployed law - a state the pack's 1,088-point grid never built.
+    RED on that code (the max assertion below fires at every combo); GREEN now for two independent reasons: the re-entry
+    cap and its "reached the hold -> full rate" test use the DEPLOYED hold in both modes, and since REVISION 3 the
+    published pedal is also min(fitted law, deployed law), so no cap behaviour can put it above the deployed law.
+    """
+    # the soft cap itself: the DEPLOYED hold / PEDAL_REENTRY_TIME_S in BOTH modes (this is the fix, at unit level)
+    for v in (12., 15., 18., 19.):
+      want = min(float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V)) / gi.PEDAL_REENTRY_TIME_S, gi.get_pedal_rate_up(v))
+      assert gi.get_pedal_reentry_rate(v) == pytest.approx(want, abs=1e-12), v
+      assert gi.rate_limit_pedal_command(0.20, 0.05, v, reentry=True) == pytest.approx(
+        min(0.05 + want * DT_CTRL, 0.20), abs=1e-12), v
+    # the trajectory, DRIVEN through the real controller (0047 REVISION 3: a poke of `CC.gas` no longer sets the
+    # deployed state `_gas_law`, so the common state has to be reached the way a drive reaches it): settle at ask 0,
+    # a short 0.10 m/s^2 dip that walks BOTH pedals down through the re-entry band, then the deliberate rise. The
+    # assertion is the invariant, on every frame: ON never above the deployed law, and ON settles materially below it.
+    worst = 9.
+    for v, ask in ((18., 0.45), (17., 0.30), (16., 0.60), (14., 0.20)):
+      rows = ([dict(ask=0.0, v=v)] * 300 + [dict(ask=-0.10, v=v)] * 6 + [dict(ask=ask, v=v)] * 250)
+      off, on = self._pair(rows)
+      d = [(a["gas"] - b["gas"]) * 255. for a, b in zip(off, on)]           # positive = ON commands LESS pedal
+      assert min(d) >= -0.5, (v, ask, min(d))                                # never above the deployed command
+      worst = min(worst, min(d))
+      # ... and the two arms are not the same run: ON settles materially BELOW the deployed command
+      assert d[-1] > 1.0, (v, d[-1])
+    assert worst >= -0.5
+
+  def test_negative_branch_stays_continuous_through_zero(self):
+    """No step at ask 0: the continuous negative branch and the positive/hold branch meet on the SAME hold, so a
+    dithering ask across zero cannot command a step (the 16a / review-C3 class of defect)."""
+    ci = self._ci(True)
+    out = []
+    for a in [0.0, -0.02, 0.0, -0.05, 0.02, -0.10, 0.0] * 20:
+      out.extend(self._gas(ci, [(a, 4.0)]))
+    h = gi.get_hold_command(4.0, hold_fit=True)
+    assert all(abs(x - h) < 0.01 or x == 0. for x in out[-40:]), (h, out[-40:])
+
+  # ---- R1-R4: the four measured ways ON used to command MORE pedal than the deployed law --------------------------
+  def _pair(self, rows, overrides=None):
+    """Drive OFF and ON through the REAL controller on ONE identical input sequence; return (off_trace, on_trace)."""
+    off, on = _Hold47Arm(False, overrides), _Hold47Arm(True, overrides)
+    return [off.step(**r) for r in rows], [on.step(**r) for r in rows]
+
+  def test_r1_one_frame_into_the_coast_zero_band(self):
+    """R1 (Opus review of 946df3b989): the over-speed release latch was only re-evaluated on frames the coast-zero latch
+    let through, and ON's coast-zero latch (decided with the LOWER fitted hold) was a strict superset of OFF's. ONE
+    frame of an ask inside ON's-only band (v 18 m/s, set 62 km/h, ask +0.20 either side) let OFF latch the exact-zero
+    release while ON skipped it; ON then climbed back to its hold - +32.203 LSB, 148 frames above +0.5 LSB, still
+    rising. RED on 946df3b989 and 35f90eedad; GREEN here because the latch is decided with the deployed hold."""
+    v, vcs = 18.0, 62.0
+    coast = gi.fca11_cont_coast(v)
+    h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
+    enter_on = coast * (1 - gi.COAST_ZERO_ENTER_PEDAL / h_on)
+    enter_off = coast * (1 - gi.COAST_ZERO_ENTER_PEDAL / h_off)
+    need_mid = 0.5 * (enter_on + enter_off)      # ON (old code) enters coast-zero, OFF does not
+    assert enter_on != enter_off
+    rows = ([dict(ask=0.2, v=v, vc=vcs)] * 200 + [dict(ask=-need_mid, v=v, vc=vcs)] +
+            [dict(ask=0.2, v=v, vc=vcs)] * 150)
+    off, on = self._pair(rows)
+    r = _two_mode_scan(off, on)
+    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, r
+    # the release latches in BOTH modes on the one-frame dip, and the pedal stays at exactly 0 afterwards
+    assert all(t["latches"][0] for t in off[201:])
+    assert all(t["latches"][0] for t in on[201:])
+    assert max(t["gas"] for t in on[201:]) == 0.
+    assert max(t["gas"] for t in off[201:]) == 0.
+
+  def test_r2_hysteresis_band_latches_the_release_in_both_modes(self):
+    """R2: the same defect entered without an ask jump. Set 62 km/h, ask -0.40 at 0.3 m/s over the set speed (both
+    coast-zeroed), then an ask between the two EXIT thresholds (OFF leaves coast-zero, ON stays), then 0.6 m/s over the
+    set speed (OFF sets the release), back inside the band, then ask -0.20: OFF held exactly 0, ON held 0.032 pedal on
+    the continuous branch for 199 frames (+8.182 LSB). RED on 946df3b989 and 35f90eedad; GREEN here."""
+    v = 18.0
+    vc_kph = 62.0
+    coast = gi.fca11_cont_coast(v)
+    h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
+    exit_on = coast * (1 - gi.COAST_ZERO_EXIT_PEDAL / h_on)
+    exit_off = coast * (1 - gi.COAST_ZERO_EXIT_PEDAL / h_off)
+    vcm = vc_kph / 3.6
+    assert exit_on != exit_off
+    mid = -(exit_off + exit_on) / 2
+    rows = ([dict(ask=-0.40, v=vcm + 0.3, vc=vc_kph)] * 60 +
+            [dict(ask=mid, v=vcm + 0.3, vc=vc_kph)] * 20 +
+            [dict(ask=mid, v=vcm + 0.6, vc=vc_kph)] * 20 +
+            [dict(ask=mid, v=vcm + 0.3, vc=vc_kph)] * 20 +
+            [dict(ask=-0.20, v=vcm + 0.3, vc=vc_kph)] * 200)
+    off, on = self._pair(rows)
+    r = _two_mode_scan(off, on)
+    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, r
+    assert all(t["latches"][0] for t in off[100:]) and all(t["latches"][0] for t in on[100:])
+    assert max(t["gas"] for t in on[140:]) == 0.
+
+  @pytest.mark.parametrize("f", [0.38, 0.55])
+  def test_r3_small_fall_walk_is_never_above_the_deployed_law(self, f):
+    """R3 (review Finding 2): with HyundaiGasRiseLag OFF the small-fall walk applies only to falls <= 8 LSB, so it is not
+    monotone across modes once the two pedals differ: OFF's fall can be > 8 LSB (applied at once) while ON's, from a
+    lower pedal, is <= 8 (walked at PEDAL_JERK_DOWN) and ON ends ABOVE OFF. 6.3 m/s, settle at ask 0, then one step of
+    ask = -(1-f)·coast(v): f = 0.38 gives +4.575 LSB on 946df3b989 for 11 frames. RED on 946/35f; GREEN here because the
+    published pedal is min(fitted law, deployed law) - the deployed law's own (untouched) walk cannot be overtaken."""
+    ov = {"HyundaiGasRiseLag": False}
+    v = 6.3
+    ask = -(1.0 - f) * gi.fca11_cont_coast(v)
+    rows = [dict(ask=0.0, v=v)] * 300 + [dict(ask=ask, v=v)] * 60
+    off, on = self._pair(rows, ov)
+    r = _two_mode_scan(off, on)
+    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, (f, r)
+    # the two arms are not the same run: ON settles materially below the deployed law at ask 0
+    assert (off[299]["gas"] - on[299]["gas"]) * 255. > 5.
+
+  def _r4(self, lead_pre=4, v=5.0, dip=-1.5, lead=(15.0, -6.0), push=3, tail=400, lead_after=0):
+    """The adaptive R4 sequence from sim/hold-fix2/mine/repro_window.py, ported: settle at ask 0 inside the 0.5 m/s band,
+    a 3-frame dip (the rise lag keeps ON's target clipped to 0 while OFF's is live), a phantom closing lead turned on
+    `lead_pre` frames before the predicted ON-zero/OFF-live window (the brake slew needs ~12 frames to reach 1 LSB),
+    then the set speed pulled down for `push` frames (v > set + 0.5) and restored. ONE input sequence, identical in both
+    modes: only the lead's onset is placed from the predicted frame, never from the arms' own outputs."""
+    import math
+    vc_band = (v - 0.3) * CV.MS_TO_KPH
+    vc_push = (v - 0.6) * CV.MS_TO_KPH
+    off, on = _Hold47Arm(False), _Hold47Arm(True)
+    off_tr, on_tr = [], []
+
+    def step(r):
+      off_tr.append(off.step(**r))
+      on_tr.append(on.step(**r))
+
+    for _ in range(300):
+      step(dict(ask=0.0, v=v, vc=vc_band))
+    for _ in range(3):
+      step(dict(ask=dip, v=v, vc=vc_band))
+    h_off, scale = gi.get_hold_command(v), gi.get_pedal_scale(v)
+    lead_on_at = max(0, int(gi.GAS_RISE_LAG_TAU_S * math.log(dip / (-h_off / scale)) * 100) - lead_pre)
+    diverged_at = None
+    n = 0
+    while n < 200:
+      step(dict(ask=0.0, v=v, vc=vc_band, lead=(lead if n >= lead_on_at else None)))
+      n += 1
+      if on_tr[-1]["latches"][3] and not off_tr[-1]["latches"][3]:     # ON's throttle window only
+        diverged_at = len(off_tr) - 1
+        break
+    for _ in range(push):
+      step(dict(ask=0.0, v=v, vc=vc_push, lead=lead))
+    for k in range(tail):
+      step(dict(ask=0.0, v=v, vc=vc_band, lead=(lead if k < lead_after else None)))
+    return off_tr, on_tr, diverged_at
+
+  @pytest.mark.parametrize("lead_pre", [4, 8])
+  def test_r4_sub_bite_brake_window_is_the_deployed_window(self, lead_pre):
+    """R4: the sub-bite gate (and the 110 ms throttle window a SENT 1-3 LSB frame arms) was keyed on each mode's OWN
+    pedal. ON's pedal reaches exactly 0 first (the fitted hold clips to 0 at a negative LAGGED ask), so ON alone sent a
+    1-LSB phantom-lead brake frame and opened its window; while it is open the over-speed release is NOT evaluated, OFF
+    latched it, and when ON's window closed the entry test was already false -> ON climbed to its hold while OFF held 0.
+    +11.218 LSB for 379 frames, 1 brake frame differing (946df3b989 AND the review's prototype). RED on 946/35f; GREEN
+    here because the gate and the fault-clear schedule are keyed on the DEPLOYED pedal, so ON never opens an ON-only
+    window and the 0x38D frames are byte-identical."""
+    off, on, diverged_at = self._r4(lead_pre=lead_pre)
+    r = _two_mode_scan(off, on)
+    assert diverged_at is None, diverged_at            # no ON-only throttle window exists
+    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, (lead_pre, r)
+    assert r["n_brake"] == 0, (lead_pre, r["n_brake"])
+    # the phantom lead really exercised the brake law (otherwise this pin would be vacuous)
+    assert any(t["latches"][3] for t in off)
+
+  # ---- the permanent randomised two-mode property test (the reviewer's prop_law.py, fast subset) --------------------
+  @staticmethod
+  def _random_stream(seed):
+    """One seeded adversarial input stream: speeds at every table node with ramps and steps, dips and rises, dithers,
+    hovering at the engine-braking cliff, cliff/positive zero-crossing trains, engagement drop-outs, gas/brake presses,
+    set speed unset or tracking vEgo, personality and drive-mode changes, and one of five pedal-parameter configs."""
+    rng = np.random.RandomState(seed)
+    n = int(rng.randint(50, 131))
+    nodes = [0., 2., 3., 4., 5., 6., 8., 10., 12., 14., 16., 18., 19., 20., 22., 25., 30., 35.]
+    v = np.zeros(n)
+    i = 0
+    cur = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
+    while i < n:
+      L = int(rng.randint(8, 60))
+      j = min(n, i + L)
+      kind = rng.choice(["hold", "ramp", "step"])
+      if kind == "hold":
+        v[i:j] = cur
+      elif kind == "ramp":
+        tgt = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
+        v[i:j] = cur + np.linspace(0, np.clip(tgt - cur, -0.03 * (j - i), 0.03 * (j - i)), j - i)
+        cur = float(v[j - 1])
+      else:
+        cur = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
+        v[i:j] = cur
+      i = j
+    a = np.zeros(n)
+    i = 0
+    while i < n:
+      kind = rng.choice(["hold", "dip_rise", "dither", "cliff", "zero_cross"], p=[0.2, 0.3, 0.15, 0.2, 0.15])
+      if kind == "hold":
+        L = int(rng.randint(8, 60))
+        seq = np.full(L, float(rng.choice([0., rng.uniform(-0.05, 0.05), rng.uniform(-0.6, 0.6),
+                                           rng.uniform(-2., -0.6), rng.uniform(0.6, 1.5)])))
+      elif kind == "dip_rise":
+        L = int(rng.randint(2, 31)) + int(rng.randint(15, 60))
+        seq = np.r_[np.full(int(rng.randint(2, 31)), float(rng.uniform(-0.6, -0.02))),
+                    np.full(int(rng.randint(15, 60)), float(rng.uniform(0.05, 1.0)))]
+      elif kind == "dither":
+        L = int(rng.randint(20, 60))
+        c, amp, f = float(rng.uniform(-0.6, 0.4)), float(rng.uniform(0.02, 0.4)), float(rng.uniform(2., 4.))
+        t = np.arange(L) * 0.01
+        seq = c + amp * (np.sign(np.sin(2 * np.pi * f * t)) if rng.rand() < 0.5 else np.sin(2 * np.pi * f * t))
+      elif kind == "cliff":
+        L = int(rng.randint(5, 50))
+        u = rng.uniform(-0.12, 0.05, L)
+        vv = [v[min(i + q, n - 1)] for q in range(L)]
+        seq = -np.array([0.365 * (1. - np.exp(-max(0., x) / 6.4)) for x in vv]) * (1. + u)
+      else:
+        L = int(rng.randint(8, 40))
+        lo = -0.365 * (1. - np.exp(-max(0., v[min(i, n - 1)]) / 6.4)) * float(rng.uniform(0.85, 1.05))
+        hi = float(rng.uniform(0., 0.45))
+        kk = int(rng.randint(1, 8))
+        seq = np.array([lo if (q // kk) % 2 == 0 else hi for q in range(L)])
+      L = min(len(seq), n - i)
+      a[i:i + L] = seq[:L]
+      i += max(L, 1)
+    active = np.ones(n, bool)
+    for _ in range(int(rng.poisson(0.8))):
+      s = int(rng.randint(0, n))
+      active[s:min(n, s + int(rng.randint(5, 40)))] = False
+    gas_p, brake_p = np.zeros(n, bool), np.zeros(n, bool)
+    for arr in (gas_p, brake_p):
+      for _ in range(int(rng.poisson(0.6))):
+        s = int(rng.randint(0, n))
+        arr[s:min(n, s + int(rng.randint(5, 40)))] = True
+    if rng.rand() < 0.35:
+      vc = np.full(n, 255.)
+    else:
+      base = float(v[0] * 3.6 + rng.uniform(-11, 7))
+      vc = np.clip(np.where(rng.rand() < 0.5, v * 3.6 + rng.uniform(-3.5, 1.0), base), 1., 254.)
+    pers = np.full(n, int(rng.randint(0, 3)), np.int8)
+    if rng.rand() < 0.2:
+      pers[int(rng.randint(0, n)):] = int(rng.randint(0, 3))
+    dm = np.full(n, 1 if rng.rand() < 0.8 else int(rng.choice([0, 2, 3, 7])), np.int8)
+    # pedal-reported fault windows (CS.interceptor_state != 0): these drive the fault-CLEAR schedule, which is keyed on
+    # the deployed pedal in both modes - the schedule's frames must be identical too
+    fault = np.zeros(n, np.int8)
+    for _ in range(int(rng.poisson(0.5))):
+      s = int(rng.randint(0, n))
+      fault[s:min(n, s + int(rng.randint(5, 60)))] = 1
+    cfgs = ({}, {"HyundaiGasRiseLag": False}, {"HyundaiPedalDeliveryLaw": False}, {"HyundaiFca11Brake": False},
+            {"HyundaiPedalDeliveryLaw": False, "HyundaiGasRiseLag": False, "HyundaiFca11Brake": False})
+    return dict(n=n, v=v, ask=a, active=active, gas=gas_p, brake=brake_p, vc=vc, pers=pers, dm=dm, fault=fault,
+                cfg=cfgs[int(rng.choice(len(cfgs)))], tog_at=int(rng.randint(1, n)), tog_dir=int(rng.randint(0, 2)))
+
+  def test_two_mode_property_random_sequences(self):
+    """The permanent randomised two-mode test (the reviewer's prop_law.py, 300-sequence fast subset). Per sequence the
+    SAME input stream drives OFF, ON and TOG (ON, with `hold_fit` flipped mid-sequence in either direction - the car
+    reads the key once at start, so TOG is a test-only mode). Asserted on EVERY frame: the deployed pedal inside the ON
+    controller equals OFF's pedal BITWISE, ON's published pedal is <= it (exactly - no tolerance), all four latches are
+    equal, every 0x38D frame is byte-identical, and the pedal wire is never above OFF's. The long run (4,000 sequences
+    over 4.66 M frames) is sim/hold-fix2/prop_law.py; this subset is what regression-tests the rule in CI."""
+    total = checked = 0
+    clears = 0
+    for seed in range(300):
+      S = self._random_stream(seed)
+      off, on = _Hold47Arm(False, S["cfg"]), _Hold47Arm(True, S["cfg"])
+      tog = _Hold47Arm(S["tog_dir"] == 0, S["cfg"])
+      off_tr, on_tr, tog_tr = [], [], []
+      for i in range(S["n"]):
+        if i == S["tog_at"]:
+          tog.CI.CC.hold_fit = (S["tog_dir"] == 1)
+        kw = dict(ask=S["ask"][i], v=S["v"][i], vc=S["vc"][i], active=bool(S["active"][i]),
+                  gas_pressed=bool(S["gas"][i]), brake_pressed=bool(S["brake"][i]), fault=int(S["fault"][i]),
+                  personality=int(S["pers"][i]), drive_mode=int(S["dm"][i]))
+        off_tr.append(off.step(**kw))
+        on_tr.append(on.step(**kw))
+        tog_tr.append(tog.step(**kw))
+      for name, tr in (("on", on_tr), ("tog", tog_tr)):
+        r = _two_mode_scan(off_tr, tr)
+        assert r["worst_lsb"] <= 0.5 and r["n_law"] == 0 and r["n_latch"] == 0 and r["n_brake"] == 0 \
+            and r["n_wire"] == 0 and r["n_above_law"] == 0, (seed, S["cfg"], name, r)
+        clears += r["n_clear"]
+      total += len(off_tr)
+      checked += 1
+    assert checked == 300 and total > 20000, (checked, total)
+    assert clears > 100, clears        # not vacuous: the fault-clear schedule really fired on both modes' runs
