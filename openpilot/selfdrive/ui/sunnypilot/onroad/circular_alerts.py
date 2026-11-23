@@ -72,6 +72,21 @@ class CircularAlertsRenderer:
       if not self._is_standstill:
         self._standstill_elapsed_time = 0.0
 
+  @property
+  def standstill_elapsed_time(self) -> float:
+    """Seconds the standstill timer has been running (0 when it is not).
+
+    Read by HudRendererSP.standstill_elapsed_time -> the top-overlay hold-timer
+    pill, so both timer elements show the SAME clock.  The clock keeps counting
+    while a selfdrive alert is up (only the *rendering* was ever gated on
+    `_allow_e2e_alerts`), which is exactly what the pill needs.
+    """
+    return self._standstill_elapsed_time
+
+  @property
+  def standstill_timer_running(self) -> bool:
+    return ui_state.standstill_timer and self._is_standstill
+
   def render(self, rect: rl.Rectangle) -> None:
     if not self._allow_e2e_alerts or (self._e2e_alert_display_timer <= 0 and not (ui_state.standstill_timer and self._is_standstill)):
       return

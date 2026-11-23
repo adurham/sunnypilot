@@ -1,0 +1,1108 @@
+diff --git a/opendbc/car/structs.py b/opendbc/car/structs.py
+index d5bec360..2bcd93d9 100644
+--- a/opendbc/car/structs.py
++++ b/opendbc/car/structs.py
+@@ -83,6 +83,10 @@ class CarParamsSP:
+   # 0042-Z: RISE-ONLY ask lag (param HyundaiGasRiseLag, default OFF). Written ONLY by setup_interfaces from that param;
+   # when unset no frame of the pedal path changes (the deployed tree skips the branch). Coupled with custom.capnp @12.
+   gasRiseLag: bool = auto_field()
++  # 0047: MEASURED low/mid-speed hold table (param HyundaiPedalHoldFit, default OFF). Written ONLY by setup_interfaces
++  # from that param; when unset the pedal law is byte-for-byte the deployed one (HOLD_CMD_*). Coupled with custom.capnp
++  # CarParamsSP.pedalHoldFit @14 and checked by check_capnp_parity.py.
++  pedalHoldFit: bool = auto_field()
+   # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (param HyundaiFca11PedalGuard, INT, default "0").
+   # Bitfield: 1 = a fault observed within HYUNDAI_FCA11_PEDAL_FAULT_GRACE_US of hyundai_init does not latch,
+   # 2 = latch only after HYUNDAI_FCA11_PEDAL_FAULT_FRAMES consecutive fault frames; 0 = the deployed rule (any frame
+diff --git a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+index 1fb2e2e8..c701fe41 100644
+--- a/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/gas_interceptor.py
+@@ -148,6 +148,74 @@ HOLD_SPEED_OFFSET_HIGHWAY_V = [0.34, 0.43, 0.49, 0.56]                 # m/s^2 e
+ HOLD_CMD_BP = [0., 5., 10., 15., 20., 25., 30., 35.]                  # vEgo, m/s
+ HOLD_CMD_V = [0., 0.08, 0.085, 0.095, *[PEDAL_SCALE_HIGHWAY * o for o in HOLD_SPEED_OFFSET_HIGHWAY_V]]  # pedal fraction
+ 
++# *** 0047: LOW/MID-SPEED HOLD RECALIBRATION (param HyundaiPedalHoldFit, default OFF) ***
++# WHAT WAS MEASURED (25 routes / 390 device segments / 298,341 frames, 2026-11-20; sim/ff/ under
++# wsSTOP/drive-2026-11-19, report F-SIM-PEDAL-FF-2026-11-20.md). Frames: longitudinal engaged, driver's feet off both
++# pedals, no accepted FCA11 level, gear D, |ask| <= 0.05 m/s^2; road grade removed with the IMU forward specific force
++# (per-route mount offset removed - the F-SIM-LSB-MAP method); each frame binned by speed and by the COMMANDED pedal
++# (0x700 echo -> gas fraction, create_gas_interceptor_command's units). The pedal that delivers exactly ZERO net
++# acceleration - the "holds speed on flat ground" property this table is supposed to have - comes out at:
++#   1.5-3 0.016 | 3-4 0.046 | 4-5 0.051 | 5-6 0.061 | 6-7 0.058 | 7-8 0.057 | 8-10 0.058 | 10-12 0.066
++#   14-16 0.070 | 16-18 0.069 | 18-20 0.081 | 20-22 0.100 | 22-25 0.130 | 25-30 0.165   (m/s, pedal fraction)
++# against HOLD_CMD_V above, which commands 0.080 @5-10, 0.085 @10, 0.095 @15, 0.1224 @20, 0.1548 @25, 0.1764 @30.
++# The deployed table therefore OVER-DELIVERS at ask 0. Measured median of the same frames, grade removed:
++#   +0.12 (1.5-3) +0.27 (4-5) +0.29 (5-6) +0.28 (6-7) +0.19 (7-8) +0.16 (8-10) +0.12 (10-12) +0.10 (14-16)
++#   +0.07 (16-18) +0.07 (18-20) +0.06 (20-22) +0.01 (22-25) 0.00 (25-30) m/s^2
++# i.e. at ask 0 the car accelerates instead of holding, peaking near +0.3 m/s^2 at 4-7 m/s. That is the 2026-11-19
++# 59:37-59:40 creep (route 000001ac: ask exactly 0.00, pedal command 605-637 raw = 0.071-0.080 pedal, vEgo 4.08 ->
++# 5.11 m/s at +0.23..+0.44 m/s^2, 1.4-5.0 m from the lead). The 5-10 m/s leg of HOLD_CMD_V came from a driver
++# STEADY-PEDAL fit (12e/12f) that pools accelerating frames; it is ~35 % above the pedal this car needs at that speed,
++# and its 12-20 m/s leg is ~25 % above. The old 0.36 * the m/s^2 table is right only at 25 m/s and up, where the
++# measured and deployed curves meet within 0.01.
++# THE FITTED TABLE replaces the hold at every breakpoint up to 18 m/s and from 20 m/s up IS the deployed table (the
++# same float nodes, HOLD_CMD_V[4:] - see HOLD_FIT_V), so above 20 m/s the fitted and the deployed law compute the same
++# value from the same pedal: with equal carried pedals (any steady state at >= 20 m/s, any zero / coast / disengage)
++# the highway law (0.1224 / 0.1548 / 0.1764 / 0.2016) is BIT-IDENTICAL with the param on or off. A pedal that arrives
++# from below 20 m/s with the switch ON can still be lower than the deployed one; it then climbs on the soft re-entry
++# cap while it is below the deployed hold (see get_pedal_reentry_rate) until the two meet. The 18-20 segment is the
++# blend into that frozen point (at 19 m/s it sits on the measured 20-22 crossing, 0.100). 0 m/s stays exactly 0: this
++# car has gas-only authority, so any pedal at a standstill is uncommanded motion.
++# NOT addressed (reported, not fixed): the residual +0.06 m/s^2 at 20-22 m/s, which lives inside the frozen highway leg.
++# *** 0047 REVISION 2 (2026-11-20): the table moves to the DERIVED values, and the soft re-entry cap is anchored on
++# the DEPLOYED hold in both modes. ***
++# (a) TABLE. The rows above are the FIRST fit; the derivation in F-HOLD-DERIVE-2026-11-20.md re-measured the same
++# quantity two more ways (zero-accel crossing on steadier frames, with route-clustered intervals; and 601 same-road
++# opposite-direction pairs, which cancel the grade without the accelerometer) and found the 3/4/5/6/8 m/s nodes still
++# 0.006-0.013 pedal too HIGH (predicted +0.10..+0.27 m/s^2 at ask 0 there, against +0.00..+0.05 for the revision).
++# Only those five nodes change: 3 -> 0.032, 4 -> 0.038, 5 -> 0.044, 6 -> 0.050, 8 -> 0.052. 0 m/s, 2 m/s (0.014) and
++# 10 m/s and up are unchanged (the highway leg: see above), and the direction-check results still hold.
++# (b) DIRECTION RULE. With the switch ON the controller must never publish more pedal - and never a later or weaker
++# brake frame - than the deployed law publishes from the same inputs. Revision 2 claimed that "by construction" from
++# monotone targets on one carried float. That was WRONG: the carried state also holds latches whose evaluation depended
++# on per-mode values. Counterexamples measured on revision 2 (and its parent), all through the real controller:
++#   R1/R2  the coast-zero latch decided with each mode's own hold, and the over-speed release latch is only
++#          re-evaluated on frames the coast-zero latch lets through, so ON could miss a release the deployed law had
++#          latched and keep a live throttle (+32.2 / +8.2 LSB, the car's own settings);
++#   R3     the small-fall walk ("walk a fall only if <= 8 LSB") is not monotone across modes (+4.6 LSB, rise lag OFF);
++#   R4     the sub-bite brake gate and the pedal-fault clear schedule were keyed on this mode's own pedal, so a 1-3 LSB
++#          brake frame could open ON's throttle window alone and hide a release from ON (+11.2 LSB).
++# (The soft re-entry cap was the first such path: per-mode, it let the lower hold overtake on a rise out of a dip,
++# +12.137 LSB at 18 m/s; it is anchored on the deployed hold in both modes, see get_pedal_reentry_rate.)
++# HOW IT IS ENFORCED (REVISION 3, create_gas_command / get_law_pedal): the DEPLOYED law always runs on its own carried
++# pedal (`_gas_law`) in both modes, and every decision is the deployed law's - the coast-zero latch (deployed hold), the
++# over-speed and launch latches, the branch, the sub-bite gate and the fault-clear schedule. The fitted table only
++# enters the PUBLISHED pedal: published = min(fitted law stepped from the published pedal, deployed law). So with the
++# same inputs the deployed pedal inside an ON controller is the OFF controller's pedal (same code, same state), the ON
++# pedal is <= it on every frame and every send slot, and the 0x38D frames are byte-identical. This holds for any ask
++# sequence and across a flip of `hold_fit` (tests only - the car reads the key once at start), because the deployed
++# state is carried in both modes. Tested: the R1-R4 reproducers and a seeded randomised two-mode property test
++# (TestPedalHoldFit47), plus 4,000 random sequences and the real controller on 390 logged segments with and without
++# altered asks (sim/hold-fix2). NOT shown: anything closed-loop - on the road the two modes' cars move differently, so
++# this is a statement about the controller given the same inputs, not about a drive.
++# REVIEW FIX (Opus re-check of revision 3): the 20-35 m/s nodes used to be retyped as the literals 0.1224 / 0.1548 /
++# 0.1764 / 0.2016, and 0.1224 is one float ulp BELOW the deployed 0.36 * 0.34 = 0.12240000000000001. At 20-25 m/s the
++# fitted steady pedal therefore sat 1 ulp under the deployed hold, and on a rise from it only the switch-ON law took the
++# soft re-entry cap (pedal below the deployed hold): up to 1.5 LSB less pedal for ~0.2 s, i.e. NOT bit-identical. The
++# nodes are now the deployed ones themselves (pinned by test_highway_rise_from_a_steady_pedal_is_bit_identical).
++HOLD_FIT_BP = [0., 2., 3., 4., 5., 6., 8., 10., 12., 14., 16., 18., 20., 25., 30., 35.]   # vEgo, m/s
++HOLD_FIT_V = [0., 0.014, 0.032, 0.038, 0.044, 0.050, 0.052, 0.063, 0.066, 0.069, 0.070, 0.081,
++              *HOLD_CMD_V[4:]]               # pedal fraction; 20/25/30/35 m/s = the deployed nodes (HOLD_CMD_BP[4:])
++
+ # Low-speed ceiling on the command (openpilot side; panda keeps its flat raw ceiling at the cap, it has no vEgo). The
+ # pedal is far stronger at low speed (driver data 127+128, aEgo(+0.3 s) per unit pedal: 0-1 m/s 10.9, 1-3 13.2, 3-6
+ # 10.0, 6-10 7.9, 10-14 6.3 vs 2.76 at highway; driver's own launch pedal p50 0.18-0.21). 0.12 at a standstill = ~0.6
+@@ -207,14 +275,18 @@ def get_pedal_scale(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+   return personality_scale(personality) * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+-def get_hold_command(v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++def get_hold_command(v_ego: float, personality=PERSONALITY_STANDARD, hold_fit: bool = False) -> float:
+   """Pedal fraction that holds speed on flat ground (accel request 0). This is a PHYSICS feedforward
+   (road-load / aero+rolling resistance), not a feel dial: it replaces a zero integral term (LongControl
+   ki=0), so any personality scaling of it is an uncorrected bias - aggressive would track above its own
+   plan, relaxed below. Personality-invariant since G3; `personality` is kept in the signature for call
+   compatibility but no longer scales the hold. (personality_scale still applies to the pull gain and the
+-  per-tier launch ceilings, which ARE driver-felt.)"""
+-  return float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
++  per-tier launch ceilings, which ARE driver-felt.)
++
++  hold_fit=True (0047, param HyundaiPedalHoldFit, default OFF) uses HOLD_FIT_* instead: the same quantity
++  re-measured from the car's own logs, which is lower at 2-18 m/s because the deployed 5-15 m/s leg came from
++  a driver steady-pedal fit that over-reads. false is the deployed table, byte for byte."""
++  return float(np.interp(v_ego, HOLD_FIT_BP, HOLD_FIT_V)) if hold_fit else float(np.interp(v_ego, HOLD_CMD_BP, HOLD_CMD_V))
+ 
+ 
+ def get_pedal_rate_up(v_ego: float, launching: bool = False) -> float:
+@@ -229,9 +301,10 @@ def get_pedal_rate_up(v_ego: float, launching: bool = False) -> float:
+   return PEDAL_JERK_UP * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+-def get_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
+-  """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake."""
+-  return float(np.clip(get_pedal_scale(v_ego, personality) * accel + get_hold_command(v_ego, personality),
++def get_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD, hold_fit: bool = False) -> float:
++  """accel request -> pedal fraction. Accelerator only: <= 0 means coast, never brake.
++  hold_fit (0047) selects the measured hold table; see get_hold_command."""
++  return float(np.clip(get_pedal_scale(v_ego, personality) * accel + get_hold_command(v_ego, personality, hold_fit),
+                        0., get_personality_ceiling(v_ego, personality)))
+ 
+ 
+@@ -299,7 +372,23 @@ def over_speed_release_held(active: bool, accel: float, v_ego: float, v_cruise:
+ 
+ def get_pedal_reentry_rate(v_ego: float) -> float:
+   """Soft recovery rate (pedal fraction per second) for a rise below the hold: 0 -> hold(v) in PEDAL_REENTRY_TIME_S,
+-  never faster than the normal jerk rate."""
++  never faster than the normal jerk rate.
++
++  0047 (dip-then-rise): anchored on the DEPLOYED hold in BOTH modes, on purpose. The soft cap is a RISE LIMIT, not a
++  steady target, and it is not monotone in the selected hold: with a per-mode cap the mode with the LOWER hold reaches
++  its own hold first, switches to the full jerk rate while the other is still on its slower cap, and OVERTAKES it. On a
++  rise out of a dip that sits between the two holds that commanded up to +12.137 LSB (0.0476 pedal, ~+0.17 m/s^2 for
++  0.24 s at 18 m/s) MORE pedal with the switch ON than the deployed law. With the cap on the deployed hold both modes
++  ramp at the same rate out of any common state. This removes that overshoot, but it is not what guarantees ON <= OFF:
++  other paths broke the rule too (the 0047 block above, R1-R4), and the rule is enforced by the min() against the
++  deployed law in create_gas_command.
++  Side effect (measured, in the LESS-pedal direction): the fitted steady pedal sits BELOW the deployed hold at
++  11.2-20 m/s, so with the switch ON a mild rise (ask < OVERSPEED_EXIT_ACCEL) out of a steady cruise climbs at this
++  soft rate until it passes the deployed hold: e.g. a +0.45 m/s^2 step at 18 m/s lags the pedal's own target by up to
++  ~5 LSB more than the steady ON/OFF gap for ~0.3 s with HyundaiGasRiseLag on (~22 LSB for ~0.4 s with it off). Anchoring
++  the FITTED evaluation's cap on its own hold would remove that and still never exceed the deployed law (the min()
++  bounds it); that is a design choice left open for the owner, not part of this patch.
++  """
+   return min(get_hold_command(v_ego) / PEDAL_REENTRY_TIME_S, get_pedal_rate_up(v_ego))
+ 
+ 
+@@ -310,6 +399,8 @@ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launchin
+   the cap is that RATE, never the hold value itself (review #1: a `hold` term here pinned the climb whenever vEgo rose,
+   because hold(v_now) > gas_last by ~1e-5 re-entered the branch every frame). At/above the hold the normal rate takes
+   over. Inert while launching or below PEDAL_REENTRY_V_MIN. reentry=False is the old limiter.
++  The hold this branch tests and the rate it applies are the DEPLOYED ones in both 0047 modes (see
++  get_pedal_reentry_rate) - that is the fix for the dip-then-rise asymmetry.
+   small_falls=False (0042-Z, whenever the rise lag is ON): the small-fall walk below is skipped on EVERY frame, not only
+   on the transparent ones. The walk's floor is gas_last, so with a LAGGED gas_last it can hold the pedal above what the
+   unlagged law commands; skipping it is what makes "lagged pedal <= unlagged pedal on every frame" true (Opus defect 1).
+@@ -317,7 +408,7 @@ def rate_limit_pedal_command(gas: float, gas_last: float, v_ego: float, launchin
+   can fall on a frame whose plan ask is still rising, i.e. a lagging frame, and the walk then held the lift back."""
+   limit = gas_last + get_pedal_rate_up(v_ego, launching) * DT_CTRL
+   if reentry and not launching and v_ego >= PEDAL_REENTRY_V_MIN:
+-    hold = get_hold_command(v_ego)
++    hold = get_hold_command(v_ego)          # DEPLOYED hold in both 0047 modes - see get_pedal_reentry_rate
+     if gas_last < hold:
+       limit = min(limit, gas_last + get_pedal_reentry_rate(v_ego) * DT_CTRL)
+   gas_out = min(gas, limit)
+@@ -462,7 +553,7 @@ def get_pedal_rate_down(v_ego: float) -> float:
+   return PEDAL_JERK_DOWN * float(np.interp(v_ego, PEDAL_SCALE_BP, PEDAL_SCALE_V))
+ 
+ 
+-def get_delivery_pedal_drop(accel: float, v_ego: float) -> float:
++def get_delivery_pedal_drop(accel: float, v_ego: float, hold_fit: bool = False) -> float:
+   """Pedal fraction below hold(v) for a negative ask, from the measured inverse (monotone in |accel|).
+ 
+   The measured table spans the pedal range [DELIVERY_PEDAL_FLOOR_MEAS, DELIVERY_PEDAL_HOLD_MEAS] at the route's mean
+@@ -470,9 +561,10 @@ def get_delivery_pedal_drop(accel: float, v_ego: float) -> float:
+   hold(v) (a drop of 0), (b) the table's last point still lands on the plateau floor at any speed, and (c) below the
+   measured band the drop shrinks with the law's own speed schedule (the pedal is far stronger there). The span cap
+   is what holds the floor: hold(v) - drop >= get_delivery_floor(v) by construction, so no separate max() is needed
+-  (review C7)."""
++  (review C7). hold_fit (0047) anchors the whole negative branch on the measured hold, so the branch stays continuous
++  at ask 0 when the fitted table is selected."""
+   floor = get_delivery_floor(v_ego)
+-  span = max(get_hold_command(v_ego) - floor, 0.)
++  span = max(get_hold_command(v_ego, hold_fit=hold_fit) - floor, 0.)
+   k = span / (DELIVERY_PEDAL_HOLD_MEAS - DELIVERY_PEDAL_FLOOR_MEAS)
+   return min(k * float(np.interp(abs(accel), DELIVERY_ACCEL_BP, DELIVERY_PEDAL_DROP)), span)
+ 
+@@ -546,31 +638,74 @@ def filter_gas_rise(accel: float, accel_prev: float, dt: float = DT_CTRL,
+   return float(accel_prev + (accel - accel_prev) * (1. - np.exp(-dt / tau)))
+ 
+ 
+-def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++def get_delivery_pedal_command_highway(accel: float, v_ego: float, personality=PERSONALITY_STANDARD,
++                                       hold_fit: bool = False) -> float:
+   """The measured-inverse law alone (blend weight 1). Accelerator only: <= 0 means the plateau floor or a coast,
+   never brake."""
+   if accel >= 0.:
+-    return get_pedal_command(accel, v_ego, personality)
++    return get_pedal_command(accel, v_ego, personality, hold_fit)
+   if -accel >= DELIVERY_COAST_ACCEL:
+     return 0.
+   ceiling = get_personality_ceiling(v_ego, personality)
+-  return float(np.clip(get_hold_command(v_ego) - get_delivery_pedal_drop(accel, v_ego), 0., ceiling))
++  return float(np.clip(get_hold_command(v_ego, hold_fit=hold_fit) - get_delivery_pedal_drop(accel, v_ego, hold_fit), 0., ceiling))
+ 
+ 
+-def get_delivery_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD) -> float:
++def get_delivery_pedal_command(accel: float, v_ego: float, personality=PERSONALITY_STANDARD,
++                               hold_fit: bool = False) -> float:
+   """accel request -> pedal fraction. The positive branch is exactly get_pedal_command (the deployed linear law);
+   the negative branch is the measured inverse cross-faded with the deployed law over DELIVERY_BLEND_LO_V ..
+   DELIVERY_BLEND_HI_V, and exactly the deployed law at/below the low end (review C2/C3)."""
+   if accel >= 0.:
+-    return get_pedal_command(accel, v_ego, personality)
++    return get_pedal_command(accel, v_ego, personality, hold_fit)
+   ceiling = get_personality_ceiling(v_ego, personality)
+   w = get_delivery_blend_weight(v_ego)
+   if w <= 0.:
+-    return get_pedal_command(accel, v_ego, personality)
+-  highway = get_delivery_pedal_command_highway(accel, v_ego, personality)
++    return get_pedal_command(accel, v_ego, personality, hold_fit)
++  highway = get_delivery_pedal_command_highway(accel, v_ego, personality, hold_fit)
+   if w >= 1.:
+     return highway
+-  return float(np.clip((1. - w) * get_pedal_command(accel, v_ego, personality) + w * highway, 0., ceiling))
++  return float(np.clip((1. - w) * get_pedal_command(accel, v_ego, personality, hold_fit) + w * highway, 0., ceiling))
++
++
++# *** 0047 REVISION 3: one frame of the pedal law as a PURE function of the state it is stepped from ***
++def get_law_pedal(gas_last: float, hold_fit: bool, cont_branch: bool, accel: float, accel_raw: float,
++                  v_ego: float, personality: int, delivery_on: bool, delivery_ask: float,
++                  hand_over: bool, launching: bool, small_falls: bool) -> float:
++  """The pedal law's arithmetic for one frame, with NO state of its own: `gas_last` is the carried pedal the frame is
++  stepped from, and every former `self.gas` read is that argument.
++
++  This is the exact body of the two live branches of create_gas_command, moved out unchanged so the SAME function can be
++  evaluated TWICE per frame in 0047: once with the DEPLOYED hold (hold_fit=False) from the controller's carried deployed
++  pedal `_gas_law`, which is the law that makes every decision, and once with the selected hold from the published pedal,
++  whose result can only LOWER the published value (published = min(fitted, deployed), written so a NaN falls back to the
++  deployed value). With the switch OFF the second evaluation does not happen and the first reproduces the deployed law
++  bit for bit - that is what makes OFF byte-identical, and it is proved by replay, not by reading this code.
++
++  cont_branch: the 0037 continuous negative branch (engine braking first, no soft re-entry, no launch rate).
++  Otherwise the positive/hold branch: the (opt-in) delivery inverse with its shallow-band fall bound, or the deployed
++  linear law, then the 185 hand-over seed and the full rate limiter.
++  """
++  if cont_branch:
++    coast = fca11_cont_coast(v_ego)
++    pedal_target = get_hold_command(v_ego, hold_fit=hold_fit) * max(0., 1. - (-accel) / coast) if coast > 1e-3 else 0.
++    return rate_limit_pedal_command(pedal_target, gas_last, v_ego, small_falls=small_falls)
++  if delivery_on:
++    weight = get_delivery_blend_weight(v_ego)
++    ask = accel + weight * (delivery_ask - accel) if accel < 0. else accel
++    pedal_target = get_delivery_pedal_command(ask, v_ego, personality, hold_fit)
++    if accel_raw < 0. and weight > 0. and pedal_target > 0.:
++      # review C5: bound a shallow-band fall to get_pedal_rate_down(v) (the band test is the RAW ask, Opus re-review N1b)
++      pedal_target = max(pedal_target, gas_last - weight * get_pedal_rate_down(v_ego) * DT_CTRL)
++  else:
++    pedal_target = get_pedal_command(accel, v_ego, personality, hold_fit)
++  # 185 HAND-OVER SEED: on the FIRST active frame of an episode start the ramp at the hold instead of 0. The min() chain
++  # keeps it strictly conservative: never above this frame's own law target, never above the launch ceiling.
++  gas_seed = gas_last
++  if hand_over and not launching:
++    gas_seed = min(pedal_target, get_hold_command(v_ego, personality, hold_fit),
++                   get_personality_ceiling(v_ego, personality))
++  return rate_limit_pedal_command(pedal_target, gas_seed, v_ego, launching,
++                                  reentry=accel_raw < OVERSPEED_EXIT_ACCEL, small_falls=small_falls)
+ 
+ 
+ # *** pedal fault latch recovery (route 11c forensics, FORK.md #14) ***
+@@ -647,6 +782,10 @@ class GasInterceptorCarController:
+     self.CP_SP = CP_SP
+ 
+     self.gas = 0.
++    # 0047 REVISION 3: the DEPLOYED law's pedal, carried in BOTH switch modes. Every decision (coast-zero, over-speed,
++    # launch, branch, sub-bite gate, fault-clear schedule) is taken from this value and from latches stepped off it, so
++    # with the switch ON it stays the OFF controller's pedal bit for bit; the fitted table only LOWERS `gas` below it.
++    self._gas_law = 0.
+     # 185 HAND-OVER: was longitudinal active on the previous controller frame? Used to recognise the FIRST active frame
+     # of an engagement episode (the hand-over), where the command is seeded at the hold instead of 0.
+     self._was_active = False
+@@ -664,6 +803,10 @@ class GasInterceptorCarController:
+     # unless CP_SP.pedalDeliveryLaw is set, so the OFF path stays byte-for-byte the deployed one.
+     self.delivery_law = bool(getattr(CP_SP, 'pedalDeliveryLaw', False))
+     self.delivery_ask = 0.
++    # 0047 (HyundaiPedalHoldFit, default OFF): use the MEASURED hold table (HOLD_FIT_*) instead of the deployed one.
++    # Read once at build time like the sibling flags, so a toggle takes effect at the NEXT ignition; OFF is byte for byte
++    # the deployed law (get_hold_command's default).
++    self.hold_fit = bool(getattr(CP_SP, 'pedalHoldFit', False))
+     # 0042-Z (HyundaiGasRiseLag, default OFF): rise-only ask-lag state. Unused (and never advanced) unless the param is
+     # set, so the OFF path is the deployed one frame for frame.
+     self.gas_rise_lag = bool(getattr(CP_SP, 'gasRiseLag', False))
+@@ -681,6 +824,11 @@ class GasInterceptorCarController:
+     that target would be below one GAS_COMMAND count (not representable as a live command) and releases only at two
+     counts - one pedal LSB of hysteresis, sized to the wire, no time delay. Inert on every non-continuous instance, on
+     asks >= 0, and when the coast is ~0 (v ~ 0, where the hold band owns the frame).
++
++    0047 REVISION 3: the latch is decided with the DEPLOYED hold in BOTH switch modes. Deciding it with the fitted
++    (lower) hold made ON's latch a strict superset of OFF's, and because the over-speed release is only re-evaluated on
++    the frames this latch lets through, an ON-only coast-zero frame could hide a release OFF had latched (R1 +32.2 /
++    R2 +8.2 LSB). The continuous branch's own TARGET still uses the selected hold - only the latch decision is deployed.
+     """
+     if not (getattr(self.fca11_brake, "cont_law", False) and self.fca11_brake.enabled) or float(accel) >= 0.0:
+       self.coast_zero_latched = False
+@@ -836,17 +984,22 @@ class GasInterceptorCarController:
+     # SENT alongside throttle (Fca11LongBrake.sub_bite_gate), so a vision phantom still does not cut the throttle.
+     # See Fca11LongBrake.gas_hold.
+     # M5: the coast cliff is a QUANTIZED level, not a timer - see _coast_zero().
+-    coast_zero = bool(active) and self._coast_zero(CC.actuators.accel, CS.out.vEgo)
++    # 0047 REVISION 3: THE LADDER DECIDES, THE LAW RUNS SEPARATELY. Every latch update and branch choice below is the
++    # deployed one and is stepped off the DEPLOYED law's pedal (`_gas_law`, carried in BOTH modes): the coast-zero latch
++    # (deployed hold), the over-speed and launch latches, and the branch selector. The ladder only records which branch
++    # this frame takes (`law`); the pedal arithmetic is get_law_pedal() further down, evaluated once for the deployed law
++    # (whose result the sub-bite gate and the fault-clear schedule use) and, with the switch ON, once for the fitted one.
++    law = None
++    accel_raw = CC.actuators.accel
++    accel = ask
++    coast_zero = bool(active) and self._coast_zero(accel_raw, CS.out.vEgo)
+     if self.fca11_brake.cam_brake or coast_zero:
+-      self.gas = 0.
+       self.gas_launching = False
+     elif active and not self.fca11_brake.gas_hold and not self.fca11_brake._cal_active:
+       # 0042-Z: the pedal law below consumes the (optionally) lagged ask; ALL THREE latch decisions (over-speed release
+       # entry + hold, launch latch, soft re-entry) stay on the RAW plan ask so their meaning cannot change when the lag
+       # is on (Opus defect 2: the over-speed pair had been left on the lagged ask, so above a real set speed ON
+       # released for 150 frames where OFF released for 0 - the lagged ask never reached OVERSPEED_EXIT_ACCEL).
+-      accel_raw = CC.actuators.accel
+-      accel = ask
+       # over-speed release (route 16a): above a REAL set speed with a <= 0 plan ask the pedal goes to EXACTLY zero
+       # (all-zero ENABLE=0 frame, pass-through) so the car coasts on engine braking instead of holding speed on
+       # hold_cmd. Every other case falls through to the unchanged law below.
+@@ -856,7 +1009,6 @@ class GasInterceptorCarController:
+                                  (self.overspeed_released and
+                                   over_speed_release_held(active, accel_raw, CS.out.vEgo, CS.out.vCruise)))
+       if self.overspeed_released:
+-        self.gas = 0.
+         self.gas_launching = False
+       elif self.fca11_brake.cont_law and accel_raw < 0.:
+         # 0037: the continuous negative branch. One straight line in the ASK domain from hold_cmd(v) at ask 0 to EXACTLY
+@@ -868,11 +1020,9 @@ class GasInterceptorCarController:
+         # this branch on ON and the positive/hold branch on OFF, and this branch has no soft re-entry, so ON came back
+         # onto the gas FASTER than OFF - +21.7 LSB above OFF for ~100 frames at 22 m/s (Opus re-review N1a). The LAW
+         # below still consumes the lagged ask; only the selector is raw.
+-        coast = fca11_cont_coast(CS.out.vEgo)
+-        pedal_target = get_hold_command(CS.out.vEgo) * max(0., 1. - (-accel) / coast) if coast > 1e-3 else 0.
++        # 0039: the launch latch is not armed here (an engaged decel is not a pull-away).
+         self.gas_launching = False
+-        self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
+-                                            small_falls=not self.gas_rise_lag)
++        law = "cont"
+       else:
+         # 0039: a launch is an engaged positive request while the car is still at (near) rest. Latch it over the first
+         # few metres so the fast launch rate is held until the car is clearly moving, then hand back to the jerk rate
+@@ -889,46 +1039,32 @@ class GasInterceptorCarController:
+         # law below 20 m/s, exactly the deployed law below 16 m/s), and its ask is the FILTERED one (deeper asks still
+         # land on the same frame; the filter only slows the return toward 0 and the hand-back from a coast/brake
+         # episode). Both are faded by the same weight as the law, so below 16 m/s the pedal path is the deployed one
+-        # INCLUDING its ask and its fall behaviour (except the small-fall walking below, which is applied after this branch).
+-        # Positive asks - including exactly 0 - keep the RAW plan value, so
+-        # that branch stays bit-identical to the deployed law too.
+-        if delivery_on:
+-          weight = get_delivery_blend_weight(CS.out.vEgo)
+-          ask = accel + weight * (self.delivery_ask - accel) if accel < 0. else accel
+-          pedal_target = get_delivery_pedal_command(ask, CS.out.vEgo, personality)
+-          if accel_raw < 0. and weight > 0. and pedal_target > 0.:
+-            # review C5: the inverse is 3.5-4.7x steeper than the linear law near ask -0.09, so plan dither would
+-            # arrive as downward pedal steps. A fall inside the shallow band (live target, |ask| < the coast
+-            # threshold) is therefore bounded to get_pedal_rate_down(v), the mirror of the rise limit. An exact-zero
+-            # target (coast at |ask| >= 0.52) and every release / FCA11 / cal / cam-brake / disengage zero, which
+-            # never reach this line, still fall immediately.
+-            # 0042-Z: the BAND test is the RAW ask (Opus re-review N1b). On a lagging frame whose raw ask has already
+-            # crossed back to >= 0 the OFF pedal lifts at once, so this bound must not apply; with the lagged ask in
+-            # the test ON walked the shallow-band fall instead (+54.6 LSB above OFF for ~0.5 s - a delayed lift).
+-            pedal_target = max(pedal_target, self.gas - weight * get_pedal_rate_down(CS.out.vEgo) * DT_CTRL)
+-        else:
+-          pedal_target = get_pedal_command(accel, CS.out.vEgo, personality)
+-        # 185 HAND-OVER SEED: on the FIRST active frame of an episode, start the ramp at the hold instead of 0, so the
+-        # pedal does not close the throttle the driver's foot was already holding open (the measured route-185 table
+-        # above this frame's `hand_over`). The min() chain makes the seed strictly conservative: it is never above this
+-        # frame's own law target (`pedal_target`: a negative ask's target is below the hold, so the seed is then a
+-        # no-op - a lift is never delayed) and never above the launch ceiling, so it cannot add authority the plan did
+-        # not ask for. Launches are skipped (gas_launching, set above for accel > 0 at vEgo <= LAUNCH_RAMP_V_MAX, where
+-        # hold_cmd is ~0 anyway), and every zeroing path above (over-speed release, FCA11 brake, cal hold, cam brake)
+-        # returns before this line, so those frames still command exactly 0. Inactive frames are untouched (0 /
+-        # ENABLE=0 below).
+-        if hand_over and not self.gas_launching:
+-          self.gas = min(pedal_target, get_hold_command(CS.out.vEgo, personality),
+-                         get_personality_ceiling(CS.out.vEgo, personality))
+-        self.gas = rate_limit_pedal_command(pedal_target, self.gas, CS.out.vEgo,
+-                                            self.gas_launching, reentry=accel_raw < OVERSPEED_EXIT_ACCEL,
+-                                            small_falls=not self.gas_rise_lag)
++        # INCLUDING its ask and its fall behaviour (except the small-fall walking, which is applied after this branch).
++        # Positive asks - including exactly 0 - keep the RAW plan value, so that branch stays bit-identical to the
++        # deployed law too. The target itself is computed in get_law_pedal (see the delivery/linear branch there).
++        law = "pos"
+     elif self.fca11_brake.gas_hold or self.fca11_brake._cal_active:
+-      self.gas = 0.
+       self.gas_launching = False
+     else:
+-      self.gas = 0.
+       self.gas_launching = False
++    # The DEPLOYED law, stepped from its own carried pedal in BOTH modes. With the switch OFF this IS the published
++    # pedal, and the fitted evaluation below does not happen (OFF is the deployed law bit for bit).
++    if law is None:
++      self._gas_law = 0.
++      self.gas = 0.
++    else:
++      self._gas_law = get_law_pedal(self._gas_law, False, law == "cont", accel, accel_raw, CS.out.vEgo, personality,
++                                    delivery_on, self.delivery_ask, hand_over, self.gas_launching,
++                                    small_falls=not self.gas_rise_lag)
++      if self.hold_fit:
++        # 0047: the fitted table only LOWERS the published pedal. Written as `fit if fit < deployed else deployed` so a
++        # NaN (a broken table) falls back to the deployed value instead of NaN-ing onto the wire.
++        fit = get_law_pedal(self.gas, True, law == "cont", accel, accel_raw, CS.out.vEgo, personality,
++                            delivery_on, self.delivery_ask, hand_over, self.gas_launching,
++                            small_falls=not self.gas_rise_lag)
++        self.gas = fit if fit < self._gas_law else self._gas_law
++      else:
++        self.gas = self._gas_law
+     if not active:
+       self.overspeed_released = False
+       # 17c delivery (opt-in): clear the pedal-path ask filter ONLY here - a disengage / new episode. It is
+@@ -943,7 +1079,10 @@ class GasInterceptorCarController:
+     send_slot = frame % 2 == 0
+     # pedal reports a latched fault while we command -> this slot carries the clear (zero) frame instead
+     # (counter stays continuous: the clear frame simply occupies the slot)
+-    clear = CS.pedal_fault_monitor.update(frame, active, CS.interceptor_state, send_slot, self.gas)
++    # 0047 REVISION 3: the schedule is keyed on the DEPLOYED pedal in both modes. Its only `gas` use is `gas > 0`, and
++    # in ON mode the published pedal is never above the deployed one, so this keeps the clear-frame timing identical
++    # between the modes while never sending a clear frame the published pedal would not have sent anyway.
++    clear = CS.pedal_fault_monitor.update(frame, active, CS.interceptor_state, send_slot, self._gas_law)
+     if send_slot:
+       can_sends.append(create_gas_interceptor_command(self.interceptor_packer, 0. if clear else self.gas, frame // 2,
+                                                      self.interceptor_ids.command_msg))
+@@ -952,8 +1091,12 @@ class GasInterceptorCarController:
+     # panda judges first, so the value it will carry is already known here: if this slot commands gas and the brake
+     # frame is below the measured bite (1-3 LSB), that frame goes out as the PASSIVE shape instead, which does not arm
+     # the panda's 100 ms throttle exclusion at all. With the pedal at exactly 0 (a coast) nothing is substituted.
++    # 0047 REVISION 3: the gate is keyed on the DEPLOYED pedal in both modes. A 1-3 LSB frame is only SENT (and only
++    # arms the panda's 110 ms throttle window) when the deployed pedal is exactly 0 - and in ON mode published <=
++    # deployed, so that also means published == 0. This is what makes ON's brake frames byte-identical to OFF's: keyed
++    # on its own pedal, ON could send a sub-bite frame OFF withheld (R4 +11.2 LSB through the skipped release update).
+     brake_sends = self.fca11_brake.sub_bite_gate(brake_sends, CS, frame,
+-                                                 0. if (clear or not send_slot) else self.gas)
++                                                 0. if (clear or not send_slot) else self._gas_law)
+     can_sends.extend(brake_sends)
+     # 185 HAND-OVER: remember whether this frame was active, so the NEXT frame can tell an engagement's first frame.
+     # Set on every call (including the inactive frames that reset the episode), after all command paths above.
+diff --git a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+index b20f225b..89f770af 100644
+--- a/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
++++ b/opendbc/sunnypilot/car/hyundai/tests/test_gas_interceptor.py
+@@ -2876,3 +2876,625 @@ class TestGasRiseLag42:
+     CI_bypass = self._ci(True)
+     CI_bypass.CC.gas_rise_lag = False
+     assert self._wire(CI_bypass, [a for a, _ in series]) == off
++
++
++# ---- 0047: the MEASURED low/mid-speed hold table (HyundaiPedalHoldFit, default OFF) --------------------------------
++
++def _get_ci_hold(fit: bool, pedal=REM):
++  """CarInterface with the pedal armed and the 0047 hold-fit switch on/off."""
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **pedal}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False, docs=False)
++  params_list: list = [{"HyundaiGasInterceptor": True}]
++  if fit:
++    params_list.append({"HyundaiPedalHoldFit": True})
++  setup_interfaces(CarInterface, CP, CP_SP, params_list)
++  assert CP_SP.enableGasInterceptor
++  return CarInterface, CP, CP_SP
++
++
++# the car's as-found pedal-path keys (BRIEF-fix-2026-11-19.md), the same list sim/hold-fix2/lawsim.py uses
++DEPLOYED_KEYS_47 = {"HyundaiGasInterceptor": True, "HyundaiPedalDeliveryLaw": True, "HyundaiGasRiseLag": True,
++                    "HyundaiFca11Brake": True, "HyundaiFca11AffineGain": True, "HyundaiFca11DynamicBrakes": True,
++                    "HyundaiFca11PedalGuard": 1}
++
++
++def _get_ci_hold47(fit: bool, overrides=None):
++  """CarInterface with the car's as-found pedal keys and the 0047 hold-fit switch on/off."""
++  fingerprint = {i: {} for i in range(8)}
++  fingerprint[0] = {**BASE_FINGERPRINT, **REM}
++  CarInterface = interfaces[CAR_UNDER_TEST]
++  CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++  CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
++                                     docs=False)
++  keys = {**DEPLOYED_KEYS_47, **(overrides or {})}
++  setup_interfaces(CarInterface, CP, CP_SP, [{k: v} for k, v in keys.items()] + [{"HyundaiPedalHoldFit": bool(fit)}])
++  return CarInterface, CP, CP_SP
++
++
++def _wire_pedal(w):
++  """0x700/0x200 command bytes -> the commanded pedal fraction (the encoding replay_real/lawsim decode)."""
++  if w is None:
++    return np.nan
++  raw = (w[0] << 8) | w[1]
++  return (raw * 0.11855 - 55.126) / 255. if raw > 0 else 0.
++
++
++class _Hold47Arm:
++  """One controller of the 0047 two-mode comparison, stepped through the REAL create_gas_command with a fresh camera
++  frame, so the FCA11 brake law really brakes (the same _Fca11CS / _fca11_cam_frame doubles the integration tests use).
++
++  Per frame it records the published pedal `gas`, the DEPLOYED law's pedal `_gas_law` (None on a pre-0047 tree, so the
++  pins fail BY VALUE there instead of by AttributeError), the four latches, the 0x700/0x200 command bytes and the 0x38D
++  brake bytes.
++  """
++
++  def __init__(self, fit: bool, overrides=None):
++    CarInterface, CP, CP_SP = _get_ci_hold47(fit, overrides)
++    self.CI = CarInterface(CP, CP_SP)
++    assert self.CI.CC.hold_fit is bool(fit)
++    self.cs = _Fca11CS(v_ego=10., cam=(0, _fca11_cam_frame(alive=5)))
++    self.cs.fca11_lead_drel_m = None
++    self.cs.fca11_lead_vrel_mps = None
++    self.cs.fca11_lead_one = None
++    self.frame = 0
++
++  def step(self, ask, v, vc=255.0, lead=None, active=True, fault=0, gas_pressed=False, brake_pressed=False,
++           personality=1, drive_mode=1):
++    cs = self.cs
++    cs.out.vEgo = float(v)
++    cs.out.vCruise = float(vc)
++    cs.out.gasPressed = bool(gas_pressed)
++    cs.out.brakePressed = bool(brake_pressed)
++    cs.interceptor_state = int(fault)
++    if lead is None:
++      cs.fca11_lead_drel_m = cs.fca11_lead_vrel_mps = cs.fca11_lead_one = None
++      cs.fca11_lead_closing = False
++    else:
++      cs.fca11_lead_drel_m, cs.fca11_lead_vrel_mps = float(lead[0]), float(lead[1])
++      cs.fca11_lead_one = object()
++      cs.fca11_lead_closing = float(lead[1]) < -0.5
++    cc = structs.CarControl()
++    cc.enabled = cc.latActive = True
++    cc.longActive = bool(active)
++    cc.actuators.accel = float(ask)
++    sends = self.CI.CC.create_gas_command(cc.as_reader(), cs, self.frame, 0, int(personality), int(drive_mode))
++    self.frame += 1
++    C = self.CI.CC
++    has_law = hasattr(C, "_gas_law")
++    brk = [bytes(d) for a, d, _ in sends if a == 0x38D]
++    ped = [bytes(d) for a, d, _ in sends if a == gi.REMAPPED_IDS.command_addr]
++    return dict(gas=float(C.gas), law=(float(C._gas_law) if has_law else None),
++                wire=(ped[0] if ped else None), brake=(brk[0] if brk else None),
++                latches=(bool(C.overspeed_released), bool(C.coast_zero_latched), bool(C.gas_launching),
++                         bool(C.fca11_brake.gas_hold)))
++
++
++def _two_mode_scan(off, on, tol_lsb=0.5):
++  """Every frame: the deployed pedal inside the ON controller is OFF's pedal BITWISE, ON's published pedal is <= it,
++  the four latches are equal, the 0x38D frames are byte-identical and the pedal wire is never above OFF's. Returns the
++  numbers instead of asserting, so a RED run prints the defect's size."""
++  res = dict(frames=len(off), worst_lsb=-1e9, first_pos=None, n_pos=0, n_law=0, n_latch=0, n_brake=0, n_wire=0,
++             n_above_law=0, n_clear=0, worst_wire_lsb=-1e9)
++  for i, (a, b) in enumerate(zip(off, on)):
++    d = (b["gas"] - a["gas"]) * 255.
++    res["worst_lsb"] = max(res["worst_lsb"], d)
++    if d > tol_lsb:
++      res["n_pos"] += 1
++      if res["first_pos"] is None:
++        res["first_pos"] = i
++    if a["law"] is not None and b["law"] is not None:
++      if b["law"] != a["gas"]:          # bitwise: same code, same carried state
++        res["n_law"] += 1
++      if not b["gas"] <= b["law"]:
++        res["n_above_law"] += 1
++    if b["latches"] != a["latches"]:
++      res["n_latch"] += 1
++    if b["brake"] != a["brake"]:
++      res["n_brake"] += 1
++    wa, wb = _wire_pedal(a["wire"]), _wire_pedal(b["wire"])
++    if a["gas"] > 0. and a["wire"] is not None and wa == 0.:
++      res["n_clear"] += 1                     # a fault CLEAR frame: the slot carried zero while the pedal was live
++    if not (np.isnan(wa) and np.isnan(wb)):
++      dw = (wb - wa) * 255. if (np.isfinite(wa) and np.isfinite(wb)) else 0.
++      res["worst_wire_lsb"] = max(res["worst_wire_lsb"], dw)
++      if dw > tol_lsb:
++        res["n_wire"] += 1
++  return res
++
++
++class TestPedalHoldFit47:
++  """0047: the pedal law's hold feedforward (the pedal fraction it commands at accel = 0) re-measured from the car's logs.
++
++  The deployed table's 5-15 m/s leg came from a driver STEADY-PEDAL fit that over-reads (it pools accelerating
++  frames), so at ask 0 the car accelerated instead of holding: median +0.19 m/s^2 over 25 routes / 390 segments /
++  298,341 foot-off frames, peaking at +0.29 at 4-7 m/s, and +0.07..+0.10 at 12-20 m/s
++  (F-SIM-PEDAL-FF-2026-11-20.md). HOLD_FIT_* is the pedal that measured ZERO net accel in each band. It meets the
++  deployed table exactly at 0 m/s and at 20 m/s and up, so the highway law and cruise hold are untouched.
++  """
++
++  # The REAL 2026-11-19 route 000001ac window 59:36.5-59:40.6 (10 Hz, engaged): vEgo 3.85 -> 5.30 m/s at ask 0.00 with
++  # the pedal commanded 605-637 raw (0.071-0.080 pedal) - the creep behind the RV. ask is 0.00 for the whole window
++  # apart from two one-frame dithers (0.058, 0.012) and the closing -0.07/-0.17.
++  WIN_V = [3.852, 3.905, 3.981, 4.021, 4.067, 4.11, 4.157, 4.188, 4.238, 4.284, 4.324, 4.376, 4.4, 4.429,
++           4.466, 4.535, 4.593, 4.627, 4.656, 4.68, 4.731, 4.779, 4.817, 4.85, 4.888, 4.928, 4.969, 5.017,
++           5.077, 5.104, 5.145, 5.206, 5.26, 5.299]
++  WIN_ASK = [0.542, 0.538, 0.131, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
++             0.0, 0.058, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.012, 0.0, 0.0, 0.0, 0.0, 0.0,
++             0.0, 0.0, 0.0, 0.0, -0.073, -0.165]
++
++  def _ci(self, fit=True):
++    CarInterface, CP, CP_SP = _get_ci_hold(fit)
++    # getattr: on a pre-0047 tree the field does not exist at all and the pin must fail BY VALUE, not by AttributeError
++    assert getattr(CP_SP, "pedalHoldFit", fit) is fit
++    return CarInterface(CP, CP_SP)
++
++  @staticmethod
++  def _sp(mode=1):
++    sp = structs.CarControlSP()
++    sp.driveMode = int(mode)
++    return sp
++
++  def _gas(self, CI, series):
++    """[(accel, v_ego)] per 100 Hz frame -> the controller's pedal command (fraction) per frame."""
++    out = []
++    for i, (accel, v) in enumerate(series):
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = CC.longActive = True
++      CC.actuators.accel = float(accel)
++      CI.update([])
++      CI.CS.out.vEgo = float(v)
++      CI.CS.out.vCruise = 255.
++      CI.CS.out.brakePressed = False
++      CI.CS.out.gasPressed = False
++      CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
++      out.append(float(CI.CC.gas))
++    return out
++
++  def _gas_active(self, CI, frames):
++    """[(accel, v_ego, long_active)] per 100 Hz frame -> the pedal command per frame; longActive varies, so an
++    inactive frame commands 0 and closes the episode exactly as a real disengage does."""
++    out = []
++    for i, (accel, v, active) in enumerate(frames):
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = True
++      CC.longActive = bool(active)
++      CC.actuators.accel = float(accel)
++      CI.update([])
++      CI.CS.out.vEgo = float(v)
++      CI.CS.out.vCruise = 255.
++      CI.CS.out.brakePressed = False
++      CI.CS.out.gasPressed = False
++      CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
++      out.append(float(CI.CC.gas))
++    return out
++
++  def _wire(self, CI, series):
++    """The 0x700 command bytes per SEND SLOT (even frames) - what the pedal actually receives."""
++    out = []
++    for i, (accel, v) in enumerate(series):
++      CC = structs.CarControl()
++      CC.enabled = CC.latActive = CC.longActive = True
++      CC.actuators.accel = float(accel)
++      CI.update([])
++      CI.CS.out.vEgo = float(v)
++      CI.CS.out.vCruise = 255.
++      CI.CS.out.brakePressed = False
++      CI.CS.out.gasPressed = False
++      _, sends = CI.apply(CC.as_reader(), self._sp(1), i * int(DT_CTRL * 1e9))
++      for a, d, _ in sends:
++        if a == gi.REMAPPED_IDS.command_addr:
++          out.append((i, bytes(d)))
++    return out
++
++  # ---- the switch ---------------------------------------------------------------------------------------------------
++  def test_param_defaults_off_and_reads_the_key(self):
++    _, _, off = _get_ci_hold(False)
++    assert getattr(off, "pedalHoldFit", None) is False
++    assert off.enableGasInterceptor is True
++    for val, want in ((True, True), ("1", True), (b"1", True), (False, False), ("0", False), ("true", False), (2, False)):
++      fingerprint = {i: {} for i in range(8)}
++      fingerprint[0] = {**BASE_FINGERPRINT, **REM}
++      CarInterface = interfaces[CAR_UNDER_TEST]
++      CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++      CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
++                                         docs=False)
++      setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}, {"HyundaiPedalHoldFit": val}])
++      assert CP_SP.pedalHoldFit is want, (val, CP_SP.pedalHoldFit)
++    # a stale libparams (key absent -> None) is OFF, never an exception
++    fingerprint = {i: {} for i in range(8)}
++    fingerprint[0] = {**BASE_FINGERPRINT, **REM}
++    CarInterface = interfaces[CAR_UNDER_TEST]
++    CP = CarInterface.get_params(CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release=False, docs=False)
++    CP_SP = CarInterface.get_params_sp(CP, CAR_UNDER_TEST, fingerprint, [], alpha_long=False, is_release_sp=False,
++                                       docs=False)
++    setup_interfaces(CarInterface, CP, CP_SP, [{"HyundaiGasInterceptor": True}])
++    assert CP_SP.pedalHoldFit is False
++
++  def test_table_shape_matches_the_measurement(self):
++    """The fitted table is the measured zero-net-accel pedal per band, meets the deployed one at 0 and >= 20 m/s,
++    and is strictly lower in between (that is the defect it corrects)."""
++    assert gi.HOLD_FIT_BP[0] == 0. and gi.HOLD_FIT_V[0] == 0.          # any pedal at a standstill is uncommanded motion
++    assert len(gi.HOLD_FIT_BP) == len(gi.HOLD_FIT_V)
++    assert gi.HOLD_FIT_BP == sorted(gi.HOLD_FIT_BP)
++    for v in (0., 20., 22., 25., 27., 30., 35., 40.):
++      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(gi.get_hold_command(v), abs=1e-12), v
++    for v in (2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18.):
++      h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
++      assert 0. < h_on < h_off, (v, h_on, h_off)
++    # monotone non-decreasing below the highway junction (a hold table that dips would command a lift while speeding up)
++    xs = [gi.get_hold_command(v, hold_fit=True) for v in (2., 4., 6., 8., 10., 12., 14., 16., 18., 20.)]
++    assert xs == sorted(xs), xs
++    # the measured zero-net-accel values at the breakpoints. UPDATED for 0047 REVISION 2 (F-HOLD-DERIVE-2026-11-20):
++    # the table is now the DERIVED value AT each node (3/4/5/6/8 m/s moved from 0.044/0.049/0.057/0.060/0.060), so the
++    # pins are the node values themselves rather than the first fit read at band midpoints.
++    for v, want in ((2., 0.014), (3., 0.032), (4., 0.038), (5., 0.044), (6., 0.050), (8., 0.052), (10., 0.063),
++                    (12., 0.066), (16., 0.070)):
++      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(want, abs=1e-9), v
++    # ... and each of the revised bands still lands on its DERIVED band hold within 0.005 pedal (the derivation's bins
++    # are 1 cm wide and its route-clustered CI90 is 0.006-0.016, so 0.005 is the tight end of what a node can be held to)
++    for v, want in ((3.5, 0.038), (4.5, 0.038), (5.5, 0.050), (7.5, 0.047), (9.0, 0.057)):
++      assert gi.get_hold_command(v, hold_fit=True) == pytest.approx(want, abs=0.005), v
++    # the DEPLOYED table is untouched by this patch (no global redefinition)
++    assert gi.HOLD_CMD_V == [pytest.approx(x) for x in (0., 0.08, 0.085, 0.095, 0.1224, 0.1548, 0.1764, 0.2016)]
++
++  # ---- OFF = the deployed law, byte for byte ------------------------------------------------------------------------
++  def test_off_path_is_the_deployed_table_and_bypass_reproduces_it(self):
++    series = ([(1.0, 2.0)] * 40 + [(0.0, 4.5)] * 60 + [(-0.2, 6.0)] * 40 + [(0.25, 8.0)] * 40 +
++              [(0.0, 15.0)] * 60 + [(-0.4, 22.0)] * 40 + [(0.0, 26.0)] * 60 + [(0.6, 30.0)] * 40)
++    off = self._wire(self._ci(False), series)
++    # the ON controller with the flag bypassed IS the OFF controller, byte for byte
++    ci_bypass = self._ci(True)
++    ci_bypass.CC.hold_fit = False
++    assert self._wire(ci_bypass, series) == off
++    # ... and the real switch DOES move the wire on that same series (the test is not vacuous)
++    assert self._wire(self._ci(True), series) != off
++    # OFF's pedal command is the deployed law's, evaluated directly
++    for accel, v in ((0.0, 4.5), (0.0, 10.0), (0.3, 6.0), (-0.15, 8.0)):
++      assert gi.get_pedal_command(accel, v, gi.PERSONALITY_STANDARD, False) == pytest.approx(
++        gi.get_pedal_command(accel, v), abs=1e-12)
++      assert gi.get_hold_command(v, hold_fit=False) == pytest.approx(float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V)))
++
++  def test_highway_is_bit_identical_20_ms_and_up(self):
++    """20 m/s and up is the frozen highway law: ON must be identical to OFF on EVERY send slot, not approximately."""
++    series = [(0.0, 20.0)] * 120 + [(0.4, 22.5)] * 80 + [(-0.3, 26.0)] * 80 + [(0.0, 30.0)] * 80 + [(0.8, 34.0)] * 80
++    assert self._wire(self._ci(True), series) == self._wire(self._ci(False), series)
++
++  @pytest.mark.parametrize("riselag", [True, False])
++  def test_highway_rise_from_a_steady_pedal_is_bit_identical(self, riselag):
++    """The highway law is identical DYNAMICALLY too, not only in the steady state the test above checks: from a steady
++    pedal at a constant 20-36 m/s, through mild rises (< 0.5 m/s^2, the soft re-entry band), a deliberate rise and a dip,
++    the switch-ON controller publishes OFF's pedal bit for bit and the same 0x700 bytes. RED on e04f25ed89, whose 20 m/s
++    node was the literal 0.1224, one float ulp below the deployed 0.36 * 0.34: at 20-25 m/s ON's steady pedal then sat
++    1 ulp under the deployed hold and only ON climbed on the soft re-entry cap (up to 1.49 LSB less for ~0.2 s)."""
++    ov = {} if riselag else {"HyundaiGasRiseLag": False}
++    for v in (20.0, 20.5, 21.0, 22.0, 22.5, 24.0, 25.0, 27.5, 30.0, 34.0, 36.0):
++      rows = ([dict(ask=0.0, v=v)] * 300 + [dict(ask=0.3, v=v)] * 60 + [dict(ask=0.0, v=v)] * 200 +
++              [dict(ask=0.45, v=v)] * 60 + [dict(ask=-0.2, v=v)] * 60 + [dict(ask=0.8, v=v)] * 60)
++      off, on = self._pair(rows, ov)
++      bad = [i for i, (a, b) in enumerate(zip(off, on)) if a["gas"] != b["gas"] or a["wire"] != b["wire"]]
++      worst = max((a["gas"] - b["gas"]) * 255. for a, b in zip(off, on))
++      assert not bad, (v, riselag, bad[0], len(bad), worst)
++    # the fitted 20-35 m/s nodes ARE the deployed nodes (not retyped literals)
++    assert list(gi.HOLD_FIT_BP[-4:]) == list(gi.HOLD_CMD_BP[-4:]) and list(gi.HOLD_FIT_V[-4:]) == list(gi.HOLD_CMD_V[-4:])
++
++  def test_standstill_commands_exactly_zero(self):
++    on = self._gas(self._ci(True), [(0.0, 0.0)] * 200 + [(-0.5, 0.0)] * 100)
++    assert max(on) == 0.
++
++  # ---- what it does to the incident window --------------------------------------------------------------------------
++  def test_incident_window_creep_is_removed(self):
++    """The 2026-11-19 59:37-59:40 fixture: the deployed law commands the hold that produced +0.23..+0.44 m/s^2; the
++    fitted one commands the pedal that measured ~0 net accel there (11-20 m/s^2 per unit pedal at 4-6 m/s)."""
++    rows = [(a, v) for a, v in zip(self.WIN_ASK, self.WIN_V) for _ in range(10)]   # 10 Hz fixture -> 100 Hz frames
++    on = self._gas(self._ci(True), rows)
++    off = self._gas(self._ci(False), rows)
++    k0 = 30                                                          # the window opens on the +0.54 closing ask
++    d = [o - n for o, n in zip(off[k0:], on[k0:])]
++    assert min(d) > 0., min(d)                                       # ON is strictly less pedal on every creep frame
++    assert 0.026 < float(np.median(d)) < 0.042, float(np.median(d))   # deployed 0.064-0.085 vs fitted 0.038-0.046 pedal
++    # the measured plant gain at 4-6 m/s is 11.5-20 m/s^2 per unit pedal, so this is 0.17-0.44 m/s^2 of thrust the
++    # deployed law was adding at ask 0 - the window measured +0.34 m/s^2 (aEgo) with a grade term of only +0.03
++    assert 11.5 * float(np.median(d)) > 0.15, 11.5 * float(np.median(d))
++    # ... and once the rate limiter has walked down, ON sits exactly on the fitted table (no artefact in the fixture)
++    checked = settle = 0
++    for i in range(50, len(rows) - 1):
++      if rows[i][0] != 0.:                                           # the two one-frame ask dithers reset the settle
++        settle = 0
++        continue
++      settle += 1
++      if settle < 8:                                                 # a fall of <= 8 LSB is walked down over ~6 frames
++        continue
++      assert on[i] == pytest.approx(float(np.interp(rows[i][1], gi.HOLD_FIT_BP, gi.HOLD_FIT_V)), abs=0.002), (i, on[i])
++      checked += 1
++    assert checked > 200                                             # not vacuous: most of the window is ask 0.00
++
++  # ---- the dip-then-rise direction invariant ------------------------------------------------------------------------
++  def test_rise_out_of_a_dip_never_commands_more_than_the_deployed_law(self):
++    """0047 FIX (dip-then-rise): ON must NEVER command more pedal than the deployed (OFF) law from the same state.
++
++    The one path that broke this was the 17c soft re-entry cap. It was proportional to each arm's OWN hold, and a rise
++    whose starting pedal sits BELOW both holds is the state where that is not monotone: the ON arm (lower hold) reaches
++    its own hold FIRST, switches to the full jerk rate while the OFF arm is still on its slower cap, and overtakes it.
++    Measured on the 0047 REVISION 1 code at 18 m/s, dip ask -0.02 for 10 frames, then ask +0.45: ON +12.137 LSB
++    (= 0.0476 pedal, ~+0.17 m/s^2 for 0.24 s) ABOVE the deployed law - a state the pack's 1,088-point grid never built.
++    RED on that code (the max assertion below fires at every combo); GREEN now for two independent reasons: the re-entry
++    cap and its "reached the hold -> full rate" test use the DEPLOYED hold in both modes, and since REVISION 3 the
++    published pedal is also min(fitted law, deployed law), so no cap behaviour can put it above the deployed law.
++    """
++    # the soft cap itself: the DEPLOYED hold / PEDAL_REENTRY_TIME_S in BOTH modes (this is the fix, at unit level)
++    for v in (12., 15., 18., 19.):
++      want = min(float(np.interp(v, gi.HOLD_CMD_BP, gi.HOLD_CMD_V)) / gi.PEDAL_REENTRY_TIME_S, gi.get_pedal_rate_up(v))
++      assert gi.get_pedal_reentry_rate(v) == pytest.approx(want, abs=1e-12), v
++      assert gi.rate_limit_pedal_command(0.20, 0.05, v, reentry=True) == pytest.approx(
++        min(0.05 + want * DT_CTRL, 0.20), abs=1e-12), v
++    # the trajectory, DRIVEN through the real controller (0047 REVISION 3: a poke of `CC.gas` no longer sets the
++    # deployed state `_gas_law`, so the common state has to be reached the way a drive reaches it): settle at ask 0,
++    # a short 0.10 m/s^2 dip that walks BOTH pedals down through the re-entry band, then the deliberate rise. The
++    # assertion is the invariant, on every frame: ON never above the deployed law, and ON settles materially below it.
++    worst = 9.
++    for v, ask in ((18., 0.45), (17., 0.30), (16., 0.60), (14., 0.20)):
++      rows = ([dict(ask=0.0, v=v)] * 300 + [dict(ask=-0.10, v=v)] * 6 + [dict(ask=ask, v=v)] * 250)
++      off, on = self._pair(rows)
++      d = [(a["gas"] - b["gas"]) * 255. for a, b in zip(off, on)]           # positive = ON commands LESS pedal
++      assert min(d) >= -0.5, (v, ask, min(d))                                # never above the deployed command
++      worst = min(worst, min(d))
++      # ... and the two arms are not the same run: ON settles materially BELOW the deployed command
++      assert d[-1] > 1.0, (v, d[-1])
++    assert worst >= -0.5
++
++  def test_negative_branch_stays_continuous_through_zero(self):
++    """No step at ask 0: the continuous negative branch and the positive/hold branch meet on the SAME hold, so a
++    dithering ask across zero cannot command a step (the 16a / review-C3 class of defect)."""
++    ci = self._ci(True)
++    out = []
++    for a in [0.0, -0.02, 0.0, -0.05, 0.02, -0.10, 0.0] * 20:
++      out.extend(self._gas(ci, [(a, 4.0)]))
++    h = gi.get_hold_command(4.0, hold_fit=True)
++    assert all(abs(x - h) < 0.01 or x == 0. for x in out[-40:]), (h, out[-40:])
++
++  # ---- R1-R4: the four measured ways ON used to command MORE pedal than the deployed law --------------------------
++  def _pair(self, rows, overrides=None):
++    """Drive OFF and ON through the REAL controller on ONE identical input sequence; return (off_trace, on_trace)."""
++    off, on = _Hold47Arm(False, overrides), _Hold47Arm(True, overrides)
++    return [off.step(**r) for r in rows], [on.step(**r) for r in rows]
++
++  def test_r1_one_frame_into_the_coast_zero_band(self):
++    """R1 (Opus review of 946df3b989): the over-speed release latch was only re-evaluated on frames the coast-zero latch
++    let through, and ON's coast-zero latch (decided with the LOWER fitted hold) was a strict superset of OFF's. ONE
++    frame of an ask inside ON's-only band (v 18 m/s, set 62 km/h, ask +0.20 either side) let OFF latch the exact-zero
++    release while ON skipped it; ON then climbed back to its hold - +32.203 LSB, 148 frames above +0.5 LSB, still
++    rising. RED on 946df3b989 and 35f90eedad; GREEN here because the latch is decided with the deployed hold."""
++    v, vcs = 18.0, 62.0
++    coast = gi.fca11_cont_coast(v)
++    h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
++    enter_on = coast * (1 - gi.COAST_ZERO_ENTER_PEDAL / h_on)
++    enter_off = coast * (1 - gi.COAST_ZERO_ENTER_PEDAL / h_off)
++    need_mid = 0.5 * (enter_on + enter_off)      # ON (old code) enters coast-zero, OFF does not
++    assert enter_on != enter_off
++    rows = ([dict(ask=0.2, v=v, vc=vcs)] * 200 + [dict(ask=-need_mid, v=v, vc=vcs)] +
++            [dict(ask=0.2, v=v, vc=vcs)] * 150)
++    off, on = self._pair(rows)
++    r = _two_mode_scan(off, on)
++    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, r
++    # the release latches in BOTH modes on the one-frame dip, and the pedal stays at exactly 0 afterwards
++    assert all(t["latches"][0] for t in off[201:])
++    assert all(t["latches"][0] for t in on[201:])
++    assert max(t["gas"] for t in on[201:]) == 0.
++    assert max(t["gas"] for t in off[201:]) == 0.
++
++  def test_r2_hysteresis_band_latches_the_release_in_both_modes(self):
++    """R2: the same defect entered without an ask jump. Set 62 km/h, ask -0.40 at 0.3 m/s over the set speed (both
++    coast-zeroed), then an ask between the two EXIT thresholds (OFF leaves coast-zero, ON stays), then 0.6 m/s over the
++    set speed (OFF sets the release), back inside the band, then ask -0.20: OFF held exactly 0, ON held 0.032 pedal on
++    the continuous branch for 199 frames (+8.182 LSB). RED on 946df3b989 and 35f90eedad; GREEN here."""
++    v = 18.0
++    vc_kph = 62.0
++    coast = gi.fca11_cont_coast(v)
++    h_on, h_off = gi.get_hold_command(v, hold_fit=True), gi.get_hold_command(v)
++    exit_on = coast * (1 - gi.COAST_ZERO_EXIT_PEDAL / h_on)
++    exit_off = coast * (1 - gi.COAST_ZERO_EXIT_PEDAL / h_off)
++    vcm = vc_kph / 3.6
++    assert exit_on != exit_off
++    mid = -(exit_off + exit_on) / 2
++    rows = ([dict(ask=-0.40, v=vcm + 0.3, vc=vc_kph)] * 60 +
++            [dict(ask=mid, v=vcm + 0.3, vc=vc_kph)] * 20 +
++            [dict(ask=mid, v=vcm + 0.6, vc=vc_kph)] * 20 +
++            [dict(ask=mid, v=vcm + 0.3, vc=vc_kph)] * 20 +
++            [dict(ask=-0.20, v=vcm + 0.3, vc=vc_kph)] * 200)
++    off, on = self._pair(rows)
++    r = _two_mode_scan(off, on)
++    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, r
++    assert all(t["latches"][0] for t in off[100:]) and all(t["latches"][0] for t in on[100:])
++    assert max(t["gas"] for t in on[140:]) == 0.
++
++  @pytest.mark.parametrize("f", [0.38, 0.55])
++  def test_r3_small_fall_walk_is_never_above_the_deployed_law(self, f):
++    """R3 (review Finding 2): with HyundaiGasRiseLag OFF the small-fall walk applies only to falls <= 8 LSB, so it is not
++    monotone across modes once the two pedals differ: OFF's fall can be > 8 LSB (applied at once) while ON's, from a
++    lower pedal, is <= 8 (walked at PEDAL_JERK_DOWN) and ON ends ABOVE OFF. 6.3 m/s, settle at ask 0, then one step of
++    ask = -(1-f)·coast(v): f = 0.38 gives +4.575 LSB on 946df3b989 for 11 frames. RED on 946/35f; GREEN here because the
++    published pedal is min(fitted law, deployed law) - the deployed law's own (untouched) walk cannot be overtaken."""
++    ov = {"HyundaiGasRiseLag": False}
++    v = 6.3
++    ask = -(1.0 - f) * gi.fca11_cont_coast(v)
++    rows = [dict(ask=0.0, v=v)] * 300 + [dict(ask=ask, v=v)] * 60
++    off, on = self._pair(rows, ov)
++    r = _two_mode_scan(off, on)
++    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, (f, r)
++    # the two arms are not the same run: ON settles materially below the deployed law at ask 0
++    assert (off[299]["gas"] - on[299]["gas"]) * 255. > 5.
++
++  def _r4(self, lead_pre=4, v=5.0, dip=-1.5, lead=(15.0, -6.0), push=3, tail=400, lead_after=0):
++    """The adaptive R4 sequence from sim/hold-fix2/mine/repro_window.py, ported: settle at ask 0 inside the 0.5 m/s band,
++    a 3-frame dip (the rise lag keeps ON's target clipped to 0 while OFF's is live), a phantom closing lead turned on
++    `lead_pre` frames before the predicted ON-zero/OFF-live window (the brake slew needs ~12 frames to reach 1 LSB),
++    then the set speed pulled down for `push` frames (v > set + 0.5) and restored. ONE input sequence, identical in both
++    modes: only the lead's onset is placed from the predicted frame, never from the arms' own outputs."""
++    import math
++    vc_band = (v - 0.3) * CV.MS_TO_KPH
++    vc_push = (v - 0.6) * CV.MS_TO_KPH
++    off, on = _Hold47Arm(False), _Hold47Arm(True)
++    off_tr, on_tr = [], []
++
++    def step(r):
++      off_tr.append(off.step(**r))
++      on_tr.append(on.step(**r))
++
++    for _ in range(300):
++      step(dict(ask=0.0, v=v, vc=vc_band))
++    for _ in range(3):
++      step(dict(ask=dip, v=v, vc=vc_band))
++    h_off, scale = gi.get_hold_command(v), gi.get_pedal_scale(v)
++    lead_on_at = max(0, int(gi.GAS_RISE_LAG_TAU_S * math.log(dip / (-h_off / scale)) * 100) - lead_pre)
++    diverged_at = None
++    n = 0
++    while n < 200:
++      step(dict(ask=0.0, v=v, vc=vc_band, lead=(lead if n >= lead_on_at else None)))
++      n += 1
++      if on_tr[-1]["latches"][3] and not off_tr[-1]["latches"][3]:     # ON's throttle window only
++        diverged_at = len(off_tr) - 1
++        break
++    for _ in range(push):
++      step(dict(ask=0.0, v=v, vc=vc_push, lead=lead))
++    for k in range(tail):
++      step(dict(ask=0.0, v=v, vc=vc_band, lead=(lead if k < lead_after else None)))
++    return off_tr, on_tr, diverged_at
++
++  @pytest.mark.parametrize("lead_pre", [4, 8])
++  def test_r4_sub_bite_brake_window_is_the_deployed_window(self, lead_pre):
++    """R4: the sub-bite gate (and the 110 ms throttle window a SENT 1-3 LSB frame arms) was keyed on each mode's OWN
++    pedal. ON's pedal reaches exactly 0 first (the fitted hold clips to 0 at a negative LAGGED ask), so ON alone sent a
++    1-LSB phantom-lead brake frame and opened its window; while it is open the over-speed release is NOT evaluated, OFF
++    latched it, and when ON's window closed the entry test was already false -> ON climbed to its hold while OFF held 0.
++    +11.218 LSB for 379 frames, 1 brake frame differing (946df3b989 AND the review's prototype). RED on 946/35f; GREEN
++    here because the gate and the fault-clear schedule are keyed on the DEPLOYED pedal, so ON never opens an ON-only
++    window and the 0x38D frames are byte-identical."""
++    off, on, diverged_at = self._r4(lead_pre=lead_pre)
++    r = _two_mode_scan(off, on)
++    assert diverged_at is None, diverged_at            # no ON-only throttle window exists
++    assert r["worst_lsb"] <= 0.5 and r["n_pos"] == 0 and r["n_latch"] == 0 and r["n_law"] == 0, (lead_pre, r)
++    assert r["n_brake"] == 0, (lead_pre, r["n_brake"])
++    # the phantom lead really exercised the brake law (otherwise this pin would be vacuous)
++    assert any(t["latches"][3] for t in off)
++
++  # ---- the permanent randomised two-mode property test (the reviewer's prop_law.py, fast subset) --------------------
++  @staticmethod
++  def _random_stream(seed):
++    """One seeded adversarial input stream: speeds at every table node with ramps and steps, dips and rises, dithers,
++    hovering at the engine-braking cliff, cliff/positive zero-crossing trains, engagement drop-outs, gas/brake presses,
++    set speed unset or tracking vEgo, personality and drive-mode changes, and one of five pedal-parameter configs."""
++    rng = np.random.RandomState(seed)
++    n = int(rng.randint(50, 131))
++    nodes = [0., 2., 3., 4., 5., 6., 8., 10., 12., 14., 16., 18., 19., 20., 22., 25., 30., 35.]
++    v = np.zeros(n)
++    i = 0
++    cur = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
++    while i < n:
++      L = int(rng.randint(8, 60))
++      j = min(n, i + L)
++      kind = rng.choice(["hold", "ramp", "step"])
++      if kind == "hold":
++        v[i:j] = cur
++      elif kind == "ramp":
++        tgt = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
++        v[i:j] = cur + np.linspace(0, np.clip(tgt - cur, -0.03 * (j - i), 0.03 * (j - i)), j - i)
++        cur = float(v[j - 1])
++      else:
++        cur = max(0., float(rng.choice(nodes) + rng.uniform(-0.6, 0.6)))
++        v[i:j] = cur
++      i = j
++    a = np.zeros(n)
++    i = 0
++    while i < n:
++      kind = rng.choice(["hold", "dip_rise", "dither", "cliff", "zero_cross"], p=[0.2, 0.3, 0.15, 0.2, 0.15])
++      if kind == "hold":
++        L = int(rng.randint(8, 60))
++        seq = np.full(L, float(rng.choice([0., rng.uniform(-0.05, 0.05), rng.uniform(-0.6, 0.6),
++                                           rng.uniform(-2., -0.6), rng.uniform(0.6, 1.5)])))
++      elif kind == "dip_rise":
++        L = int(rng.randint(2, 31)) + int(rng.randint(15, 60))
++        seq = np.r_[np.full(int(rng.randint(2, 31)), float(rng.uniform(-0.6, -0.02))),
++                    np.full(int(rng.randint(15, 60)), float(rng.uniform(0.05, 1.0)))]
++      elif kind == "dither":
++        L = int(rng.randint(20, 60))
++        c, amp, f = float(rng.uniform(-0.6, 0.4)), float(rng.uniform(0.02, 0.4)), float(rng.uniform(2., 4.))
++        t = np.arange(L) * 0.01
++        seq = c + amp * (np.sign(np.sin(2 * np.pi * f * t)) if rng.rand() < 0.5 else np.sin(2 * np.pi * f * t))
++      elif kind == "cliff":
++        L = int(rng.randint(5, 50))
++        u = rng.uniform(-0.12, 0.05, L)
++        vv = [v[min(i + q, n - 1)] for q in range(L)]
++        seq = -np.array([0.365 * (1. - np.exp(-max(0., x) / 6.4)) for x in vv]) * (1. + u)
++      else:
++        L = int(rng.randint(8, 40))
++        lo = -0.365 * (1. - np.exp(-max(0., v[min(i, n - 1)]) / 6.4)) * float(rng.uniform(0.85, 1.05))
++        hi = float(rng.uniform(0., 0.45))
++        kk = int(rng.randint(1, 8))
++        seq = np.array([lo if (q // kk) % 2 == 0 else hi for q in range(L)])
++      L = min(len(seq), n - i)
++      a[i:i + L] = seq[:L]
++      i += max(L, 1)
++    active = np.ones(n, bool)
++    for _ in range(int(rng.poisson(0.8))):
++      s = int(rng.randint(0, n))
++      active[s:min(n, s + int(rng.randint(5, 40)))] = False
++    gas_p, brake_p = np.zeros(n, bool), np.zeros(n, bool)
++    for arr in (gas_p, brake_p):
++      for _ in range(int(rng.poisson(0.6))):
++        s = int(rng.randint(0, n))
++        arr[s:min(n, s + int(rng.randint(5, 40)))] = True
++    if rng.rand() < 0.35:
++      vc = np.full(n, 255.)
++    else:
++      base = float(v[0] * 3.6 + rng.uniform(-11, 7))
++      vc = np.clip(np.where(rng.rand() < 0.5, v * 3.6 + rng.uniform(-3.5, 1.0), base), 1., 254.)
++    pers = np.full(n, int(rng.randint(0, 3)), np.int8)
++    if rng.rand() < 0.2:
++      pers[int(rng.randint(0, n)):] = int(rng.randint(0, 3))
++    dm = np.full(n, 1 if rng.rand() < 0.8 else int(rng.choice([0, 2, 3, 7])), np.int8)
++    # pedal-reported fault windows (CS.interceptor_state != 0): these drive the fault-CLEAR schedule, which is keyed on
++    # the deployed pedal in both modes - the schedule's frames must be identical too
++    fault = np.zeros(n, np.int8)
++    for _ in range(int(rng.poisson(0.5))):
++      s = int(rng.randint(0, n))
++      fault[s:min(n, s + int(rng.randint(5, 60)))] = 1
++    cfgs = ({}, {"HyundaiGasRiseLag": False}, {"HyundaiPedalDeliveryLaw": False}, {"HyundaiFca11Brake": False},
++            {"HyundaiPedalDeliveryLaw": False, "HyundaiGasRiseLag": False, "HyundaiFca11Brake": False})
++    return dict(n=n, v=v, ask=a, active=active, gas=gas_p, brake=brake_p, vc=vc, pers=pers, dm=dm, fault=fault,
++                cfg=cfgs[int(rng.choice(len(cfgs)))], tog_at=int(rng.randint(1, n)), tog_dir=int(rng.randint(0, 2)))
++
++  def test_two_mode_property_random_sequences(self):
++    """The permanent randomised two-mode test (the reviewer's prop_law.py, 300-sequence fast subset). Per sequence the
++    SAME input stream drives OFF, ON and TOG (ON, with `hold_fit` flipped mid-sequence in either direction - the car
++    reads the key once at start, so TOG is a test-only mode). Asserted on EVERY frame: the deployed pedal inside the ON
++    controller equals OFF's pedal BITWISE, ON's published pedal is <= it (exactly - no tolerance), all four latches are
++    equal, every 0x38D frame is byte-identical, and the pedal wire is never above OFF's. The long run (4,000 sequences
++    over 4.66 M frames) is sim/hold-fix2/prop_law.py; this subset is what regression-tests the rule in CI."""
++    total = checked = 0
++    clears = 0
++    for seed in range(300):
++      S = self._random_stream(seed)
++      off, on = _Hold47Arm(False, S["cfg"]), _Hold47Arm(True, S["cfg"])
++      tog = _Hold47Arm(S["tog_dir"] == 0, S["cfg"])
++      off_tr, on_tr, tog_tr = [], [], []
++      for i in range(S["n"]):
++        if i == S["tog_at"]:
++          tog.CI.CC.hold_fit = (S["tog_dir"] == 1)
++        kw = dict(ask=S["ask"][i], v=S["v"][i], vc=S["vc"][i], active=bool(S["active"][i]),
++                  gas_pressed=bool(S["gas"][i]), brake_pressed=bool(S["brake"][i]), fault=int(S["fault"][i]),
++                  personality=int(S["pers"][i]), drive_mode=int(S["dm"][i]))
++        off_tr.append(off.step(**kw))
++        on_tr.append(on.step(**kw))
++        tog_tr.append(tog.step(**kw))
++      for name, tr in (("on", on_tr), ("tog", tog_tr)):
++        r = _two_mode_scan(off_tr, tr)
++        assert r["worst_lsb"] <= 0.5 and r["n_law"] == 0 and r["n_latch"] == 0 and r["n_brake"] == 0 \
++            and r["n_wire"] == 0 and r["n_above_law"] == 0, (seed, S["cfg"], name, r)
++        clears += r["n_clear"]
++      total += len(off_tr)
++      checked += 1
++    assert checked == 300 and total > 20000, (checked, total)
++    assert clears > 100, clears        # not vacuous: the fault-clear schedule really fired on both modes' runs
+diff --git a/opendbc/sunnypilot/car/interfaces.py b/opendbc/sunnypilot/car/interfaces.py
+index d35896de..e745a692 100644
+--- a/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc/sunnypilot/car/interfaces.py
+@@ -212,6 +212,17 @@ def _initialize_hyundai_gas_interceptor(CP: structs.CarParams, CP_SP: structs.Ca
+   # CarParams build time => a toggle takes effect at the NEXT ignition. OFF = the deployed law, byte for byte.
+   if _param_truthy(params_dict.get("HyundaiPedalDeliveryLaw")):
+     CP_SP.pedalDeliveryLaw = True
++  # 0047 HOLD FIT (HyundaiPedalHoldFit, PERSISTENT BOOL, default "0" = OFF): the pedal law's hold feedforward
++  # (hold_cmd(v), the "pedal fraction that holds speed on flat ground") re-measured from the car's own logs. The
++  # deployed 5-15 m/s leg came from a driver STEADY-PEDAL fit that over-reads, so at ask 0 the car accelerated
++  # +0.12..+0.29 m/s^2 instead of holding (peak at 4-7 m/s; the 2026-11-19 59:37-59:40 creep behind the RV), and the
++  # 12-20 m/s leg was ~25 % high. ON uses the measured HOLD_FIT_* table, which is identical to the deployed one at
++  # 0 m/s and at 20 m/s and up, so the highway law and cruise hold are untouched by construction. Same truthy parser
++  # and same "missing key on a stale libparams -> OFF" rule as the sibling Hyundai keys; it rides the pedal feature
++  # (this function only runs with the pedal armed). Read at CarParams build time => a toggle takes effect at the NEXT
++  # ignition. OFF = the deployed law, byte for byte.
++  if _param_truthy(params_dict.get("HyundaiPedalHoldFit")):
++    CP_SP.pedalHoldFit = True
+   # 0042-Z RISE-LAG (HyundaiGasRiseLag, PERSISTENT BOOL, default "0" = OFF): a first-order lag on the accel ask applied
+   # to RISES ONLY, ahead of the pedal law (gas_interceptor.filter_gas_rise). Lane Y measured the small NORMAL-mode gas
+   # moves as real 1.3-2 s planner requests, not pedal artefacts, so the ask is the only lever; the lag slows a rise

@@ -43,13 +43,15 @@ Two rules the swap keeps:
 """
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
+from collections import deque
 
 from jetlink import protocol as P
 from jetlink.comma import gadget
-from jetlink.openpilot.model_state import JetlinkModelState
+from jetlink.openpilot.model_state import HOLD_WINDOW, JetlinkModelState
 from jetlink.transport.priority import background_thread
 
 # after a join fails or the large model dies mid-drive. Long enough not to
@@ -118,6 +120,60 @@ RECONNECTING = {LOST: ('reconnecting', 'lost'), BEHIND: ('fell behind, reconnect
                 BAD_OUTPUT: ('bad output, reconnecting', 'bad_output')}
 # how long a model name the comma's index did not have stays the sha's
 NAME_RETRY = 30.0
+# The warm hand-back (JoiningModelState(warm_handback=True); off by default,
+# and off is main's frame path call for call). A hand-back resets the small
+# model, and its first frames from the reset plan whatever their empty history
+# gives: on the drive of 2026-11-21 its first 4 planned 14 to 20 m/s whatever
+# the car's speed, and three times, steering active, put a 0.4 to 0.65 m/s^2
+# jump into the steering command for about a quarter of a second. Every
+# hand-back that drive came after 3 to 5 held frames, so from the frame after
+# the large model's first held frame the small model is reset once and then
+# runs every frame unpublished, in the large model's wait (its frame is on the
+# link first and collected after, as prepare, send and end split it): at a
+# hand-back it is already past its reset, and is not reset again. It stops
+# warming after this many frames the large model answered in time, and is
+# reset afresh at the next held frame
+WARM_QUIET = 20
+# a warm frame the comma took this long over (the large model's out, the small
+# model and the large model's in, to its answer) ends the warm-up for the swap:
+# its time is the camera frame's, and a frame that long would be dropped. The
+# large model's own wait is held to HOLD_FRAME from its warp's start whatever
+# the small model costs; this catches a small model that ran past it
+WARM_FRAME_BUDGET = 0.046
+# the most warm frames in any model_state.HOLD_WINDOW (10 s), counted across
+# warm-ups. The small model and the link's frame on one frame is the load that
+# took the driver monitoring model to ~16 Hz and selfdrived's commIssueAvgFreq
+# (d790583), and selfdrived judges that rate over 10 s. A host that holds one
+# frame in 10 to 40 never hands back, yet keeps one warm-up going or starts
+# another within WARM_QUIET most frames. Full, the warm-up ends as WARM_QUIET
+# ends it (the next hand-back resets, as without it) and none starts until the
+# window has room: at most 30 % of the frames in it
+WARM_MAX = 60
+# the small model's frames from its reset a hand-back logs the plan of: the
+# reset block (the model's image pair is a frame and the one 4 before it)
+WARM_LOGGED = 4
+# where the record reads a plan (modeld's parsed outputs['plan'], (1, 33, 15)):
+# the forward speed and lateral position columns, and the point 2.2 s ahead
+# (T_IDXS = 10 (i / 32)^2)
+PLAN_VX, PLAN_Y, PLAN_2S = 3, 1, 15
+
+
+def plan_point(outputs) -> tuple[float, float, float] | None:
+  """What a hand-back's record says of a frame's plan: its speed now and
+  2.2 s ahead (m/s) and its lateral position 2.2 s ahead (m), or None for
+  outputs without a finite plan of the shape modeld parses. Never raises: it
+  runs on the frame thread, for the log alone."""
+  try:
+    plan = outputs['plan']
+    point = (float(plan[0, 0, PLAN_VX]), float(plan[0, PLAN_2S, PLAN_VX]), float(plan[0, PLAN_2S, PLAN_Y]))
+  except Exception:
+    return None
+  return point if all(math.isfinite(v) for v in point) else None
+
+
+def said_points(points) -> str:
+  """Plans as the record says them: speed now and 2.2 s ahead, lateral position 2.2 s ahead."""
+  return '; '.join('no plan' if p is None else f'{p[0]:.1f}->{p[1]:.1f} m/s y {p[2]:+.2f} m' for p in points) or 'none'
 
 
 class JoiningModelState:
@@ -130,7 +186,7 @@ class JoiningModelState:
   """
 
   def __init__(self, small, connect, build, prepare=None, reset_small=None, *, progress, log, in_control=None,
-               name=None):
+               name=None, warm_handback=False):
     self._small = small
     self._active = small
     self._connect = connect
@@ -214,6 +270,32 @@ class JoiningModelState:
     self._record = threading.Event()
     self._record_path = gadget.MODELD
     self._name = name
+
+    # the warm hand-back (WARM_QUIET), only with a reset to warm from. All
+    # of it is the frame thread's, as _big is. _warming: the small model runs
+    # each frame unpublished from its reset; _warm: its frames since that
+    # reset; _quiet: frames answered in time since the last held one;
+    # _warm_off: why the warm-up is off for this swap, said once; _cold: a
+    # hand-back's record of the small model's first frames after it
+    self._warm_handback = bool(warm_handback) and reset_small is not None
+    self._warming = False
+    self._warm = 0
+    self._quiet = 0
+    self._warm_off: str | None = None
+    self._cold: dict | None = None
+    # for the record: the large model's last plan, the small model's first
+    # warm frames from its reset (what a cold hand-back would have published)
+    # and its last ones, and the warm-up's slowest timings (small model,
+    # done into the frame, whole frame; ms)
+    self._big_point = None
+    self._first_points: list = []
+    self._last_points: deque = deque(maxlen=WARM_LOGGED)
+    self._warm_ms = [0.0, 0.0, 0.0, 0.0]
+    self._reset_s = 0.0
+    # when the warm frames in the last HOLD_WINDOW ran (WARM_MAX)
+    self._warm_times: deque = deque()
+    if warm_handback and reset_small is None:
+      log.warning("jetlink: no reset of the small model to warm it from; every hand-back starts it cold")
 
     self._thread = threading.Thread(target=self._join_loop, daemon=True)
     self._thread.start()
@@ -340,31 +422,207 @@ class JoiningModelState:
     self._maybe_swap()
     if self._active is self._small:
       self._small_frames += 1
+      if self._cold is not None:
+        return self._run_small_recorded(bufs, transforms, inputs, after_enqueue)
       return self._small.run(bufs, transforms, inputs, after_enqueue)
     return self._run_big(bufs, transforms, inputs, after_enqueue)
 
   def _run_big(self, bufs, transforms, inputs, after_enqueue):
     big = self._big
+    if self._warm_handback and self._warming:
+      return self._run_big_warm(big, bufs, transforms, inputs, after_enqueue)
     started = time.monotonic()
     try:
       result = big.run(bufs, transforms, inputs, after_enqueue)
     except Exception as e:
-      failed = time.monotonic()
-      self._log.exception("jetlink: large model failed mid-drive, back to the small model")
-      self._demote(BAD_OUTPUT if isinstance(e, P.NotFinite) else LOST)
-      demoted = time.monotonic()
-      # re-run the frame rather than propagate: modeld's fallback is permanent,
-      # this one is retryable. after_enqueue is dropped, the large model may
-      # already have called it
-      result = self._small.run(bufs, transforms, inputs, None)
-      # all of it is one modeld frame, 42 to 107 ms measured with the small
-      # model warm. The dropped camera frames are forgiven
-      # (modeld sees the model change), but the log should say which part it was
-      done = time.monotonic()
-      self._log.warning("jetlink: fallback frame %.0f ms: link %.0f, demote %.0f, small model %.0f",
-                        (done - started) * 1e3, (failed - started) * 1e3,
-                        (demoted - failed) * 1e3, (done - demoted) * 1e3)
-      return result
+      return self._fall_back(e, bufs, transforms, inputs, started)
+    if self._warm_handback:
+      self._noted(big, result)
+    return self._ran_big(big, result)
+
+  def _fall_back(self, e, bufs, transforms, inputs, started, ran=None):
+    """The large model failed on this frame: back to the small model, which
+    drives it. Called inside the except clause, whose exception is logged.
+    `ran` is the small model's own output for this frame, from a warm run in
+    the large model's wait, published rather than run again: a second run of
+    one camera frame would put it in the small model's history twice."""
+    failed = time.monotonic()
+    self._log.exception("jetlink: large model failed mid-drive, back to the small model")
+    self._demote(BAD_OUTPUT if isinstance(e, P.NotFinite) else LOST)
+    demoted = time.monotonic()
+    if ran is not None:
+      self._log.warning("jetlink: fallback frame %.0f ms: link with the small model's warm run in its wait %.0f, "
+                        "demote %.0f; its warm output is this frame's", (demoted - started) * 1e3,
+                        (failed - started) * 1e3, (demoted - failed) * 1e3)
+      self._recorded(ran)
+      return ran
+    # re-run the frame rather than propagate: modeld's fallback is permanent,
+    # this one is retryable. after_enqueue is dropped, the large model may
+    # already have called it
+    result = self._small.run(bufs, transforms, inputs, None)
+    # all of it is one modeld frame, 42 to 107 ms measured with the small
+    # model warm. The dropped camera frames are forgiven
+    # (modeld sees the model change), but the log should say which part it was
+    done = time.monotonic()
+    self._log.warning("jetlink: fallback frame %.0f ms: link %.0f, demote %.0f, small model %.0f",
+                      (done - started) * 1e3, (failed - started) * 1e3,
+                      (demoted - failed) * 1e3, (done - demoted) * 1e3)
+    self._recorded(result)
+    return result
+
+  # -- the warm hand-back (WARM_QUIET); none of it runs while it is off ---------
+
+  def _run_big_warm(self, big, bufs, transforms, inputs, after_enqueue):
+    """A frame the large model drives while the small model warms: the large
+    model's frame goes on the link first, the small model runs this frame
+    unpublished in the wait, and the large model's answer is collected after
+    (JetlinkModelState's prepare, send and end, as its run() makes them). The
+    large model's frame keeps its own rules: its wait is HOLD_FRAME from its
+    warp's start whatever the small model took, so the small model's time
+    comes out of the wait, and a reply that came in the meantime is read. A
+    failure of the small model's run is the warm-up's alone (_warm_run); a
+    failure of the large model's is a hand-back, whose frame is the small
+    model's run of it, already made or made now."""
+    started = time.monotonic()
+    try:
+      big.prepare(bufs, transforms, inputs)
+      big.send(after_enqueue is not None)
+    except Exception as e:
+      # before the small model ran this frame: it runs it now, published
+      return self._fall_back(e, bufs, transforms, inputs, started)
+    sent = time.monotonic()
+    ran = self._warm_run(bufs, transforms, inputs)
+    warmed = time.monotonic()
+    try:
+      result = big.end(after_enqueue)
+    except Exception as e:
+      return self._fall_back(e, bufs, transforms, inputs, started, ran)
+    if ran is not None:
+      self._warm_timed(started, sent, warmed, time.monotonic())
+    self._noted(big, result)
+    return self._ran_big(big, result)
+
+  def _warm_run(self, bufs, transforms, inputs):
+    """The small model's unpublished run of this frame, from a reset on the
+    warm-up's first. Never raises: a failure is said once and ends the
+    warm-up for this swap, and the hand-back resets the small model as
+    without one. None when it did not run."""
+    reset = self._reset_small
+    self._reset_s = 0.0
+    try:
+      if self._warm == 0:
+        t0 = time.monotonic()
+        if reset is not None:
+          reset()
+        self._reset_s = time.monotonic() - t0
+      out = self._small.run(bufs, transforms, inputs, None)
+    except Exception:
+      self._log.exception("jetlink: the small model's warm run failed")
+      self._warm_stop('its warm run failed')
+      return None
+    self._warm += 1
+    self._warm_times.append(time.monotonic())
+    point = plan_point(out)
+    if len(self._first_points) < WARM_LOGGED:
+      self._first_points.append(point)
+    self._last_points.append(point)
+    return out
+
+  def _warm_timed(self, started: float, sent: float, warmed: float, done: float) -> None:
+    """A warm frame's timings, kept for the log. One whose small model ended
+    past WARM_FRAME_BUDGET from the large model's warp, less the reset on
+    the warm-up's first, ends the warm-up for this swap: that frame was
+    longer than a held one."""
+    small, into = warmed - sent - self._reset_s, warmed - started - self._reset_s
+    t = self._warm_ms
+    t[0], t[1], t[2] = max(t[0], small * 1e3), max(t[1], into * 1e3), max(t[2], (done - started) * 1e3)
+    t[3] = max(t[3], self._reset_s * 1e3)
+    if into > WARM_FRAME_BUDGET:
+      self._log.warning("jetlink: the small model's warm run ended %.1f ms into the frame, past the %.0f ms budget "
+                        "(large model out %.1f, small model %.1f, reset %.1f ms)", into * 1e3,
+                        WARM_FRAME_BUDGET * 1e3, (sent - started) * 1e3, small * 1e3, self._reset_s * 1e3)
+      self._warm_stop(f'a warm run ended {into * 1e3:.1f} ms into its frame')
+
+  def _warm_stop(self, why: str) -> None:
+    """No more warm frames this swap: the hand-back resets the small model,
+    as without the warm-up."""
+    self._warm_off = why
+    self._warming, self._warm = False, 0
+    self._log.warning("jetlink: the small model's warm-up is off until the next swap: %s", why)
+
+  def _noted(self, big, result) -> None:
+    """After a frame the large model drove: a held frame starts the warm-up,
+    from the next frame; WARM_QUIET frames answered in time end it."""
+    self._big_point = plan_point(result)
+    now, times = time.monotonic(), self._warm_times
+    while times and now - times[0] > HOLD_WINDOW:
+      times.popleft()
+    if len(times) >= WARM_MAX:
+      if self._warming:
+        self._log.warning("jetlink: the small model stops warming: %d warm frames in %.0f s, the most it may run",
+                          len(times), HOLD_WINDOW)
+        self._warming, self._warm, self._quiet = False, 0, 0
+      return
+    if getattr(big, 'held', False):
+      self._quiet = 0
+      if not self._warming and self._warm_off is None:
+        self._warming, self._warm = True, 0
+        self._warm_ms = [0.0, 0.0, 0.0, 0.0]
+        self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
+        self._log.warning("jetlink: the large model held a frame; the small model is reset and runs from the next "
+                          "one unpublished, warm for a hand-back")
+    elif self._warming:
+      self._quiet += 1
+      if self._quiet >= WARM_QUIET:
+        self._log.warning("jetlink: the large model answered %d frames in time; the small model stops warming after "
+                          "%d frames (small model up to %.1f ms, done up to %.1f ms into the frame, frame up to "
+                          "%.1f ms, reset %.1f ms)", self._quiet, self._warm, *self._warm_ms)
+        self._warming, self._warm, self._quiet = False, 0, 0
+
+  def _demote_warm(self, why: str) -> None:
+    """_demote's reset with the warm-up on: none when the small model has
+    run the large model's last frames from its own reset, a reset as without
+    the warm-up when it has not. The hand-back's record starts here."""
+    warm = self._warm if self._warming else 0
+    if warm == 0 and self._reset_small is not None:
+      self._reset_small()
+    self._cold = {'why': why, 'warm': warm, 'off': self._warm_off, 'big': self._big_point,
+                  'first': list(self._first_points) if warm else [], 'last': list(self._last_points) if warm else [],
+                  'ms': list(self._warm_ms), 'after': []}
+    self._warming, self._warm, self._quiet = False, 0, 0
+
+  def _run_small_recorded(self, bufs, transforms, inputs, after_enqueue):
+    """The small model's frame after a hand-back, its plan kept for the record."""
+    result = self._small.run(bufs, transforms, inputs, after_enqueue)
+    self._recorded(result)
+    return result
+
+  def _recorded(self, result) -> None:
+    """The hand-back's record, said once it has WARM_LOGGED of the small
+    model's published frames: warm or cold, and the plans of the small
+    model's first published frames, the large model's last frame, and, when
+    warm, the small model's first warm frames (what a cold hand-back would
+    have published) and its last ones."""
+    cold = self._cold
+    if cold is None:
+      return
+    cold['after'].append(plan_point(result))
+    if len(cold['after']) < WARM_LOGGED:
+      return
+    self._cold = None
+    if cold['warm']:
+      ms = cold['ms']
+      how = (f"warm, not reset: {cold['warm']} frames run unpublished (small model up to {ms[0]:.1f} ms, done up to "
+             f"{ms[1]:.1f} ms into the frame, frame up to {ms[2]:.1f} ms, its reset {ms[3]:.1f} ms); its first warm "
+             f"frames planned {said_points(cold['first'])}, its last {said_points(cold['last'])}")
+    else:
+      how = 'cold, reset at the hand-back' + (f" (warm-up off: {cold['off']})" if cold['off'] else '')
+    self._log.warning("jetlink: hand-back record (%s): the small model was %s. Its first %d published frames "
+                      "planned %s; the large model's last frame %s", cold['why'], how, len(cold['after']),
+                      said_points(cold['after']), said_points([cold['big']]))
+
+  def _ran_big(self, big, result):
+    """After a frame the large model drove and answered or held."""
     if not getattr(big, 'held', False):
       self._output_at = time.monotonic()
     if self._loading:
@@ -413,12 +671,21 @@ class JoiningModelState:
     # no wake: the record says the swap with the first answer, which wakes it
     self._handovers += 1
     self._active = big
+    if self._warm_handback:
+      # a swap starts cold, with the warm-up on if the large model splits its
+      # frame as JetlinkModelState does (prepare, send, end)
+      split = all(callable(getattr(big, name, None)) for name in ('prepare', 'send', 'end'))
+      self._warming, self._warm, self._quiet = False, 0, 0
+      self._warm_off = None if split else "the large model's frame is not split (prepare, send, end)"
+      self._cold, self._big_point = None, None
+      self._first_points, self._last_points = [], deque(maxlen=WARM_LOGGED)
 
   def _demote(self, why: str) -> None:
     """Back to the small model, from a reset history. On the frame thread, so
     nothing here waits: the join thread reads the port, reports and closes
     the link, moments later. Counted as a lost link or a hand-back for lag,
-    and backed off."""
+    and backed off. With the warm hand-back on, a small model that warmed
+    through the large model's last frames is not reset (_demote_warm)."""
     big, self._big = self._big, None
     if why in LAGS:
       self._lags += 1
@@ -430,7 +697,9 @@ class JoiningModelState:
     self._active = self._small
     self._handed_over()
     self._loading = True
-    if self._reset_small is not None:
+    if self._warm_handback:
+      self._demote_warm(why)
+    elif self._reset_small is not None:
       self._reset_small()
 
   def _handed_over(self) -> None:
@@ -784,4 +1053,24 @@ def join(parts, cam_w: int, cam_h: int, small) -> JoiningModelState:
 
   return JoiningModelState(small, connect, build, prepare, reset_small=lambda: ready['reset_small'](),
                            progress=parts.progress, log=parts.log, in_control=op.in_control,
-                           name=parts.models.name_for)
+                           name=parts.models.name_for, warm_handback=warm_handback(op, parts.log))
+
+
+def warm_handback(op, log) -> bool:
+  """The adapter's warm_handback() (interface.ModelSide), asked once: True
+  and nothing else turns the warm hand-back on. Off without the member, and
+  off, said, when it raises or answers something else."""
+  ask = getattr(op, 'warm_handback', None)
+  if ask is None:
+    return False
+  try:
+    answer = ask()
+  except Exception:
+    log.exception("jetlink: the adapter's warm_handback() failed; every hand-back starts the small model cold")
+    return False
+  if answer is not True:
+    if answer not in (False, None):
+      log.error("jetlink: the adapter's warm_handback() answered %r, not True or False; the warm-up is off", answer)
+    return False
+  log.warning("jetlink: the small model is kept warm for a hand-back (warm_handback)")
+  return True

@@ -96,6 +96,8 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
+    if gui_app.sunnypilot_ui():
+      AugmentedRoadViewSP.render_top_overlays(self, self._content_rect)
 
     # End clipping region
     rl.end_scissor_mode()

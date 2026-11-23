@@ -160,6 +160,14 @@ class ModelSide(WorkerSide, Protocol):
     frame thread at a hand-back, so it zeroes the history in place and
     allocates and compiles nothing; warp.reset_queues makes one."""
 
+  def warm_handback(self) -> bool:
+    """Optional (OPTIONAL): should the small model be kept warm for a
+    hand-back? True turns on joining.WARM_QUIET's warm-up: from the frame
+    after the large model's first held frame, the small model is reset and
+    runs every frame unpublished in the large model's wait, and a hand-back
+    after it does not reset it. Off without the member, or with anything but
+    True. Asked once on modeld's main thread; a raise is off, said."""
+
   def model_warp(self, small: Any, cam_w: int, cam_h: int, model_w: int, model_h: int) -> FrameWarp | None:
     """Optional (OPTIONAL): the warp the link sends frames through, warmed,
     or None for openpilot's driving warp pickle at warp_path (warp.Warp). For
@@ -237,7 +245,7 @@ class FrameWarp(Protocol):
 # the protocols, where a name would be a member itself; a type checker still
 # asks for these, as typing has no optional member
 OPTIONAL: dict[type, tuple[str, ...]] = {
-  ModelSide: ('small_reset', 'model_warp'),
+  ModelSide: ('small_reset', 'model_warp', 'warm_handback'),
   SmallModel: ('desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL'),
   JoinedModel: ('get_action_from_model', 'constants', 'LAT_SMOOTH_SECONDS', 'LONG_SMOOTH_SECONDS', 'lat_delay'),
 }

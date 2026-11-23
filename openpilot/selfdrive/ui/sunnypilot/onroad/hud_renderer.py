@@ -64,6 +64,13 @@ class HudRendererSP(HudRenderer):
     self.circular_alerts_renderer.update()
     self.speed_renderer.update()
 
+  @property
+  def standstill_elapsed_time(self) -> float:
+    """Seconds the 3X standstill clock has been running (the same number the
+    "STOPPED" circle shows).  The clock itself lives with the circular alerts,
+    which update it every frame; the top overlay only reads it."""
+    return self.circular_alerts_renderer.standstill_elapsed_time
+
   def _get_icbm_status(self):
     if not self.pcm_cruise_speed and ui_state.sm['carControl'].enabled:
       if round(self.set_speed) != round(self.speed_cluster):
