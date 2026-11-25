@@ -60,11 +60,12 @@ class CircularAlertsRenderer:
         self._alert_img = self._lead_depart_alert_img
 
     elif ui_state.standstill_timer and self._is_standstill:
+      # The clock keeps running for the top-right pill (HoldTimerOverlay); this
+      # renderer no longer draws a stop timer of its own (owner, 2026-11-25:
+      # two stop timers, one has to go).  Keeping the clock here, in one place,
+      # means the pill shows the same number the circle used to.
       self._alert_img = None
       self._standstill_elapsed_time += 1.0 / gui_app.target_fps
-      minute = int(self._standstill_elapsed_time / 60)
-      second = int(self._standstill_elapsed_time - (minute * 60))
-      self._alert_text = f"{minute:01d}:{second:02d}"
       self._e2e_alert_frame += 1
 
     else:
@@ -88,7 +89,10 @@ class CircularAlertsRenderer:
     return ui_state.standstill_timer and self._is_standstill
 
   def render(self, rect: rl.Rectangle) -> None:
-    if not self._allow_e2e_alerts or (self._e2e_alert_display_timer <= 0 and not (ui_state.standstill_timer and self._is_standstill)):
+    # Only the e2e alerts (green light / lead departing) use this circle now.  The
+    # standstill clock is drawn by HoldTimerOverlay in the top-right corner, in every
+    # state, so there is exactly ONE stop timer on screen (owner, 2026-11-25).
+    if not self._allow_e2e_alerts or self._e2e_alert_display_timer <= 0:
       return
 
     e2e_alert_size = 250
@@ -103,11 +107,7 @@ class CircularAlertsRenderer:
     # Pulse logic
     is_pulsing = (self._e2e_alert_frame % gui_app.target_fps) < (gui_app.target_fps / 2.5)
 
-    # Standstill Timer (STOPPED) should be static white
-    if self._e2e_alert_display_timer == 0 and ui_state.standstill_timer and self._is_standstill:
-      frame_color = rl.Color(255, 255, 255, 75)
-    else:
-      frame_color = rl.Color(255, 255, 255, 75) if is_pulsing else rl.Color(0, 255, 0, 75)
+    frame_color = rl.Color(255, 255, 255, 75) if is_pulsing else rl.Color(0, 255, 0, 75)
 
     # Draw Circle
     rl.draw_circle_v(center, e2e_alert_size, rl.Color(0, 0, 0, 190))
@@ -134,22 +134,8 @@ class CircularAlertsRenderer:
     # Draw lines upwards from bottom
     current_y = bottom_y - (len(lines) * text_size * FONT_SCALE)
 
-    if self._e2e_alert_display_timer == 0 and ui_state.standstill_timer and self._is_standstill:
-      # Standstill Timer Text
-      alert_alt_text = "STOPPED"
-      top_text_size = 80
-      measure_top = measure_text_cached(font, alert_alt_text, top_text_size, spacing)
-      top_y = alert_rect.y + alert_rect.height / 3.5
-      rl.draw_text_ex(font, alert_alt_text, rl.Vector2(center.x - measure_top.x / 2, top_y), top_text_size, spacing, rl.Color(255, 175, 3, 240))
-
-      # Timer
-      timer_text_size = 100
-      measure_timer = measure_text_cached(font, self._alert_text, timer_text_size, spacing)
-      timer_y = (alert_rect.y + alert_rect.height) - (alert_rect.height / 5) - measure_timer.y
-      rl.draw_text_ex(font, self._alert_text, rl.Vector2(center.x - measure_timer.x / 2, timer_y), timer_text_size, spacing, rl.WHITE)
-    else:
-      for line in lines:
-        measure = measure_text_cached(font, line, text_size, spacing)
-        line_x = center.x - measure.x / 2
-        rl.draw_text_ex(font, line, rl.Vector2(line_x, current_y), text_size, spacing, txt_color)
-        current_y += text_size * FONT_SCALE
+    for line in lines:
+      measure = measure_text_cached(font, line, text_size, spacing)
+      line_x = center.x - measure.x / 2
+      rl.draw_text_ex(font, line, rl.Vector2(line_x, current_y), text_size, spacing, txt_color)
+      current_y += text_size * FONT_SCALE

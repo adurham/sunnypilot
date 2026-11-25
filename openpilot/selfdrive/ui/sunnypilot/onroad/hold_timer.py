@@ -4,24 +4,29 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-The standstill hold timer, drawn ALONGSIDE the alert on the comma 3X (tici).
+The standstill timer on the comma 3X (tici) - the ONLY one.
 
-Why this exists.  The standstill timer (Settings > Display > "Enable Standstill
-Timer") is drawn by CircularAlertsRenderer as the big "STOPPED 1:30" circle on the
-right of the 3X screen.  That whole layer is suppressed whenever ANY selfdrive
+History.  The standstill timer (Settings > Display > "Enable Standstill Timer")
+used to be drawn by CircularAlertsRenderer as the big "STOPPED 1:30" circle on
+the right of the 3X screen.  That whole layer is suppressed whenever ANY selfdrive
 alert is up (`_allow_e2e_alerts` requires `selfdriveState.alertSize == none`).
 During an openpilot (FCA11) hold an alert is up from the dead stop to the end:
 the small "stop complete - hold brake pedal" (fca11StopComplete) from +0.06 s,
 then the 0043 countdown ("Stopped - press the brake" at 1:00, "Press the brake
 now" at 1:30, the full-screen "Brakes release in 10 seconds" at 1:50, "BRAKES
-RELEASED" at 2:00).  Measured on the owner's 2026-11-19/20 drives: an alert on
-screen for the whole of every engaged hold (no alert-free stretch over 1.0 s), so
-the circle was never visible while openpilot held the car - only on stops the
-driver held himself.  (Review correction, 2026-11-20: the first write-up said the
-circle vanished only from 1:00.)
+RELEASED" at 2:00).  So the circle was hidden for the whole of every engaged hold
+and showed only on stops the driver held himself.  A first version of this file
+therefore added the pill ONLY while an alert was up, to fill that gap.
 
-This renderer puts the same clock in its own small pill in the TOP-RIGHT corner
-whenever an alert is up, drawn AFTER the alert renderer (see
+Owner, 2026-11-25: "there are two stop timers now, one of them needs to be
+removed."  The alert can clear mid-hold (a 2 s alert expires while the car is
+still standing), so the circle and the pill alternated on one stop - the same
+clock, two places.  The fix keeps ONE element: this pill draws whenever
+`StandstillTimer` is on and the car is standing still, alert or no alert, and
+CircularAlertsRenderer no longer draws a STOPPED timer at all (it keeps only the
+green-light / lead-departing e2e alerts).
+
+The pill is drawn AFTER the alert renderer (see
 AugmentedRoadViewSP.render_top_overlays), so it shows for the whole hold and
 survives even the full-screen banners.  The top-right corner is the one region no
 3X alert or HUD element occupies (alert text starts 200 px down; the MAX box and

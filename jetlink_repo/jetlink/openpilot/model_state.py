@@ -52,8 +52,16 @@ HOLD_FRAME = 0.046
 # More in a row than the client's deadline (link.INFERENCE_TIMEOUT, 0.2 s)
 # lets a quiet host run to, so a run of holds is always a host that answers,
 # late; one that has stopped answering fails the link first
-# (JetlinkClient.infer_begin), as a lost link
-HOLDS_IN_A_ROW = 5
+# (JetlinkClient.infer_begin), as a lost link.
+# 10, not 5 (2026-11-25): on the owner's 2026-11-24 drives the phone made
+# exactly ONE run of 5 holds in 3.3 and 5.3 minutes - 0.57 % and 0.24 % of its
+# frames past HOLD_FRAME - and each run handed the car back to the small model
+# where the swap gate then stayed shut for the rest of the drive (MADS). With
+# 10 those runs are tail, not a hand-back; a host that is actually behind still
+# trips HOLDS_ALLOWED (20 in 10 s), which no run of 5 comes near. Every held
+# frame is a plan ONE frame old, never older, so the cost of the longer run is
+# bounded by the same one frame.
+HOLDS_IN_A_ROW = 10
 HOLDS_ALLOWED = 20
 HOLD_WINDOW = 10.0
 # The first frames after a swap, which the fork holds engagement off for (a

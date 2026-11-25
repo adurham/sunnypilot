@@ -146,9 +146,25 @@ class TestWiring(unittest.TestCase):
     self.assertIn("render_top_overlays", sp_view)
     self.assertIn("self._hold_timer.render(", sp_view)
     self.assertIn("self._confidence_meter.render(", sp_view)
-    # the timer pill is gated on an alert being up (otherwise the circle shows it)
-    self.assertIn("AlertSize.none", sp_view)
     self.assertIn("ui_state.standstill_timer", sp_view)
+
+  def test_there_is_exactly_one_stop_timer(self):
+    """Owner, 2026-11-25: two stop timers on the 3X, one had to go.
+
+    The pill has to be the ONLY standstill timer: not gated on an alert being up
+    (that gate is what let the circle and the pill alternate on one stop), and the
+    circular-alerts renderer must no longer draw a STOPPED timer of its own.
+    """
+    sp_view = (REPO / "openpilot" / "selfdrive" / "ui" / "sunnypilot" / "onroad" / "augmented_road_view.py").read_text()
+    gate_start = sp_view.index("if ui_state.standstill_timer")
+    pill_gate = sp_view[gate_start:sp_view.index("self._hold_timer.render(")]
+    self.assertNotIn("AlertSize", pill_gate, "the pill must draw on every standstill, not only while an alert is up")
+    self.assertIn("carState'].standstill", pill_gate)
+
+    circular = CIRCULAR.read_text()
+    self.assertNotIn("alert_alt_text", circular, "the circle must not draw a second standstill timer")
+    self.assertIn("_standstill_elapsed_time += 1.0 / gui_app.target_fps", circular,
+                  "the shared clock must keep running - the pill reads it")
 
   def test_confidence_has_a_toggle_and_defaults_on(self):
     keys = (REPO / "openpilot" / "common" / "params_keys.h").read_text()

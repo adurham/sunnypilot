@@ -49,9 +49,11 @@ class AugmentedRoadViewSP:
     * The confidence dot (the comma 4's confidence ball) on the right edge - off
       while a FULL alert is up: an urgent takeover screen is not the place for it,
       and mici's own full alert covers the ball the same way.
-    * The standstill hold timer as a small pill, ONLY while an alert is up.  With
-      no alert the existing "STOPPED" circle already shows it, so this never
-      duplicates the timer.
+    * The standstill hold timer as a small pill in the top-right corner.  It is the
+      ONLY standstill timer on the 3X now (owner, 2026-11-25: "two stop timers ...
+      one of them needs to be removed"): the old STOPPED circle in
+      CircularAlertsRenderer no longer draws the clock, so the time shows in one
+      place, always the same place, whether an alert is up or not.
 
     Each element is drawn under its OWN guard (review fix, 2026-11-20): these run every frame in the process that also
     draws the alert layer, and the pill runs through every openpilot hold (an alert is up from the dead stop), so a
@@ -69,8 +71,7 @@ class AugmentedRoadViewSP:
       except Exception:
         self._top_overlay_failed("confidence meter")
 
-    if (ui_state.standstill_timer and alert_size != log.SelfdriveState.AlertSize.none
-            and ui_state.sm['carState'].standstill):
+    if ui_state.standstill_timer and ui_state.sm['carState'].standstill:
       try:
         self._hold_timer.render(content_rect, self._hud_renderer.standstill_elapsed_time)
       except Exception:
