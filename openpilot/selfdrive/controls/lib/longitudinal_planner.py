@@ -290,7 +290,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
-    t_follow = LongitudinalPlannerSP.get_t_follow(self, sm, v_ego)  # fork: adaptive follow distance (None = stock)
+    t_follow = LongitudinalPlannerSP.get_effective_t_follow(self, sm, v_ego)  # fork: adaptive follow + optional earlier braking
     self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality, t_follow=t_follow)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)

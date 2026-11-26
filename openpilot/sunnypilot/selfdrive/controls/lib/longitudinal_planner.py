@@ -17,6 +17,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolve
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.fork.adaptive_follow import AdaptiveFollow, is_throttle_only
+from openpilot.sunnypilot.fork.planner_earlier import PlannerEarlierBraking
 from openpilot.sunnypilot.fork.scc import ForkSmartCruiseControl
 from openpilot.sunnypilot.fork.setspeed_ease import SetSpeedEase
 
@@ -36,6 +37,7 @@ class LongitudinalPlannerSP:
     self.accel_boost_sp = AccelBoostSP()
     self.openpilot_longitudinal = CP.openpilotLongitudinalControl
     self.adaptive_follow = AdaptiveFollow(is_throttle_only(CP, CP_SP))
+    self.planner_earlier = PlannerEarlierBraking()  # fork: optional earlier lead/stop-approach braking
     self.setspeed_ease = SetSpeedEase()  # fork: gentler, personality-dependent chase of a raised target
 
     self.output_v_target = 0.
@@ -46,6 +48,37 @@ class LongitudinalPlannerSP:
     road_type = str(sm['liveMapDataSP'].roadType)  # unknown (enum default) until mapd publishes
     lead = sm['radarState'].leadOne
     return self.adaptive_follow.update(sm['selfdriveState'].personality, v_ego, road_type, lead.present, lead.vLead)
+
+  def get_effective_t_follow(self, sm: messaging.SubMaster, v_ego: float) -> float:
+    """Fork: apply the optional PlannerEarlierBraking time-gap offset to the MPC/gate follow distance.
+
+    When PlannerEarlierBraking is OFF (default) this returns the same t_follow the MPC would have used:
+    the adaptive-follow value if AdaptiveFollowDistance is ON, otherwise the stock personality T_FOLLOW.
+    When ON it adds planner_earlier.EXTRA_T_FOLLOW seconds to that base time gap, but only on the intended
+    approach frames: a closing/slower lead (v_ego > v_lead + 0.5 m/s), a braking lead, or a model-predicted stop.
+    The effective value is passed to LongitudinalMpc.update() as the lead_t_follow parameter and to the e2e
+    far-lead gate as d_des. This moves the timing of the lead/stop-approach plan; it does NOT change the FCA11
+    map, panda, engine braking, ACCEL_MIN/MAX, AccelBoost, NoClose cap, standstill-launch hold, stop-commit,
+    min-gap floor, or SCC/SLA arbitration. A matched or pulling-away lead is unaffected.
+    """
+    from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
+    from openpilot.sunnypilot.fork.planner_earlier import EXTRA_T_FOLLOW
+    t_follow = self.get_t_follow(sm, v_ego)
+    if t_follow is None:
+      t_follow = get_T_FOLLOW(sm['selfdriveState'].personality)
+
+    apply = False
+    lead = sm['radarState'].leadOne
+    if lead.present:
+      # closing/slower lead, or a stop directly behind a lead
+      apply = v_ego > lead.vLead + 0.5 or bool(sm['modelV2'].action.shouldStop)
+    else:
+      # e2e stop with no lead
+      apply = bool(sm['modelV2'].action.shouldStop)
+
+    if self.planner_earlier.enabled and apply:
+      t_follow += EXTRA_T_FOLLOW
+    return t_follow
 
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']
