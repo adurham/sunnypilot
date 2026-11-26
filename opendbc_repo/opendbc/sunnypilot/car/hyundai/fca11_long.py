@@ -1520,6 +1520,14 @@ FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT = (FCA11_STANDSTILL_HOLD_LSB /
 FCA11_DYN_DECREASE_MAX_DROP_LSB = 1           # the largest single-frame step the comfort rate may render as
 FCA11_DYN_STANDSTILL_MAX_DROP_LSB = 2        # ... and the standstill rate, so 30 -> 0 still fits in 0.5 s
 
+# *** FAST LAUNCH RELEASE (code switch, ENABLED in this shipped patch): from a standstill hold on a positive planner ask, release to <= 3 LSB at the panda rate ***
+# On a positive plan ask from a stop (a launch), drop the FCA11 request to <= 3 LSB at the panda's own per-frame rate
+# (HYUNDAI_FCA11_LONG_RATE_STEP, +4 LSB per sent frame) instead of walking the ~0.5 s comfort ramp. OFF keeps the comfort
+# ramp byte-for-byte. The rule applies ONLY to a release that starts from a standstill/stop-band hold while the planner is
+# asking to move forward (accel > 0). Untouched: hold at a stop, negative asks, driver taps, camera braking, the emergency
+# path, the throttle-exclusion window, and the launch-overlap feature (which stays OFF).
+FCA11_FAST_LAUNCH_RELEASE_ENABLED = True  # shipped ON in patch 0058
+
 
 def feel_gentle_gain(accel: float) -> float:
   """0051: the gentle-ask strength scale on the feel target: GENTLE_GAIN at/above GAIN_FADE_ACCEL, linear to 1.0 at the HARD
@@ -3103,6 +3111,11 @@ class Fca11LongBrake:
       hold = float(fca11_standstill_hold_lsb()) if standstill else float(FCA11_CONT_HOLD_FLOOR_LSB)
       target = (1.0 - bw) * target + bw * max(target, hold)
     target = max(0.0, min(float(FCA11_CONT_CEIL_LSB), target))
+    # FAST LAUNCH RELEASE: on a positive planner ask from a standstill hold, drop the hold at the panda's own per-frame
+    # rate (HYUNDAI_FCA11_LONG_RATE_STEP) until the level is <= 3 LSB. The caller's ok/withhold/cal/brake_now gates already
+    # excluded driver taps, camera braking and the emergency path. The rule is OFF by default; OFF leaves every number below
+    # byte-identical.
+    launch_release = bool(FCA11_FAST_LAUNCH_RELEASE_ENABLED and float(accel_ask) > 0.0 and standstill and prev > 3.0)
     # 0040-nz (lane N): a CORRECTION term must refine a level, never END an episode. The trim is a feedback term on the
     # level, so while a level is on the wire it may lower it to the weakest actuating step (1 LSB) but not to 0 as long
     # as the UNTRIMMED demand is still asking for the pads: an untrimmed demand of >= 0.5 LSB is exactly what
@@ -3135,7 +3148,11 @@ class Fca11LongBrake:
     if target >= prev:
       new_acc = min(target, prev + min(step, rate))
     else:
-      new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
+      if launch_release:
+        # panda's own per-frame rate down to <= 3 LSB (then normal release closes the next frame).
+        new_acc = max(0.0, prev - step)
+      else:
+        new_acc = max(target, prev - min(step, FCA11_CONT_JERK_DOWN_MULT * rate, float(FCA11_CONT_DOWN_STEP_LSB)))
     new_acc = max(0.0, new_acc)
     self._shape_acc = new_acc
     # 0040 v2: the WIRE quantiser (see the block below). The slew above stays continuous, and the demand is untouched.
@@ -3150,7 +3167,10 @@ class Fca11LongBrake:
     #      non-zero wire level, and the panda refused the frame -> _refused_cut -> fca11Unavailable).
     prev_wire = int(self._cont_q_last)
     dec = fca11_cont_qhyst(new_acc, self._cont_q_bus)
-    dec = max(dec, prev_wire - int(FCA11_CONT_DOWN_STEP_LSB))
+    # FAST LAUNCH RELEASE: the down-step clamp is the comfort-ramp limit (3 LSB / sent frame); during a launch release we
+    # drop at the panda's own +4 rate instead, so the clamp must allow a 4-LSB step. OFF path is unchanged.
+    down_step = int(HYUNDAI_FCA11_LONG_RATE_STEP) if launch_release else int(FCA11_CONT_DOWN_STEP_LSB)
+    dec = max(dec, prev_wire - down_step)
     # 0056: while the standstill clamp is engaged the wire carries the clamp's level, so the law's own panda-gate
     # reference is the level the LAW put on the wire last sent frame (`_ss_off_sent`) - exactly the `_dec_last_sent` it
     # would have had without the clamp. OFF (and whenever the floor is not engaged): `_dec_last_sent`, byte for byte.
@@ -3743,6 +3763,7 @@ class Fca11LongBrake:
     self._rel_acc = None               # 18x: nor a release ramp (a re-opened episode starts from the wire, not mid-ramp)
     self._rel_sent = 0
     self._rel_fast = False
+    self._rel_launch_fast = False
 
   def _feel_target(self, a_tgt: float, accel: float, personality, gain_speed: float = 1.0,
                    v_mps=None) -> int:
@@ -3844,15 +3865,17 @@ class Fca11LongBrake:
       return FCA11_FEEL_FIRST_LSB
     return FCA11_DYN_GENTLE_FIRST_LSB
 
-  def _dyn_release_level(self, frame: int, prev_sent: int, standstill: bool = False) -> int:
+  def _dyn_release_level(self, frame: int, prev_sent: int, standstill: bool = False, launch: bool = False) -> int:
     """18x (c): the level (raw CR_VSM_DecCmd) for ONE frame of a soft release ramp; 0 = the ramp is over, close now.
 
     The ramp starts from the level that is actually on the wire (``prev_sent``) and decreases by
     FCA11_DYN_DECREASE_LSB_PER_SENT per SENT frame (4 -> 0 in 0.27 s), or by
     FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT when it started from a standstill/stop-band hold (>= 8 LSB, 30 -> 0 in
-    FCA11_DYN_STANDSTILL_RELEASE_S = 0.5 s). It only ever LOWERS the command, it is capped by nothing else, and it never
-    exceeds the panda's gate. Non-send frames do not advance it (they are not transmitted). Nothing here is a safety
-    path: the CALLER decides whether a ramp is allowed at all (see _update_law), and every veto closes immediately."""
+    FCA11_DYN_STANDSTILL_RELEASE_S = 0.5 s). With FCA11_FAST_LAUNCH_RELEASE_ENABLED and a positive launch ask, the
+    standstill hold instead drops at the panda's own per-frame rate (HYUNDAI_FCA11_LONG_RATE_STEP) until the level on the
+    wire is <= 3 LSB, then closes. It only ever LOWERS the command, it is capped by nothing else, and it never exceeds
+    the panda's gate. Non-send frames do not advance it (they are not transmitted). Nothing here is a safety path: the
+    CALLER decides whether a ramp is allowed at all (see _update_law), and every veto closes immediately."""
     if self._rel_acc is None:
       if prev_sent <= 0:
         return 0                     # nothing on the wire -> there is nothing to ramp
@@ -3861,21 +3884,35 @@ class Fca11LongBrake:
       # the rate is latched at the start of the ramp: a release from the standstill/stop-band hold gets the 0.5 s ramp,
       # every other release the 0.3 LSB/frame comfort rate (from the 4 LSB floor that is 0.27 s).
       self._rel_fast = bool(standstill)
+      # fast launch release: positive planner ask from a standstill/stop-band hold, and the switch is ON.
+      self._rel_launch_fast = bool(FCA11_FAST_LAUNCH_RELEASE_ENABLED and launch and standstill)
     if frame % FCA11_SEND_EVERY != 0:
       return int(self._rel_sent)
-    step = (FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT if self._rel_fast
-            else FCA11_DYN_DECREASE_LSB_PER_SENT)
-    self._rel_acc = max(0.0, self._rel_acc - step)
-    # The emitted integer may never be more than max_drop LSB below the previous one, whatever the float accumulator does
-    # (rounding a 1.2 LSB step lands on a 2 LSB jump on the frames where the accumulator sits just above an integer). It
-    # only ever keeps the level HIGHER for a frame or two - slower to release, the safe direction - and it still walks to
-    # 0 because the bound is relative. The comfort rate is bounded at 1 LSB (= 0.1 m/s^2 per 20 ms); the standstill rate
-    # allows 2 so that 30 -> 0 still lands inside FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s): at 50 Hz a uniform 1 LSB/frame
-    # would take 0.6 s, and 0.2 m/s^2 is still 15x smaller than the deployed one-frame 30 -> 0 (3.0 m/s^2).
-    max_drop = FCA11_DYN_STANDSTILL_MAX_DROP_LSB if step > 1.0 else FCA11_DYN_DECREASE_MAX_DROP_LSB
-    level = max(int(round(self._rel_acc)), self._rel_sent - max_drop)
-    level = max(0, min(fca11_standstill_hold_lsb(), level))
-    self._rel_sent = level
+    if self._rel_launch_fast:
+      # panda's own per-frame rate ( +4 LSB / sent frame) down to <= 3 LSB, then the ramp ends.
+      step = float(HYUNDAI_FCA11_LONG_RATE_STEP)
+      max_drop = int(HYUNDAI_FCA11_LONG_RATE_STEP)
+      self._rel_acc = max(0.0, self._rel_acc - step)
+      level = max(int(round(self._rel_acc)), self._rel_sent - max_drop)
+      level = max(0, min(fca11_standstill_hold_lsb(), level))
+      if level <= 3:
+        # last actuating frame of the launch release: level is <= 3 LSB on the wire. Next call returns 0 (passive close).
+        self._rel_acc = 0.0
+        self._rel_sent = 0
+    else:
+      step = (FCA11_DYN_STANDSTILL_DECREASE_LSB_PER_SENT if self._rel_fast
+              else FCA11_DYN_DECREASE_LSB_PER_SENT)
+      self._rel_acc = max(0.0, self._rel_acc - step)
+      # The emitted integer may never be more than max_drop LSB below the previous one, whatever the float accumulator does
+      # (rounding a 1.2 LSB step lands on a 2 LSB jump on the frames where the accumulator sits just above an integer). It
+      # only ever keeps the level HIGHER for a frame or two - slower to release, the safe direction - and it still walks to
+      # 0 because the bound is relative. The comfort rate is bounded at 1 LSB (= 0.1 m/s^2 per 20 ms); the standstill rate
+      # allows 2 so that 30 -> 0 still lands inside FCA11_DYN_STANDSTILL_RELEASE_S (0.5 s): at 50 Hz a uniform 1 LSB/frame
+      # would take 0.6 s, and 0.2 m/s^2 is still 15x smaller than the deployed one-frame 30 -> 0 (3.0 m/s^2).
+      max_drop = FCA11_DYN_STANDSTILL_MAX_DROP_LSB if step > 1.0 else FCA11_DYN_DECREASE_MAX_DROP_LSB
+      level = max(int(round(self._rel_acc)), self._rel_sent - max_drop)
+      level = max(0, min(fca11_standstill_hold_lsb(), level))
+      self._rel_sent = level
     return level
 
   def _log_dyn_send(self, CS, frame: int, dec_cmd: int, accel: float, v_kph: float) -> None:
@@ -4737,6 +4774,7 @@ class Fca11LongBrake:
       self._rel_acc = None
       self._rel_sent = 0
       self._rel_fast = False
+      self._rel_launch_fast = False
       # 0029 CAL: latch whether THIS frame is part of a scripted hold AND the frame is being commanded
       # (ok True). This drives the gas neutralization in GasInterceptorCarController.create_gas_command.
       self._cal_active = bool(cal_on and ok)
@@ -4876,10 +4914,12 @@ class Fca11LongBrake:
       # The final frame of the ramp is the ordinary passive close below (level 0 -> the panda hand-back), so the close
       # frame, its frame number and the echo re-owe are the deployed ones.
       ramp = 0
+      launch = bool(accel > 0.0)
       if self.dynamic_brakes and was_braking and ok and not cal_on and not withhold and \
           not self._release_pending and self._attrib_hold == 0 and not self.brake_now:
         ramp = self._dyn_release_level(frame, prev_sent,
-                                       standstill=bool(getattr(CS.out, "standstill", False)) or self._feel_standstill_hold)
+                                       standstill=bool(getattr(CS.out, "standstill", False)) or self._feel_standstill_hold,
+                                       launch=launch)
       if ramp > 0:
         # one more ACTUATING frame at the ramped level: the episode stays open, the pedal stays at exactly 0 (braking),
         # and the panda's rate reference follows the decaying command down. A re-ask during the ramp does NOT reset the
