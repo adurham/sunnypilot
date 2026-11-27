@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from jetlink.openpilot import latency
 from jetlink.protocol import NotFinite
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
@@ -191,6 +192,14 @@ class JetlinkModelState:
     self._last_logged = 0.0
     self._last_hold_logged = 0.0
     self.trips = Trips()
+    # what each frame cost, stage by stage, joined with the server's own stamps
+    # by frame id: the numbers the slow-frame lines only carry for the frames
+    # that already missed (latency, JetlinkModelState.log_telemetry)
+    self.latency = latency.Latency()
+    # the client says when a reply is read, a held frame's late one included:
+    # nothing else ever looks at those, which censored every frame past the hold
+    self.client.on_reply = self._replied
+    self.client.on_stamps = self.latency.stamps
     # the frame prepared and not yet ended, if any
     self._frame: Frame | None = None
     # the newest output parsed, with what it parsed to: a held frame
@@ -210,19 +219,35 @@ class JetlinkModelState:
 
   def log_telemetry(self) -> None:
     """The server's health, piggybacked on the previous response, to the log
-    at 1 Hz. chestnutState is comma's board on the wire and a Jetson's
-    telemetry has no message of its own yet."""
+    at 1 Hz, with what this end measured of the frames since the last line:
+    chestnutState is comma's board on the wire and a Jetson's telemetry has no
+    message of its own yet.
+
+    The frame stages ride along rather than a line of their own: one line a
+    second is a drive's worth of log as it is, and a frame's stages and the
+    server's health are the same question asked of the same second."""
     telemetry = self.client.last_state
-    if not telemetry:
-      return
     now = time.monotonic()
     if now - self._last_logged < TELEMETRY_PERIOD:
       return
+    # drains the window: the frames answered since the last line, joined with
+    # the server's stamps where a newer phone sent them
+    measured = self.latency.report()
+    if not telemetry and not measured:
+      return
     self._last_logged = now
-    self._event("jetlinkTelemetry", dead=bool(self.client.dead), **telemetry)
+    fields = dict(telemetry or {})
+    fields.update(measured)
+    self._event("jetlinkTelemetry", dead=bool(self.client.dead), **fields)
     send = getattr(self.client.t, 'last_send', None)
     if send:
       self._event("jetlinkSend", nonce=self.client.nonce, frame=self._frame_id, totals=self.client.t.send_totals.copy(), **send)
+
+  def _replied(self, frame_id: int, at: float) -> None:
+    """A reply read off the link, whichever call read it. A held frame's late
+    answer lands here, a frame after the hold gave up on it: nothing else would
+    ever look at it, which left every frame past HOLD_FRAME out of the record."""
+    self.latency.replied(frame_id, at)
 
   def prepare(self, bufs: dict, transforms: dict[str, np.ndarray], inputs: dict[str, np.ndarray]) -> None:
     """Take this frame up: start the warp, and while the GPU runs it, read
@@ -269,8 +294,13 @@ class JetlinkModelState:
       self._log.warning("jetlink: frame %d send failed: %s", self._frame_id, getattr(self.client.t, 'last_send', {}))
       raise
     frame.sent = time.perf_counter()
+    # a frame the link could not take has no reply to wait for: it still cost
+    # the warp, and it counts as held (send's docstring)
+    self.latency.sent(self._frame_id, frame.t0, frame.t1, frame.t2, frame.sent if frame.seq is not None else None)
     if frame.seq is not None:
       self._need_reset = False
+    else:
+      self.latency.not_sent(self._frame_id)
 
   def end(self, after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:
     """The sent frame's output, as modeld blocks on a chestnut's, but not past
@@ -294,9 +324,19 @@ class JetlinkModelState:
         raise
     t4 = time.perf_counter()
     held = self.held = model_output is None
+    # a held frame's own reply is still out, and lands in a later drain: its
+    # lateness is measured from the hold's deadline when it does (_replied).
+    # A frame that did come back is this frame loop's own wait, timed from
+    # inside end()
+    if held:
+      self.latency.held(self._frame_id, frame.t0 + HOLD_FRAME)
+    elif frame.seq is not None:
+      self.latency.replied(self._frame_id, t4, waited_from=waiting_from)
     self.behind = self._note_hold(held)
     self.trips.record(t4 - frame.t0, self.client.last_timings[2])
     outputs = self._outputs(self.client.last_output if held else model_output)
+    # modeld has its outputs: the parse, the dict, and nothing after this
+    self.latency.published(self._frame_id, time.perf_counter())
     # a frame past the budget is a dropped camera frame; send against reply
     # says which end it was. Held frames are a steady few on a marginal host,
     # so after the first they go to the log at TELEMETRY_PERIOD

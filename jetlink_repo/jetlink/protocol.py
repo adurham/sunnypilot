@@ -82,6 +82,11 @@ class Msg(IntEnum):
                        # The client stops using the link: it handed the model back or is exiting.
                        # The connection may stay for a later HELLO_REQ. An older server answers
                        # ERROR unknown_message, which the client discards (JetlinkClient.leave)
+  FRAME_STAMPS = 20    # FrameStamps: what the server measured of one frame. Unsolicited,
+                       # after its INFER_RESP, and only for a request that set
+                       # Flag.WANT_STAMPS: an older server never sends one, and an
+                       # older client never asks, so neither end sees a message it
+                       # cannot place
 
 
 # Why a client stops using the link, LEAVE's json 'reason' (JetlinkClient.leave);
@@ -101,6 +106,11 @@ class Flag(IntEnum):
   WANT_HIDDEN = 1 << 2    # on INFER_REQ: keep hidden_state in the response, for
                           # a caller logging the whole output vector. 64 KB more
                           # on the big models; nothing else needs it.
+  WANT_STAMPS = 1 << 3    # on INFER_REQ: follow the reply with FRAME_STAMPS for
+                          # this frame. A server that does not know the flag ignores
+                          # it and answers as it always did; the comma then logs the
+                          # whole round trip, which holds the phone's own time and
+                          # the wire together (openpilot.latency)
   PADDED = 1 << 7         # one pad byte follows the payload; see PACKET_MULTIPLE
 
 
@@ -113,6 +123,20 @@ _infer_req = struct.Struct(INFER_REQ_FMT)
 INFER_RESP_FMT = '<IIIII'
 INFER_RESP_SIZE = struct.calcsize(INFER_RESP_FMT)
 _infer_resp = struct.Struct(INFER_RESP_FMT)
+
+# FRAME_STAMPS: frame_id, then what the server measured of that frame on its own
+# clock, in microseconds. The three spans, not timestamps: the phone's clock is
+# not the comma's, and no sync between them is worth trusting, so what crosses
+# is what only the phone can measure.
+#   queue_us   the request's arrival to the inference starting: the read, the
+#              wait for the host lock, the layout check
+#   infer_us   the inference: staging, the engine, reading the output back. The
+#              same span as INFER_RESP's total_us, from the same clock
+#   send_us    the inference's end to its reply written: the reply's own send
+# A frame's phone residence is their sum: what the comma cannot see for itself.
+FRAME_STAMPS_FMT = '<IIII'
+FRAME_STAMPS_SIZE = struct.calcsize(FRAME_STAMPS_FMT)
+_frame_stamps = struct.Struct(FRAME_STAMPS_FMT)
 
 
 # A frame over the phone's cable as UDP datagrams (TcpTransport.use_datagrams):
@@ -194,6 +218,14 @@ def pack_infer_resp(frame_id: int, status: int, gpu_us: int, queue_us: int, tota
 
 def unpack_infer_resp(buf, offset: int = 0) -> tuple[int, int, int, int, int]:
   return _infer_resp.unpack_from(buf, offset)
+
+
+def pack_frame_stamps(frame_id: int, queue_us: int, infer_us: int, send_us: int) -> bytes:
+  return _frame_stamps.pack(frame_id, queue_us, infer_us, send_us)
+
+
+def unpack_frame_stamps(buf, offset: int = 0) -> tuple[int, int, int, int]:
+  return _frame_stamps.unpack_from(buf, offset)
 
 
 class Status(IntEnum):

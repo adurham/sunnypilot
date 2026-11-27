@@ -56,6 +56,11 @@ StopFn = Callable[[], bool]
 # set, from what infer_end returns. The server keeps the hidden state, so ask for
 # it on those runs, or the log would carry zeros where it goes.
 RAW_PRED_ENV = 'SEND_RAW_PRED'
+# Ask every server for its own stamps on each frame (protocol FRAME_STAMPS): 48
+# bytes a frame, and the only way to tell the phone's own time from the wire
+# without guessing. A server that does not know the flag ignores it. Set to 1 to
+# keep them off, for an A/B run of the link against itself.
+NO_STAMPS_ENV = 'JETLINK_NO_STAMPS'
 
 
 class Sent(NamedTuple):
@@ -110,6 +115,14 @@ class JetlinkClient:
     # frames the server never answered this session, for the log: a lost
     # datagram is one, and to the caller a held frame like any late reply
     self.frames_lost = 0
+    # ask each frame for the server's own stamps (FRAME_STAMPS): what only the
+    # far end can measure of a frame, joined to this end's timing by frame id
+    self.want_stamps = not os.environ.get(NO_STAMPS_ENV)
+    # set by the frame loop that wants the frame-level latency picture: called
+    # with (frame_id, perf_counter) as a reply is read, whichever call read it,
+    # and with the server's spans as its stamps come off the link
+    self.on_reply: Callable[[int, float], None] | None = None
+    self.on_stamps: Callable[[int, int, int, int], None] | None = None
     # take a server's offer of frame datagrams (_take_datagrams); False keeps frames on the stream, for A/B runs
     self.allow_datagrams = True
 
@@ -186,6 +199,8 @@ class JetlinkClient:
                     str(state.get('sha256'))[:16], wanted[:16])
       else:
         self._engine_state = state
+    elif msg.msg_type == P.Msg.FRAME_STAMPS:
+      self._take_stamps(msg)
     elif msg.msg_type == P.Msg.ERROR:
       e = json.loads(bytes(msg.payload))
       if msg.seq in self._no_reply_wanted:
@@ -210,7 +225,7 @@ class JetlinkClient:
       msg = self.t.recv(timeout=remaining)
       if msg.msg_type == msg_type and msg.seq == seq:
         return msg
-      if msg.msg_type in (P.Msg.PROGRESS, P.Msg.ENGINE_RESP, P.Msg.ERROR):
+      if msg.msg_type in (P.Msg.PROGRESS, P.Msg.ENGINE_RESP, P.Msg.FRAME_STAMPS, P.Msg.ERROR):
         self._dispatch(msg)
         continue
       if msg.msg_type == P.Msg.INFER_RESP and any(f.seq == msg.seq for f in self._in_flight):
@@ -439,7 +454,8 @@ class JetlinkClient:
     packed = _as_bytes(packed, self.spec.packed_nbytes, 'packed')
     seq = self._next_seq()
     flags = ((P.Flag.RESET_QUEUES if reset else 0) | (P.Flag.WANT_STATE if want_state else 0)
-             | (P.Flag.WANT_HIDDEN if self.want_hidden else 0))
+             | (P.Flag.WANT_HIDDEN if self.want_hidden else 0)
+             | (P.Flag.WANT_STAMPS if self.want_stamps else 0))
     parts = (P.pack_infer_req(frame_id, flags), warped, packed)
     sent = Sent(seq, frame_id, flags, time.monotonic())
     timeout = self.deadline if deadline is None else deadline
@@ -488,12 +504,16 @@ class JetlinkClient:
     return self._take_reply(msg)
 
   def drain(self) -> int:
-    """Read every reply that has already arrived, without waiting for one that
+    """Read every message that has already arrived, without waiting for one that
     has not. How many frames were answered. What they carried is kept as
     last_output, last_timings and last_state, as infer_end keeps it; a frame
-    the server failed is this link's failure, as it would have been there."""
+    the server failed is this link's failure, as it would have been there.
+
+    It reads with nothing in flight too: a frame's FRAME_STAMPS follows its
+    reply, so without this the stamps would sit until the next frame's wait and
+    every latency window would be one frame short of its stamps."""
     answered = 0
-    while self._in_flight:   # with nothing out there is nothing to read for
+    while True:
       try:
         msg = self.t.recv(timeout=0)
       except LinkTimeout:
@@ -501,9 +521,13 @@ class JetlinkClient:
       except LinkError:
         self.dead = True
         raise
-      if msg.msg_type == P.Msg.INFER_RESP:
+      if msg.msg_type == P.Msg.INFER_RESP and self._in_flight:
         self._take_reply(msg)
         answered += 1
+      elif msg.msg_type == P.Msg.INFER_RESP:
+        # answers nothing this client still holds (a hello cleared the flight):
+        # dropped, as _expect drops one
+        log.warning('discarding stale %s seq=%d with nothing in flight', _name(P.Msg, msg.msg_type), msg.seq)
       else:
         self._dispatch(msg)
     return answered
@@ -535,6 +559,11 @@ class JetlinkClient:
       self.dead = True
       raise LinkError(f'inference response seq {msg.seq} answers no frame sent')
     _, frame_id, flags, _ = self._in_flight.popleft()
+    if self.on_reply is not None:
+      # the userspace read itself, before anything below can fail the frame:
+      # a reply that answered with NOT_FINITE was still a reply, and its
+      # lateness is what the caller needs to see
+      self.on_reply(frame_id, time.perf_counter())
     if msg.payload.nbytes < P.INFER_RESP_SIZE:
       self.dead = True
       raise LinkError('inference response is missing its header')
@@ -574,6 +603,17 @@ class JetlinkClient:
                   gpu_us / 1e3, queue_us / 1e3, total_us / 1e3)
     self.last_output = _whole_output(self.spec, np.frombuffer(msg.payload, np.float32, n, P.INFER_RESP_SIZE), whole)
     return self.last_output
+
+  def _take_stamps(self, msg: Message) -> None:
+    """One FRAME_STAMPS off the stream: what the server measured of a frame, on
+    its own clock, sent after the reply. A message that is not one is dropped:
+    the latency record is a log, never a reason to fail a frame."""
+    if msg.payload.nbytes < P.FRAME_STAMPS_SIZE:
+      log.warning('frame stamps are %d bytes, not %d; dropped', msg.payload.nbytes, P.FRAME_STAMPS_SIZE)
+      return
+    frame_id, queue_us, infer_us, send_us = P.unpack_frame_stamps(msg.payload)
+    if self.on_stamps is not None:
+      self.on_stamps(frame_id, queue_us, infer_us, send_us)
 
   def infer(self, warped: np.ndarray, packed: np.ndarray, frame_id: int = 0,
             reset: bool = False, deadline: float | None = None,
