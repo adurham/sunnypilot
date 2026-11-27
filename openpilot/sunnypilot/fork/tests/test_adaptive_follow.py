@@ -69,7 +69,7 @@ class TestClosingMargin(OpenpilotTestCase):
     self.assertEqual(af.closing_margin(0.5, 0.), 0.)
 
   def test_margin_matches_coast_physics(self):
-    # 30 m/s closing on a 28 m/s lead: coasting at 0.42 vs braking at 2.5 needs vrel^2/2*(1/0.42-1/2.5) extra metres
+    # 30 m/s closing on a 28 m/s lead: coasting at 0.42 vs braking at 2.5 needs vrel^2/2*(1/0.42-1/2.5) extra meters
     v, vl = 30., 28.
     expected = (2. ** 2 / 2. * (1. / 0.42 - 1. / 2.5)) / v
     self.assertAlmostEqual(af.closing_margin(v, vl), expected, places=6)

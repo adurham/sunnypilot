@@ -162,9 +162,9 @@ sleep 0.5
 # --- check ------------------------------------------------------------------
 log "digest rows: $(wc -l < "$DIGEST" 2>/dev/null || echo 0)"
 set +e
-EXTRA=""; [[ "$FRAMES" == "1" ]] && EXTRA="--strict-missing"
+EXTRA=(); [[ "$FRAMES" == "1" ]] && EXTRA=(--strict-missing)
 "$PY" -m openpilot.offload.replay.integrity check "$EXPECTED" "$DIGEST" \
-  --json "$RUN/integrity.json" $EXTRA | tee "$RUN/check.log"
+  --json "$RUN/integrity.json" "${EXTRA[@]}" | tee "$RUN/check.log"
 CHECK_RC=$?
 set -e
 

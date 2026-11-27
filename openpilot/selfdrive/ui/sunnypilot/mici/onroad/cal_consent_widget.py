@@ -159,7 +159,8 @@ class CalConsentWidget(Widget):
     recorded and the rep stays pending/expires -- never actuates. Binds to the EXACT prompt the owner
     saw (rep_id + plan_id + seq), so a tap for an older prompt of the same rep cannot fire a newer one."""
     doc = {"rep_id": self._rep_id, "plan_id": self._plan_id, "seq": self._seq,
-           "ts": time.time(), "accept": bool(accept)}
+           "ts": time.time(), "accept": bool(accept)}  # noqa: TID251 -- wall clock on purpose: the car layer
+    # compares this stamp against its own file-written prompt time, so it must be wall time, not monotonic
     tmp = self._consent_path + ".tmp"
     try:
       os.makedirs(self.dir, exist_ok=True)

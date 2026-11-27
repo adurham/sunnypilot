@@ -56,7 +56,7 @@ class HyundaiSettings(BrandSettings):
       [tr("Default"), tr("Dynamic"), tr("Predictive")], button_width=200,
       callback=self._on_tuning_selected, param="HyundaiLongitudinalTuning", inline=False)
 
-    # Following and stopping are longitudinal behaviours, not Hyundai-specific switches.
+    # Following and stopping are longitudinal behaviors, not Hyundai-specific switches.
     self.follow_header = _section(tr("Following and stopping"))
     self._elastic_desc = tr("Keeps one following gap at every personality, shrinking a little at highway speed.")
     self._no_close_desc = tr("Never speeds up to close on a car it can already see; it holds or coasts instead.")
@@ -147,7 +147,7 @@ class HyundaiSettings(BrandSettings):
 
     offroad = ui_state.is_offroad()
     # One-time migration: writes only when the new keys are absent, only offroad.  initialize_params()
-    # has already done the same at ignition, so the page never depends on this write for behaviour.
+    # has already done the same at ignition, so the page never depends on this write for behavior.
     if offroad:
       migrate_hyundai_settings(ui_state.params)
 
@@ -159,7 +159,7 @@ class HyundaiSettings(BrandSettings):
     self.mode_item.action_item.set_enabled(mode_toggle_state(offroad).enabled)
     self.mode_item.action_item.set_selected_button(state.mode)
     self.mode_item.set_description(self._offroad_hint(
-      tr("Choose what controls speed: the car's own cruise, the comma pedal, or the comma pedal plus FCA11 "
+      tr("Choose what controls speed: the car's own cruise, the comma pedal, or the comma pedal plus FCA11 " +
          "braking; the change takes effect at the next ignition."), offroad))
     self.mode_item.show_description(True)
     self.mode_item.set_visible(True)

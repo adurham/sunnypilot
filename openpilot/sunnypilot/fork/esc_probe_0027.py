@@ -996,7 +996,7 @@ def resolve_key(seed: bytes, key_mode: str, key_hex: str | None = None, algo: st
   identity2 = the seed's first 2 bytes; identity4 = first 4; identity8 = the whole seed; algo = the separate
   ``esc_probe_seedkey`` module's ``key_for(seed, algo)`` (``algo`` names a recovered G-scan algorithm, None -> its
   vendor-exact 27100 default); hex = the operator-supplied ``key_hex``. A missing/failing algo module, an unknown algo
-  name, a zero-byte seed the vendor path bails on (``key_for`` -> None), an unparseable hex string, or any length other
+  name, a zero-byte seed the vendor path bails on (``key_for`` -> None), an unparsable hex string, or any length other
   than 2/4/8 aborts the run (recorded).
 
   The 8-byte CONSTRUCTION modes wrap the same resolvers into exactly 8 wire bytes (the car proved 27 02 wants an 8-byte
@@ -1260,7 +1260,7 @@ class EscProbeClient:
     self._rx_frames()
 
   def wait(self, seconds: float) -> None:
-    """Phase-4 step 4: honour the vendor ``delaytime`` (~500 ms) before the key. Pumping the bus keeps the state fresh."""
+    """Phase-4 step 4: honor the vendor ``delaytime`` (~500 ms) before the key. Pumping the bus keeps the state fresh."""
     t_end = self.now() + seconds
     while self.now() < t_end:
       self._rx_frames()

@@ -16,7 +16,7 @@ missing", which is the failure this whole lane exists to prevent, so the chain i
   icon    BookmarkIconSP --feeds---->  mark_gesture.is_bad_mark
   typing  lone bookmarkButton --becomes--> verdict bad, source "touch2"
 
-Static source assertions are deliberate: they catch an unwiring, not a behaviour change (behaviour is covered by
+Static source assertions are deliberate: they catch an unwiring, not a behavior change (behavior is covered by
 test_mark_gesture.py, test_driver_mark.py and test_driver_mark_hook.py).
 """
 import ast
@@ -32,7 +32,7 @@ def _src(rel: str) -> str:
 
 def _init_args(rel: str, class_name: str) -> list[str]:
   """The parameter names of a class's ``__init__``, read from the source with AST (never imported: importing a mici UI
-  module initialises raylib, which segfaults in a test process that already loaded msgq)."""
+  module initializes raylib, which segfaults in a test process that already loaded msgq)."""
   for node in ast.walk(ast.parse(_src(rel))):
     if isinstance(node, ast.ClassDef) and node.name == class_name:
       for fn in node.body:
@@ -94,7 +94,7 @@ class TestBadMarkWiring(unittest.TestCase):
   def test_the_views_keep_their_arguments_in_the_right_slots(self):
     # The base view takes (bookmark_callback, bad_mark_callback, stream_type) and the sunnypilot view forwards all three,
     # so a later reorder of either signature would put a callback where the stream type belongs. Parsed, not imported:
-    # importing this module initialises raylib, which is not safe in a test process that already loaded msgq.
+    # importing this module initializes raylib, which is not safe in a test process that already loaded msgq.
     self.assertEqual(["self", "bookmark_callback", "bad_mark_callback", "stream_type"],
                      _init_args("openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py", "AugmentedRoadView"))
     self.assertEqual(["self", "bookmark_callback", "bad_mark_callback", "args", "kwargs"],

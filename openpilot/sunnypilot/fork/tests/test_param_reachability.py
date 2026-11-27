@@ -144,9 +144,9 @@ class TestParamReachability(unittest.TestCase):
     feeds it, so the branch that sets the CarParamsSP field is unreachable on the car and the writer lint still passes."""
     read = 'def setup(CP_SP, params_dict):\n  if params_dict.get("HyundaiFca11X"):\n    CP_SP.a = True\n'
     feed_without = 'def initialize_params(params):\n  keys = []\n  return [{k: params.get(k) for k in keys}]\n'
-    feed_with = ('def initialize_params(params):\n  keys = []\n'
-                 '  params_list = [{k: params.get(k) for k in keys}]\n'
-                 '  params_list.append({"HyundaiFca11X": params.get("HyundaiFca11X", return_default=True)})\n'
+    feed_with = ('def initialize_params(params):\n  keys = []\n' +
+                 '  params_list = [{k: params.get(k) for k in keys}]\n' +
+                 '  params_list.append({"HyundaiFca11X": params.get("HyundaiFca11X", return_default=True)})\n' +
                  '  return params_list\n')
     reg = {"HyundaiFca11X"}
     self.assertEqual(({"HyundaiFca11X"}, ["HyundaiFca11X"]), CPR._feed_gaps(read, feed_without, reg))

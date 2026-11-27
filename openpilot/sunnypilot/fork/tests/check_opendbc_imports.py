@@ -112,7 +112,7 @@ def main() -> int:
   ap = argparse.ArgumentParser()
   ap.add_argument("--tree", required=True, help="superproject tree to scan (prebuilt clone or a checkout)")
   ap.add_argument("--all", action="store_true",
-                  help="scan the whole tree (default: only the production <tree>/openpilot subtree; "
+                  help="scan the whole tree (default: only the production <tree>/openpilot subtree; " +
                        "tools/ scripts lag upstream renames and are not shipped to the device)")
   ap.add_argument("--opendbc", default=None, help="opendbc source root (default: <tree>/opendbc_repo)")
   a = ap.parse_args()
@@ -161,7 +161,7 @@ def main() -> int:
         if alias.name not in have and module_file(odb, node.module + "." + alias.name) is None:
           missing.append((str(py.relative_to(scan_root)), node.lineno, node.module, alias.name))
 
-  print(f"scanned {scanned} file(s) importing opendbc; resolved {len(cache)} opendbc module(s); "
+  print(f"scanned {scanned} file(s) importing opendbc; resolved {len(cache)} opendbc module(s); " +
         f"{star_checked} star-import(s) not name-checked")
   if missing:
     for path, lineno, module, name in missing:

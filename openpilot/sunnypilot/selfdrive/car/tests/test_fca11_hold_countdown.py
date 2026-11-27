@@ -280,7 +280,7 @@ def test_expiry_drops_longitudinal_and_keeps_lateral(rig, name, overrides, uem):
     assert ('mads', 'enabled', 'disabled') not in r.transitions, \
       f"[{name}] lateral must not be dropped by the expiry: {r.transitions}"
     # the mechanism: mads.update_events removes pcmDisable (mads.py l.205) before the MADS state machine looks at
-    # anything. Pinned so the reason lateral survives cannot be lost with the behaviour.
+    # anything. Pinned so the reason lateral survives cannot be lost with the behavior.
     assert out["pcm_disable_stripped"] is True, "mads.update_events must strip pcmDisable before its state machine"
   else:
     # MADS off: no lateral machine is running, so the expiry cannot "drop" one - assert it is off on both sides of the
@@ -334,7 +334,7 @@ def test_any_clear_drops_the_alert_and_the_enable_strip_on_that_frame(rig):
   WITH THE DRIVER'S GAS PEDAL DOWN, on a car driven away - speed alone never clears it, so an unattended roll and a
   one-frame wheel-speed glitch keep the alarm up) - it only reads `nag == 4` vs not. Both clears must therefore end the
   PERMANENT alert AND the pcmDisable/ENABLE strip on the frame the value drops, and the engage offered on that frame
-  must be honoured.
+  must be honored.
 
   This is the driven-away half's superproject contract: without it the hazard is fixed in the law and left standing in
   the alerts (the driver pulls away and keeps the red banner and the strip).
@@ -349,10 +349,10 @@ def test_any_clear_drops_the_alert_and_the_enable_strip_on_that_frame(rig):
   assert out["expired"] is False, "the PERMANENT alert must be gone on the clear frame"
   assert out["pcm_disable"] is False, "no standard disengage may be written once the latch is clear"
   assert r.events_sp.names == [], f"no SP alert may survive the clear: {r.events_sp.names}"
-  # the proof that the ENABLE strip stopped is the honoured engage below: `mads.update_events` consumes the press for
+  # the proof that the ENABLE strip stopped is the honored engage below: `mads.update_events` consumes the press for
   # its own machine on the way through (mads.py l.170-181), so the carrier is gone from `events` by here either way -
   # while the car layer's strip (which runs BEFORE both machines) would have left `main` disabled.
-  assert out["main"] == 'enabled', f"the engage on that frame must be honoured: {out}"
+  assert out["main"] == 'enabled', f"the engage on that frame must be honored: {out}"
   assert r.main_state() == 'enabled'
 
 

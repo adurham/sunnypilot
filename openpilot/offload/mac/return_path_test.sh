@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # return_path_test.sh — one-command, end-to-end RETURN-path test on THIS Mac (no device).
 #
 # Runs returnsend (Mac msgq -> ZMQ PUB) AND offloadd (ZMQ SUB -> device msgq SHADOW topics) as

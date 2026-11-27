@@ -80,7 +80,8 @@ class TestMapping:
 
   def test_enabled_param_default_off(self):
     assert dmp.read_enabled(_Params()) is False
-    p = _Params(); p.store[dmp.PARAM] = True
+    p = _Params()
+    p.store[dmp.PARAM] = True
     assert dmp.read_enabled(p) is True
 
   def test_read_enabled_never_raises_on_stale_libparams(self):

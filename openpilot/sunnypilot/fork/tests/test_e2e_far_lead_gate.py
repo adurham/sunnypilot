@@ -681,7 +681,7 @@ def cut_in_replay():
   """Replay ROUTE_16B_CUT_IN at 20 Hz through the gate alone; return the per-frame outputs and gate flags."""
   g = GateOnly()
   outs, flags = [], []
-  for t, v, d_rel, v_rel, a_lead, e2e, mpc, t_follow in ROUTE_16B_CUT_IN:
+  for _t, v, d_rel, v_rel, a_lead, e2e, mpc, t_follow in ROUTE_16B_CUT_IN:
     outs.append(g.step(lead(d_rel=d_rel, v_rel=v_rel, a_lead=a_lead), v=v, e2e=e2e, mpc=mpc, t_follow=t_follow))
     flags.append(g.e2e_gate)
   return outs, flags
@@ -702,7 +702,7 @@ class TestClosingRateVeto(OpenpilotTestCase):
     # (a) the incident profile: the gate never turns ON and the model's wish is never raised, on any of the 102 frames
     outs, flags = cut_in_replay()
     self.assertFalse(any(flags))
-    for i, (row, out) in enumerate(zip(ROUTE_16B_CUT_IN, outs)):
+    for i, (row, out) in enumerate(zip(ROUTE_16B_CUT_IN, outs, strict=True)):
       self.assertEqual(out, row[5], i)  # raw e2e through, bit-exact
     # the entry frame is blocked by all three terms, not by luck: raw past the stay floor, 0.3 s median past the enter
     # threshold, and the rebound latch still armed from the -6.1 m/s closure 1 s earlier
@@ -848,7 +848,7 @@ class TestClosingRateVetoThroughPlanner(OpenpilotTestCase):
     pg, pu = make_planner(), make_planner()
     pu.update_e2e_gate = lambda lead_, v, e2e, *a: e2e
     flags = []
-    for t, v, d_rel, v_rel, a_lead, e2e, mpc, t_follow in ROUTE_16B_CUT_IN:
+    for t, v, d_rel, v_rel, a_lead, e2e, _mpc, _t_follow in ROUTE_16B_CUT_IN:
       sm = planner_sm(v, e2e, d_rel=d_rel, v_lead=v + v_rel, a_lead=a_lead)
       pg.update(sm)
       pu.update(sm)
@@ -859,7 +859,7 @@ class TestClosingRateVetoThroughPlanner(OpenpilotTestCase):
 
 class TestComfortCap(OpenpilotTestCase):
   """Cycle 3 (routes 16d/16f, 2026-10-26): the gate may stop the model braking for a far lead, but it may not hand the
-  car the MPC's gap-chasing ask. Raising to min(mpc, E2E_GATE_MAX_RAISE) keeps the anti-lag behaviour (the 167/168
+  car the MPC's gap-chasing ask. Raising to min(mpc, E2E_GATE_MAX_RAISE) keeps the anti-lag behavior (the 167/168
   lag signature: model +0.04, MPC +0.81) and removes the race-then-brake pattern (measured: gate-caused frames above
   0.8 m/s^2 drop to zero, accel > 0.3 m/s^2 over a drive 64.7 s -> 17.5 s with the gate off)."""
 
@@ -907,7 +907,7 @@ class TestComfortCap(OpenpilotTestCase):
       rec.append((e2e, mpc, out))
       return out
     with mock.patch.object(lp.LongitudinalPlanner, 'update_e2e_gate', spy):
-      for i in range(120):
+      for _ in range(120):
         p.update(planner_sm(15., -0.9, d_rel=2.0 * d_des(15.), v_lead=17.))
     self.assertEqual(len(rec), 120)
     self.assertTrue(any(out != e2e for e2e, _, out in rec))       # the gate did act

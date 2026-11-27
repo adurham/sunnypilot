@@ -1,0 +1,10 @@
+# Tracked files allowed to exceed the 120 KB limit in scripts/lint/check_added_large_files.py.
+# One glob per line, optionally followed by "# reason". Everything not listed must stay under the limit:
+# large generated data belongs in LFS or outside the tree.
+#
+# fork: the 0027 ESC probe lane is one runner + one pinned test battery, generated together and read as a unit.
+openpilot/sunnypilot/fork/esc_probe_0027.py
+openpilot/sunnypilot/fork/tests/test_esc_probe_0027.py
+# fork: the opendbc patch series is a verbatim diff of the submodule tree (openpilot/sunnypilot/fork/patches/);
+# a patch cannot be split without breaking `git apply` and the series rehearsal, and it is generated, not authored.
+openpilot/sunnypilot/fork/patches/*.patch

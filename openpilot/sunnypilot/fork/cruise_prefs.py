@@ -34,7 +34,7 @@ One predicate (``preserved``) and one wrapper (``remove_unless_preserved``) that
 those cleanup sites calls instead of ``params.remove`` directly. The five keys below are kept
 in Params no matter what the current ignition's CarParams say. Nothing else changes:
 
-  * the UI still DISABLES / greys the toggles when the feature is unavailable
+  * the UI still DISABLES / grays the toggles when the feature is unavailable
     (``sync_toggle`` keeps the toggle showing the stored value while it is disabled, so what
     the screen shows always matches the param);
   * the runtime consumers stay gated on longitudinal being active — they are untouched by this

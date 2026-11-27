@@ -72,7 +72,7 @@ E2E_GATE_VREL_CLOSE_GAP = 3.0     # x d_des, the closing veto applies only insid
 # at -7.2. vRel crossing back is not "the approach ended" - it is noise on a lead that cut in 2 s earlier. Once a raw
 # vRel <= E2E_GATE_ENTER_VREL (the gate's own idea of a fast closure, never present in the 168 trace it was built for:
 # min -2.65) has been seen, no entry for E2E_GATE_REBOUND_FRAMES, and the latch only counts down on frames whose raw
-# vRel is clear of the veto band (a frame inside the band freezes it: ambiguous -> fail toward OFF, stock behaviour).
+# vRel is clear of the veto band (a frame inside the band freezes it: ambiguous -> fail toward OFF, stock behavior).
 E2E_GATE_REBOUND_FRAMES = 80      # 4.0 s at 20 Hz
 E2E_GATE_ENTER_VREL_MEDIAN_FRAMES = 6  # 0.3 s at 20 Hz, same window as the aLeadK median
 # comfort cap (cycle 3, routes 16d/16f 2026-10-26): the gate's job is to stop the model braking for a lead it can see
@@ -83,7 +83,7 @@ E2E_GATE_ENTER_VREL_MEDIAN_FRAMES = 6  # 0.3 s at 20 Hz, same window as the aLea
 # haven't hit the max yet, let me race to it, oh but now we're too close, I need to brake". So the raise target is
 # min(mpc, E2E_GATE_MAX_RAISE): the model still may not BRAKE for a far, slow-closing lead, but the gate can never
 # command more than a comfortable acceleration on its own. 0.4 m/s^2 removes every gate-caused frame above 0.8 (the
-# hard-accel tail falls back to the pre-gate baseline) while keeping the anti-lag behaviour the gate was built for
+# hard-accel tail falls back to the pre-gate baseline) while keeping the anti-lag behavior the gate was built for
 # (the lagging case measured +0.04 model vs +0.81 MPC -> the car now accelerates at 0.4 instead of sticking at 0.04).
 E2E_GATE_MAX_RAISE = 0.4      # m/s^2, ceiling on the accel the gate itself may add
 # stop-plan veto (lane C, routes 193 #3 / 194 #6): the gate exists to stop the model braking EARLY for a far lead; it must
@@ -99,7 +99,7 @@ E2E_GATE_STOP_PLAN_V = 2.0    # m/s
 
 def model_plans_stop(plan_v) -> bool:
   """lane C stop-plan veto: True while the model's own velocity plan falls to <= E2E_GATE_STOP_PLAN_V somewhere in its
-  horizon. An empty or non-finite plan is NOT a stop (the gate keeps its old behaviour)."""
+  horizon. An empty or non-finite plan is NOT a stop (the gate keeps its old behavior)."""
   v = [float(x) for x in plan_v]
   if not v or not all(math.isfinite(x) for x in v):
     return False

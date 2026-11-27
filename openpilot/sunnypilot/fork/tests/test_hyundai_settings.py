@@ -44,7 +44,7 @@ class TestModeMapping(unittest.TestCase):
     self.assertEqual(hs.MODE_PEDAL, hs.mode_from_legacy("1", "0"))
     self.assertEqual(hs.MODE_PEDAL_FCA11, hs.mode_from_legacy("1", "1"))
     # (0, 1) is the old inert combination: braking without the pedal never actuated anything.  It
-    # maps to Stock, which keeps the car's behaviour identical.
+    # maps to Stock, which keeps the car's behavior identical.
     self.assertEqual(hs.MODE_STOCK, hs.mode_from_legacy("0", "1"))
     self.assertEqual(hs.MODE_STOCK, hs.mode_from_legacy(None, None))
 

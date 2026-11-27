@@ -40,7 +40,7 @@ rev-1 reps (fresh ids), so the whole matrix is ~24 reps at the levels the fit ca
 The shipped progress model keys completion on the REP ID (``cal_mode.CalSequencer._is_complete``):
 a done rep never re-runs. Bumping ``rev`` alone does NOT reset progress, so rev 2 gives every rep a
 FRESH id (``r2-*``); that is what makes the redo set actually re-run. ``plan_id`` is a hash of
-{rev, reps} and is recorded for provenance/labelling, not used to gate completion.
+{rev, reps} and is recorded for provenance/labeling, not used to gate completion.
 
 PROTOCOL
 --------
@@ -116,7 +116,7 @@ R2_MOVED_28_BAND = 60.0                # the 28-LSB rep's NEW band (was 90)
 R2_MOVED_28_ID = "r3-step-28-60-0"     # fresh id -> it RUNS even if a rev-2 plan recorded an r2 28 rep
 R2_PLAN_REV = 4                        # rev 4: adds the 0033 driver-consent (tap-to-fire) config
 # 0033 driver consent ("tap to fire"): the default the builder emits. "off" = the backward-
-# compatible autonomous behaviour; "all" / "high" require a driver tap per rep (see cal_mode.py).
+# compatible autonomous behavior; "all" / "high" require a driver tap per rep (see cal_mode.py).
 # min_level_lsb 22 = 0.22 g: at/above it a rep is "high-g" and (in "high" mode) needs a tap.
 CONSENT_MODE_DEFAULT = "off"
 CONSENT_MIN_LEVEL_LSB = 22
@@ -204,9 +204,9 @@ def _plan_doc(reps, rev, issued_at, ttl_s, expires_days, per_drive_cap, cond,
               consent_timeout=CONSENT_TIMEOUT_S):
   doc = {
     "rev": int(rev),
-    "issued_at": float(issued_at if issued_at is not None else time.time()),
+    "issued_at": float(issued_at if issued_at is not None else time.time()),  # noqa: TID251 -- wall clock: a plan TTL must survive a reboot
     "ttl_s": float(ttl_s) if ttl_s is not None else float(expires_days * 86400.0),
-    "expires_at": float(time.time() + expires_days * 86400.0),
+    "expires_at": float(time.time() + expires_days * 86400.0),  # noqa: TID251 -- wall clock: matched against issued_at
     "per_drive_cap": int(per_drive_cap),
     "conditions": _conditions(consent_mode, consent_min_level, consent_timeout),
     "reps": reps,
@@ -306,17 +306,17 @@ def dry_run(phases, matrix="rev2", *, band_assumed=60.0, release_gap_s=3.5, reco
     rows.append((r["id"], r["phase"], r["level_lsb"], band, t, t + hold, step))
     t += hold + release_gap_s + recovery_s
   total = t - start
-  print(f"[dry-run] matrix={matrix} plan_id={plan_id(doc)} phases={sorted(phases)} reps={len(doc['reps'])} "
+  print(f"[dry-run] matrix={matrix} plan_id={plan_id(doc)} phases={sorted(phases)} reps={len(doc['reps'])} " +
         f"assumed band={band_assumed:.0f} km/h release-gap={release_gap_s}s recovery={recovery_s}s")
   print(f"[dry-run] {'rep':28s} {'phase':10s} {'LSB':>4s} {'band':>5s} {'start':>8s} {'end':>8s}  step")
   for rid, ph, lv, band, s, e, step in rows:
     print(f"[dry-run] {rid:28s} {ph:10s} {lv:4d} {band:5.0f} {s:8.1f} {e:8.1f}  {step}")
-  print(f"[dry-run] TOTAL active sequence approx {total:.1f} s ({total / 60.0:.1f} min) across "
-        f"{len(rows)} reps; per-rep rep time = hold {DEFAULT_HOLD_S}s + {release_gap_s}s release gap + "
+  print(f"[dry-run] TOTAL active sequence approx {total:.1f} s ({total / 60.0:.1f} min) across " +
+        f"{len(rows)} reps; per-rep rep time = hold {DEFAULT_HOLD_S}s + {release_gap_s}s release gap + " +
         f"{recovery_s}s recovery")
   if matrix == "rev2":
-    print("[dry-run] NOTE: one clean plateau rep per staircase level is used instead of the "
-          "contract's '4 steps x 0.55s per 2.2s episode'; the K(level) curve is finer this way and "
+    print("[dry-run] NOTE: one clean plateau rep per staircase level is used instead of the " +
+          "contract's '4 steps x 0.55s per 2.2s episode'; the K(level) curve is finer this way and " +
           "each plateau is uncontaminated by intra-episode steps.")
   print("[dry-run] NO state was written.")
   return rows
@@ -358,7 +358,7 @@ def cmd_why(args):
   validity = _load_validity()
   print(f"matrix=rev2 rev={doc['rev']} plan_id={plan_id(doc)} reps={len(doc['reps'])}")
   if not validity:
-    print("(rep_validity.csv not found; redo reasons come from the rev-2 rules only. "
+    print("(rep_validity.csv not found; redo reasons come from the rev-2 rules only. " +
           "Set FCA11_VALIDITY_CSV to cal-refresh/out/rep_validity.csv for the per-rep join.)")
   n_redo = 0
   for r in doc["reps"]:
@@ -367,7 +367,7 @@ def cmd_why(args):
       n_redo += 1
     print(f"  {r['id']:24s} lvl={r['level_lsb']:3d} band={r['band_kph']:5.0f}  {why}")
   print(f"\n{n_redo}/{len(doc['reps'])} reps are new coverage or an explicit redo.")
-  print("NOTE: completion keys on rep ID (cal_mode._is_complete), not plan_id; rev 2 uses fresh ids "
+  print("NOTE: completion keys on rep ID (cal_mode._is_complete), not plan_id; rev 2 uses fresh ids " +
         "so the REDO set re-runs. Bumping rev alone does not reset progress.")
   return 0
 
@@ -395,12 +395,12 @@ def cmd_write_plan(args):
     old_ids = sorted(r.get("id") for r in (old or {}).get("reps", []))
     new_ids = sorted(r["id"] for r in doc["reps"])
     if old is not None and old_ids == new_ids:
-      print(f"plan.json already matches this matrix ({len(new_ids)} reps, plan_id {plan_id(doc)}); "
-            f"nothing to do (use --force to rewrite or bump --rev for a gap-fill revision).")
+      print(f"plan.json already matches this matrix ({len(new_ids)} reps, plan_id {plan_id(doc)}); " +
+            "nothing to do (use --force to rewrite or bump --rev for a gap-fill revision).")
       return 0
-    print(f"REFUSING to overwrite existing {PLAN_PATH} (different matrix: "
-          f"{len(old_ids)} vs {len(new_ids)} reps). Use --force if intended.\n"
-          f"  existing: rev {old.get('rev') if old else '?'} plan_id {plan_id(old) if old else '?'}\n"
+    print(f"REFUSING to overwrite existing {PLAN_PATH} (different matrix: " +
+          f"{len(old_ids)} vs {len(new_ids)} reps). Use --force if intended.\n" +
+          f"  existing: rev {old.get('rev') if old else '?'} plan_id {plan_id(old) if old else '?'}\n" +
           f"  new     : rev {doc['rev']} plan_id {plan_id(doc)}")
     return 2
   tmp = PLAN_PATH + ".tmp"
@@ -408,11 +408,11 @@ def cmd_write_plan(args):
     json.dump(doc, f, indent=1, sort_keys=True)
   os.replace(tmp, PLAN_PATH)
   n = len(doc["reps"])
-  print(f"wrote {PLAN_PATH}: rev {doc['rev']}, {n} reps, phases {sorted(phases)}, "
-        f"ttl {doc['ttl_s']:.0f}s, per_drive_cap {doc['per_drive_cap']}, "
+  print(f"wrote {PLAN_PATH}: rev {doc['rev']}, {n} reps, phases {sorted(phases)}, " +
+        f"ttl {doc['ttl_s']:.0f}s, per_drive_cap {doc['per_drive_cap']}, " +
         f"expires {time.strftime('%Y-%m-%d', time.localtime(doc['expires_at']))}")
   print(f"plan_id {plan_id(doc)}  (informational: completion is keyed on REP ID, not this hash)")
-  print("ARM: only with the owner's FCA11 toggle ON. DISARM: toggle it off, delete the file, or let "
+  print("ARM: only with the owner's FCA11 toggle ON. DISARM: toggle it off, delete the file, or let " +
         "the TTL/expiry lapse.")
   return 0
 
@@ -434,7 +434,7 @@ def cmd_consent(args):
     except OSError:
       print(f"{path} already absent")
     return 0
-  doc = {"rep_id": rep_id, "ts": time.time(), "accept": args.consent == "accept"}
+  doc = {"rep_id": rep_id, "ts": time.time(), "accept": args.consent == "accept"}  # noqa: TID251 -- wall clock: the consumer compares it to plan.json
   tmp = path + ".tmp"
   with open(tmp, "w") as f:
     json.dump(doc, f, sort_keys=True)
@@ -454,19 +454,19 @@ def cmd_status(_args):
     issued = plan.get("issued_at")
     ttl = plan.get("ttl_s")
     exp = plan.get("expires_at")
-    now = time.time()
+    now = time.time()  # noqa: TID251 -- wall clock: compared against plan.json's own issued_at/expires_at
     fresh = isinstance(ttl, (int, float)) and ttl > 0 and isinstance(issued, (int, float)) \
         and (now - issued) <= ttl
     expired = isinstance(exp, (int, float)) and now > exp
     iss = time.strftime("%Y-%m-%d %H:%M", time.localtime(issued)) if isinstance(issued, (int, float)) else issued
     print(f"plan.json: rev {plan.get('rev')}, {len(reps)} reps, plan_id {plan_id(plan)}, ttl {ttl}, issued {iss}")
-    print(f"           fresh={fresh} expired={expired} -> "
+    print(f"           fresh={fresh} expired={expired} -> " +
           f"{'VALID' if (fresh and not expired) else 'INERT (stale TTL or expired)'}")
     if expired:
-      print(f"           expires_at {time.strftime('%Y-%m-%d', time.localtime(exp))} (PAST) -- "
-            f"re-issue the plan (--write-plan --rev N+1) to collect more.")
+      print(f"           expires_at {time.strftime('%Y-%m-%d', time.localtime(exp))} (PAST) -- " +
+            "re-issue the plan (--write-plan --rev N+1) to collect more.")
     elif isinstance(exp, (int, float)):
-      print(f"           expires_at {time.strftime('%Y-%m-%d', time.localtime(exp))} "
+      print(f"           expires_at {time.strftime('%Y-%m-%d', time.localtime(exp))} " +
             f"({(exp - now) / 86400.0:.1f} days left)")
   if prog is None:
     print("progress.json: none yet (no reps recorded).")
@@ -501,16 +501,16 @@ def cmd_tail(args):
       print(ln.rstrip())
       continue
     ts = time.strftime("%H:%M:%S", time.localtime(rec.get("ts", 0)))
-    print(f"{ts} {rec.get('event', '?'):12s} "
-          f"{str(rec.get('rep', rec.get('plan_id', ''))):22s} "
-          f"lvl={rec.get('level_lsb', '')} band={rec.get('band_kph', '')} "
+    print(f"{ts} {rec.get('event', '?'):12s} " +
+          f"{str(rec.get('rep', rec.get('plan_id', ''))):22s} " +
+          f"lvl={rec.get('level_lsb', '')} band={rec.get('band_kph', '')} " +
           f"dir={rec.get('direction', '')} outcome={rec.get('outcome', '')}")
   return 0
 
 
 # ------------------------------------------------------------------------------------------------
 def main(argv=None):
-  ap = argparse.ArgumentParser(description="FCA11 calibration-drive runner (plan writer / monitor). "
+  ap = argparse.ArgumentParser(description="FCA11 calibration-drive runner (plan writer / monitor). " +
                                            "The actuation is in-car (cal_mode.py); this tool is not in that path.")
   g = ap.add_mutually_exclusive_group(required=True)
   g.add_argument("--write-plan", action="store_true", help="write /data/fca11-cal/plan.json (one-time setup / gap-fill)")
@@ -519,7 +519,7 @@ def main(argv=None):
   g.add_argument("--dry-run", action="store_true", help="offline pacing validator (no state writes)")
   g.add_argument("--why", action="store_true", help="per-rep redo report (read-only)")
   g.add_argument("--consent", choices=["accept", "dismiss", "clear"],
-                  help="0033: write a driver-consent tap (accept/dismiss) or clear it, for the cal "
+                  help="0033: write a driver-consent tap (accept/dismiss) or clear it, for the cal " +
                        "dir (operates on pending.json's rep_id; read-only w.r.t. the plan)")
   ap.add_argument("--matrix", choices=["rev1", "rev2"], default="rev2",
                   help="which matrix to build: rev2 (default, slimmed ~24 reps) or rev1 (the original 72)")

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run_framebridge.sh — launch framebridge.py under caffeinate, with App-Nap visibility.
 #
 # Why: a soak/bench run on a Mac must not be interrupted by idle sleep, and an

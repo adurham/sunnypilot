@@ -8,7 +8,7 @@ and is unit-tested in fork/tests/test_fca11_settings.py.
 The page has one master selector (HyundaiLongitudinalMode, see fork/hyundai_settings.py) and three
 kinds of rows:
 
-  * path rows (pedal / FCA11 modifiers) are always listed and GREYED when their path is not selected,
+  * path rows (pedal / FCA11 modifiers) are always listed and GRAYED when their path is not selected,
     so the owner can see what exists without being misled into thinking it does anything;
   * experimental rows are hidden behind the "Show experimental" reveal, except while their own
     stored value is ON (a backup restore must never leave a live lane with no switch in sight);

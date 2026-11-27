@@ -35,7 +35,7 @@ the new key once from it, and keeps the old key registered/readable.  The car la
 the value under the old key name because its dataclass field (``CarParamsSP.fca11AffineGain``,
 capnp ordinal @7) is a wire contract that must not move; only the user-facing key is renamed.
 
-No default is changed by this module: every new key defaults to the behaviour the old key had at its
+No default is changed by this module: every new key defaults to the behavior the old key had at its
 default, and the migration derives the mode/shaping from the values already stored on the device.
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _as_int(raw, default: int = 0) -> int:
 
 def mode_from_legacy(pedal_raw, brake_raw) -> int:
   """The one deterministic mapping from the old pair to the mode.  (0, 1) is Stock: braking without
-  the pedal is inert in the car layer, so the behaviour is the old behaviour (nothing actuates)."""
+  the pedal is inert in the car layer, so the behavior is the old behavior (nothing actuates)."""
   pedal = _truthy(pedal_raw)
   brake = _truthy(brake_raw)
   if pedal and brake:
@@ -100,7 +100,7 @@ def mode_from_legacy(pedal_raw, brake_raw) -> int:
 
 def resolve_mode(params) -> tuple[int, str]:
   """(mode, source).  The new key wins when it holds a valid value; otherwise derive from the legacy
-  pair, which is exactly the pre-0046 behaviour.  An invalid value falls back to the legacy pair
+  pair, which is exactly the pre-0046 behavior.  An invalid value falls back to the legacy pair
   rather than silently selecting Stock."""
   try:
     raw = params.get(MODE_KEY, return_default=False)

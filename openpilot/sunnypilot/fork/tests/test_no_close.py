@@ -4,7 +4,6 @@ Tests for the fork's no-accelerate-toward-a-lead cap (sunnypilot/fork/no_close.p
 Owner's note after the 2026-11-01 drive: "it still accelerates towards a car that comes into its view to try and get TO
 the follow distance, it never needs to do that."
 """
-import math
 
 import numpy as np
 
@@ -124,11 +123,11 @@ class TestNoCloseCap(OpenpilotTestCase):
     bound = a * dv / (nc.ENTER - nc.EXIT) + 1e-9
     v_rels = list(np.arange(-1.0, 1.2, dv)) + list(np.arange(1.2, -1.0, -dv))
     out = [c.update(a, 20., True, 20. - v) for v in v_rels]
-    falls = [p - q for p, q in zip(out, out[1:])]
+    falls = [p - q for p, q in zip(out, out[1:], strict=False)]
     self.assertLessEqual(max(falls), bound)
     self.assertEqual(min(out), 0.)          # still reaches the full cap
     self.assertEqual(out[-1], a)            # and fully releases
-    rises = [q - p for p, q in zip(out, out[1:])]
+    rises = [q - p for p, q in zip(out, out[1:], strict=False)]
     self.assertLessEqual(max(rises), bound)  # release is continuous too (the dwell shifts it, it doesn't step it)
 
   def test_unusable_lead_speed_frame_does_not_release(self):
@@ -178,5 +177,5 @@ def test_lead_hovering_at_the_threshold_cannot_square_wave():
   for i in range(200):
     v_rel = 0.62 if i % 4 == 0 else 0.22          # radar noise straddling the old 0.3/0.1 band
     out.append(c.update(0.4, 20., True, 20. - v_rel))
-  flips = sum(1 for a, b in zip(out, out[1:]) if abs(a - b) > 0.1)
+  flips = sum(1 for a, b in zip(out, out[1:], strict=False) if abs(a - b) > 0.1)
   assert flips <= 2, f"pedal command flipped {flips} times in 10 s"

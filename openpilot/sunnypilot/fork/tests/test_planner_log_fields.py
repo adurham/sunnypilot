@@ -85,7 +85,8 @@ class TestSchemaAppendOnly(OpenpilotTestCase):
     m_sp = re.search(r'(?ms)enum Candidate \{(.*?)\}', _struct_block(_capnp_text(), 'LongitudinalPlanSP'))
     if m_log is None or m_sp is None:
       self.fail('the Candidate mirror or LongitudinalPlanSource was not found (see the parse above)')
-    parse = lambda body: [(n, int(o)) for n, o in re.findall(r'(\w+)\s+@(\d+)', body)]
+    def parse(body):
+      return [(n, int(o)) for n, o in re.findall(r'(\w+)\s+@(\d+)', body)]
     self.assertEqual(parse(m_sp.group(1)), parse(m_log.group(1)))
     self.assertEqual(parse(m_sp.group(1)), [(n, int(o)) for o, n in
                                             [(0, 'cruise'), (1, 'lead0'), (2, 'lead1'), (3, 'lead2'), (4, 'e2e')]])

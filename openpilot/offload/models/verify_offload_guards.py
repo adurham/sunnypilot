@@ -5,7 +5,7 @@ INTERFACES.md §0/§4: every hunk must be inert when OFFLOAD is unset. This scri
 parses the three patched files and asserts each `os.environ.get('OFFLOAD')` check
 guards the new behavior. Reports file:line for the audit trail.
 
-FAILS CLOSED: a missing target file, an unparseable file, or ZERO guards found all
+FAILS CLOSED: a missing target file, an unparsable file, or ZERO guards found all
 exit non-zero. A verifier that reports success when it inspected nothing is worse
 than no verifier — the first version exited 0 with "MISSING ./modeld.py ... total
 OFFLOAD If-guards: 0" when invoked from the wrong directory (2026-10-07).
@@ -51,7 +51,7 @@ def audit(d) -> tuple[int, list[str]]:
     try:
       src, found = guards(p)
     except SyntaxError as e:
-      problems.append(f"UNPARSEABLE {p}: {e}")
+      problems.append(f"UNPARSABLE {p}: {e}")
       continue
     for lineno, node in sorted(found):
       body_lines = [n.lineno for n in ast.walk(node) if hasattr(n, 'lineno') and n.lineno > node.lineno]
@@ -59,13 +59,13 @@ def audit(d) -> tuple[int, list[str]]:
       total += 1
       print(f"  GUARD {name}:{span}  source=L{lineno}")
   if total == 0:
-    problems.append(f"no OFFLOAD guards found under {os.path.abspath(d)} — wrong directory, "
-                    f"or every guard was removed")
+    problems.append(f"no OFFLOAD guards found under {os.path.abspath(d)} — wrong directory, " +
+                    "or every guard was removed")
   return total, problems
 
 
 def main() -> int:
-  args = [a for a in sys.argv[1:]]
+  args = list(sys.argv[1:])
   if '--selftest' in args:
     return selftest()
   d = args[0] if args else os.path.normpath(DEFAULT_DIR)

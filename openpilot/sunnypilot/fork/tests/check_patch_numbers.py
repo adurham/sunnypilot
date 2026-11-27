@@ -64,7 +64,7 @@ def find_patch_numbers(directories: list[Path], require_numbered: bool = True) -
         continue
       prefix = m.group(1)
       if prefix in seen:
-        raise ValueError(f"DUPLICATE patch number {prefix}: "
+        raise ValueError(f"DUPLICATE patch number {prefix}: " +
                          f"{seen[prefix].name}  vs  {p.name}  (in {d})")
       seen[prefix] = p
       out.append((prefix, p))
@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
   try:
     series = find_patch_numbers([args.series], require_numbered=True)
-    held = find_patch_numbers(args.held, require_numbered=False)
+    _held = find_patch_numbers(args.held, require_numbered=False)  # validation only, not reported
     panda = check_shared_number_space(args.series)
   except ValueError as e:
     print(f"::error::patch-number guard FAILED: {e}", file=sys.stderr)

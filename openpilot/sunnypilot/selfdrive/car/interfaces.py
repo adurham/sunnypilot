@@ -183,7 +183,7 @@ def initialize_params(params) -> list[dict[str, Any]]:
 
   # PROPOSAL (0045, OWNER DECISION): the pedal-fault guard mode (HyundaiFca11PedalGuard, INT, default "0" = the deployed
   # fail-closed rule). Same stale-libparams guard as the siblings: a missing/junk value leaves the guard OFF, i.e. the
-  # deployed behaviour, never raises. It only ever WEAKENS a fail-closed latch for a bounded window / frame count, so it
+  # deployed behavior, never raises. It only ever WEAKENS a fail-closed latch for a bounded window / frame count, so it
   # must stay 0 until the owner signs off; opendbc mirrors the value into the panda's safetyParam bits 4096/8192.
   try:
     params_list.append({"HyundaiFca11PedalGuard": params.get("HyundaiFca11PedalGuard", return_default=True)})

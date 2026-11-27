@@ -258,7 +258,7 @@ DEFAULT_ALGO = "27100"
 
 
 def _seed4(seed: bytes) -> bytes:
-  """Normalise the 27 01 raw response bytes to the 4-byte window every algorithm consumes."""
+  """Normalize the 27 01 raw response bytes to the 4-byte window every algorithm consumes."""
   if len(seed) >= 4:
     return bytes(seed[:4])
   if len(seed) == 2:

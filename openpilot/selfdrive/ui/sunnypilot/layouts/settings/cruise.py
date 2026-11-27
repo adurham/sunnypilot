@@ -152,7 +152,7 @@ class CruiseLayout(Widget):
         self.scc_m_toggle.action_item.set_enabled(True)
       else:
         # fork #30: disable the toggles but KEEP the stored prefs, and show the stored value so
-        # the screen always matches the param even while greyed out.
+        # the screen always matches the param even while grayed out.
         for item, key in ((self.custom_acc_toggle, "CustomAccIncrementsEnabled"),
                           (self.scc_v_toggle, "SmartCruiseControlVision"),
                           (self.scc_m_toggle, "SmartCruiseControlMap")):

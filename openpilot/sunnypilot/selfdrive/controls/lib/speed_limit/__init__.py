@@ -27,7 +27,7 @@ MAX_AUTO_DECREASE = {
   False: 15.0,  # mph
 }
 
-# Speed Limit Assist (fork): after a manual set-speed override, keep honouring it for at least this
+# Speed Limit Assist (fork): after a manual set-speed override, keep honoring it for at least this
 # many seconds regardless of speed-limit changes, so a fast-changing area (limits that flip every
 # block) does not immediately re-engage SLA under the driver's hands. Clearing the override requires
 # BOTH a speed-limit change since the override AND this window to have elapsed.

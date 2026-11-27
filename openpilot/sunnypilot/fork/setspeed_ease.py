@@ -105,7 +105,7 @@ The cruise speed handed to ``get_cruise_accel`` is replaced by an eased speed ``
   bit, no timestamp), so it has no freshness channel and it persists after the car leaves the sign. A lone stale
   >= 55 mph reading can therefore keep the gate active on a normal road while the car is > 15 mph below a
   highway-class set speed. The effect is benign by construction: the gate only SUPPRESSES easing, i.e. restores
-  exact upstream behaviour; it never adds acceleration or weakens braking. A freshness guard was investigated and
+  exact upstream behavior; it never adds acceleration or weakens braking. A freshness guard was investigated and
   rejected: it cannot be built from the signals available (no age / valid field on the message) and an
   evidence-veto version would suppress the gate on the real 134 on-ramp merge (``roadType`` reads ``urban`` at merge
   start), breaking the "never suppress a real merge" constraint. Proper remediation is upstream: add a validity /
@@ -179,7 +179,7 @@ NODATA_DEFICIT = 25 * MPH  # m/s; no map / car limit at all: merging while v_ego
 MERGE_HYST = 3 * MPH       # m/s; leave the merge only once v_ego >= ref - (deficit - this)
 MERGE_REF_HOLD_S = 0.5     # s; ref-boundary debounce: a ref that drops away must stay away this long before easing
                            # resumes (a flapping roadType / limit-valid must not toggle merging tick-to-tick). Keeping the
-                           # gate up suppresses easing = upstream behaviour, the benign direction.
+                           # gate up suppresses easing = upstream behavior, the benign direction.
 MERGE_AHEAD_DIST = 500.    # m; a highway-class map limit this close ahead counts (on-ramp onto it)
 HIGHWAY_ROAD_TYPES = ('highway', 'interstate')
 _ROAD_TYPE_NAMES = {v: k for k, v in RoadType.schema.enumerants.items()}  # int -> name
@@ -187,7 +187,7 @@ _ROAD_TYPE_NAMES = {v: k for k, v in RoadType.schema.enumerants.items()}  # int 
 
 def road_type_name(road_type) -> str:
   """liveMapDataSP.roadType arrives as a capnp enum (str() = name), classify_road_type returns the raw int, tests use
-  text. Normalize to the name; anything unrecognised -> 'unknown' (the fail-safe branch)."""
+  text. Normalize to the name; anything unrecognized -> 'unknown' (the fail-safe branch)."""
   if isinstance(road_type, int):
     return _ROAD_TYPE_NAMES.get(road_type, 'unknown')
   return str(road_type)
@@ -256,7 +256,7 @@ def merge_reference(road_type, map_limit: float, map_limit_valid: bool, ahead_li
 class MergeGate:
   """True while the car is merging onto / catching up to a highway-class speed (easing steps aside). Speed hysteresis
   (``MERGE_HYST``) plus a reference-hold debounce (``MERGE_REF_HOLD_S``) so a flapping ref cannot toggle ``merging``
-  tick-to-tick; both only ever keep the gate UP (suppress easing = upstream behaviour), never down."""
+  tick-to-tick; both only ever keep the gate UP (suppress easing = upstream behavior), never down."""
 
   def __init__(self):
     self.merging = False
@@ -269,7 +269,7 @@ class MergeGate:
   def update(self, ref: float, deficit: float, v_ego: float, dt: float = DT_MDL) -> bool:
     if ref <= 0.:
       # the highway reference dropped away: hold the gate briefly. A flapping roadType / limit-valid must not hand the
-      # target back to the ease every other tick (holding suppresses easing = upstream behaviour, the benign direction).
+      # target back to the ease every other tick (holding suppresses easing = upstream behavior, the benign direction).
       self._no_ref_t += dt
       if self._no_ref_t >= MERGE_REF_HOLD_S:
         self.merging = False
@@ -337,7 +337,7 @@ class SetSpeedEase:
         self.v_ease = None                                      # launch over: ramp from here, not from the target
 
     if self.launching or merging:
-      # shipped launch / merge behaviour (raw target). After a merge the ramp's own leash hands over at
+      # shipped launch / merge behavior (raw target). After a merge the ramp's own leash hands over at
       # v_ego + rate * LEASH_S: the request steps down to ~1.5 x rate, never to zero
       v_ease = v_target
     elif self._down_target is not None and v_ego > self._down_target:

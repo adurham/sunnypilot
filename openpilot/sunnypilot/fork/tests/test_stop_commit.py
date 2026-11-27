@@ -1,5 +1,5 @@
 """
-Fork (17c): unit/behaviour tests for the no-lead stop-approach commitment (sunnypilot/fork/stop_commit.py).
+Fork (17c): unit/behavior tests for the no-lead stop-approach commitment (sunnypilot/fork/stop_commit.py).
 """
 import numpy as np
 
@@ -175,7 +175,7 @@ class TestPinnedConstants(OpenpilotTestCase):
   """The comfort / debounce constants define the feel and the lead gate. Every other test in this file reads them
   symbolically (``sc.J_IN``, ``sc.LEAD_CLEAR_FRAMES``, ...), so a mutated VALUE survives the whole suite (review #3:
   J_IN 1.0->5.0, J_OUT 1.5->50, LEAD_CLEAR_FRAMES 20->1, R_NONE 0.5->1.0 and T_MIN 1->0 all SURVIVED). Each test
-  below pins the literal AND the behaviour that literal produces, with the numbers written out rather than read
+  below pins the literal AND the behavior that literal produces, with the numbers written out rather than read
   back from the module."""
 
   def setUp(self):
@@ -189,7 +189,7 @@ class TestPinnedConstants(OpenpilotTestCase):
     self.assertEqual(sc.T_MIN, 1.0)                 # s, plan points nearer than this are the live ask, not a plan
 
   def test_deepening_rate_is_1_0_m_s3(self):
-    # behaviour, not the symbol: each 20 Hz frame deepens delta by exactly J_IN*dt = 1.0*0.05 = 0.05 m/s^2
+    # behavior, not the symbol: each 20 Hz frame deepens delta by exactly J_IN*dt = 1.0*0.05 = 0.05 m/s^2
     plan = stop_plan(17., 100.)
     run(self.c, 25, -0.4, 17., plan=plan)   # 20 frames to arm + 5 ramping frames; target is -1.045, so still ramping
     self.assertTrue(self.c.armed)
@@ -204,7 +204,7 @@ class TestPinnedConstants(OpenpilotTestCase):
     self.assertLessEqual(sc.J_IN, 1.4)                              # the owner's comfort reference is the ceiling
 
   def test_release_rate_is_the_1_4_reference(self):
-    # behaviour: after the plan stops planning a stop, delta returns at J_OUT*dt = 1.4*0.05 = 0.07 m/s^2 per frame
+    # behavior: after the plan stops planning a stop, delta returns at J_OUT*dt = 1.4*0.05 = 0.07 m/s^2 per frame
     plan = stop_plan(17., 100.)
     run(self.c, 60, -0.4, 17., plan=plan)
     self.assertLess(self.c.delta, -0.5)

@@ -24,7 +24,8 @@ What it does
   camera-only lead, by design.
 * closing margin (throttle-only cars only): extra distance needed to cancel the closing speed by coasting instead
   of braking at ``COMFORT_BRAKE``: ``vrel^2/2 * (1/a_coast(v) - 1/COMFORT_BRAKE)``, as time at v_ego, capped at
-  ``MAX_CLOSING_MARGIN`` = 0.25 s and only while closing faster than ``CLOSING_MARGIN_MIN_VREL`` = 0.5 m/s. It only acts while the lead is slower. A same-speed lead that brakes hard gets no extra
+  ``MAX_CLOSING_MARGIN`` = 0.25 s and only while closing faster than ``CLOSING_MARGIN_MIN_VREL`` = 0.5 m/s. It
+  only acts while the lead is slower. A same-speed lead that brakes hard gets no extra
   margin from this; that case still relies on FCW + the driver.
 
 The time gap is a runtime MPC parameter (p[4]), so the OCP and the generated solver are unchanged.

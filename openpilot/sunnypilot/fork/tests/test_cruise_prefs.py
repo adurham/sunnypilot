@@ -270,7 +270,7 @@ class TestUiShowsStoredValue(OpenpilotTestCase):
                       (layout.scc_m_toggle, "SmartCruiseControlMap")):
       self.assertEqual(item.action_item.get_state(), p.get_bool(key), key)  # shown == stored
       self.assertTrue(item.action_item.get_state(), key)                    # really True, not clobbered
-      self.assertFalse(item.action_item.enabled, key)                       # ... and greyed out
+      self.assertFalse(item.action_item.enabled, key)                       # ... and grayed out
     # nothing got deleted
     self.assertEqual(read_all(p), STORE)
 

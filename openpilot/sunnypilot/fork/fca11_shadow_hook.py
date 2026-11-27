@@ -20,5 +20,5 @@ def fca11_shadow_post_send(CI) -> None:
     return
   try:
     fn()
-  except Exception:  # noqa: BLE001 - V3 is log-only; it must never break the send loop
+  except Exception:
     pass

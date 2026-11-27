@@ -47,7 +47,7 @@ would also stop at yields and roundabouts, "I'd rather that then blowing through
 ``commit_accel`` prices the plan's own stop point, but at the empty stops the plan does not stop: it falls to a creep
 plateau (1.6-2.5 m/s) and parks there, so the commitment only paid for reaching the creep speed. The ask stayed at
 0.4-0.9 m/s^2 eight seconds out, exploded to 3-4.8 m/s^2 two seconds out, and the car finished 2.5-2.9 m/s^2 past the
-plan's own point (measured +3.9 / +4.2 / +7.1 m on route 185). ``stop_line_accel`` recognises that plateau -- the rest
+plan's own point (measured +3.9 / +4.2 / +7.1 m on route 185). ``stop_line_accel`` recognizes that plateau -- the rest
 of the plan stays at or below V_CREEP + V_END_TOL, does not climb back, and has stopped braking (V_FLAT_DECEL, which
 keeps a real stop that the 10 s horizon truncates on ``commit_accel``'s path) -- and returns the decel that ends the
 car AT that point (capped at A_FLOOR so this rule alone is never harsher than -2.5 m/s^2). When it returns a value the
@@ -138,7 +138,7 @@ def stop_line_distance(x, v, t=None):
     * the plan has stopped braking there: the tail's own decel is shallower than V_FLAT_DECEL. A uniform stop plan that
       the horizon truncates (e.g. 17 m/s braking to a stop 100 m out still reads 2.55 m/s at 10 s) keeps braking at
       the tail and is left to commit_accel(), which prices it exactly.
-  Returns the plan's own plateau distance ``d`` (metres ahead), or None when the plan is not parking on one.
+  Returns the plan's own plateau distance ``d`` (meters ahead), or None when the plan is not parking on one.
   """
   x = np.asarray(x, dtype=float)
   v = np.clip(np.asarray(v, dtype=float), 0., None)

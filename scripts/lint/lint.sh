@@ -46,7 +46,7 @@ function run_tests() {
   run "check_shell" python3 "$DIR/check_shell.py" "${SHELL_FILES[@]}"
   run "check_dependencies" python3 "$DIR/check_dependencies.py"
   run "check_indentation" "$DIR/check_indentation.py" "${PYTHON_FILES[@]}"
-  run "check_added_large_files" "$DIR/check_added_large_files.py" --maxkb=120 "${ALL_FILES[@]}"
+  run "check_added_large_files" "$DIR/check_added_large_files.py" --maxkb=120 --exclude-from="$ROOT/.largefiles-ignore" "${ALL_FILES[@]}"
   run "check_shebang_scripts_are_executable" "$DIR/check_shebang_scripts_are_executable.py" "${ALL_FILES[@]}"
   run "check_shebang_format" "$DIR/check_shebang_format.sh" "${ALL_FILES[@]}"
   run "check_nomerge_comments" "$DIR/check_nomerge_comments.sh" "${ALL_FILES[@]}"

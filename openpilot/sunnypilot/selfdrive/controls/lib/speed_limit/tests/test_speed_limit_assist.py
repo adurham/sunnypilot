@@ -540,7 +540,7 @@ class TestSpeedLimitAssistOverrideMemory(_SLAForkTestBase):
     assert self.sla.state == SpeedLimitAssistState.inactive
     # simulate OVERRIDE_MEMORY_S elapsing, then another limit change -> releases
     base = self.sla._override_ts
-    with unittest.mock.patch("openpilot.sunnypilot.selfdrive.controls.lib.speed_limit."
+    with unittest.mock.patch("openpilot.sunnypilot.selfdrive.controls.lib.speed_limit." +
                              "speed_limit_assist.time.monotonic", return_value=base + OVERRIDE_MEMORY_S + 1.0):
       self._drive(40.0, 55.0, sll_mph=55.0)
     assert not self.sla.override_memory_active

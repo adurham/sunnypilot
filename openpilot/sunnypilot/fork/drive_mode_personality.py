@@ -12,7 +12,7 @@ The car's drive mode (decoded from CLU13 CF_Clu_DriveMode on the opendbc side an
     lockout, so a MADS lateral-only engagement survives.
   * Unknown mode / signal absent -> do nothing (never force a personality, never block).
 
-The param defaults OFF: with it OFF the whole feature is inert and today's behaviour is byte-for-byte
+The param defaults OFF: with it OFF the whole feature is inert and today's behavior is byte-for-byte
 unchanged. Manual gap-button cycling between mode changes stays allowed; the mode re-asserts on the
 next change.
 

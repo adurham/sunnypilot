@@ -19,9 +19,9 @@ export COMBINED_MODEL_PKL="$PWD/openpilot/offload/models/driving_supercombo_fork
 OFFLOAD=1 .venv/bin/python -m openpilot.offload.replay.modeld_runner --frames 300 --timeout 40 \
   > /tmp/mr.log 2>&1 &
 MR=$!
-wait $MR 2>/dev/null || true
+wait "$MR" 2>/dev/null || true
 sleep 1
-kill $FB 2>/dev/null || true
+kill "$FB" 2>/dev/null || true
 sleep 2
 
 echo "[3/3] results"

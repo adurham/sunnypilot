@@ -130,7 +130,7 @@ class SpeedLimitAssist:
 
   @property
   def override_memory_active(self) -> bool:
-    """fork: a manual set-speed override is being honoured. It never clears on the strength of a
+    """fork: a manual set-speed override is being honored. It never clears on the strength of a
     speed-limit change alone; a limit change only releases it once OVERRIDE_MEMORY_S has elapsed
     since the driver made the change. It also clears early if the driver has adjusted back onto
     the limit SLA is driving to (converged)."""
@@ -292,7 +292,7 @@ class SpeedLimitAssist:
             self.state = SpeedLimitAssistState.inactive
           elif self.speed_limit_changed and self.target_set_speed_change_requires_confirm and not self.override_memory_active:
             # fork: only a drop beyond MAX_AUTO_DECREASE asks for a press, and only when no manual
-            # override is being honoured (override memory).
+            # override is being honored (override memory).
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self._has_speed_limit and self.v_offset < LIMIT_SPEED_OFFSET_TH:
@@ -347,7 +347,7 @@ class SpeedLimitAssist:
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
           elif self.override_memory_active:
-            # fork: honour the driver's manual set speed — no press prompt while override memory holds.
+            # fork: honor the driver's manual set speed — no press prompt while override memory holds.
             self.state = SpeedLimitAssistState.inactive
           else:
             self.state = SpeedLimitAssistState.pending
@@ -375,7 +375,7 @@ class SpeedLimitAssist:
 
           elif self.speed_limit_changed and self.target_set_speed_change_requires_confirm and not self.override_memory_active:
             # fork: only a drop beyond MAX_AUTO_DECREASE asks for a press (and not while an override
-            # is being honoured).
+            # is being honored).
             self.state = SpeedLimitAssistState.preActive
             self.pre_active_timer = int(PRE_ACTIVE_GUARD_PERIOD[self.pcm_op_long] / DT_MDL)
 

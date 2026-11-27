@@ -147,7 +147,7 @@ class SelfdriveD:
       max(log.LongitudinalPersonality.schema.enumerants.values()),
       self.params
     )
-    # fork (adurham): drive-mode-follows-personality. OFF (default) = inert = today's behaviour.
+    # fork (adurham): drive-mode-follows-personality. OFF (default) = inert = today's behavior.
     # drive_mode_result is the last mapped action, so the personality is (re)written only on a CHANGE.
     self.drive_mode_personality = dmp.read_enabled(self.params)
     self.drive_mode_result = dmp.UNKNOWN

@@ -11,7 +11,7 @@ every N seconds and produces the *evidence* for a soak:
   * system memory pressure via `memory_pressure` (pages free / system free %),
     with a `vm_stat` fallback when that command is unavailable
   * swap usage via `sysctl vm.swapusage`, plus vm_stat swap-in/out deltas
-  * compressor occupancy (the macOS analogue of anonymous-page growth)
+  * compressor occupancy (the macOS analog of anonymous-page growth)
   * thermal pressure one-shot via `pmset -g therm` (non-sudo; best effort)
 
 Output: one JSON object per sample (jsonl) + a start-vs-end summary with a
@@ -462,7 +462,7 @@ def main(argv=None) -> int:
       elapsed = time.monotonic() - s["mono"]
       time.sleep(max(0.0, args.interval - elapsed))
   except KeyboardInterrupt:
-    print("\n[bench_resources_mac] interrupted — summarising what we have")
+    print("\n[bench_resources_mac] interrupted — summarizing what we have")
 
   summary = build_summary(samples, args.leak_mb_per_hour, args.min_window_s)
   print_summary(summary)

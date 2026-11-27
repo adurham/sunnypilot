@@ -102,7 +102,7 @@ that never stops.)
 - **Remote delivery (offloadd, WS-D):** Mac→device over ZMQ; offloadd forwards each remote message into
   device msgq under SHADOW names (contract.SHADOW_OUTPUT_SERVICES), header `logMonoTime` = device monotonic
   at receipt, payload untouched. Stale (>OFFLOAD_STALE_MS) or non-finite messages are dropped, never forwarded.
-  Eligibility counters + behind/lost events logged; eligibility is signalled by presence/age of the shadow
+  Eligibility counters + behind/lost events logged; eligibility is signaled by presence/age of the shadow
   messages, not by an API.
 - **SP pairing rule (added 2026-10-07):** `modelDataV2SP` carries no frameId and no timestamps
   (custom.capnp ModelDataV2SP), so it cannot be aged on its own. offloadd forwards it ONLY when paired

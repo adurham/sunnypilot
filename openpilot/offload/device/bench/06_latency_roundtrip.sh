@@ -70,8 +70,15 @@ echo ">> target: $HOST   n=$N   sizes=$SIZES   port=$PORT"
 
 echo ">> [0/4] copy the echo helper to the device (/tmp, RAM) and resolve addresses"
 scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$LOCAL_ECHO" "$HOST:$DEV_ECHO"
-DEV_IP="${OFFLOAD_DEV_IP:-$("${SSH[@]}" "ip -4 -o addr show usb0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1")}"
-MAC_IP="${OFFLOAD_MAC_IP:-$(ifconfig 2>/dev/null | awk '/inet 169\.254\./{print $2}' | head -1)}"
+DEV_IP="${OFFLOAD_DEV_IP:-}"
+if [[ -z "$DEV_IP" ]]; then
+  # the remote command is ONE word for ssh; $4 is awk's field on the far side, escaped for the local shell
+  DEV_IP=$("${SSH[@]}" "ip -4 -o addr show usb0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1")
+fi
+MAC_IP="${OFFLOAD_MAC_IP:-}"
+if [[ -z "$MAC_IP" ]]; then
+  MAC_IP=$(ifconfig 2>/dev/null | awk '/inet 169\.254\./{print $2}' | head -1)
+fi
 [[ -n "$DEV_IP" ]] || { echo "no device usb0 IPv4 — did 01_enable_tether.sh succeed?"; exit 1; }
 [[ -n "$MAC_IP" ]] || { echo "no Mac 169.254.x address — cable? give autoconf ~10 s; or set OFFLOAD_MAC_IP"; exit 1; }
 echo "   device usb0 = $DEV_IP    Mac 169.254 = $MAC_IP"

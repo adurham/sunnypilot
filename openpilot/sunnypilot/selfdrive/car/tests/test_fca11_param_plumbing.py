@@ -15,7 +15,7 @@ These tests drive a real `Params` object, the real `initialize_params()`, and th
   * a raw string '1' (libparams form) still arms it (the bool/str type tolerance);
   * nothing else about the pedal-only baseline changes when the toggle is off.
 0044 adds TestFca11ShapingParamPlumbingE2E: the same real path for HyundaiFca11AffineGain (the brake-shaping law), four
-cases {pedal on/off} x {shaping on/off} incl. a behavioural difference of the controller.
+cases {pedal on/off} x {shaping on/off} incl. a behavioral difference of the controller.
 """
 import os
 import tempfile
@@ -71,7 +71,7 @@ def _run_real_path(fca11, shaping=None):
 
 
 def _soft_ask_dec_series(CP, CP_SP, accel=-0.8, kph=50.0, frames=200):
-  """BEHAVIOUR probe: an Fca11LongBrake built from the production CP/CP_SP, fed a fixed soft ask while moving.
+  """BEHAVIOR probe: an Fca11LongBrake built from the production CP/CP_SP, fed a fixed soft ask while moving.
   Returns (affine_gain, [sent CR_VSM_DecCmd...]). FCA11_AFFINE must be unset (0044 refuses it)."""
   CS = SimpleNamespace(out=structs.CarState(), interceptor_state=0, interceptor_fault_seen=False,
                        fca11_cam_frame=(0, bytes(8)), fca11_now_nanos=0, fca11_wheel_min_kph=None)
@@ -112,7 +112,7 @@ class TestFca11ShapingParamPlumbingE2E(OpenpilotTestCase):
   params_keys.h (put_bool raised UnknownKeyName on the compiled registry), initialize_params never read it, and nothing
   wrote CP_SP.fca11AffineGain - the law was UNREACHABLE on the car. Four cases {pedal on/off} x {shaping on/off} with
   FCA11 Braking ON, each through REAL Params.put_bool -> initialize_params -> setup_interfaces, asserting the CP_SP
-  fields, the safetyParam bit, the car-layer dependency, and a BEHAVIOURAL difference of the controller."""
+  fields, the safetyParam bit, the car-layer dependency, and a BEHAVIORAL difference of the controller."""
 
   @classmethod
   def setUpClass(cls):
@@ -141,7 +141,7 @@ class TestFca11ShapingParamPlumbingE2E(OpenpilotTestCase):
           else:
             self.assertEqual([], decs, f"FCA11 braking not armed: the controller is inert {ctx}")
           seen[(pedal, brake, shaping)] = decs
-    # BEHAVIOUR: armed, shaping ON emits a DIFFERENT dec_cmd sequence than OFF for the same fixed soft ask (-0.8 moving)
+    # BEHAVIOR: armed, shaping ON emits a DIFFERENT dec_cmd sequence than OFF for the same fixed soft ask (-0.8 moving)
     on, off = seen[(True, True, True)], seen[(True, True, False)]
     self.assertNotEqual(on, off, "the shaping param must change the controller's output")
     self.assertEqual({4}, set(on[:fl.FCA11_SHAPE_ONSET_HOLD_SENT]), "shaped law: the onset hold at the 4 LSB floor")
@@ -246,7 +246,7 @@ def _run_shadow_path(brake, shaping, shadow):
 class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
   """0045 v2 (Amendment 1): HyundaiFca11Shadow end to end through the REAL compiled registry. Truth table: Shadow ON =>
   the wire stays OLD-LAW: fca11Brake / bit 256 follow HyundaiFca11Brake exactly as the deployed build, fca11AffineGain is
-  FORCED False (V3 never actuates); Shadow OFF => unchanged freeze behaviour."""
+  FORCED False (V3 never actuates); Shadow OFF => unchanged freeze behavior."""
 
   def test_key_is_registered_in_the_compiled_registry(self):
     params = Params()
@@ -265,7 +265,7 @@ class TestFca11ShadowParamPlumbingE2E(OpenpilotTestCase):
     for brake in (True, False, None):
       for shaping in (True, False, None):
         for shadow in (True, False, None):
-          ctx = dict(brake=brake, shaping=shaping, shadow=shadow)
+          ctx = {"brake": brake, "shaping": shaping, "shadow": shadow}
           _, CP_SP, _ = _run_shadow_path(brake, shaping, shadow)
           self.assertEqual(bool(shadow), CP_SP.fca11Shadow, ctx)
           self.assertEqual(bool(brake), CP_SP.fca11Brake, ctx)                       # OLD-LAW armed exactly as today
@@ -417,4 +417,4 @@ class TestFca11StopHoldRetired(OpenpilotTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+  unittest.main()

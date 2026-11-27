@@ -59,11 +59,11 @@ WRITER_ALLOWLIST: dict[str, str] = {}
 
 # FCA11_* env names that are OPERATIONAL DIRECTORIES (where to write logs / read the cal plan), not feature flags.
 ENV_ALLOWLIST = {
-  "FCA11_LOG_DIR": "operational dir: the per-episode logger output dir ('0' disables I/O in tests); not a behaviour flag",
+  "FCA11_LOG_DIR": "operational dir: the per-episode logger output dir ('0' disables I/O in tests); not a behavior flag",
   "FCA11_CAL_DIR": ("operational dir: the cal-plan dir ('0' disables the sequencer in tests); the cal mode itself is " +
-                    "file-gated under the HyundaiFca11Brake kill switch; not a behaviour flag"),
+                    "file-gated under the HyundaiFca11Brake kill switch; not a behavior flag"),
   "FCA11_VALIDITY_CSV": ("operational input path of the OFFLINE cal-runner CLI (fork/fca11_cal_runner.py --status): where " +
-                         "the rep-validity analysis CSV lives; not in the actuation path, not a behaviour flag"),
+                         "the rep-validity analysis CSV lives; not in the actuation path, not a behavior flag"),
 }
 # (file suffix, function) -> {env name: reason}: a read whose ONLY purpose is to REFUSE a removed override.
 ENV_GUARD_ALLOWLIST = {
@@ -396,9 +396,9 @@ def _feed_lint(rc: int, tree: str, opendbc: str, registry: set[str]) -> int:
   read, missing = _feed_gaps(read_src, feed_src, registry)
   for k in missing:
     lines = [i + 1 for i, ln in enumerate(read_src.splitlines()) if f'params_dict.get("{k}")' in ln]
-    print(f"FAIL feed-lint: opendbc setup_interfaces READS params key {k!r} from params_dict at "
-          f"opendbc/sunnypilot/car/interfaces.py:{lines}, but initialize_params() never feeds it -- its branch is "
-          f"unreachable on the car (default OFF for the whole ignition)")
+    print(f"FAIL feed-lint: opendbc setup_interfaces READS params key {k!r} from params_dict at " +
+          f"opendbc/sunnypilot/car/interfaces.py:{lines}, but initialize_params() never feeds it -- its branch is " +
+          "unreachable on the car (default OFF for the whole ignition)")
   tag = "ok  " if not missing else "FAIL"
   print(f"{tag} feed-lint: {len(read)} param key(s) read out of params_dict; not fed by initialize_params(): {missing}")
   return 1 if missing else rc

@@ -334,7 +334,7 @@ class TestPedalButtons(OpenpilotTestCase):
     op.press(DOWN, LONG, v=26.)  # now at 58.2 mph
     assert op.enabled
     assert op.v_set_mph == 45  # floor(47/5)*5: one standard 5 mph step DOWN, no extra -1 on release
-    assert op.v_set_mph != round(26. * CV.MS_TO_MPH)  # 58: NOT the current speed (the behaviour that was removed)
+    assert op.v_set_mph != round(26. * CV.MS_TO_MPH)  # 58: NOT the current speed (the behavior that was removed)
     assert op.vch.v_cruise_kph == 72.0  # floor(75.6 / 8)*8: the standard long-press step lands on a 5 mph multiple
     # held 3 s (150 samples): only the standard 0.5 s ticks fire (at 0.5/1.0/1.5/... s), no re-capture of anything
     op.press(DOWN, 150, v=17.)  # 45 -> 40 -> 35 -> 30 -> 25 -> 20 over 7 ticks

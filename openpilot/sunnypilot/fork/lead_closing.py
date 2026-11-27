@@ -44,7 +44,7 @@ V_SIGMA_PER_M = 0.012    # m/s per m of range (~2.0 m/s at 100 m). Swept 0.012/0
 # process noise: relative acceleration (lead accel minus ours) as white noise, 1 sigma
 A_REL_SIGMA = 1.0        # m/s^2 (swept 0.5/1.0/2.0; 1.0 = the middle, the misses/false-alarm trade is flat around it)
 R0_SIGMA = 2.0           # m/s, extra prior rate uncertainty of a new track (the first frames follow vRel)
-# vRel is modelled as  rate + bias  with a slowly wandering bias: a vision lead's vRel is BIASED for seconds at a time
+# vRel is modeled as  rate + bias  with a slowly wandering bias: a vision lead's vRel is BIASED for seconds at a time
 # (194 t=329-335: +0.7..+1.3 while the gap shrank ~3.8 m/s), so the long-term rate must come from the gap itself
 B0_SIGMA = 1.0           # m/s, prior bias uncertainty of a new track
 B_WALK_SIGMA = 0.3       # m/s per sqrt(s), bias random walk

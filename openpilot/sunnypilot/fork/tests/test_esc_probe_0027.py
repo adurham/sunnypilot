@@ -2257,7 +2257,7 @@ class TestPhase6(Base):
     self.assertTrue(doc["unlocked"])
     self.assertEqual([d for d in self.tx_frames(car) if d[1] == 0x2E], [])   # still NO write
 
-  # ---- session / programming-session / DTC behaviours ------------------------------------------------------------
+  # ---- session / programming-session / DTC behaviors ------------------------------------------------------------
   def test_session_refused_skips_key_part_but_still_sweeps(self):
     car = self.p6_car()
     car.session_refused = True               # 10 03 -> 7F 10 12: skip steps 5-7, still do the DID sweep + step 8
@@ -2673,7 +2673,7 @@ class TestPhase7(Base):
     self.assertTrue(doc["lockout_ask"])
     self.assertEqual([c["candidate"] for c in doc["cands_ask"]], ["zero8"])
 
-  # ---- session / seed gate behaviours ------------------------------------------------------------------------------
+  # ---- session / seed gate behaviors ------------------------------------------------------------------------------
   def test_session_not_positive_skips_candidate_loop(self):
     car = self.p7_car()
     car.session_refused = True         # 10 03 -> 7F 10 12: no 27 11 at all, but 29 01 + F100 + leave still run

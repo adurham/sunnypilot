@@ -170,7 +170,7 @@ class TestStep(OpenpilotTestCase):
     run_steps(e, 30, 30., 20.)
     self.assertGreater(e.v_ease, 20.)
     v = e.step(30., 15., P.standard, False, 0.)
-    self.assertEqual(v, 30.)            # inactive: pass-through (upstream behaviour)
+    self.assertEqual(v, 30.)            # inactive: pass-through (upstream behavior)
     self.assertEqual(e.v_ease, 15.)     # ... with the ramp re-armed at the current speed
     # re-engage at a stored higher set speed while moving: ramps from the current speed
     v = e.step(30., 15., P.standard, True, 0.)
@@ -446,7 +446,7 @@ class TestMergeGate(OpenpilotTestCase):
 
   def test_ref_boundary_debounce(self):
     # a flapping ref (roadType / limit-valid dropping in and out) must not toggle `merging` tick-to-tick: a short gap
-    # (< MERGE_REF_HOLD_S) keeps the gate UP. Holding = suppress easing = upstream behaviour, the benign direction.
+    # (< MERGE_REF_HOLD_S) keeps the gate UP. Holding = suppress easing = upstream behavior, the benign direction.
     g = se.MergeGate()
     self.assertTrue(g.update(30., se.MERGE_DEFICIT, 10.))
     for _ in range(int(0.3 / DT_MDL)):           # 0.3 s < MERGE_REF_HOLD_S of no ref
@@ -740,7 +740,7 @@ class TestUpstreamHooks(OpenpilotTestCase):
       self._run(planner, 5, v, 45 * 1.609344)
       self._run(planner, 20, v, 65 * 1.609344, **kw)
       self.assertAlmostEqual(planner.setspeed_ease.v_ease, v, places=4, msg=str(kw))
-      # while not in control the planner gets the raw target (upstream behaviour)
+      # while not in control the planner gets the raw target (upstream behavior)
       v_out, _ = planner.update_targets(planner_sm(v, 65 * 1.609344, **kw), v, 0., 65 * 1.609344 / 3.6)
       self.assertAlmostEqual(v_out, 65 * 1.609344 / 3.6, places=4, msg=str(kw))
 
