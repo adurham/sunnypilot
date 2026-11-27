@@ -130,7 +130,7 @@ jobs:
         # openpilot.sunnypilot.fork, so apply the same series here, the same way: plain `git apply` from inside the
         # submodule (the patch paths are submodule-relative), no fuzz -- a patch that no longer matches the pin is a
         # red step, never a silently different tree.
-        for p in openpilot/sunnypilot/fork/patches/*.patch; do
+        for p in "$PWD"/openpilot/sunnypilot/fork/patches/*.patch; do
           echo "--- applying $(basename "$p")"
           git -C opendbc_repo apply --check "$p"
           git -C opendbc_repo apply "$p"
@@ -161,7 +161,7 @@ jobs:
         set -euo pipefail
         # same series and same rules as the unit-tests job and sync-upstream.yaml: the fork's car layer lives in
         # openpilot/sunnypilot/fork/patches/*.patch over a pristine opendbc pin, and process replay imports it.
-        for p in openpilot/sunnypilot/fork/patches/*.patch; do
+        for p in "$PWD"/openpilot/sunnypilot/fork/patches/*.patch; do
           echo "--- applying $(basename "$p")"
           git -C opendbc_repo apply --check "$p"
           git -C opendbc_repo apply "$p"
