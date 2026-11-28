@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
+from openpilot.sunnypilot.fork.hyundai_settings import MODE_KEY, SHAPING_KEY
 from openpilot.sunnypilot.selfdrive.car import interfaces as sp_interfaces
 from opendbc.car import structs
 from opendbc.car.car_helpers import interfaces
@@ -50,6 +51,11 @@ def _run_real_path(fca11, shaping=None):
   0044: `shaping` is the HyundaiFca11AffineGain key (the brake-shaping law), written through the REAL compiled
   registry - put_bool raises UnknownKeyName if the key is not in params_keys.h (the pre-0044 defect)."""
   params = Params()
+  # 0046: HyundaiLongitudinalMode / HyundaiFca11Shaping are authoritative once present, and
+  # initialize_params()'s one-time migration writes the mode from the legacy pair on its first call.
+  # Leaving either in the store lets an earlier test in this process decide what this one reads.
+  for k in (MODE_KEY, SHAPING_KEY):
+    params.remove(k)
   params.remove("HyundaiFca11Brake")
   params.remove("HyundaiGasInterceptor")
   params.remove("HyundaiFca11AffineGain")
@@ -92,7 +98,7 @@ def _soft_ask_dec_series(CP, CP_SP, accel=-0.8, kph=50.0, frames=200):
 def _run_with_pedal(pedal, fca11, shaping):
   """As _run_real_path but the pedal param is driven too (pedal False => the whole FCA11 stack must stay off)."""
   params = Params()
-  for k in ("HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11AffineGain"):
+  for k in (MODE_KEY, SHAPING_KEY, "HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11AffineGain"):
     params.remove(k)
   params.put_bool("HyundaiGasInterceptor", pedal, block=True)
   params.put_bool("HyundaiFca11Brake", fca11, block=True)
@@ -227,7 +233,8 @@ class TestFca11ParamPlumbingE2E(OpenpilotTestCase):
 def _run_shadow_path(brake, shaping, shadow):
   """0045: real Params (compiled registry) -> initialize_params() -> setup_interfaces() with HyundaiFca11Shadow."""
   params = Params()
-  for k in ("HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11AffineGain", "HyundaiFca11Shadow"):
+  for k in (MODE_KEY, SHAPING_KEY, "HyundaiGasInterceptor", "HyundaiFca11Brake", "HyundaiFca11AffineGain",
+            "HyundaiFca11Shadow"):
     params.remove(k)
   params.put_bool("HyundaiGasInterceptor", True, block=True)
   for k, v in (("HyundaiFca11Brake", brake), ("HyundaiFca11AffineGain", shaping), ("HyundaiFca11Shadow", shadow)):
