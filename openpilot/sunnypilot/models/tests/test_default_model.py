@@ -9,10 +9,16 @@ import os
 import subprocess
 
 from openpilot.sunnypilot import get_file_hash
-from openpilot.sunnypilot.models.default_model import MODEL_HASH_PATH, SUPERCOMBO_ONNX_PATH, BIG_MODEL_HASH_PATH, \
-                                                      BIG_DRIVING_PKL_PATH, _read_model_name_fields
 import hashlib
 from openpilot.common.test import OpenpilotTestCase
+
+
+def _default_model():
+  """`default_model` imports the openpilot UI state singleton, which builds a SubMaster('deviceState') at import
+  time; that needs the per-test msgq directory OpenpilotTestCase.run() creates. Importing it at module scope runs
+  before any test (collection time), where no msgq directory exists, and takes the whole module down with it."""
+  from openpilot.sunnypilot.models import default_model
+  return default_model
 
 
 def _get_lfs_oid(path: str) -> str:
@@ -26,23 +32,25 @@ def _get_lfs_oid(path: str) -> str:
 
 class TestDefaultModel(OpenpilotTestCase):
   def test_compare_onnx_hashes(self):
-    fields = _read_model_name_fields()
-    supercombo_hash = get_file_hash(SUPERCOMBO_ONNX_PATH)
+    dm = _default_model()
+    fields = dm._read_model_name_fields()
+    supercombo_hash = get_file_hash(dm.SUPERCOMBO_ONNX_PATH)
     fingerprint = f"{supercombo_hash}:{fields.get('DEFAULT_MODEL', '')}:{fields.get('DEFAULT_MODEL_REF', '')}"
     combined_hash = hashlib.sha256(fingerprint.encode()).hexdigest()
 
-    with open(MODEL_HASH_PATH) as f:
+    with open(dm.MODEL_HASH_PATH) as f:
       current_hash = f.read().strip()
 
     assert combined_hash == current_hash, "Run openpilot/sunnypilot/models/default_model.py to update the default model name and hash"
 
   def test_compare_big_pkl_hashes(self):
-    fields = _read_model_name_fields()
-    oid = _get_lfs_oid(os.path.relpath(BIG_DRIVING_PKL_PATH, os.getcwd()))
+    dm = _default_model()
+    fields = dm._read_model_name_fields()
+    oid = _get_lfs_oid(os.path.relpath(dm.BIG_DRIVING_PKL_PATH, os.getcwd()))
     big_fingerprint = f"{oid}:{fields.get('DEFAULT_BIG_MODEL', '')}:{fields.get('DEFAULT_BIG_MODEL_REF', '')}"
     combined_hash = hashlib.sha256(big_fingerprint.encode()).hexdigest()
 
-    with open(BIG_MODEL_HASH_PATH) as f:
+    with open(dm.BIG_MODEL_HASH_PATH) as f:
       current_hash = f.read().strip()
 
     assert combined_hash == current_hash, "Run openpilot/sunnypilot/models/default_model.py to update the default model name and hash"

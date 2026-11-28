@@ -6,12 +6,10 @@ import random
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import log
 from opendbc.car.structs import car
-from openpilot.cereal.messaging import SubMaster
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import Alert, EVENTS, ET
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
-from openpilot.selfdrive.test.process_replay.process_replay import CONFIGS
 
 AlertSize = log.SelfdriveState.AlertSize
 
@@ -34,8 +32,6 @@ class TestAlerts(OpenpilotTestCase):
       # Create fake objects for callback
       cls.CS = car.CarState.new_message()
       cls.CP = car.CarParams.new_message()
-      cfg = [c for c in CONFIGS if c.proc_name == 'selfdrived'][0]
-      cls.sm = SubMaster(cfg.pubs)
 
   def test_events_defined(self):
     # Ensure all events in capnp schema are defined in events.py

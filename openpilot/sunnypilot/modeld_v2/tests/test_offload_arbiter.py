@@ -35,7 +35,7 @@ T0 = 10_000_000_000
 try:
   import msgq
   from openpilot.cereal import log as cereal_log
-  from openpilot.cereal.messaging import PubMaster, new_message
+  from openpilot.cereal.messaging import new_message
   from openpilot.cereal.services import SERVICE_LIST
   _HAVE_CEREAL = True
 except Exception:  # pragma: no cover - host without native bindings
@@ -286,6 +286,7 @@ class TestCohesion(_CodecPatched):
     _ingest_set(arb, 100, T0)
     out = arb.select(100, T0 + MS)
     self.assertIsNotNone(out)
+    assert out is not None
     self.assertEqual(set(out.keys()), set(oa.REAL_SERVICES))
     self.assertEqual(out["modelV2"], _raw("modelV2", 100) + b"@" + str(T0 + MS).encode())
     self.assertEqual(out["cameraOdometry"], _raw("cameraOdometry", 100) + b"@" + str(T0 + MS).encode())
@@ -361,11 +362,13 @@ class TestSocketPath(unittest.TestCase):
 
   def setUp(self):
     msgq.set_fake_prefix(f"arbtest-{os.getpid()}")
-    self.arb = oa.OffloadArbiter(eligible_ms=1000, enter_n=1, exit_n=3, settle_n=0)
-    self.arb.open()
     # publishers first (so the msgq segments exist), then subscribers, then let SUBSCRIBE propagate
+    # (arb.open() subscribes to the shadow names: the sockets cannot connect before their segments exist)
+    from openpilot.cereal.messaging import PubMaster
     self.pm_shadow = PubMaster(list(oa.SHADOW_NAMES))
     self.pm_real = PubMaster(list(oa.REAL_SERVICES))
+    self.arb = oa.OffloadArbiter(eligible_ms=1000, enter_n=1, exit_n=3, settle_n=0)
+    self.arb.open()
     self.real_subs = {
       name: msgq.sub_sock(name, addr="127.0.0.1", timeout=200, segment_size=SERVICE_LIST[name].queue_size)
       for name in oa.REAL_SERVICES
@@ -421,6 +424,7 @@ class TestSocketPath(unittest.TestCase):
     self.assertFalse(self.arb.engaged)                 # not engaged until select()
     out = self.arb.select(fid, now + MS)
     self.assertIsNotNone(out)
+    assert out is not None
     self.assertTrue(self.arb.engaged)
 
     pm_real = self.pm_real

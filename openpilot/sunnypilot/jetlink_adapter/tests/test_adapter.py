@@ -167,7 +167,12 @@ class TestTheActionRule(unittest.TestCase):
     self.assertEqual(compared, 60)
 
   def test_stock_modelds_big_model_is_left_stock(self):
-    # in stock modeld there is no modeld_v2 rule to match: manager's launcher runs it, so __main__ is manager
+    # in stock modeld there is no modeld_v2 rule to match: manager's launcher runs it, so __main__ is manager.
+    # The second clause keys on sys.modules, so isolate the test from any modeld_v2 import another test in this
+    # process has already made.
+    saved = sys.modules.pop('openpilot.sunnypilot.modeld_v2.modeld', None)
+    if saved is not None:
+      self.addCleanup(sys.modules.__setitem__, 'openpilot.sunnypilot.modeld_v2.modeld', saved)
     with mock.patch.dict(sys.modules, {'__main__': SimpleNamespace(__file__='/data/openpilot/openpilot/system/manager/manager.py')}):
       self.assertFalse(jetlink_adapter._in_modeld_v2())
     with mock.patch.dict(sys.modules, {'__main__': SimpleNamespace(__file__='/data/openpilot/openpilot/sunnypilot/modeld_v2/modeld.py')}):
