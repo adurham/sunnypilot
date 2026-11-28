@@ -357,6 +357,24 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     e2eGated @21 :Float32;       # e2e candidate after gate + turn limit (m/s^2)
     e2eFinal @22 :Float32;       # e2e candidate after AccelBoost + stop commitment -- what entered the min()
   }
+
+  gasTrim @9 :GasTrim;
+
+  struct GasTrim {
+    # fork (lane-zeroask 2026-11-27): the gas-side integral trim's own state, so an offline review can separate the
+    # planner's ask from what the trim added. WITHOUT askPreTrim the published ask already contains the trim and the
+    # delivered/asked ratio reads near baseline by construction, which would make the whole trial look like a no-op.
+    enabled @0 :Bool;          # GasTrim param as read this frame
+    keyKnown @1 :Bool;         # the libparams knows the key (False = a stale build, feature forced OFF)
+    abEnabled @2 :Bool;        # GasTrimAB: the arm alternates every AB_BLOCK_FRAMES
+    armWanted @3 :UInt8;       # 1 = this block is a TRIM arm
+    armEffective @4 :UInt8;    # 1 = the trim was actually applied on this frame
+    askPreTrim @5 :Float32;    # the ask handed to the trim (after the cap and the standstill launch stage)
+    askPostTrim @6 :Float32;   # the ask the trim published (== askPreTrim whenever it stood down)
+    trimState @7 :Float32;     # the integrator state, clamped to [0, TRIM_MAX]
+    trimApplied @8 :Float32;   # the ramped-in part actually added this frame
+    capFactor @9 :Float32 = 1; # the no_close factor; < 1 freezes the trim (the cap owns the ask)
+  }
 }
 
 struct OnroadEventSP @0xda96579883444c35 {

@@ -152,6 +152,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # fork (lane-zeroask 2026-11-27): gas-side integral trim for the steady-state accel error left by kiV=0/kf=0 on
     # this car (fork/gas_trim.py, param GasTrim, default OFF)
     self.gas_trim = GasTrim()
+    # fork (lane-zeroask): log-only, filled in update() and read by publish_fork_plan_log()
+    self._log_ask_pre_trim = 0.
+    self._log_ask_post_trim = 0.
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -351,10 +354,12 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # candidate can raise it back; it only ever touches a POSITIVE ask and never runs below V_MIN, so a brake frame is
     # byte-identical to stock. Inert unless the param is set.
     self.gas_trim.update_params()
+    self._log_ask_pre_trim = float(output_a_target)   # fork (lane-zeroask): log-only, the ask handed to the trim
     output_a_target = self.gas_trim.update(output_a_target, sm['carState'].aEgo, v_ego,
                                            bool(sm['carState'].gasPressed), not reset_state,
                                            cap_factor=float(self.no_close.factor))
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+    self._log_ask_post_trim = float(self.output_a_target)  # fork (lane-zeroask): log-only
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
@@ -420,3 +425,20 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     nc.e2eGate = bool(self._log_e2e_gate)
     nc.e2eGated = float(self._log_e2e_gated)
     nc.e2eFinal = float(self._log_e2e_final)
+    # fork (lane-zeroask 2026-11-27): the gas trim's own state. Its own try/except for the same reason as the block
+    # above: a cereal build that predates the field must publish the plan unchanged, never take it down.
+    try:
+      gt = plan_sp.gasTrim
+    except Exception:
+      return
+    g = self.gas_trim
+    gt.enabled = bool(g.enabled)
+    gt.keyKnown = bool(g.key_known)
+    gt.abEnabled = bool(g.ab_enabled)
+    gt.armWanted = int(g.arm_wanted)
+    gt.armEffective = int(g.arm_effective)
+    gt.askPreTrim = float(self._log_ask_pre_trim)
+    gt.askPostTrim = float(self._log_ask_post_trim)
+    gt.trimState = float(g.trim)
+    gt.trimApplied = float(g.applied)
+    gt.capFactor = float(self.no_close.factor)
