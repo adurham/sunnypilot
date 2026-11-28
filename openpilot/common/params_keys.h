@@ -355,6 +355,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PlannerEarlierBraking", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/planner_earlier.py (default ON for this car)
     {"NoCloseOnLead", {PERSISTENT | BACKUP, BOOL, "1"}},  // fork: sunnypilot/fork/no_close.py (never accelerate toward a lead)
     {"StopApproachCommit", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (17c): sunnypilot/fork/stop_commit.py (default OFF)
+    {"GasTrim", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (lane-zeroask): sunnypilot/fork/gas_trim.py (gas-side integral trim, default OFF)
+    {"GasTrimAB", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork (lane-zeroask): gas_trim.py A/B arm alternation, 60 s blocks
     {"MinGapBrakeFloor", {PERSISTENT | BACKUP, BOOL, "0"}},  // fork: sunnypilot/fork/min_gap_floor.py (low-speed minimum-gap brake floor, default OFF)
     {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ConfidenceMeter", {PERSISTENT | BACKUP, BOOL, "1"}},  // 3X: the comma 4 confidence ball on the wide onroad screen

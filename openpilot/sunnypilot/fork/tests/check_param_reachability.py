@@ -58,6 +58,8 @@ FORK_KEY_PREFIXES = ("HyundaiFca11", "HyundaiGasInterceptor", "DriveModePersonal
                                              #          stale libparams_c.so raises UnknownKeyName and the UI cannot start;
                                              #          naming it puts it under the compiled-libparams guard
                      "HyundaiPedalDeliveryLaw",  # 17c delivery: inside Hyundai*, but named so a prefix edit cannot drop it
+                     "GasTrim",              # lane-zeroask 2026-11-27: a whole key outside every Hyundai* prefix; without
+                                             #          this the compiled-libparams guard never checks it
                      "HyundaiGasRiseLag",  # 0042-Z rise-lag: named for the same reason (a fork key that must stay registered)
                      "HyundaiPedalHoldFit")  # 0047 hold-fit: same reason (inside the pedal family, but named so a prefix edit cannot drop it)
 
