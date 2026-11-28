@@ -1,0 +1,20 @@
+--- a/opendbc/car/hyundai/carstate.py
++++ b/opendbc/car/hyundai/carstate.py
+@@ -372,9 +372,14 @@
+       # (the k="b" level trace records it). Subscribed with a NaN rate = ignore_alive (opendbc/can/parser.py:161), so an
+       # optional instrument can NEVER time a parser out / make canValid flap, and its rate is whatever the TCU sends
+       # (measured ~7-15 Hz on the owner's routes, not 100). Empty frame -> carstate_ext publishes None.
+-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [(DRIVE_MODE_MSG, 10), ("EMS_453", 100), ("ESP_49D", 10),
+-                                                         ("BATT_568", 20), ("N_MODE_4A0", 20),
+-                                                         ("TCU_DCT13", float("nan"))], 0),
++      # 0047: every one of these is an OPTIONAL instrument on the legacy-CAN path, so all of them are
++      # subscribed with a NaN rate = ignore_alive (opendbc/can/parser.py:161): they decode when present and
++      # can NEVER time a parser out / make canValid flap on a platform that does not broadcast them. A 2021
++      # Sonata (process-replay HYUNDAI) has no 0x49D, and a real rate there made carState/sendcan 0% valid
++      # for the whole segment -> "Communication Issue Between Processes", no engagement, on those cars.
++      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [(DRIVE_MODE_MSG, float("nan")), ("EMS_453", float("nan")),
++                                                         ("ESP_49D", float("nan")), ("BATT_568", float("nan")),
++                                                         ("N_MODE_4A0", float("nan")), ("TCU_DCT13", float("nan"))], 0),
+       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
+     }
+     if CP_SP.enableGasInterceptor:
