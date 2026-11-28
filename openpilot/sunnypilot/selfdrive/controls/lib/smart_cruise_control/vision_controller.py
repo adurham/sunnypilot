@@ -96,8 +96,9 @@ class SmartCruiseControlVision:
       v_ego = max(self.v_ego, 0.1)  # ensure a value greater than 0 for calculations
       max_curve = self.max_pred_lat_acc / (v_ego**2)
 
-      # Get the target velocity for the maximum curve
-      self.v_target = (_A_LAT_REG_MAX / max_curve) ** 0.5
+      # Get the target velocity for the maximum curve.  A zero (or negative) predicted curvature means
+      # "no curve ahead": there is no curve-speed target, and the division below would be by zero.
+      self.v_target = (_A_LAT_REG_MAX / max_curve) ** 0.5 if max_curve > 0. else V_CRUISE_UNSET
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, ENTERING, TURNING, LEAVING, OVERRIDING
