@@ -100,6 +100,7 @@ class HyundaiSettings(BrandSettings):
       self.follow_header, self.elastic_follow_toggle, self.no_close_toggle, self.stop_approach_toggle,
       self.fca11_header, self.fca11_shaping_toggle, self.fca11_dynamic_release_toggle,
       self.pedal_header, self.pedal_delivery_toggle, self.gas_rise_lag_toggle,
+      self.experimental_header, self.show_experimental_toggle, self.fca11_shadow_toggle,
     ]
 
   @staticmethod
