@@ -151,8 +151,12 @@ class TestFca11ShapingParamPlumbingE2E(OpenpilotTestCase):
     on, off = seen[(True, True, True)], seen[(True, True, False)]
     self.assertNotEqual(on, off, "the shaping param must change the controller's output")
     self.assertEqual({4}, set(on[:fl.FCA11_SHAPE_ONSET_HOLD_SENT]), "shaped law: the onset hold at the 4 LSB floor")
-    self.assertEqual(fl.dec_cmd_from_accel(-0.8), max(off), "OFF = the deployed 0.67 law level")
-    self.assertGreater(max(off), max(on))
+    # 0054/0055: the shaping-OFF path is the MEASURED plant inverse (not the retired 0.67 through-origin map), so at
+    # 50 kph a -0.8 m/s^2 ask lands on the 4 LSB floor; the shaping-ON affine law inverts the same measured plant and
+    # differs in the RAMP (the onset hold asserted above), not in the level it converges to.
+    self.assertEqual(fl.dec_cmd_from_accel_measured(-0.8, 50.0 / 3.6), max(off),
+                     "OFF = the measured plant inverse at speed")
+    self.assertGreaterEqual(max(on), max(off), "the shaped law holds the 4 LSB onset and climbs from it")
     # shaping is inert whenever braking is not armed: ON and OFF identical (and empty)
     for pedal, brake in ((True, False), (False, True), (False, False)):
       self.assertEqual(seen[(pedal, brake, True)], seen[(pedal, brake, False)], (pedal, brake))

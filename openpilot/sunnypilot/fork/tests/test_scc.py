@@ -5,6 +5,7 @@ Fork SCC fixes + throttle-only guard (fork/scc.py). Scenarios are taken from rou
 import json
 import platform
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import numpy as np
@@ -31,7 +32,7 @@ LAT0, LON0 = 41.5, -87.3
 M_PER_DEG_LAT = R * np.pi / 180.
 
 
-def gps_sm(lat=LAT0, lon=LON0, live_map=None) -> dict:
+def gps_sm(lat=LAT0, lon=LON0, live_map=None) -> Any:
   """SubMaster stand-in carrying the car's GPS position. 922513f312 upstream sync: upstream reads the position from
   sm[get_gps_location_service(params)] (gpsLocation / gpsLocationExternal), not from the LastGPSPosition param."""
   pos = SimpleNamespace(latitude=lat, longitude=lon)
@@ -40,7 +41,7 @@ def gps_sm(lat=LAT0, lon=LON0, live_map=None) -> dict:
   return sm
 
 
-def model_sm(v_ego: float, cur_lat: float, pred_lat: float, live_map=None) -> dict:
+def model_sm(v_ego: float, cur_lat: float, pred_lat: float, live_map=None) -> Any:
   """sm for SCC-V: predicted lat accel = |orientationRate.z| * velocity.x = pred_lat at every point; current lat accel
   = v^2 * |curvature| = cur_lat."""
   mdl = messaging.new_message('modelV2')
@@ -541,10 +542,10 @@ class TestEndToEndPlanner(OpenpilotTestCase):
                   p.scc.guard_active))
     return out
 
-  def _baseline(self, seconds):
+  def _baseline(self, seconds, live_map=None):
     # control: same scenario with no map path at all (what the planner does without SCC)
     self.mem_params.put("MapTargetVelocities", "[]", block=True)
-    return self._drive(True, matched_map(), seconds=seconds)
+    return self._drive(True, matched_map() if live_map is None else live_map, seconds=seconds)
 
   def test_phantom_without_guard_coasts_whole_time(self):
     put_path(self.mem_params, 3., RAMP_PATH)
@@ -579,8 +580,11 @@ class TestEndToEndPlanner(OpenpilotTestCase):
   def test_unmatched_ramp_never_binds(self):
     # 12f @698 as logged: mapd unmatched -> SCC-M ignored outright, no coast at all, guard not needed
     put_path(self.mem_params, 3., RAMP_PATH)
-    out = self._drive(True, messaging.new_message('liveMapDataSP').liveMapDataSP, seconds=4.)
+    unmatched = messaging.new_message('liveMapDataSP').liveMapDataSP
+    out = self._drive(True, unmatched, seconds=4.)
     self.assertTrue(all(src != 'sccMap' for _, src, _, _ in out))
     self.assertFalse(any(o[3] for o in out))
-    base = self._baseline(4.)
+    # same live map as the run above: the merge gate (which steps the ease aside on a matched highway map) must not
+    # be the thing that changes the answer, so only the path differs
+    base = self._baseline(4., live_map=unmatched)
     self.assertEqual([round(a, 6) for a, *_ in out], [round(a, 6) for a, *_ in base])  # identical to no SCC path
