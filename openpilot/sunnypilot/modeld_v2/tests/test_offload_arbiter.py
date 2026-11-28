@@ -361,6 +361,12 @@ class TestSocketPath(unittest.TestCase):
   """PubMaster on the SHADOW names -> arbiter.poll() raw sockets -> publish under the REAL names."""
 
   def setUp(self):
+    # A per-test isolation prefix: it creates /dev/shm/msgq_<prefix> (the directory the sockets below connect
+    # into). Without it the test depends on which module was imported first -- test_returnsend sets a global
+    # OPENPILOT_PREFIX whose directory is never created, and every socket here then fails with IpcError/ENOENT.
+    from openpilot.common.prefix import OpenpilotPrefix
+    self._prefix = OpenpilotPrefix()
+    self._prefix.__enter__()
     msgq.set_fake_prefix(f"arbtest-{os.getpid()}")
     # publishers first (so the msgq segments exist), then subscribers, then let SUBSCRIBE propagate
     # (arb.open() subscribes to the shadow names: the sockets cannot connect before their segments exist)
@@ -382,6 +388,7 @@ class TestSocketPath(unittest.TestCase):
         s.close()
       except Exception:
         pass
+    self._prefix.__exit__(None, None, None)
 
   def _publish_set(self, fid, t_ns, timeout_s=6.0):
     """Resend the shadow set until the arbiter has cached the complete frame set.
