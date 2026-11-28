@@ -292,6 +292,7 @@ class TestLaunch(OpenpilotTestCase):
     e.step(20., 20. - se.LAUNCH_DONE_MARGIN + 0.01, P.relaxed, True, 1.0)
     self.assertFalse(e.launching)
     e.step(25., 19.5, P.relaxed, True, 0.3)  # a later raise is eased
+    assert e.v_ease is not None
     self.assertLess(e.v_ease, 20.)
 
   def test_launch_ends_after_low_accel(self):
@@ -397,7 +398,8 @@ class TestMergeReference(OpenpilotTestCase):
     # driving 50 on a 70 mph highway, +10 to 60: reference 60, deficit 10 mph < MERGE_DEFICIT -> eased, not a merge
     self.assertEqual(ref('highway', 70 * MPH, v_set=60 * MPH), (60 * MPH, se.MERGE_DEFICIT))
     g = se.MergeGate()
-    self.assertFalse(g.update(*ref('highway', 70 * MPH, v_set=60 * MPH), 50 * MPH))
+    _ref, _deficit = ref('highway', 70 * MPH, v_set=60 * MPH)
+    self.assertFalse(g.update(_ref, _deficit, 50 * MPH))
 
   def test_highest_highway_evidence_wins(self):
     self.assertEqual(ref('highway', 55 * MPH, car=65 * MPH, ahead=70 * MPH, ahead_dist=100.)[0], 70 * MPH)
@@ -487,7 +489,7 @@ class TestMergeGate(OpenpilotTestCase):
     self.assertNotIn('valid', fields)         # no validity channel
     self.assertNotIn('age', fields)           # no age/freshness channel
     self.assertNotIn('timestamp', fields)
-    doc = inspect.getdoc(se)
+    doc = inspect.getdoc(se) or ''
     self.assertIn('staleness', doc)
     self.assertIn('last-seen', doc.lower())
     self.assertIn('never adds acceleration', doc)

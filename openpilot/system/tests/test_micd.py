@@ -124,7 +124,7 @@ class TestOpenAudioStream(OpenpilotTestCase):
     def broken_query_devices():
       raise RuntimeError("PortAudio: not initialized")
 
-    sd.query_devices = broken_query_devices
+    mocker.patch.object(sd, "query_devices", broken_query_devices)
     mocker.patch.object(micd.cloudlog, "warning")
 
     stream = micd.open_audio_stream(sd, sd.factory(), log_prefix="test", retry_delay=0.0, attempts=2)

@@ -49,8 +49,8 @@ class TestCommitAccel(OpenpilotTestCase):
       self.assertAlmostEqual(sc.commit_accel(x, v, T), -a, delta=0.02 * a)
 
   def test_steady_and_accelerating_plans_are_zero(self):
-    self.assertEqual(sc.commit_accel(*cruise_plan(20.), T), 0.)
-    self.assertEqual(sc.commit_accel(*cruise_plan(5., 1.0), T), 0.)
+    for plan in (cruise_plan(20.), cruise_plan(5., 1.0)):
+      self.assertEqual(sc.commit_accel(plan[0], plan[1], T), 0.)
 
   def test_standstill_and_malformed_plans_are_zero(self):
     self.assertEqual(sc.commit_accel(np.zeros(33), np.zeros(33), T), 0.)

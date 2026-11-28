@@ -91,14 +91,16 @@ class HoldFixture:
     self.ctx = zmq.Context()
     self.pub = self.ctx.socket(zmq.PUB)
     self.pub.setsockopt(zmq.LINGER, 0)
-    self.pub.bind(self.cfg.endpoint_for("modelV2"))
+    endpoint_for = self.cfg.endpoint_for
+    assert endpoint_for is not None
+    self.pub.bind(endpoint_for("modelV2"))
     self.pub.monitor(f"inproc://holdpolicy-mon-{id(self)}", zmq.EVENT_ACCEPTED)
     self.mon = self.pub.get_monitor_socket()
 
     # a second PUB for the SP return service (own port) — the §7 pairing test needs it.
     self.sp_pub = self.ctx.socket(zmq.PUB)
     self.sp_pub.setsockopt(zmq.LINGER, 0)
-    self.sp_pub.bind(self.cfg.endpoint_for("modelDataV2SP"))
+    self.sp_pub.bind(endpoint_for("modelDataV2SP"))
     self.sp_pub.monitor(f"inproc://holdpolicy-sp-mon-{id(self)}", zmq.EVENT_ACCEPTED)
     self.sp_mon = self.sp_pub.get_monitor_socket()
 

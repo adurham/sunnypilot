@@ -139,7 +139,9 @@ import signal
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import zmq
 
@@ -285,7 +287,7 @@ class Config:
   offload_mode: str = "auto"               # auto | shadow | drive | holds (explicit = bench bypass)
   camera_addr: str = "127.0.0.1"           # local msgq address for camera states
   services: tuple = field(default_factory=lambda: tuple(RETURN_SERVICES))
-  endpoint_for: object = None             # callable(service)->endpoint; tests inject a free port
+  endpoint_for: Callable[[str], str] | None = None             # callable(service)->endpoint; tests inject a free port
   shadow_map: dict = field(default_factory=lambda: dict(DEFAULT_SHADOW_MAP))
   # shadow service names to open a device msgq PubMaster on (defaults to shadow_map's values).
   shadow_services: tuple = field(default_factory=lambda: SHADOW_SERVICES)
@@ -321,11 +323,12 @@ class _CerealIO:
 
   def __init__(self, cfg: Config):
     self.cfg = cfg
-    self._SubMaster = None
-    self._PubMaster = None
-    self._log = None
-    self.sub = None
-    self.pub = None
+    # lazily imported cereal bindings (see ready()); Any keeps the lazy contract while typing the calls below
+    self._SubMaster: Any = None
+    self._PubMaster: Any = None
+    self._log: Any = None
+    self.sub: Any = None
+    self.pub: Any = None
 
   def ready(self) -> bool:
     if self._SubMaster is not None:

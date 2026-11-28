@@ -18,6 +18,7 @@ import importlib
 import inspect
 import sys
 import types
+from typing import cast
 
 from opendbc.car import structs
 from openpilot.cereal import custom, messaging
@@ -75,7 +76,7 @@ def run_interface_cleanup(params, openpilot_long: bool):
 def run_ui_state_constraints(params, openpilot_long: bool):
   from openpilot.selfdrive.ui.sunnypilot.ui_state import UIStateSP
   shim = UIStateShim(params, make_cp(openpilot_long), CPSP(pcm_cruise_speed=not openpilot_long), has_long=openpilot_long)
-  UIStateSP._enforce_constraints(shim)
+  UIStateSP._enforce_constraints(cast(UIStateSP, shim))
 
 
 CLEANUP_PATHS = {
@@ -153,7 +154,7 @@ class TestCleanupKeepsPrefs(OpenpilotTestCase):
     cp = make_cp(False)
     cp.alphaLongitudinalAvailable = False
     shim = UIStateShim(p, cp, CPSP(False), has_long=False)
-    UIStateSP._enforce_constraints(shim)
+    UIStateSP._enforce_constraints(cast(UIStateSP, shim))
     self.assertFalse(p.get_bool("AlphaLongitudinalEnabled"))
 
 

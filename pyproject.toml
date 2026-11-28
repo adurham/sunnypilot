@@ -172,6 +172,15 @@ quote-style = "preserve"
 [tool.ty.src]
 exclude = [
   "openpilot/third_party/",
+  # Offline harness / probe / bench scripts: not shipped, not imported by the car, and never run by CI's test
+  # runner as a test (the probe/harness entry points are invoked by hand). Everything else -- production code
+  # and the tests that do run -- is checked.
+  "openpilot/sunnypilot/fork/tests/check_e2e_gate_logs.py",   # route-log analysis harness
+  "openpilot/sunnypilot/fork/tests/test_esc_probe_0027.py",   # ESC probe script
+  "openpilot/offload/device/bench/bench_resources.py",        # bench tool
+  "openpilot/offload/mac/bench_resources_mac.py",             # bench tool
+  "openpilot/offload/models/smoke_offline.py",                # offline smoke driver
+  "openpilot/offload/models/verify_offload_guards.py",        # offline guard probe
 ]
 
 [tool.ty.rules]

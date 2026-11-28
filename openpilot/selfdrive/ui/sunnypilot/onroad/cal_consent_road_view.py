@@ -46,11 +46,11 @@ class AugmentedRoadViewCal(AugmentedRoadView):
     # Only take part in rendering / touch when a rep is genuinely pending (or briefly, "firing...").
     self._cal_consent.set_visible(lambda: self._cal_consent.is_prompting())
 
-  def _handle_mouse_press(self, mouse_pos) -> None:
+  def _handle_mouse_press(self, _) -> None:
     # A tap on the consent prompt must NOT also toggle the sidebar (the base acts on press).
     if self._cal_consent.interacting():
       return
-    super()._handle_mouse_press(mouse_pos)
+    super()._handle_mouse_press(_)
 
   def _render(self, rect) -> None:
     super()._render(rect)

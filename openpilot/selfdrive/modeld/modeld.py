@@ -145,6 +145,7 @@ def input_view(buffer: Buffer, shape: tuple[int, ...], dtype: DType, offset: int
 
 class ModelState(ModelStateBase):
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
+  frame_drop_ratio: float = 0.0  # read by jetlink's joining model to hand a lagging big model back
 
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool):
     ModelStateBase.__init__(self)
@@ -411,7 +412,7 @@ def main(demo=False):
       frames_dropped = 0.
     run_count = run_count + 1
 
-    frame_drop_ratio = frames_dropped / (1 + frames_dropped)
+    frame_drop_ratio = float(frames_dropped / (1 + frames_dropped))
     # Jetlink's joining model reads the drop ratio to hand a lagging big model back; stock modeld never wrote it on the model
     model.frame_drop_ratio = frame_drop_ratio
 

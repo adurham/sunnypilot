@@ -182,8 +182,7 @@ class TestStandstillFlicker(OpenpilotTestCase):
            [(5., -0.5, False)] * 20 + [(0.2, -0.2, True)] * 5 + [(0.2, 0.3, False)] * 10 + [(1.0, 0.5, False)] * 10]
     a, b = make_planner(), make_planner()
     b.standstill_launch = sl.StandstillLaunchDebounce()
-    b.standstill_launch.update = lambda s, acc, ss, act: (s, acc)    # the stock path
-    with mpc_as_logged():
+    with mock.patch.object(sl.StandstillLaunchDebounce, 'update', lambda s, acc, ss, act: (s, acc)), mpc_as_logged():
       for sm in seq:
         a.update(sm)
         b.update(sm)

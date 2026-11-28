@@ -2,6 +2,7 @@
 import queue
 import threading
 import time
+from typing import Any, cast
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.params import Params
@@ -201,7 +202,7 @@ class TestParamsWorker(OpenpilotTestCase):
       entered.set()
       gate.wait(5)
       return value
-    w.params.get = slow_get
+    cast(Any, w.params).get = slow_get
     t = threading.Thread(target=w._refresh)
     t.start()
     entered.wait(5)

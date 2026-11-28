@@ -169,6 +169,7 @@ class FrameMeta:
 class ModelState(ModelStateBase):
   inputs: dict[str, np.ndarray]
   prev_desire: np.ndarray
+  frame_drop_ratio: float = 0.0  # read by jetlink's joining model to hand a lagging big model back
 
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool = False):
     ModelStateBase.__init__(self)
@@ -561,7 +562,7 @@ def main(demo=False):
       frames_dropped = 0.
     run_count = run_count + 1
 
-    frame_drop_ratio = frames_dropped / (1 + frames_dropped)
+    frame_drop_ratio = float(frames_dropped / (1 + frames_dropped))
     # Jetlink's joining model reads the drop ratio to hand a lagging big model back
     model.frame_drop_ratio = frame_drop_ratio
 

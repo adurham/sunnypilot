@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from typing import cast
 
 import numpy as np
 import pytest
@@ -142,7 +143,7 @@ def test_gate_g6_threshold_from_synthetic_rows(tmp_path):
   assert g["detail"]["p99.9_ms"] == pytest.approx(99.9)
 
   # push p50 over 75 ms => FAIL
-  rows_bad = [dict(r, modelv2_mac_ns=r["recv_mac_ns"] + 80_000_000) for r in rows]
+  rows_bad = [dict(r, modelv2_mac_ns=cast(int, r["recv_mac_ns"]) + 80_000_000) for r in rows]
   assert M.gate_g6(rows_bad)["status"] == "FAIL"
 
 
@@ -156,7 +157,7 @@ def test_gate_g7_threshold_from_synthetic_rows():
   assert g["detail"]["p50_ms"] == pytest.approx(1.0)
   assert g["status"] == "FAIL"
 
-  rows_ok = [dict(r, decode_done_mac_ns=r["recv_mac_ns"] + 2_000_000) for r in rows]
+  rows_ok = [dict(r, decode_done_mac_ns=cast(int, r["recv_mac_ns"]) + 2_000_000) for r in rows]
   assert M.gate_g7(rows_ok)["status"] == "PASS"
 
 

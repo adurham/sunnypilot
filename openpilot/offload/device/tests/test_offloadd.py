@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import time
+from typing import Any, cast
 
 import pytest
 import zmq
@@ -220,14 +221,16 @@ class Fixture:
     self.ctx = zmq.Context()
     self.pub = self.ctx.socket(zmq.PUB)
     self.pub.setsockopt(zmq.LINGER, 0)
-    self.pub.bind(self.cfg.endpoint_for("modelV2"))
+    endpoint_for = self.cfg.endpoint_for
+    assert endpoint_for is not None
+    self.pub.bind(endpoint_for("modelV2"))
     self.pub.monitor(f"inproc://offloadd-test-mon-{os.getpid()}", zmq.EVENT_ACCEPTED)
     self.mon = self.pub.get_monitor_socket()
 
     # a second PUB for the SP return service (own port) — the §7 pairing tests need it.
     self.sp_pub = self.ctx.socket(zmq.PUB)
     self.sp_pub.setsockopt(zmq.LINGER, 0)
-    self.sp_pub.bind(self.cfg.endpoint_for("modelDataV2SP"))
+    self.sp_pub.bind(endpoint_for("modelDataV2SP"))
     self.sp_pub.monitor(f"inproc://offloadd-test-sp-mon-{os.getpid()}", zmq.EVENT_ACCEPTED)
     self.sp_mon = self.sp_pub.get_monitor_socket()
 
@@ -715,7 +718,7 @@ def test_long_camera_block_in_later_step_does_not_overpair_sp():
       clk["t"] += block_ns["v"]
       real_update(0)
 
-    fx.daemon.cereal.update = update
+    cast(Any, fx.daemon.cereal).update = update
 
     fx.send_modelv2(1, n)
     assert _step_real(fx, lambda: fx.daemon.forwarded == 1)          # partner forwarded, anchor == n
@@ -744,7 +747,7 @@ def test_sp_straddling_two_steps_still_pairs_on_true_stamps():
       clk["t"] += block_ns["v"]
       real_update(0)
 
-    fx.daemon.cereal.update = update
+    cast(Any, fx.daemon.cereal).update = update
     fx.send_modelv2(1, n)
     assert _step_real(fx, lambda: fx.daemon.forwarded == 1)
     fx.send_sp(turn=2)

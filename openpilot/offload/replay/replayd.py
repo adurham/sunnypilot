@@ -35,6 +35,7 @@ import random
 import signal
 import sys
 import time
+from typing import Any
 
 import zmq
 
@@ -121,7 +122,7 @@ def build_timeline(route_dirs: list[str], fixture_dir: str):
   Each event: dict(dev_ns, service, kind, raw, frame_id, encode_id, nbytes).
   Video events are built eagerly (raw bytes cached) — ~2.4 k events, fine.
   """
-  events = []
+  events: list[dict[str, Any]] = []
 
   for cam in fx.CAMERAS:
     header, recs = _load_fixture_cam(fixture_dir, cam)

@@ -152,6 +152,7 @@ def test_modeld_runner_and_real_forward_pass_over_device_geometry(tmp_path, monk
       bufs = dict.fromkeys(model.vision_input_names, fb)
       transforms = {k: np.eye(3, dtype=np.float32) for k in model.vision_input_names}
       out = model.run(bufs, transforms, make_inputs(model))
+      assert out is not None
       key = "plan" if "plan" in out else sorted(out)[0]
       outs.append(np.asarray(out[key], dtype=np.float64).ravel())
     return outs

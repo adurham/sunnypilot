@@ -49,6 +49,8 @@ import signal
 import struct
 import sys
 import time
+from collections.abc import Callable
+from typing import Any
 
 import zmq
 
@@ -114,7 +116,7 @@ class ReturnSender:
     self._pub: dict[str, zmq.Socket] = {}
     self._mon: dict[str, zmq.Socket] = {}
     self._readers: dict[str, int] = dict.fromkeys(self.cfg.services, 0)
-    self._log_from_bytes = None
+    self._log_from_bytes: Callable[[bytes], Any] | None = None
     self._start_mono = time.monotonic()
 
   # -- lifecycle ---------------------------------------------------------------
@@ -208,6 +210,10 @@ class ReturnSender:
   def _handle(self, raw: bytes) -> None:
     """Age-gate and forward one raw Event; count and drop instead of ever blocking."""
     self.received += 1
+    if self._log_from_bytes is None:
+      # not open(): never forward blind (fail safe)
+      self.dropped_age += 1
+      return
     try:
       reader = self._log_from_bytes(raw)
       which = reader.which()

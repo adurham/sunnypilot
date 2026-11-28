@@ -132,15 +132,20 @@ class TestAdaptiveFollowController(OpenpilotTestCase):
   def test_rate_limits(self):
     a = af.AdaptiveFollow(True, params=FakeParams())
     t0 = a.update(STANDARD, 15., "urban", False, 0.)
+    assert t0 is not None
     self.assertAlmostEqual(t0, af.BASE_T_FOLLOW)
     # jump to highway speed with no lead: the gap now SHRINKS, at most T_FOLLOW_RATE_DOWN per second
     t1 = a.update(STANDARD, 31., "highway", False, 0.)
+    assert t1 is not None
     self.assertAlmostEqual(t0 - t1, af.T_FOLLOW_RATE_DOWN * a.dt, places=6)
+    t_hi = None
     for _ in range(100):
       t_hi = a.update(STANDARD, 31., "highway", False, 0.)
+    assert t_hi is not None
     self.assertAlmostEqual(t_hi, af.get_adaptive_t_follow(STANDARD, 31., "highway", False, 0., True), places=6)
     # back to urban: the gap is given back slowly
     t2 = a.update(STANDARD, 15., "urban", False, 0.)
+    assert t2 is not None
     self.assertAlmostEqual(t2 - t_hi, af.T_FOLLOW_RATE_UP * a.dt, places=6)
 
   def test_throttle_only_detection(self):

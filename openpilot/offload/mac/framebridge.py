@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import TypedDict
 
 # --- ZMQ semantics must be decided before importing messaging ----------------
 # We deliberately do NOT set os.environ["ZMQ"]="1": this msgq build has no ZMQ
@@ -57,7 +58,13 @@ try:
 except Exception as e:  # pragma: no cover
   raise SystemExit(f"msgq.visionipc unavailable: {e}") from e
 
-CAMERAS = {
+class _CameraSpec(TypedDict):
+  encode: str
+  cam_state: str
+  stream: VisionStreamType
+
+
+CAMERAS: dict[str, _CameraSpec] = {
   "narrow": {
     "encode": "narrowRoadEncodeData",
     "cam_state": "narrowRoadCameraState",

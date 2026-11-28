@@ -15,6 +15,7 @@ matched-speed case that the gate was built for is pinned as unchanged, and the m
 profile gates on the same frame) is a permanent test.
 """
 from types import SimpleNamespace
+from typing import cast
 from unittest import mock
 
 import numpy as np
@@ -50,7 +51,7 @@ class GateOnly:
     self.e2e_gate_latch = 0
 
   def step(self, ld, v=15., e2e=-0.8, mpc=0.2, should_stop=False, t_follow=T_FOLLOW):
-    return lp.LongitudinalPlanner.update_e2e_gate(self, ld, v, e2e, mpc, should_stop, t_follow)
+    return lp.LongitudinalPlanner.update_e2e_gate(cast(lp.LongitudinalPlanner, self), ld, v, e2e, mpc, should_stop, t_follow)
 
 
 V = 15.
