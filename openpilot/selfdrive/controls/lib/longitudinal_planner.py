@@ -20,6 +20,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 from openpilot.sunnypilot.fork.stop_commit import StopCommit
 from openpilot.sunnypilot.fork.no_close import NoCloseCap
+from openpilot.sunnypilot.fork.gas_trim import GasTrim
 from openpilot.sunnypilot.fork.standstill_launch import StandstillLaunchDebounce
 
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -148,6 +149,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self._log_e2e_final = 0.        # e2e after AccelBoost + stop commitment = the e2e candidate
     self._log_e2e_gate = False      # the gate's state this frame
     self._log_lead_present = False  # radarState.leadOne.present
+    # fork (lane-zeroask 2026-11-27): gas-side integral trim for the steady-state accel error left by kiV=0/kf=0 on
+    # this car (fork/gas_trim.py, param GasTrim, default OFF)
+    self.gas_trim = GasTrim()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -343,6 +347,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # go, never raises the ask; a moving car and a reset planner pass through unchanged.
     self.output_should_stop, output_a_target = self.standstill_launch.update(self.output_should_stop, output_a_target,
                                                                              sm['carState'].standstill, not reset_state)
+    # fork (lane-zeroask 2026-11-27): gas-side integral trim, param-gated (GasTrim, default OFF). Last stage, so no
+    # candidate can raise it back; it only ever touches a POSITIVE ask and never runs below V_MIN, so a brake frame is
+    # byte-identical to stock. Inert unless the param is set.
+    self.gas_trim.update_params()
+    output_a_target = self.gas_trim.update(output_a_target, sm['carState'].aEgo, v_ego,
+                                           bool(sm['carState'].gasPressed), not reset_state,
+                                           cap_factor=float(self.no_close.factor))
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
