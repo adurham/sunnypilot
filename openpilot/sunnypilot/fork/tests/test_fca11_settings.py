@@ -91,8 +91,10 @@ class TestPanel(unittest.TestCase):
 
   def test_experimental_rows_are_behind_the_reveal(self):
     self.assertIn('tr("Show experimental")', self.src)
-    self.assertIn("experimental_row_state(pedal, brake, self.show_experimental", self.src)
-    self.assertIn("experimental_row_state(pedal, True, self.show_experimental", self.src)
+    # The stop-hold row this file used to pin was retired by 277f97d21e, which deleted its
+    # experimental_row_state(pedal, brake, ...) call.  The shadow row is what remains, and 524c72f9f3
+    # gave it the prerequisite literal plus own-value and offroad arguments.
+    self.assertIn("experimental_row_state(pedal, True, self.show_experimental, shadow_on, offroad)", self.src)
 
   def test_panel_uses_the_pure_rules(self):
     self.assertIn("mode_toggle_state(offroad).enabled", self.src)
